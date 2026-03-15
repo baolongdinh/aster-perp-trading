@@ -74,9 +74,15 @@ func (s *FlagPennantStrategy) State(symbol string) string {
 	defer s.mu.RUnlock()
 	dir, ok := s.impulseDir[symbol]
 	if !ok || dir == "" {
-		return "hunting for impulse"
+		return "hunting for impulse move"
 	}
-	return fmt.Sprintf("hunting flag breakout | impulse %s", dir)
+	wait := "Wait for Flag Breakout"
+	if dir == strategy.SideBuy {
+		wait += " UP"
+	} else {
+		wait += " DOWN"
+	}
+	return fmt.Sprintf("Impulse:%s | %s", dir, wait)
 }
 
 func (s *FlagPennantStrategy) OnKline(k stream.WsKline) {

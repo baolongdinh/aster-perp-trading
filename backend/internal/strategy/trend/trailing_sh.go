@@ -66,8 +66,13 @@ func (s *TrailingSHStrategy) SetEnabled(v bool) {
 func (s *TrailingSHStrategy) State(symbol string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fmt.Sprintf("HH: %.2f | HL: %.2f | LH: %.2f | LL: %.2f",
-		s.lastHH[symbol], s.lastHL[symbol], s.lastLH[symbol], s.lastLL[symbol])
+	hh := s.lastHH[symbol]
+	ll := s.lastLL[symbol]
+	if hh == 0 && ll == 0 {
+		return "hunting for initial structure"
+	}
+	wait := fmt.Sprintf("Wait for Price > %.2f (UP) or < %.2f (DOWN)", hh, ll)
+	return fmt.Sprintf("HH:%.2f LL:%.2f | %s", hh, ll, wait)
 }
 
 func (s *TrailingSHStrategy) OnKline(k stream.WsKline) {

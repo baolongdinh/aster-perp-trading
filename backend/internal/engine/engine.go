@@ -274,7 +274,7 @@ func (e *Engine) evaluateSignals(ctx context.Context) {
 				continue
 			}
 			e.log.Info("signal",
-				zap.String("strategy", s.Name()),
+				zap.String("strategy", sig.StrategyName), // uses sub-strategy name
 				zap.String("symbol", sym),
 				zap.String("type", string(sig.Type)),
 				zap.String("side", string(sig.Side)),
@@ -298,7 +298,7 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		slPrice := 0.0
 		// SL will be computed after fill for MARKET orders (we don't know entry price yet)
 		// For now, pass 0 and the order manager handles it post-fill
-		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), sig.Quantity, slPrice, sig.TakeProfit); err != nil {
+		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), sig.Quantity, slPrice, sig.TakeProfit, sig.StrategyName); err != nil {
 			e.log.Error("place entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
 			return
 		}

@@ -50,10 +50,11 @@ func (s *MomentumROCStrategy) State(symbol string) string {
 	defer s.mu.RUnlock()
 	closes := s.closes[symbol]
 	if len(closes) < s.cfg.ROCPeriod+1 {
-		return "warming up"
+		return fmt.Sprintf("warming up (%d/%d)", len(closes), s.cfg.ROCPeriod+1)
 	}
 	val := indicators.ROC(closes, s.cfg.ROCPeriod)
-	return fmt.Sprintf("ROC(%d): %.2f%%", s.cfg.ROCPeriod, val)
+	wait := fmt.Sprintf("Wait for ROC > %.1f%% or < -%.1f%% and accelerating", s.cfg.ROCThreshold, s.cfg.ROCThreshold)
+	return fmt.Sprintf("ROC(%d):%.2f%% | %s", s.cfg.ROCPeriod, val, wait)
 }
 
 func (s *MomentumROCStrategy) OnKline(k stream.WsKline) {

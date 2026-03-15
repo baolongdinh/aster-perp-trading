@@ -49,11 +49,12 @@ func (s *VolumeSpikeStrategy) SetEnabled(v bool) { s.cfg.Enabled = v }
 func (s *VolumeSpikeStrategy) State(symbol string) string {
 	volList, ok := s.volumes[symbol]
 	if !ok || len(volList) < s.cfg.VolumeMaPeriod {
-		return "accumulating data"
+		return fmt.Sprintf("warming up (%d/%d)", len(volList), s.cfg.VolumeMaPeriod)
 	}
 	avgVol := indicators.SMA(volList, s.cfg.VolumeMaPeriod)
 	lastVol := volList[len(volList)-1]
-	return fmt.Sprintf("AvgVol: %.2f | LastVol: %.2f (%.1fx)", avgVol, lastVol, lastVol/avgVol)
+	wait := fmt.Sprintf("Wait for Vol > %.2f (%.1fx spike)", avgVol*s.cfg.SpikeMultiplier, s.cfg.SpikeMultiplier)
+	return fmt.Sprintf("AvgVol:%.2f LastVol:%.2f (%.1fx) | %s", avgVol, lastVol, lastVol/avgVol, wait)
 }
 
 func (s *VolumeSpikeStrategy) OnKline(k stream.WsKline) {

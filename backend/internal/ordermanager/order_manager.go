@@ -5,6 +5,7 @@ package ordermanager
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 
@@ -61,6 +62,7 @@ func (m *Manager) PlaceMarketEntry(
 	ctx context.Context,
 	symbol, side, qty string,
 	slPrice, tpPrice float64,
+	strategyName string,
 ) (*LocalOrder, error) {
 	clientID := "bot_" + uuid.New().String()[:12]
 
@@ -80,11 +82,24 @@ func (m *Manager) PlaceMarketEntry(
 	m.orders[order.OrderID] = lo
 	m.mu.Unlock()
 
-	m.log.Info("entry order placed",
+	rr := 0.0
+	if slPrice > 0 && tpPrice > 0 && order.AvgPrice > 0 {
+		riskVal := math.Abs(order.AvgPrice - slPrice)
+		rewardVal := math.Abs(tpPrice - order.AvgPrice)
+		if riskVal > 0 {
+			rr = rewardVal / riskVal
+		}
+	}
+
+	m.log.Info("🚀 TRADE ENTERED",
+		zap.String("strategy", strategyName),
 		zap.String("symbol", symbol),
 		zap.String("side", side),
+		zap.Float64("entry", order.AvgPrice),
+		zap.Float64("sl", slPrice),
+		zap.Float64("tp", tpPrice),
+		zap.Float64("rr", rr),
 		zap.String("qty", qty),
-		zap.String("clientId", clientID),
 		zap.Int64("orderId", order.OrderID),
 	)
 

@@ -34,6 +34,7 @@ type Signal struct {
 	StopLoss     float64 // stop-loss price (0 = no SL)
 	TakeProfit   float64 // take-profit price (0 = no TP)
 	Reason       string  // log label
+	StrategyName string  // which sub-strategy fired this
 }
 
 // Strategy is implemented by every trading strategy.

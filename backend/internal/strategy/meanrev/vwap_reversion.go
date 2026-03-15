@@ -61,8 +61,11 @@ func (s *VWAPReversionStrategy) State(symbol string) string {
 	if !ok {
 		return "init"
 	}
-	diff := (s.lastPrice[symbol] - vwap.Value()) / vwap.Value() * 100
-	return fmt.Sprintf("VWAP: %.2f | Price: %.2f | Dev: %+.2f%%", vwap.Value(), s.lastPrice[symbol], diff)
+	val := vwap.Value()
+	price := s.lastPrice[symbol]
+	diff := (price - val) / val * 100
+	wait := fmt.Sprintf("Wait for Dev >= %.1f%% or <= -%.1f%%", s.cfg.DevThreshold, s.cfg.DevThreshold)
+	return fmt.Sprintf("VWAP:%.2f Price:%.2f Dev:%+.2f%% | %s", val, price, diff, wait)
 }
 
 func (s *VWAPReversionStrategy) OnKline(k stream.WsKline) {

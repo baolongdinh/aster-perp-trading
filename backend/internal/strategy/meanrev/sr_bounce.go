@@ -50,7 +50,21 @@ func (s *SRBounceStrategy) SetEnabled(v bool) { s.enabled = v }
 func (s *SRBounceStrategy) State(symbol string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fmt.Sprintf("hunting S/R bounce (%d candles lookback)", s.cfg.Lookback)
+	highs := s.highs[symbol]
+	lows := s.lows[symbol]
+	if len(highs) < s.cfg.Lookback {
+		return fmt.Sprintf("warming up (%d/%d)", len(highs), s.cfg.Lookback)
+	}
+	
+	res := 0.0
+	sup := math.MaxFloat64
+	for i := 0; i < len(highs)-1; i++ {
+		if highs[i] > res { res = highs[i] }
+		if lows[i] < sup { sup = lows[i] }
+	}
+	price := highs[len(highs)-1]
+	wait := fmt.Sprintf("Wait for Price >= %.2f or <= %.2f", res*(1-s.cfg.BouncePct/100), sup*(1+s.cfg.BouncePct/100))
+	return fmt.Sprintf("Price:%.2f Lvl:[Sup:%.2f Res:%.2f] | %s", price, sup, res, wait)
 }
 
 func (s *SRBounceStrategy) OnKline(k stream.WsKline) {

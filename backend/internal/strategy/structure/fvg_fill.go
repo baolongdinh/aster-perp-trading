@@ -46,7 +46,13 @@ func (s *FVGStrategy) IsEnabled() bool   { return s.enabled }
 func (s *FVGStrategy) SetEnabled(v bool) { s.enabled = v }
 
 func (s *FVGStrategy) State(symbol string) string {
-	return "hunting fair value gaps"
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	highs := s.highs[symbol]
+	if len(highs) < 3 {
+		return fmt.Sprintf("warming up (%d/3)", len(highs))
+	}
+	return "Wait for Fair Value Gap formation (3-candle sequence)"
 }
 
 func (s *FVGStrategy) OnKline(k stream.WsKline) {

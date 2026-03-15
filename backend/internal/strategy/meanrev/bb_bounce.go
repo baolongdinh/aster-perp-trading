@@ -60,11 +60,12 @@ func (s *BBBounceStrategy) State(symbol string) string {
 	defer s.mu.RUnlock()
 	closes := s.closes[symbol]
 	if len(closes) < s.cfg.Period {
-		return "waiting for candles"
+		return fmt.Sprintf("warming up (%d/%d)", len(closes), s.cfg.Period)
 	}
 	up, mid, low := s.bb.Calculate(closes)
 	last := closes[len(closes)-1]
-	return fmt.Sprintf("Last: %.2f | BB: (%.2f / %.2f / %.2f)", last, up, mid, low)
+	wait := fmt.Sprintf("Wait for Price <= %.2f or >= %.2f", low, up)
+	return fmt.Sprintf("Last:%.2f BB:[%.2f|%.2f|%.2f] | %s", last, low, mid, up, wait)
 }
 
 func (s *BBBounceStrategy) OnKline(k stream.WsKline) {

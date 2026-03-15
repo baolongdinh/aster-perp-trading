@@ -83,9 +83,22 @@ func (s *BreakoutRetestStrategy) State(symbol string) string {
 	defer s.mu.RUnlock()
 	st, ok := s.stage[symbol]
 	if !ok {
-		return "init"
+		return "warming up"
 	}
-	return fmt.Sprintf("stage: %s | high: %.2f | low: %.2f", st, s.boxHigh[symbol], s.boxLow[symbol])
+	high := s.boxHigh[symbol]
+	low := s.boxLow[symbol]
+	var wait string
+	switch st {
+	case StateConsolidating:
+		wait = fmt.Sprintf("Wait for Break Close > %.2f or < %.2f", high, low)
+	case StateBreakout, StateWaitingRetest:
+		if s.breakDir[symbol] == strategy.SideBuy {
+			wait = fmt.Sprintf("Wait for Retest of %.2f (UP)", high)
+		} else {
+			wait = fmt.Sprintf("Wait for Retest of %.2f (DOWN)", low)
+		}
+	}
+	return fmt.Sprintf("Stage:%s Box:[%.2f|%.2f] | %s", st, low, high, wait)
 }
 
 func (s *BreakoutRetestStrategy) OnKline(k stream.WsKline) {

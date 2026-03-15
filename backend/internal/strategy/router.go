@@ -55,10 +55,43 @@ func (r *Router) Symbols() []string { return r.cfg.Symbols }
 func (r *Router) IsEnabled() bool   { return r.cfg.Enabled }
 func (r *Router) SetEnabled(v bool) { r.cfg.Enabled = v }
 
-// State returns the overarching regime state + the selected strategy
+// State returns the overarching regime state + details from the primary sub-strategy
 func (r *Router) State(symbol string) string {
-	regstr, adx, bbw := r.classifier.Current()
-	return string(regstr) + " | ADX: " + formatFloat(adx) + " | BBW: " + formatFloat(bbw) + "%"
+	reg, adx, bbw := r.classifier.Current()
+	candidates := r.getCandidates(reg)
+
+	// Build active candidate string
+	var activeNames []string
+	for _, name := range candidates {
+		if s, ok := r.strategies[name]; ok && s.IsEnabled() {
+			activeNames = append(activeNames, name)
+		}
+	}
+
+	res := fmt.Sprintf("[%s] ADX:%.1f BBW:%.2f%% | Active: %v", reg, adx, bbw, activeNames)
+
+	// If we have an active candidate, show the status of the first one
+	if len(activeNames) > 0 {
+		top := activeNames[0]
+		if strat, ok := r.strategies[top]; ok {
+			res += fmt.Sprintf(" | Focus: %s", strat.State(symbol))
+		}
+	}
+
+	return res
+}
+
+func (r *Router) getCandidates(reg regime.RegimeType) []string {
+	switch reg {
+	case regime.RegimeTrend:
+		return []string{"structure_bos", "breakout_retest", "flag_pennant", "trailing_sh", "ema_cross"}
+	case regime.RegimeRanging:
+		return []string{"rsi_divergence", "vwap_reversion", "bb_bounce", "sr_bounce", "fvg_fill", "liquidity_sweep"}
+	case regime.RegimeBreakout:
+		return []string{"volume_spike", "orb", "momentum_roc"}
+	default:
+		return nil
+	}
 }
 
 // OnKline proxies data to the classifier AND all sub-strategies (so they stay warm).
@@ -103,16 +136,8 @@ func (r *Router) OnAccountUpdate(u stream.WsAccountUpdate) {
 func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 	reg, _, _ := r.classifier.Current()
 
-	// Define strategy priority per regime
-	var candidates []string
-	switch reg {
-	case regime.RegimeTrend:
-		candidates = []string{"structure_bos", "breakout_retest", "flag_pennant", "trailing_sh", "ema_cross"}
-	case regime.RegimeRanging:
-		candidates = []string{"rsi_divergence", "vwap_reversion", "bb_bounce", "sr_bounce", "fvg_fill", "liquidity_sweep"}
-	case regime.RegimeBreakout:
-		candidates = []string{"volume_spike", "orb", "momentum_roc"}
-	default:
+	candidates := r.getCandidates(reg)
+	if candidates == nil {
 		return &Signal{Type: SignalNone}
 	}
 
@@ -125,6 +150,7 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 			}
 			sig := str.Signal(symbol, pos)
 			if sig != nil && sig.Type == SignalExit {
+				sig.StrategyName = sName
 				return sig
 			}
 		}
@@ -140,6 +166,7 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 
 		sig := strat.Signal(symbol, pos)
 		if sig != nil && sig.Type == SignalEnter {
+			sig.StrategyName = name
 			return sig
 		}
 	}

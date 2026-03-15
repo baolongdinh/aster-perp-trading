@@ -71,7 +71,7 @@ func (e *EMACrossStrategy) State(symbol string) string {
 
 	req := e.cfg.SlowPeriod + 1
 	if len(closes) < req {
-		return fmt.Sprintf("accumulating klines: %d/%d (%.1f%%)", len(closes), req, float64(len(closes))/float64(req)*100)
+		return fmt.Sprintf("warming up (%d/%d)", len(closes), req)
 	}
 
 	fastNow := ema(closes, e.cfg.FastPeriod)
@@ -80,21 +80,21 @@ func (e *EMACrossStrategy) State(symbol string) string {
 	slowPrev := ema(closes[:len(closes)-1], e.cfg.SlowPeriod)
 
 	diff := (fastNow - slowNow) / slowNow * 100
-
-	// Explain logic
-	trend := "NO CROSS"
+	var trend, wait string
 	if fastPrev <= slowPrev && fastNow > slowNow {
-		trend = "CROSS UP (LONG)"
+		trend = "GOLDEN CROSS"
+		wait = "Wait for Signal Confirmation"
 	} else if fastPrev >= slowPrev && fastNow < slowNow {
-		trend = "CROSS DOWN (SHORT)"
+		trend = "DEATH CROSS"
+		wait = "Wait for Signal Confirmation"
 	} else if fastNow > slowNow {
-		trend = "BULLISH (Wait for cross down)"
+		trend = "BULLISH"
+		wait = "Wait for Cross Down"
 	} else {
-		trend = "BEARISH (Wait for cross up)"
+		trend = "BEARISH"
+		wait = "Wait for Cross Up"
 	}
-
-	return fmt.Sprintf("ready | %s | prev(f:%.2f s:%.2f) now(f:%.2f s:%.2f) | gap: %+.3f%%",
-		trend, fastPrev, slowPrev, fastNow, slowNow, diff)
+	return fmt.Sprintf("%s | gap:%+.3f%% | %s", trend, diff, wait)
 }
 
 // OnKline accumulates closed bars.

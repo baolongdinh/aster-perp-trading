@@ -46,7 +46,9 @@ func (s *RSIDivergenceStrategy) State(symbol string) string {
 	if !ok {
 		return "waiting for data"
 	}
-	return "RSI: " + formatFloat(rsiState.Value())
+	val := rsiState.Value()
+	wait := fmt.Sprintf("Wait for RSI <= %.0f or >= %.0f", s.cfg.Oversold, s.cfg.Overbought)
+	return fmt.Sprintf("RSI: %.2f | %s", val, wait)
 }
 
 func (s *RSIDivergenceStrategy) OnKline(k stream.WsKline) {

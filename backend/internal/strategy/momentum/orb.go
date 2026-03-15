@@ -55,7 +55,8 @@ func (s *ORBStrategy) State(symbol string) string {
 	if !s.rangeSet[symbol] {
 		return "waiting for session start (00:00 UTC)"
 	}
-	return fmt.Sprintf("ORB set: (%.2f - %.2f)", s.orbLow[symbol], s.orbHigh[symbol])
+	wait := fmt.Sprintf("Wait for Close > %.2f or < %.2f", s.orbHigh[symbol], s.orbLow[symbol])
+	return fmt.Sprintf("Range:[%.2f|%.2f] | %s", s.orbLow[symbol], s.orbHigh[symbol], wait)
 }
 
 func (s *ORBStrategy) OnKline(k stream.WsKline) {

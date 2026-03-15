@@ -50,7 +50,19 @@ func (s *LiquiditySweepStrategy) SetEnabled(v bool) { s.enabled = v }
 func (s *LiquiditySweepStrategy) State(symbol string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fmt.Sprintf("hunting liquidity sweep (%d candles)", s.cfg.Lookback)
+	highs := s.highs[symbol]
+	if len(highs) < s.cfg.Lookback {
+		return fmt.Sprintf("warming up (%d/%d)", len(highs), s.cfg.Lookback)
+	}
+	
+	maxHigh := 0.0
+	minLow := math.MaxFloat64
+	for i := 0; i < len(highs)-1; i++ {
+		if highs[i] > maxHigh { maxHigh = highs[i] }
+		if s.lows[symbol][i] < minLow { minLow = s.lows[symbol][i] }
+	}
+	wait := fmt.Sprintf("Wait for Wick > %.2f or < %.2f", maxHigh, minLow)
+	return fmt.Sprintf("Pools:[L:%.2f H:%.2f] | %s", minLow, maxHigh, wait)
 }
 
 func (s *LiquiditySweepStrategy) OnKline(k stream.WsKline) {

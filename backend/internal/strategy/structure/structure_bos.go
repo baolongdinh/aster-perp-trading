@@ -53,7 +53,13 @@ func (s *BOSStrategy) SetEnabled(v bool) { s.enabled = v }
 func (s *BOSStrategy) State(symbol string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fmt.Sprintf("Last HH: %.2f | Last LL: %.2f", s.lastHH[symbol], s.lastLL[symbol])
+	hh := s.lastHH[symbol]
+	ll := s.lastLL[symbol]
+	if hh == 0 && ll == 0 {
+		return "mapping structure"
+	}
+	wait := fmt.Sprintf("Wait for BOS > %.2f or < %.2f", hh, ll)
+	return fmt.Sprintf("Range:[%.2f|%.2f] | %s", ll, hh, wait)
 }
 
 func (s *BOSStrategy) OnKline(k stream.WsKline) {
