@@ -78,6 +78,7 @@ func (m *Manager) PlaceMarketEntry(
 	slPrice, tpPrice float64,
 	strategyName string,
 ) (*LocalOrder, error) {
+	m.log.Info("[DEBUG ENTRY] PlaceMarketEntry called", zap.String("symbol", symbol), zap.String("side", side), zap.String("qty", qty))
 	clientID := "bot_" + uuid.New().String()[:12]
 
 	order, err := m.futures.PlaceOrder(ctx, client.PlaceOrderRequest{
@@ -306,6 +307,7 @@ func (m *Manager) PlaceLimitEntry(
 	slPrice, tpPrice float64,
 	strategyName string,
 ) (*LocalOrder, error) {
+	m.log.Info("[DEBUG ENTRY] PlaceLimitEntry called", zap.String("symbol", symbol), zap.String("side", side), zap.String("qty", qty), zap.String("price", price))
 	clientID := "bot_limit_" + uuid.New().String()[:8]
 
 	order, err := m.futures.PlaceOrder(ctx, client.PlaceOrderRequest{

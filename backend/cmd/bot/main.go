@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
 
 	"aster-bot/internal/api"
 	"aster-bot/internal/auth"
@@ -43,7 +43,6 @@ func main() {
 	// --- Logger ---
 	log := buildLogger(cfg.Log.Level, cfg.Log.File)
 	defer log.Sync()
-
 
 	if cfg.Bot.DryRun {
 		log.Warn("⚠️  DRY-RUN MODE — no real orders will be sent")
@@ -172,7 +171,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				FastPeriod:    intParam(sc.Params, "fast_period", 9),
 				SlowPeriod:    intParam(sc.Params, "slow_period", 21),
 				Leverage:      intParam(sc.Params, "leverage", 5),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Timeframe:     stringParam(sc.Params, "timeframe", "5m"),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -193,7 +192,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				Overbought:    floatParam(sc.Params, "overbought", 70.0),
 				Oversold:      floatParam(sc.Params, "oversold", 30.0),
 				Leverage:      intParam(sc.Params, "leverage", 5),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -210,7 +209,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "vwap_reversion":
 			vCfg := meanrev.VWAPReversionConfig{
 				DevThreshold:  floatParam(sc.Params, "dev_threshold_pct", 0.5),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -229,7 +228,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			bbCfg := meanrev.BBBounceConfig{
 				Period:        intParam(sc.Params, "period", 20),
 				StdDev:        floatParam(sc.Params, "std_dev", 2.0),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -248,7 +247,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			srCfg := meanrev.SRBounceConfig{
 				Lookback:      intParam(sc.Params, "lookback", 50),
 				BouncePct:     floatParam(sc.Params, "bounce_pct", 0.1),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -266,13 +265,13 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "breakout_retest":
 			brCfg := trend.BreakoutRetestConfig{
 				ConsolidationPeriods: intParam(sc.Params, "consolidation_periods", 20),
-				BreakoutVolumeMult:    floatParam(sc.Params, "breakout_vol_mult", 2.0),
-				RetestTolerancePct:    floatParam(sc.Params, "retest_tolerance_pct", 0.1),
-				OrderSizeUSDT:         floatParam(sc.Params, "order_size_usdt", 50),
-				Leverage:              intParam(sc.Params, "leverage", 5),
-				Symbols:               sc.Symbols,
-				Enabled:               sc.Enabled,
-				Timeframe:             stringParam(sc.Params, "timeframe", "1h"),
+				BreakoutVolumeMult:   floatParam(sc.Params, "breakout_vol_mult", 2.0),
+				RetestTolerancePct:   floatParam(sc.Params, "retest_tolerance_pct", 0.1),
+				OrderSizeUSDT:        floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:             intParam(sc.Params, "leverage", 5),
+				Symbols:              sc.Symbols,
+				Enabled:              sc.Enabled,
+				Timeframe:            stringParam(sc.Params, "timeframe", "1h"),
 			}
 			activeSubs = append(activeSubs, trend.NewBreakoutRetest(brCfg, log))
 			if sc.Enabled {
@@ -286,14 +285,14 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "flag_pennant":
 			fpCfg := trend.FlagPennantConfig{
 				ImpulseMinPct:     floatParam(sc.Params, "impulse_min_pct", 3.0),
-				ImpulseCandles:   intParam(sc.Params, "impulse_candles", 5),
+				ImpulseCandles:    intParam(sc.Params, "impulse_candles", 5),
 				FlagMaxRetracePct: floatParam(sc.Params, "flag_max_retrace_pct", 38.2),
-				FlagCandles:      intParam(sc.Params, "flag_candles", 10),
+				FlagCandles:       intParam(sc.Params, "flag_candles", 10),
 				OrderSizeUSDT:     floatParam(sc.Params, "order_size_usdt", 50),
 				Leverage:          intParam(sc.Params, "leverage", 5),
-				Symbols:               sc.Symbols,
-				Enabled:               sc.Enabled,
-				Timeframe:             stringParam(sc.Params, "timeframe", "1h"),
+				Symbols:           sc.Symbols,
+				Enabled:           sc.Enabled,
+				Timeframe:         stringParam(sc.Params, "timeframe", "1h"),
 			}
 			activeSubs = append(activeSubs, trend.NewFlagPennant(fpCfg, log))
 			if sc.Enabled {
@@ -307,7 +306,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "trailing_sh":
 			shCfg := trend.TrailingSHConfig{
 				SwingPeriod:   intParam(sc.Params, "swing_period", 5),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -324,13 +323,13 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			)
 		case "momentum_roc":
 			rocCfg := momentum.MomentumROCConfig{
-				ROCPeriod:      intParam(sc.Params, "roc_period", 10),
-				ROCThreshold:   floatParam(sc.Params, "roc_threshold", 1.0),
-				OrderSizeUSDT:  floatParam(sc.Params, "order_size_usdt", 50),
-				Leverage:       intParam(sc.Params, "leverage", 5),
-				Symbols:        sc.Symbols,
-				Enabled:        sc.Enabled,
-				Timeframe:      stringParam(sc.Params, "timeframe", "15m"),
+				ROCPeriod:     intParam(sc.Params, "roc_period", 10),
+				ROCThreshold:  floatParam(sc.Params, "roc_threshold", 1.0),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
 			}
 			activeSubs = append(activeSubs, momentum.NewMomentumROC(rocCfg, log))
 			if sc.Enabled {
@@ -343,7 +342,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			)
 		case "orb":
 			orbCfg := momentum.ORBConfig{
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -378,7 +377,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "structure_bos":
 			bosCfg := structure.BOSConfig{
 				SwingPeriod:   intParam(sc.Params, "swing_period", 5),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -397,7 +396,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			lqCfg := structure.LiquiditySweepConfig{
 				Lookback:      intParam(sc.Params, "lookback", 50),
 				TolerancePct:  floatParam(sc.Params, "tolerance_pct", 0.05),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -415,7 +414,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "fvg_fill":
 			fvgCfg := structure.FVGConfig{
 				MinGapPct:     floatParam(sc.Params, "min_gap_pct", 0.1),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
@@ -451,7 +450,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 	}
 	router := strategy.NewRouter(routerCfg, riskMgr, log)
 
-
 	for _, sub := range activeSubs {
 		router.Register(sub)
 	}
@@ -482,7 +480,7 @@ func buildLogger(level, filePath string) *zap.Logger {
 
 	// Output paths
 	stdout := zapcore.Lock(os.Stdout)
-	
+
 	cores := []zapcore.Core{
 		zapcore.NewCore(zapcore.NewConsoleEncoder(encoderConfig), stdout, lvl),
 	}
@@ -495,7 +493,7 @@ func buildLogger(level, filePath string) *zap.Logger {
 		} else if i := strings.LastIndex(filePath, "\\"); i != -1 {
 			dir = filePath[:i]
 		}
-		
+
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
 		} else {
@@ -512,7 +510,6 @@ func buildLogger(level, filePath string) *zap.Logger {
 	core := zapcore.NewTee(cores...)
 	return zap.New(core, zap.AddCaller())
 }
-
 
 // --- Config param helpers ---
 
@@ -533,11 +530,49 @@ func intParam(params map[string]interface{}, key string, def int) int {
 func floatParam(params map[string]interface{}, key string, def float64) float64 {
 	v, ok := params[key]
 	if !ok {
+		fmt.Printf("[DEBUG CONFIG] %s missing, using default: %f\n", key, def)
 		return def
 	}
-	if f, ok := v.(float64); ok {
-		return f
+	
+	var result float64 = def
+	var parsed bool = true
+
+	switch t := v.(type) {
+	case float64:
+		result = t
+	case float32:
+		result = float64(t)
+	case int:
+		result = float64(t)
+	case int32:
+		result = float64(t)
+	case int64:
+		result = float64(t)
+	case uint:
+		result = float64(t)
+	case uint64:
+		result = float64(t)
+	case string:
+		if f, err := strconv.ParseFloat(t, 64); err == nil {
+			result = f
+		} else {
+			parsed = false
+		}
+	default:
+		// Fallback to sprintf
+		if f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64); err == nil {
+			result = f
+		} else {
+			parsed = false
+		}
 	}
+	
+	if parsed {
+		fmt.Printf("[DEBUG CONFIG] %s successfully parsed as: %f (raw type: %T, raw val: %v)\n", key, result, v, v)
+		return result
+	}
+
+	fmt.Printf("[DEBUG CONFIG] %s failed to parse, using default: %f (raw type: %T, raw val: %v)\n", key, def, v, v)
 	return def
 }
 

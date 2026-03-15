@@ -38,7 +38,7 @@ strategies:
       fast_period: 9
       slow_period: 21
       leverage: 5
-      order_size_usdt: 5
+      order_size_usdt: 100
       timeframe: 5m
 
   - name: rsi_divergence
@@ -55,7 +55,7 @@ strategies:
       overbought: 70.0
       oversold: 30.0
       leverage: 5
-      order_size_usdt: 5
+      order_size_usdt: 100
       timeframe: 15m
 
   - name: vwap_reversion
@@ -69,7 +69,7 @@ strategies:
       - ASTERUSDT
     params:
       dev_threshold_pct: 0.5
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 15m
 
@@ -85,7 +85,7 @@ strategies:
     params:
       period: 20
       std_dev: 2.0
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 15m
 
@@ -101,7 +101,7 @@ strategies:
     params:
       lookback: 50
       bounce_pct: 0.1
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h
 
@@ -118,7 +118,7 @@ strategies:
     params:
       roc_period: 10
       roc_threshold: 1.0
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 15m
 
@@ -134,7 +134,7 @@ strategies:
       - BNBUSDT
       - SOLUSDT
     params:
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 15m
 
@@ -153,7 +153,7 @@ strategies:
     params:
       volume_ma_period: 20
       spike_multiplier: 3.0
-      order_size_usdt: 5
+      order_size_usdt: 100
 
   - name: breakout_retest
     enabled: true
@@ -168,7 +168,7 @@ strategies:
       consolidation_periods: 20
       breakout_vol_mult: 2.0
       retest_tolerance_pct: 0.1
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h
 
@@ -186,7 +186,7 @@ strategies:
       impulse_candles: 5
       flag_max_retrace_pct: 38.2
       flag_candles: 10
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h
 
@@ -201,7 +201,7 @@ strategies:
       - ASTERUSDT
     params:
       swing_period: 5
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h
 
@@ -216,7 +216,7 @@ strategies:
       - ASTERUSDT
     params:
       swing_period: 5
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h
 
@@ -232,7 +232,7 @@ strategies:
     params:
       lookback: 50
       tolerance_pct: 0.05
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h
 
@@ -247,6 +247,6 @@ strategies:
       - ASTERUSDT
     params:
       min_gap_pct: 0.1
-      order_size_usdt: 5
+      order_size_usdt: 100
       leverage: 5
       timeframe: 1h

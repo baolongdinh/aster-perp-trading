@@ -2,14 +2,14 @@
 
 ## Context Summary
 
-| Item | Detail |
-|------|--------|
-| Exchange | Aster Finance (Futures perp) |
-| API Version | **V3** (EIP-712 wallet signing, on-chain traceability, Noop cancel) |
-| Auth | `user` (main wallet) + `signer` (API wallet) + `nonce` (µs) + ECDSA sig |
-| Base URLs | REST `https://fapi.asterdex.com`, WS `wss://fstream.asterdex.com` |
+| Item             | Detail                                                                   |
+| ---------------- | ------------------------------------------------------------------------ |
+| Exchange         | Aster Finance (Futures perp)                                             |
+| API Version      | **V3** (EIP-712 wallet signing, on-chain traceability, Noop cancel)      |
+| Auth             | `user` (main wallet) + `signer` (API wallet) + `nonce` (µs) + ECDSA sig  |
+| Base URLs        | REST `https://fapi.asterdex.com`, WS `wss://fstream.asterdex.com`        |
 | Skills available | auth-v3, trading-v3, account-v3, market-data-v3, websocket-v3, errors-v3 |
-| Language | **Go** (backend bot) + **Next.js / React** (frontend dashboard) |
+| Language         | **Go** (backend bot) + **Next.js / React** (frontend dashboard)          |
 
 ---
 
@@ -29,13 +29,13 @@
 
 ### 1.2 Strategy Ideas
 
-| Strategy | Description | Signals |
-|----------|-------------|---------|
-| **Trend Following (EMA cross)** | Fast EMA crosses slow EMA → enter in trend direction | Kline WS + EMA calc |
-| **Funding Rate Arb** | Long/Short based on extreme funding rates (funding fee income) | `GET /fapi/v3/fundingInfo` + `premiumIndex` |
-| **Grid Trading (perp)** | Place buy/sell grid around current price, profit from oscillation | Depth + markPrice |
-| **Breakout (Bollinger)** | Enter when price breaks Bollinger Band, SL inside band | Kline OHLCV |
-| **Liquidation Hunting** | Watch `forceOrder` stream for large liquidations as momentum signal | WS `!forceOrder@arr` |
+| Strategy                        | Description                                                         | Signals                                     |
+| ------------------------------- | ------------------------------------------------------------------- | ------------------------------------------- |
+| **Trend Following (EMA cross)** | Fast EMA crosses slow EMA → enter in trend direction                | Kline WS + EMA calc                         |
+| **Funding Rate Arb**            | Long/Short based on extreme funding rates (funding fee income)      | `GET /fapi/v3/fundingInfo` + `premiumIndex` |
+| **Grid Trading (perp)**         | Place buy/sell grid around current price, profit from oscillation   | Depth + markPrice                           |
+| **Breakout (Bollinger)**        | Enter when price breaks Bollinger Band, SL inside band              | Kline OHLCV                                 |
+| **Liquidation Hunting**         | Watch `forceOrder` stream for large liquidations as momentum signal | WS `!forceOrder@arr`                        |
 
 ### 1.3 Key Architecture Decisions
 
@@ -162,6 +162,7 @@ Uses `go-ethereum` (`crypto` package) for Keccak256 + ECDSA.
 ### 3.4 Strategy Engine (`internal/strategy`)
 
 Interface:
+
 ```go
 type Strategy interface {
     Name() string
@@ -208,6 +209,7 @@ REST endpoints:
 | GET | `/api/v1/metrics` | P&L, win rate, drawdown |
 
 WebSocket: `ws://localhost:8080/ws` — push events:
+
 - `position_update`, `order_update`, `trade_filled`, `pnl_snapshot`, `risk_alert`
 
 ---
@@ -216,12 +218,12 @@ WebSocket: `ws://localhost:8080/ws` — push events:
 
 ### Pages
 
-| Page | Key Features |
-|------|-------------|
-| **Dashboard** | Account equity, unrealized P&L card, daily P&L chart, live positions table, recent fills |
-| **Strategies** | Cards per strategy: enabled toggle, param editor (leverage, size, symbols), last signal |
-| **Trades** | Paginated trade history, filters by symbol/strategy/date, export CSV |
-| **Config** | Global settings: risk limits, symbols list, API connectivity test, bot start/stop |
+| Page           | Key Features                                                                             |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| **Dashboard**  | Account equity, unrealized P&L card, daily P&L chart, live positions table, recent fills |
+| **Strategies** | Cards per strategy: enabled toggle, param editor (leverage, size, symbols), last signal  |
+| **Trades**     | Paginated trade history, filters by symbol/strategy/date, export CSV                     |
+| **Config**     | Global settings: risk limits, symbols list, API connectivity test, bot start/stop        |
 
 ### Tech Stack
 
@@ -237,12 +239,12 @@ WebSocket: `ws://localhost:8080/ws` — push events:
 
 ```yaml
 bot:
-  dry_run: false           # true = simulate, don't send real orders
+  dry_run: false # true = simulate, don't send real orders
   log_level: info
 
 exchange:
-  user_wallet: "0x..."    # from env: ASTER_USER
-  signer_wallet: "0x..."  # from env: ASTER_SIGNER
+  user_wallet: "0x..." # from env: ASTER_USER
+  signer_wallet: "0x..." # from env: ASTER_SIGNER
   # signer_private_key: never in config file, only env: ASTER_SIGNER_KEY
 
 risk:
@@ -250,7 +252,7 @@ risk:
   max_open_positions: 3
   daily_loss_limit_usdt: 100
   per_trade_stop_loss_pct: 2.0
-  position_mode: one_way   # or hedge
+  position_mode: one_way # or hedge
 
 strategies:
   - name: ema_cross
@@ -267,9 +269,9 @@ strategies:
     enabled: false
     symbols: [BTCUSDT]
     params:
-      threshold_pct: 0.05   # enter if funding > 0.05%
+      threshold_pct: 0.05 # enter if funding > 0.05%
       leverage: 3
-      order_size_usdt: 100
+      order_size_usdt: 1000
 ```
 
 ---
@@ -277,23 +279,27 @@ strategies:
 ## 6. Phased Delivery Roadmap
 
 ### Phase 1 — Foundation (Week 1-2)
+
 - [ ] `backend/` Go module scaffold
 - [ ] Auth engine (EIP-712 V3 signer) + unit tests
 - [ ] REST client (market data + signed endpoints) + integration test (testnet)
 - [ ] Config loader (YAML + env)
 
 ### Phase 2 — Market Connectivity (Week 2-3)
+
 - [ ] WebSocket market stream manager (kline, markPrice, depth)
 - [ ] User data stream (listenKey lifecycle, ORDER_TRADE_UPDATE, ACCOUNT_UPDATE)
 - [ ] SQLite store for trades + config
 
 ### Phase 3 — Core Bot Logic (Week 3-4)
+
 - [ ] Strategy interface + EMA cross strategy (first impl)
 - [ ] Order manager (place, cancel, SL/TP, reconcile)
 - [ ] Risk manager
 - [ ] Engine orchestrator (strategy runner goroutines)
 
 ### Phase 4 — Internal API + Frontend (Week 4-5)
+
 - [ ] Backend REST + WS API for FE (`internal/api`)
 - [ ] Next.js project scaffold
 - [ ] Dashboard page (P&L, positions)
@@ -301,6 +307,7 @@ strategies:
 - [ ] Trades history page
 
 ### Phase 5 — Strategies + Polish (Week 5-6)
+
 - [ ] Funding rate arb strategy
 - [ ] Grid strategy
 - [ ] Dry-run mode (simulate orders)
@@ -311,15 +318,15 @@ strategies:
 
 ## 7. Key Technical Decisions
 
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| API Version | V3 | On-chain traceability, Noop cancel, replay protection |
-| Language | Go | Goroutines for concurrency, fast, strong stdlib, good for trading bots |
-| Frontend | Next.js | Full-stack capability, good ecosystem, easy API integration |
-| DB | SQLite first, Postgres later | Simple local dev, easy migration |
-| Private key handling | Env var only, zeroed after sign | Match security model from skills audit |
-| Dry-run | Built-in flag | Safe development without real orders |
-| Position mode | Configurable (one_way/hedge) | V3 supports both, hedge gives more control |
+| Decision             | Choice                          | Reason                                                                 |
+| -------------------- | ------------------------------- | ---------------------------------------------------------------------- |
+| API Version          | V3                              | On-chain traceability, Noop cancel, replay protection                  |
+| Language             | Go                              | Goroutines for concurrency, fast, strong stdlib, good for trading bots |
+| Frontend             | Next.js                         | Full-stack capability, good ecosystem, easy API integration            |
+| DB                   | SQLite first, Postgres later    | Simple local dev, easy migration                                       |
+| Private key handling | Env var only, zeroed after sign | Match security model from skills audit                                 |
+| Dry-run              | Built-in flag                   | Safe development without real orders                                   |
+| Position mode        | Configurable (one_way/hedge)    | V3 supports both, hedge gives more control                             |
 
 ## 8. Security Notes (from existing audit)
 

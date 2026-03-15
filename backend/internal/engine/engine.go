@@ -269,6 +269,8 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 	case strategy.SignalEnter:
 		// Check risk
 		notional := parseFloat(sig.Quantity)
+		e.log.Info("[DEBUG ENTRY] Received entry signal", zap.String("strategy", sig.StrategyName), zap.String("symbol", sig.Symbol), zap.Float64("raw_notional", notional))
+		
 		if err := e.risk.CanEnter(sig.Symbol, notional); err != nil {
 			e.log.Warn("risk blocked entry", zap.Error(err))
 			return
@@ -531,20 +533,53 @@ func (e *Engine) refreshPositions(ctx context.Context) error {
 }
 
 func (e *Engine) initLeverage(ctx context.Context) {
+	e.log.Info("[DEBUG LEVERAGE] initLeverage starting", zap.Int("strategy_configs", len(e.cfg.Strategies)))
+	var maxLvgs = make(map[string]int)
 
-	for _, strat := range e.strategies {
-		if !strat.IsEnabled() {
+	for _, sc := range e.cfg.Strategies {
+		if !sc.Enabled {
 			continue
 		}
-		// Get leverage from strategy config (cast if supported)
-		// For now, default to the risk config; strategies may override per symbol
-		for _, sym := range strat.Symbols() {
-			if err := e.futures.SetLeverage(ctx, client.SetLeverageRequest{
-				Symbol:   sym,
-				Leverage: 5, // default; TODO: pull from strategy params
-			}); err != nil {
-				e.log.Warn("set leverage error", zap.String("symbol", sym), zap.Error(err))
+		var stratLvg int
+		if v, ok := sc.Params["leverage"]; ok {
+			switch t := v.(type) {
+			case int: stratLvg = t
+			case int32: stratLvg = int(t)
+			case int64: stratLvg = int(t)
+			case float64: stratLvg = int(t)
+			case float32: stratLvg = int(t)
+			case string:
+				if parsed, err := strconv.Atoi(t); err == nil {
+					stratLvg = parsed
+				}
+			default:
+				// Fallback to sprintf
+				if parsed, err := strconv.Atoi(fmt.Sprintf("%v", v)); err == nil {
+					stratLvg = parsed
+				}
 			}
+		}
+		if stratLvg <= 0 {
+			stratLvg = 5 // fallback safely
+		}
+
+		for _, sym := range sc.Symbols {
+			e.log.Info("[DEBUG LEVERAGE] Raw maxLvgs parsing", zap.String("strategy", sc.Name), zap.String("symbol", sym), zap.Int("parsedLvg", stratLvg))
+			if stratLvg > maxLvgs[sym] {
+				maxLvgs[sym] = stratLvg
+			}
+		}
+	}
+
+	for sym, lvg := range maxLvgs {
+		e.log.Info("[DEBUG LEVERAGE] Sending SetLeverage to API", zap.String("symbol", sym), zap.Int("leverage", lvg))
+		if err := e.futures.SetLeverage(ctx, client.SetLeverageRequest{
+			Symbol:   sym,
+			Leverage: lvg,
+		}); err != nil {
+			e.log.Warn("[DEBUG LEVERAGE] set leverage error", zap.String("symbol", sym), zap.Error(err))
+		} else {
+			e.log.Info("[DEBUG LEVERAGE] leverage configured SUCCESS", zap.String("symbol", sym), zap.Int("leverage", lvg))
 		}
 	}
 }

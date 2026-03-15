@@ -335,15 +335,6 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 					}
 				}
 
-				// PHASE 2: Dynamic ATR Sizing
-				atr := cf.GetATR("5m", 14)
-				closes := cf.GetCloses("5m")
-				if len(closes) == 0 {
-					r.log.Warn("IQ-ROUTER: Missing price data for sizing", zap.String("symbol", symbol))
-					continue
-				}
-				price := closes[len(closes)-1]
-
 				// PHASE 3: Funding Rate Filter
 				funding := cf.GetFundingRate()
 				if sig.Side == SideBuy && funding > 0.0003 { // 0.03%
@@ -355,14 +346,22 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 					continue
 				}
 
-				notional, err := r.risk.CalculatePositionSize(symbol, price, atr)
-				if err != nil {
-					r.log.Warn("IQ-RISK: Could not calculate ATR size", zap.String("symbol", symbol), zap.Error(err))
-					if sig.Quantity == "" || sig.Quantity == "0" {
-						continue
+				// PHASE 2: Dynamic ATR Sizing
+				// ONLY calculate size if strategy didn't provide one
+				if sig.Quantity == "" || sig.Quantity == "0" {
+					atr := cf.GetATR("5m", 14)
+					closes := cf.GetCloses("5m")
+					if len(closes) > 0 {
+						price := closes[len(closes)-1]
+						notional, err := r.risk.CalculatePositionSize(symbol, price, atr)
+						if err == nil {
+							sig.Quantity = fmt.Sprintf("%.4f", notional)
+						} else {
+							r.log.Warn("IQ-RISK: Could not calculate ATR size", zap.String("symbol", symbol), zap.Error(err))
+						}
+					} else {
+						r.log.Warn("IQ-ROUTER: Missing price data for sizing", zap.String("symbol", symbol))
 					}
-				} else {
-					sig.Quantity = fmt.Sprintf("%.4f", notional)
 				}
 
 				sig.StrategyName = name
