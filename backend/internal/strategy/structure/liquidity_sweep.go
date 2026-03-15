@@ -39,6 +39,10 @@ func NewLiquiditySweep(cfg LiquiditySweepConfig, log *zap.Logger) *LiquiditySwee
 	}
 }
 
+func (s *LiquiditySweepStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *LiquiditySweepStrategy) Name() string      { return "liquidity_sweep" }
 func (s *LiquiditySweepStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *LiquiditySweepStrategy) IsEnabled() bool   { return s.enabled }

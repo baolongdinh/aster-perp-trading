@@ -43,6 +43,10 @@ func NewBBBounce(cfg BBBounceConfig, log *zap.Logger) *BBBounceStrategy {
 	}
 }
 
+func (s *BBBounceStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *BBBounceStrategy) Name() string      { return "bb_bounce" }
 func (s *BBBounceStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *BBBounceStrategy) IsEnabled() bool {

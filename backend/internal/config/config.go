@@ -46,6 +46,7 @@ type RiskConfig struct {
 	RiskPerTradeUSDT            float64 `mapstructure:"risk_per_trade_usdt"`
 	ATRMultiplier               float64 `mapstructure:"atr_multiplier"`
 	PositionMode                string  `mapstructure:"position_mode"` // one_way | hedge
+	CorrelationThreshold        float64 `mapstructure:"correlation_threshold"`
 }
 
 
@@ -139,6 +140,9 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Risk.DailyDrawdownPct <= 0 {
 		cfg.Risk.DailyDrawdownPct = 5.0 // 5% max daily drawdown
+	}
+	if cfg.Risk.CorrelationThreshold <= 0 {
+		cfg.Risk.CorrelationThreshold = 0.8
 	}
 	if cfg.Risk.RiskPerTradeUSDT <= 0 {
 		cfg.Risk.RiskPerTradeUSDT = 10.0 // Risk $10 per signal by default

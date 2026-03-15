@@ -40,6 +40,10 @@ func NewRSIDivergence(cfg RSIDivergenceConfig, log *zap.Logger) *RSIDivergenceSt
 	}
 }
 
+func (s *RSIDivergenceStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *RSIDivergenceStrategy) Name() string      { return "rsi_divergence" }
 func (s *RSIDivergenceStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *RSIDivergenceStrategy) IsEnabled() bool   { return s.cfg.Enabled }

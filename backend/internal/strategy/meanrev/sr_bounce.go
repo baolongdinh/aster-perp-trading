@@ -48,6 +48,10 @@ func (s *SRBounceStrategy) SetClassifier(symbol string, c *regime.Classifier) {
 	s.mu.Unlock()
 }
 
+func (s *SRBounceStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *SRBounceStrategy) Name() string      { return "sr_bounce" }
 func (s *SRBounceStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *SRBounceStrategy) IsEnabled() bool   { return s.enabled }

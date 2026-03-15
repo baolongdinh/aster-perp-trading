@@ -135,8 +135,10 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	// 9. Position refresh loop (every 30s for unrealized PnL)
-
 	go e.positionRefreshLoop(ctx)
+
+	// 10. Safety Monitor Loop (every 60s to heal "naked" positions)
+	go e.safetyMonitorLoop(ctx)
 
 	e.log.Info("engine started")
 	return nil
@@ -336,11 +338,12 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		// --- Derive SL/TP from RiskManager if strategy didn't set them ---
 		sl := sig.StopLoss
 		tp := sig.TakeProfit
+		atr, reg := e.getMarketContext(sig.Symbol)
 		if sl == 0 {
-			sl = e.risk.StopLossPrice(lastPrice, string(sig.Side))
+			sl = e.risk.StopLossPrice(lastPrice, string(sig.Side), atr)
 		}
 		if tp == 0 {
-			tp = e.risk.TakeProfitPrice(lastPrice, string(sig.Side))
+			tp = e.risk.TakeProfitPrice(lastPrice, string(sig.Side), sl, reg)
 		}
 
 		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, tp, sig.StrategyName); err != nil {
@@ -437,11 +440,12 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 	// 3. Derive SL/TP from RiskManager if strategy didn't set them
 	sl := sig.StopLoss
 	tp := sig.TakeProfit
+	atr, reg := e.getMarketContext(sig.Symbol)
 	if sl == 0 {
-		sl = e.risk.StopLossPrice(roundedPriceFloat, string(sig.Side))
+		sl = e.risk.StopLossPrice(roundedPriceFloat, string(sig.Side), atr)
 	}
 	if tp == 0 {
-		tp = e.risk.TakeProfitPrice(roundedPriceFloat, string(sig.Side))
+		tp = e.risk.TakeProfitPrice(roundedPriceFloat, string(sig.Side), sl, reg)
 	}
 
 	// PHASE 9: Risk Tracking - Add to pending BEFORE placing
@@ -605,20 +609,9 @@ func (e *Engine) requiredIntervals() []string {
 		if !s.IsEnabled() {
 			continue
 		}
-		// Try to find timeframe in strategy config via reflection or well-known interface
-		// For now, since we know our strategies, we can just assume they might use different ones.
-		// A better way is to add a GetIntervals() method to Strategy interface if we have many.
-		// However, Router already knows his sub-strategies.
-		// Let's check them specifically or add a way to query them.
-
-		// For now, we'll brute force common ones or better: ask strategies for their symbols/intervals.
-		// Wait, most of our strategies have a Timeframe field in their config.
-		// Let's assume we can get it or we keep a list of common ones.
-
-		// Actually, let's just subscribe to the most common ones used in config.yaml:
-		intervals["5m"] = true
-		intervals["15m"] = true
-		intervals["1h"] = true
+		for _, interval := range s.RequiredIntervals() {
+			intervals[interval] = true
+		}
 	}
 
 	var out []string
@@ -626,6 +619,15 @@ func (e *Engine) requiredIntervals() []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func (e *Engine) getMarketContext(symbol string) (float64, string) {
+	for _, s := range e.strategies {
+		if r, ok := s.(*strategy.Router); ok {
+			return r.GetMarketContext(symbol)
+		}
+	}
+	return 0, ""
 }
 
 func (e *Engine) prewarmStrategies(ctx context.Context) {
@@ -690,3 +692,35 @@ func abs(f float64) float64 {
 	}
 	return f
 }
+
+// safetyMonitorLoop checks every 60s if open positions have SL and TP, and heals them if not.
+func (e *Engine) safetyMonitorLoop(ctx context.Context) {
+ticker := time.NewTicker(60 * time.Second)
+defer ticker.Stop()
+
+for {
+select {
+case <-ctx.Done():
+return
+case <-ticker.C:
+e.mu.RLock()
+positions := make([]*client.Position, 0, len(e.positions))
+for _, pos := range e.positions {
+cp := *pos
+positions = append(positions, &cp)
+}
+e.mu.RUnlock()
+
+for _, pos := range positions {
+atr, reg := e.getMarketContext(pos.Symbol)
+			sl := e.risk.StopLossPrice(pos.EntryPrice, string(pos.PositionSide), atr)
+			tp := e.risk.TakeProfitPrice(pos.EntryPrice, string(pos.PositionSide), sl, reg)
+
+e.orders.EnsureProtectiveOrders(ctx, pos.Symbol, string(pos.PositionSide), pos.PositionAmt, sl, tp)
+}
+}
+}
+}
+
+
+

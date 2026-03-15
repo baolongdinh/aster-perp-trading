@@ -72,6 +72,9 @@ type Strategy interface {
 
 	// SetClassifier gives the strategy access to market regime context for a specific symbol.
 	SetClassifier(symbol string, c *regime.Classifier)
+
+	// RequiredIntervals returns the list of kline intervals needed by this strategy.
+	RequiredIntervals() []string
 }
 
 // MarketContextReceiver allows a strategy to receive external market metrics.

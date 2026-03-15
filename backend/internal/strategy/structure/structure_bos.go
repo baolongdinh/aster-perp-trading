@@ -41,6 +41,10 @@ func NewBOS(cfg BOSConfig, log *zap.Logger) *BOSStrategy {
 	}
 }
 
+func (s *BOSStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *BOSStrategy) Name() string      { return "structure_bos" }
 func (s *BOSStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *BOSStrategy) IsEnabled() bool   { return s.enabled }

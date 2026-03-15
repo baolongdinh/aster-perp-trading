@@ -45,6 +45,10 @@ func NewTrailingSH(cfg TrailingSHConfig, log *zap.Logger) *TrailingSHStrategy {
 	}
 }
 
+func (s *TrailingSHStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *TrailingSHStrategy) Name() string      { return "trailing_sh" }
 func (s *TrailingSHStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *TrailingSHStrategy) IsEnabled() bool {

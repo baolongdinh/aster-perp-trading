@@ -19,6 +19,7 @@ type VolumeSpikeConfig struct {
 	VolumeMaPeriod  int      `yaml:"volume_ma_period"`
 	SpikeMultiplier float64  `yaml:"spike_multiplier"` // Volume must be > MA * Multiplier
 	OrderSizeUSDT   float64  `yaml:"order_size_usdt"`
+	Timeframe         string   `yaml:"timeframe"`
 }
 
 type VolumeSpikeStrategy struct {
@@ -38,6 +39,10 @@ func NewVolumeSpike(cfg VolumeSpikeConfig, log *zap.Logger) *VolumeSpikeStrategy
 		lastSig:     make(map[string]strategy.Side),
 		classifiers: make(map[string]*regime.Classifier),
 	}
+}
+
+func (s *VolumeSpikeStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
 }
 
 func (s *VolumeSpikeStrategy) Name() string      { return "volume_spike" }

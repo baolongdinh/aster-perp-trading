@@ -2,12 +2,16 @@
 package risk
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"os"
 	"sync"
 	"time"
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
+	"aster-bot/internal/strategy/regime"
 	"go.uber.org/zap"
 )
 
@@ -17,25 +21,43 @@ type Manager struct {
 	cfg config.RiskConfig
 	log *zap.Logger
 
-	mu             sync.Mutex
-	dailyPnL       float64           // running daily P&L
-	dailyPnLReset  time.Time         // reset timestamp
-	dailyStartingEquity float64      // equity at the start of the day
-	openPositions  int               // current open total position count
-	symPositions   map[string]int    // symbol -> open position count
-	pendingOrders  map[string]float64 // symbol -> total pending notional (NEW/PARTIALLY_FILLED)
-	paused         bool              // true when daily loss limit hit
+	mu                  sync.Mutex
+	dailyPnL            float64            // running daily P&L
+	dailyPnLReset       time.Time          // reset timestamp
+	dailyStartingEquity float64            // equity at the start of the day
+	openPositions       int                // current open total position count
+	symPositions        map[string]int     // symbol -> open position count
+	lastCumulativePnL   map[string]float64 // symbol -> last known total realized PnL
+	pendingOrders       map[string]float64 // symbol -> total pending notional (NEW/PARTIALLY_FILLED)
+	paused              bool               // true when daily loss limit hit
+	corrTracker         *regime.CorrelationTracker
+}
+
+func (m *Manager) SetCorrelationTracker(t *regime.CorrelationTracker) {
+	m.mu.Lock()
+	m.corrTracker = t
+	m.mu.Unlock()
+}
+
+// PersistentState defines the risk data saved to disk.
+type PersistentState struct {
+	DailyPnL            float64            `json:"daily_pnl"`
+	DailyStartingEquity float64            `json:"daily_starting_equity"`
+	DailyPnLReset       time.Time          `json:"daily_pnl_reset"`
+	LastCumulativePnL   map[string]float64 `json:"last_cumulative_pnl"`
+	Paused              bool               `json:"paused"`
 }
 
 
 // NewManager creates a new risk manager.
 func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
 	return &Manager{
-		cfg:           cfg,
-		log:           log,
-		dailyPnLReset: todayUTC(),
-		symPositions:  make(map[string]int),
-		pendingOrders: make(map[string]float64),
+		cfg:               cfg,
+		log:               log,
+		dailyPnLReset:     todayUTC(),
+		symPositions:      make(map[string]int),
+		pendingOrders:     make(map[string]float64),
+		lastCumulativePnL: make(map[string]float64),
 	}
 }
 
@@ -54,6 +76,21 @@ func (m *Manager) CanEnter(symbol string, notionalUSDT float64) error {
 	}
 	if m.openPositions >= m.cfg.MaxOpenPositions {
 		return fmt.Errorf("risk: max open positions reached (%d)", m.cfg.MaxOpenPositions)
+	}
+
+	// Correlation Check
+	if m.corrTracker != nil {
+		var active []string
+		for sym, count := range m.symPositions {
+			if count > 0 {
+				active = append(active, sym)
+			}
+		}
+		
+		highlyCorr := m.corrTracker.GetHighlyCorrelated(symbol, active)
+		if len(highlyCorr) > 0 {
+			return fmt.Errorf("risk: correlation limit — %s highly correlated with existing position(s) %v", symbol, highlyCorr)
+		}
 	}
 
 	return nil
@@ -101,7 +138,19 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 		m.symPositions[symbol] = 0
 	}
 
-	m.dailyPnL += realizedPnL
+	// Calculate delta PnL to avoid using cumulative account totals
+	last := m.lastCumulativePnL[symbol]
+	delta := realizedPnL - last
+	m.dailyPnL += delta
+	m.lastCumulativePnL[symbol] = realizedPnL
+
+	if delta != 0 {
+		m.log.Info("risk: position pnl recorded",
+			zap.String("symbol", symbol),
+			zap.Float64("delta", delta),
+			zap.Float64("daily_pnl", m.dailyPnL),
+		)
+	}
 	
 	// 1. ABSOLUTE LIMIT
 	if m.dailyPnL <= -m.cfg.DailyLossLimitUSDT {
@@ -123,6 +172,9 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 			)
 		}
 	}
+
+	// Save state after PnL update
+	m.saveState()
 }
 
 // CalculatePositionSize returns the recommended notional size in USDT based on ATR and capital risk.
@@ -163,7 +215,19 @@ func (m *Manager) SetInitialEquity(equity float64) {
 
 
 // StopLossPrice calculates the SL price given entry and side.
-func (m *Manager) StopLossPrice(entryPrice float64, side string) float64 {
+// If atr is > 0, it uses ATR-based stop loss (preferred).
+func (m *Manager) StopLossPrice(entryPrice float64, side string, atr float64) float64 {
+	if atr > 0 {
+		mult := m.cfg.ATRMultiplier
+		if mult <= 0 {
+			mult = 2.0
+		}
+		if side == "BUY" {
+			return entryPrice - (atr * mult)
+		}
+		return entryPrice + (atr * mult)
+	}
+
 	pct := m.cfg.PerTradeStopLossPct / 100.0
 	if side == "BUY" {
 		return entryPrice * (1 - pct)
@@ -172,16 +236,25 @@ func (m *Manager) StopLossPrice(entryPrice float64, side string) float64 {
 }
 
 // TakeProfitPrice calculates the TP price given entry and side.
-func (m *Manager) TakeProfitPrice(entryPrice float64, side string) float64 {
-	pct := m.cfg.PerTradeTakeProfitPct / 100.0
-	if pct == 0 {
-		// Fallback to 1.5x Risk-Reward if not explicitly set
-		pct = (m.cfg.PerTradeStopLossPct * 1.5) / 100.0
+// reg is the current market regime from strategy/regime package.
+func (m *Manager) TakeProfitPrice(entryPrice float64, side string, slPrice float64, reg string) float64 {
+	dist := math.Abs(entryPrice - slPrice)
+	rr := 1.5 // Default RR
+
+	// Dynamic RR based on Regime
+	switch regime.RegimeType(reg) {
+	case regime.RegimeTrend:
+		rr = 2.5 // Aim higher in trends
+	case regime.RegimeRanging:
+		rr = 1.2 // Take profits earlier in ranges
+	case regime.RegimeBreakout:
+		rr = 2.0 // Decent follow-through expected
 	}
+
 	if side == "BUY" {
-		return entryPrice * (1 + pct)
+		return entryPrice + (dist * rr)
 	}
-	return entryPrice * (1 - pct)
+	return entryPrice - (dist * rr)
 }
 
 // DailyPnL returns the current daily P&L.
@@ -227,11 +300,78 @@ func (m *Manager) SetOpenPositions(positions map[string]*client.Position) {
 func (m *Manager) maybeDailyReset() {
 	now := todayUTC()
 	if now.After(m.dailyPnLReset) {
-		m.dailyPnL = 0
 		m.dailyStartingEquity = 0 // will be re-set by next account update
 		m.paused = false
 		m.dailyPnLReset = now
+		m.lastCumulativePnL = make(map[string]float64) // reset cumulative deltas for the new day
 		m.log.Info("risk: daily P&L reset")
+		m.saveState()
+	}
+}
+
+const stateFile = "bot_state.json"
+
+// LoadState reads the risk state from disk.
+func (m *Manager) LoadState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn("risk: could not read state file", zap.Error(err))
+		}
+		return
+	}
+
+	var s PersistentState
+	if err := json.Unmarshal(data, &s); err != nil {
+		m.log.Warn("risk: could not decode state file", zap.Error(err))
+		return
+	}
+
+	// Only load if the reset date is still valid (same day)
+	if !todayUTC().After(s.DailyPnLReset) {
+		m.dailyPnL = s.DailyPnL
+		m.dailyStartingEquity = s.DailyStartingEquity
+		m.dailyPnLReset = s.DailyPnLReset
+		m.paused = s.Paused
+		if s.LastCumulativePnL != nil {
+			m.lastCumulativePnL = s.LastCumulativePnL
+		}
+		m.log.Info("risk: state loaded from disk",
+			zap.Float64("daily_pnl", m.dailyPnL),
+			zap.Bool("paused", m.paused),
+		)
+	} else {
+		m.log.Info("risk: stale state file on disk ignored (different day)")
+	}
+}
+
+func (m *Manager) saveState() {
+	// Assumes lock is already held by caller if called internally, 
+	// but actually this is called from OnPositionClosed and maybeDailyReset.
+	// Let's make it safe or assume caller manages it.
+	// Given current design, let's just make it a helper that takes what it needs.
+	
+	s := PersistentState{
+		DailyPnL:            m.dailyPnL,
+		DailyStartingEquity: m.dailyStartingEquity,
+		DailyPnLReset:       m.dailyPnLReset,
+		LastCumulativePnL:   m.lastCumulativePnL,
+		Paused:              m.paused,
+	}
+
+	data, _ := json.MarshalIndent(s, "", "  ")
+	
+	// Write to temp file first then rename for atomic safety
+	tmp := stateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		m.log.Warn("risk: could not write temp state file", zap.Error(err))
+		return
+	}
+	if err := os.Rename(tmp, stateFile); err != nil {
+		m.log.Warn("risk: could not rename state file", zap.Error(err))
 	}
 }
 

@@ -48,6 +48,10 @@ func (s *VWAPReversionStrategy) SetClassifier(symbol string, c *regime.Classifie
 	s.mu.Unlock()
 }
 
+func (s *VWAPReversionStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *VWAPReversionStrategy) Name() string      { return "vwap_reversion" }
 func (s *VWAPReversionStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *VWAPReversionStrategy) IsEnabled() bool {

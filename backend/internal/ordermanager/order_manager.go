@@ -206,6 +206,33 @@ func (m *Manager) OnOrderUpdate(u stream.WsOrderUpdate) {
 		// Run cancellation in background to avoid blocking the update handler
 		go m.CancelAllEntriesForSymbol(context.Background(), o.Symbol, o.OrderID, string(o.Side))
 	}
+
+	// 2. Sibling Cleanup: If SL or TP is filled, cancel the other one
+	if (lo.Purpose == PurposeSL || lo.Purpose == PurposeTP) && lo.Status == "FILLED" {
+		m.log.Info("Bracket Cleanup: Order filled, canceling sibling",
+			zap.String("symbol", o.Symbol),
+			zap.String("purpose", lo.Purpose),
+			zap.Int64("orderId", o.OrderID),
+		)
+		// We need to find the specific entry order this SL/TP belonged to.
+		// For now, let's find the sibling in the order map by checking if any order's SLID or TPID matches.
+		// This is slightly inefficient but safe.
+		var entryOrder *LocalOrder
+		for _, entry := range m.orders {
+			if entry.SLID == o.ClientOrderID || entry.TPID == o.ClientOrderID {
+				entryOrder = entry
+				break
+			}
+		}
+
+		if entryOrder != nil {
+			go m.CancelSLTP(context.Background(), o.Symbol, entryOrder)
+		} else {
+			// Fallback: Mass cancel all SL/TP for this symbol if we can't find the exact sibling
+			// this is a safety net for manually placed orders or lost local state.
+			go m.CancelAllSLTPForSymbol(context.Background(), o.Symbol)
+		}
+	}
 }
 
 // GetAll returns a snapshot of all local orders.
@@ -418,4 +445,66 @@ func (m *Manager) CountAllPendingEntries() int {
 		}
 	}
 	return count
+}
+
+// CancelAllSLTPForSymbol cancels all SL and TP orders for a given symbol.
+func (m *Manager) CancelAllSLTPForSymbol(ctx context.Context, symbol string) {
+	m.mu.RLock()
+	var toCancel []string
+	for _, lo := range m.orders {
+		if lo.Symbol == symbol && (lo.Purpose == PurposeSL || lo.Purpose == PurposeTP) &&
+			(lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			toCancel = append(toCancel, lo.ClientOrderID)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, cid := range toCancel {
+		if err := m.cancelByClientID(ctx, symbol, cid); err != nil {
+			m.log.Warn("failed to cancel stale SL/TP", zap.String("cid", cid), zap.Error(err))
+		}
+	}
+}
+
+// EnsureProtectiveOrders checks if a position has SL and TP, and places them if missing.
+func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, side string, qty float64, slPrice, tpPrice float64) {
+	m.mu.RLock()
+	hasSL := false
+	hasTP := false
+	for _, lo := range m.orders {
+		if lo.Symbol == symbol && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			if lo.Purpose == PurposeSL {
+				hasSL = true
+			}
+			if lo.Purpose == PurposeTP {
+				hasTP = true
+			}
+		}
+	}
+	m.mu.RUnlock()
+
+	oppositeSide := "SELL"
+	if side == "SHORT" { // Binance PositionSide or Side from Position object
+		oppositeSide = "BUY"
+	} else if side == "SELL" { // Simple side from Position object
+		oppositeSide = "BUY"
+	}
+	
+	qtyStr := strconv.FormatFloat(math.Abs(qty), 'f', -1, 64)
+
+	if !hasSL && slPrice > 0 {
+		m.log.Info("Safety Monitor: SL missing for position, healing...", zap.String("symbol", symbol), zap.Float64("price", slPrice))
+		_, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, slPrice, "STOP_MARKET")
+		if err != nil {
+			m.log.Error("Safety Monitor: failed to heal SL", zap.Error(err))
+		}
+	}
+
+	if !hasTP && tpPrice > 0 {
+		m.log.Info("Safety Monitor: TP missing for position, healing...", zap.String("symbol", symbol), zap.Float64("price", tpPrice))
+		_, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, tpPrice, "TAKE_PROFIT_MARKET")
+		if err != nil {
+			m.log.Error("Safety Monitor: failed to heal TP", zap.Error(err))
+		}
+	}
 }

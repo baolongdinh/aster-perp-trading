@@ -41,6 +41,10 @@ func NewMomentumROC(cfg MomentumROCConfig, log *zap.Logger) *MomentumROCStrategy
 	}
 }
 
+func (s *MomentumROCStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *MomentumROCStrategy) Name() string      { return "momentum_roc" }
 func (s *MomentumROCStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *MomentumROCStrategy) IsEnabled() bool   { return s.enabled }

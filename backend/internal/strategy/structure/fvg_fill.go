@@ -37,6 +37,10 @@ func NewFVG(cfg FVGConfig, log *zap.Logger) *FVGStrategy {
 	}
 }
 
+func (s *FVGStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *FVGStrategy) Name() string      { return "fvg_fill" }
 func (s *FVGStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *FVGStrategy) IsEnabled() bool   { return s.enabled }

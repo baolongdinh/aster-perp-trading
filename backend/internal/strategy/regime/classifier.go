@@ -2,6 +2,7 @@ package regime
 
 import (
 	"math"
+	"sync"
 )
 
 // RegimeType defines the current market context.
@@ -16,6 +17,7 @@ const (
 
 // Classifier tracks HTF data and classifies the market.
 type Classifier struct {
+	mu        sync.RWMutex
 	adxPeriod int
 	bbPeriod  int
 	bbStdDev  float64
@@ -61,6 +63,9 @@ func NewClassifier(adxPeriod, bbPeriod int, bbStdDev float64) *Classifier {
 
 // AddKline inserts a CLOSED kline into the classifier.
 func (c *Classifier) AddKline(timeframe string, high, low, closePrice, volume float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if _, ok := c.closes[timeframe]; !ok {
 		c.highs[timeframe] = make([]float64, 0)
 		c.lows[timeframe] = make([]float64, 0)
@@ -428,3 +433,25 @@ func (c *Classifier) WasSqueezingRecently(lookback int) bool {
 	return false
 }
 
+
+// GetLogReturns returns the log-returns (ln(p1/p0)) for a timeframe.
+func (c *Classifier) GetLogReturns(timeframe string, periods int) []float64 {
+c.mu.RLock()
+defer c.mu.RUnlock()
+
+closes, ok := c.closes[timeframe]
+if !ok || len(closes) < 2 {
+return nil
+}
+if periods > len(closes)-1 {
+periods = len(closes) - 1
+}
+
+out := make([]float64, periods)
+for i := 0; i < periods; i++ {
+idx := len(closes) - 1 - i
+// Log return = ln(price_t / price_{t-1})
+out[i] = math.Log(closes[idx] / closes[idx-1])
+}
+return out
+}

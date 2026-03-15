@@ -63,6 +63,13 @@ func (r *Router) getClassifier(symbol string) *regime.Classifier {
 	return c
 }
 
+func (r *Router) GetMarketContext(symbol string) (float64, string) {
+	cf := r.getClassifier(symbol)
+	reg, _, _ := cf.Current()
+	atr := cf.GetATR("5m", 14)
+	return atr, string(reg)
+}
+
 // GetATR returns the current ATR for a symbol (using default 14 period).
 func (r *Router) GetATR(symbol string) float64 {
 	return r.getClassifier(symbol).GetATR("5m", 14)
@@ -85,10 +92,24 @@ func (r *Router) Register(s Strategy) {
 	}
 }
 
-// Name returns the router name.
 func (r *Router) Name() string { return "router_meta" }
 
-// Symbols returns the master list of symbols watched.
+func (r *Router) RequiredIntervals() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range r.strategies {
+		for _, interval := range s.RequiredIntervals() {
+			if !seen[interval] {
+				seen[interval] = true
+				out = append(out, interval)
+			}
+		}
+	}
+	return out
+}
+
 func (r *Router) Symbols() []string { return r.cfg.Symbols }
 
 func (r *Router) IsEnabled() bool   { return r.cfg.Enabled }
@@ -388,3 +409,4 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 func formatFloat(f float64) string {
 	return fmt.Sprintf("%.2f", f)
 }
+

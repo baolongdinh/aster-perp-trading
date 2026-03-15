@@ -40,6 +40,10 @@ func NewFlagPennant(cfg FlagPennantConfig, log *zap.Logger) *FlagPennantStrategy
 	}
 }
 
+func (s *FlagPennantStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *FlagPennantStrategy) Name() string      { return "flag_pennant" }
 func (s *FlagPennantStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *FlagPennantStrategy) IsEnabled() bool {

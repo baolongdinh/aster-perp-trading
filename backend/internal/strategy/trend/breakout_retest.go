@@ -62,6 +62,10 @@ func (s *BreakoutRetestStrategy) SetClassifier(symbol string, c *regime.Classifi
 	s.mu.Unlock()
 }
 
+func (s *BreakoutRetestStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *BreakoutRetestStrategy) Name() string      { return "breakout_retest" }
 func (s *BreakoutRetestStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *BreakoutRetestStrategy) IsEnabled() bool {

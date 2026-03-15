@@ -61,6 +61,10 @@ func (e *EMACrossStrategy) SetClassifier(symbol string, c *regime.Classifier) {
 	e.mu.Unlock()
 }
 
+func (e *EMACrossStrategy) RequiredIntervals() []string {
+	return []string{e.cfg.Timeframe}
+}
+
 func (e *EMACrossStrategy) Name() string      { return "ema_cross" }
 func (e *EMACrossStrategy) Symbols() []string { return e.cfg.Symbols }
 func (e *EMACrossStrategy) IsEnabled() bool {

@@ -45,6 +45,10 @@ func NewORB(cfg ORBConfig, log *zap.Logger) *ORBStrategy {
 	}
 }
 
+func (s *ORBStrategy) RequiredIntervals() []string {
+	return []string{s.cfg.Timeframe}
+}
+
 func (s *ORBStrategy) Name() string      { return "orb" }
 func (s *ORBStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *ORBStrategy) IsEnabled() bool   { return s.enabled }
