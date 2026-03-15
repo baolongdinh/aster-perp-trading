@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+
+body {
+  @apply bg-[#0b0e11] text-gray-100 font-sans;
+}

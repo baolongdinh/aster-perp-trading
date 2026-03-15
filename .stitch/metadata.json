@@ -1,0 +1,42 @@
+{
+  "name": "projects/12066261183802566974",
+  "projectId": "12066261183802566974",
+  "title": "Aster Perp Trading Dashboard",
+  "visibility": "PRIVATE",
+  "projectType": "PROJECT_DESIGN",
+  "origin": "STITCH",
+  "screens": {
+    "index": {
+      "id": "c0c3af993531486d8a3e644489d1a515",
+      "sourceScreen": "projects/12066261183802566974/screens/c0c3af993531486d8a3e644489d1a515",
+      "x": 0,
+      "y": 0,
+      "width": 2560,
+      "height": 2048
+    },
+    "strategies": {
+      "id": "c338cf91ff9a4a4f817b9dc6bbf17781",
+      "sourceScreen": "projects/12066261183802566974/screens/c338cf91ff9a4a4f817b9dc6bbf17781",
+      "x": 2600,
+      "y": 0,
+      "width": 2560,
+      "height": 2048
+    },
+    "trades": {
+      "id": "e42ea2833a2a4df1a0ab530b7f501009",
+      "sourceScreen": "projects/12066261183802566974/screens/e42ea2833a2a4df1a0ab530b7f501009",
+      "x": 5200,
+      "y": 0,
+      "width": 2560,
+      "height": 2048
+    },
+    "config": {
+      "id": "1f6c9b4b2a66480bae386c7b153b8e3d",
+      "sourceScreen": "projects/12066261183802566974/screens/1f6c9b4b2a66480bae386c7b153b8e3d",
+      "x": 7800,
+      "y": 0,
+      "width": 2560,
+      "height": 2048
+    }
+  }
+}
