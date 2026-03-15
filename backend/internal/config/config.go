@@ -53,7 +53,9 @@ type APIConfig struct {
 
 type LogConfig struct {
 	Level string `mapstructure:"level"` // debug | info | warn | error
+	File  string `mapstructure:"file"`  // path to log file
 }
+
 
 type StrategyConfig struct {
 	Name    string                 `mapstructure:"name"`
@@ -78,6 +80,8 @@ func Load(cfgPath string) (*Config, error) {
 	v.SetDefault("api.host", "0.0.0.0")
 	v.SetDefault("api.port", 8080)
 	v.SetDefault("log.level", "info")
+	v.SetDefault("log.file", "logs/bot.log")
+
 	v.SetDefault("risk.position_mode", "one_way")
 
 	// YAML file

@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+
 
 	"aster-bot/internal/api"
 	"aster-bot/internal/auth"
@@ -39,8 +41,9 @@ func main() {
 	}
 
 	// --- Logger ---
-	log := buildLogger(cfg.Log.Level)
+	log := buildLogger(cfg.Log.Level, cfg.Log.File)
 	defer log.Sync()
+
 
 	if cfg.Bot.DryRun {
 		log.Warn("⚠️  DRY-RUN MODE — no real orders will be sent")
@@ -446,33 +449,57 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 	return []strategy.Strategy{router}
 }
 
-func buildLogger(level string) *zap.Logger {
+func buildLogger(level, filePath string) *zap.Logger {
 	lvl := zapcore.InfoLevel
 	lvl.UnmarshalText([]byte(level))
 
-	cfg := zap.Config{
-		Level:       zap.NewAtomicLevelAt(lvl),
-		Development: false,
-		Encoding:    "console",
-		EncoderConfig: zapcore.EncoderConfig{
-			TimeKey:        "T",
-			LevelKey:       "L",
-			NameKey:        "N",
-			CallerKey:      "C",
-			MessageKey:     "M",
-			StacktraceKey:  "S",
-			LineEnding:     zapcore.DefaultLineEnding,
-			EncodeLevel:    zapcore.CapitalColorLevelEncoder,
-			EncodeTime:     zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05"),
-			EncodeDuration: zapcore.StringDurationEncoder,
-			EncodeCaller:   zapcore.ShortCallerEncoder,
-		},
-		OutputPaths:      []string{"stdout"},
-		ErrorOutputPaths: []string{"stderr"},
+	encoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "T",
+		LevelKey:       "L",
+		NameKey:        "N",
+		CallerKey:      "C",
+		MessageKey:     "M",
+		StacktraceKey:  "S",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalColorLevelEncoder,
+		EncodeTime:     zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05"),
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
-	logger, _ := cfg.Build()
-	return logger
+
+	// Output paths
+	stdout := zapcore.Lock(os.Stdout)
+	
+	cores := []zapcore.Core{
+		zapcore.NewCore(zapcore.NewConsoleEncoder(encoderConfig), stdout, lvl),
+	}
+
+	if filePath != "" {
+		// Ensure directory exists
+		dir := "logs"
+		if i := strings.LastIndex(filePath, "/"); i != -1 {
+			dir = filePath[:i]
+		} else if i := strings.LastIndex(filePath, "\\"); i != -1 {
+			dir = filePath[:i]
+		}
+		
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
+		} else {
+			file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to open log file: %v\n", err)
+			} else {
+				// We use console encoder for file too as requested by user's preference for readable logs
+				cores = append(cores, zapcore.NewCore(zapcore.NewConsoleEncoder(encoderConfig), zapcore.AddSync(file), lvl))
+			}
+		}
+	}
+
+	core := zapcore.NewTee(cores...)
+	return zap.New(core, zap.AddCaller())
 }
+
 
 // --- Config param helpers ---
 

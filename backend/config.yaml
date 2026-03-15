@@ -23,6 +23,8 @@ api:
 
 log:
   level: info # debug | info | warn | error
+  file: "logs/bot.log"
+
 
 strategies:
   - name: ema_cross
