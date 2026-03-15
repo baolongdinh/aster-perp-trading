@@ -12,9 +12,9 @@ import (
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/strategy/regime"
+
 	"go.uber.org/zap"
 )
-
 
 // Manager enforces trading risk rules.
 type Manager struct {
@@ -27,8 +27,11 @@ type Manager struct {
 	dailyStartingEquity float64            // equity at the start of the day
 	openPositions       int                // current open total position count
 	symPositions        map[string]int     // symbol -> open position count
+	symNotional         map[string]float64 // symbol -> open position notional (USDT)
 	lastCumulativePnL   map[string]float64 // symbol -> last known total realized PnL
 	pendingOrders       map[string]float64 // symbol -> total pending notional (NEW/PARTIALLY_FILLED)
+	pendingMargin       float64            // total initial margin of pending orders (NEW/PARTIALLY_FILLED)
+	availableBalance    float64            // current exchange available USDT balance
 	paused              bool               // true when daily loss limit hit
 	corrTracker         *regime.CorrelationTracker
 }
@@ -48,7 +51,6 @@ type PersistentState struct {
 	Paused              bool               `json:"paused"`
 }
 
-
 // NewManager creates a new risk manager.
 func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
 	return &Manager{
@@ -56,29 +58,40 @@ func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
 		log:               log,
 		dailyPnLReset:     todayUTC(),
 		symPositions:      make(map[string]int),
+		symNotional:       make(map[string]float64),
 		pendingOrders:     make(map[string]float64),
 		lastCumulativePnL: make(map[string]float64),
 	}
 }
 
-
 // CanEnter checks if a new position can be opened given current risk state.
 // Returns an error describing why the trade is blocked, or nil if allowed.
 // NOTE: Pending limit order slot enforcement is handled separately in the Engine.
-func (m *Manager) CanEnter(symbol string, notionalUSDT float64) error {
+func (m *Manager) CanEnter(symbol string, notional float64, leverage float64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.maybeDailyReset()
-
 	if m.paused {
 		return fmt.Errorf("risk: bot paused — daily loss limit reached (%.2f USDT)", m.cfg.DailyLossLimitUSDT)
 	}
+
+	// 1. Max Global Open Positions
 	if m.openPositions >= m.cfg.MaxOpenPositions {
-		return fmt.Errorf("risk: max open positions reached (%d)", m.cfg.MaxOpenPositions)
+		if m.symPositions[symbol] == 0 {
+			return fmt.Errorf("risk: max open positions reached (%d)", m.cfg.MaxOpenPositions)
+		}
 	}
 
-	// Correlation Check
+	// 2. No Stacking Check: Prevent increasing existing positions or duplicate entries
+	if m.symPositions[symbol] > 0 {
+		return fmt.Errorf("risk: stacking blocked — %s already has an open position", symbol)
+	}
+	if m.pendingOrders[symbol] > 0 {
+		return fmt.Errorf("risk: stacking blocked — %s already has a pending entry", symbol)
+	}
+
+	// 3. Correlation Check
 	if m.corrTracker != nil {
 		var active []string
 		for sym, count := range m.symPositions {
@@ -86,13 +99,28 @@ func (m *Manager) CanEnter(symbol string, notionalUSDT float64) error {
 				active = append(active, sym)
 			}
 		}
-		
+
 		highlyCorr := m.corrTracker.GetHighlyCorrelated(symbol, active)
 		if len(highlyCorr) > 0 {
 			return fmt.Errorf("risk: correlation limit — %s highly correlated with existing position(s) %v", symbol, highlyCorr)
 		}
 	}
 
+	// 4. Affordability check including OTHER pending margin
+	if leverage <= 0 {
+		leverage = 1.0
+	}
+	marginReq := notional / leverage
+	usableBalance := m.availableBalance * 0.95 // 5% buffer
+
+	if (marginReq + m.pendingMargin) > usableBalance {
+		return fmt.Errorf("risk: insufficient balance after pending reserve (req:%.2f, pend_margin:%.2f, available:%.2f)",
+			marginReq, m.pendingMargin, m.availableBalance)
+	}
+
+	// ATOMIC RESERVATION: Locking in the notional exposure and margin immediately
+	m.pendingOrders[symbol] += notional
+	m.pendingMargin += marginReq
 	return nil
 }
 
@@ -103,24 +131,45 @@ func (m *Manager) AddPending(symbol string, notional float64) {
 	m.mu.Unlock()
 }
 
-// RemovePending removes a pending order's notional.
-func (m *Manager) RemovePending(symbol string, notional float64) {
+// RemovePending removes a pending order's notional and margin.
+func (m *Manager) RemovePending(symbol string, notional float64, leverage float64) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.pendingOrders[symbol] -= notional
 	if m.pendingOrders[symbol] < 0 {
 		m.pendingOrders[symbol] = 0
 	}
-	m.mu.Unlock()
+
+	if leverage <= 0 {
+		leverage = 20.0 // default
+	}
+	m.pendingMargin -= (notional / leverage)
+	if m.pendingMargin < 0 {
+		m.pendingMargin = 0
+	}
+}
+
+// SetPendingOrders synchronizes known pending state from Engine.
+func (m *Manager) SetPendingOrders(notionals map[string]float64, totalMargin float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingOrders = notionals
+	m.pendingMargin = totalMargin
 }
 
 // OnPositionOpened records that a new position was opened.
-func (m *Manager) OnPositionOpened(symbol string) {
+func (m *Manager) OnPositionOpened(symbol string, notionalUSDT float64) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.openPositions++
 	m.symPositions[symbol]++
-	m.mu.Unlock()
+	m.symNotional[symbol] += notionalUSDT
+	m.pendingOrders[symbol] -= notionalUSDT
+	if m.pendingOrders[symbol] < 0 {
+		m.pendingOrders[symbol] = 0
+	}
 }
-
 
 // OnPositionClosed records that a position was closed with some realised PnL.
 func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
@@ -151,7 +200,7 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 			zap.Float64("daily_pnl", m.dailyPnL),
 		)
 	}
-	
+
 	// 1. ABSOLUTE LIMIT
 	if m.dailyPnL <= -m.cfg.DailyLossLimitUSDT {
 		m.paused = true
@@ -179,29 +228,76 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 
 // CalculatePositionSize returns the recommended notional size in USDT based on ATR and capital risk.
 func (m *Manager) CalculatePositionSize(symbol string, price float64, atr float64) (float64, error) {
-	if atr <= 0 {
-		return 0, fmt.Errorf("invalid ATR (warming up?)")
-	}
+	var notional float64
 
-	// Risk per unit = ATR * Multiplier
-	riskPerUnit := atr * m.cfg.ATRMultiplier
-	if riskPerUnit <= 0 {
-		return 0, fmt.Errorf("invalid risk per unit calculation")
-	}
+	if atr > 0 {
+		// Risk per unit = ATR * Multiplier
+		riskPerUnit := atr * m.cfg.ATRMultiplier
+		if riskPerUnit <= 0 {
+			return 0, fmt.Errorf("invalid risk per unit calculation")
+		}
 
-	// Quantity = DollarRisk / RiskPerUnit
-	qty := m.cfg.RiskPerTradeUSDT / riskPerUnit
-	
-	// Final size in notional
-	notional := qty * price
+		// Quantity = DollarRisk / RiskPerUnit
+		qty := m.cfg.RiskPerTradeUSDT / riskPerUnit
+
+		// Final size in notional
+		notional = qty * price
+		m.log.Debug("IQ-RISK: ATR-based sizing", zap.String("symbol", symbol), zap.Float64("notional", notional), zap.Float64("atr", atr))
+	} else {
+		// FALLBACK: Use %-based SL logic if ATR is warming up
+		// Asset size = RiskPerTrade / (Price * SLPct) * Price = RiskPerTrade / SLPct
+		slPct := m.cfg.PerTradeStopLossPct / 100.0
+		if slPct <= 0 {
+			slPct = 0.02 // Default 2%
+		}
+		notional = m.cfg.RiskPerTradeUSDT / slPct
+		m.log.Info("IQ-RISK: ATR warming up - using fallback %-based sizing",
+			zap.String("symbol", symbol),
+			zap.Float64("notional", notional),
+			zap.Float64("sl_pct", slPct*100),
+		)
+	}
 
 	// Check against max position size limit
 	if notional > m.cfg.MaxPositionUSDT {
+		m.log.Info("IQ-RISK: Capping notional size to max limit",
+			zap.String("symbol", symbol),
+			zap.Float64("requested_notional", notional),
+			zap.Float64("max_limit", m.cfg.MaxPositionUSDT),
+		)
 		notional = m.cfg.MaxPositionUSDT
-		m.log.Debug("risk: capping notional due to max_position_usdt", zap.String("symbol", symbol))
 	}
 
 	return notional, nil
+}
+
+// SetAvailableBalance updates the current available USDT balance from the exchange.
+func (m *Manager) SetAvailableBalance(balance float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.availableBalance = balance
+}
+
+// CanAfford checks if the account has enough margin to cover the trade.
+// RequiredMargin = Notional / Leverage.
+// We apply a 5% safety buffer (only use 95% of available balance).
+func (m *Manager) CanAfford(symbol string, notional float64, leverage float64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if leverage <= 0 {
+		leverage = 1.0
+	}
+
+	requiredMargin := notional / leverage
+	usableBalance := m.availableBalance * 0.95 // 5% safety buffer
+
+	if requiredMargin > usableBalance {
+		return fmt.Errorf("risk: insufficient available balance for symbol %s (margin_req:%.2f, available:%.2f, usable:%.2f)",
+			symbol, requiredMargin, m.availableBalance, usableBalance)
+	}
+
+	return nil
 }
 
 // SetInitialEquity sets the starting equity for drawdown calculations.
@@ -212,7 +308,6 @@ func (m *Manager) SetInitialEquity(equity float64) {
 		m.dailyStartingEquity = equity
 	}
 }
-
 
 // StopLossPrice calculates the SL price given entry and side.
 // If atr is > 0, it uses ATR-based stop loss (preferred).
@@ -229,6 +324,9 @@ func (m *Manager) StopLossPrice(entryPrice float64, side string, atr float64) fl
 	}
 
 	pct := m.cfg.PerTradeStopLossPct / 100.0
+	if pct <= 0 {
+		pct = 0.01 // Default 1% SL if unconfigured or 0
+	}
 	if side == "BUY" {
 		return entryPrice * (1 - pct)
 	}
@@ -239,6 +337,10 @@ func (m *Manager) StopLossPrice(entryPrice float64, side string, atr float64) fl
 // reg is the current market regime from strategy/regime package.
 func (m *Manager) TakeProfitPrice(entryPrice float64, side string, slPrice float64, reg string) float64 {
 	dist := math.Abs(entryPrice - slPrice)
+	if dist <= 0 {
+		// SL not yet calculated properly or invalid, fallback to fixed %
+		dist = entryPrice * 0.01
+	}
 	rr := 1.5 // Default RR
 
 	// Dynamic RR based on Regime
@@ -288,14 +390,15 @@ func (m *Manager) OpenPositions() int {
 // SetOpenPositions sets the open positions count (e.g. after reconcile).
 func (m *Manager) SetOpenPositions(positions map[string]*client.Position) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.openPositions = len(positions)
 	m.symPositions = make(map[string]int)
-	for sym := range positions {
+	m.symNotional = make(map[string]float64)
+	for sym, pos := range positions {
 		m.symPositions[sym] = 1
+		m.symNotional[sym] = math.Abs(pos.PositionAmt) * pos.EntryPrice
 	}
-	m.mu.Unlock()
 }
-
 
 func (m *Manager) maybeDailyReset() {
 	now := todayUTC()
@@ -349,11 +452,11 @@ func (m *Manager) LoadState() {
 }
 
 func (m *Manager) saveState() {
-	// Assumes lock is already held by caller if called internally, 
+	// Assumes lock is already held by caller if called internally,
 	// but actually this is called from OnPositionClosed and maybeDailyReset.
 	// Let's make it safe or assume caller manages it.
 	// Given current design, let's just make it a helper that takes what it needs.
-	
+
 	s := PersistentState{
 		DailyPnL:            m.dailyPnL,
 		DailyStartingEquity: m.dailyStartingEquity,
@@ -363,7 +466,7 @@ func (m *Manager) saveState() {
 	}
 
 	data, _ := json.MarshalIndent(s, "", "  ")
-	
+
 	// Write to temp file first then rename for atomic safety
 	tmp := stateFile + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
@@ -374,7 +477,6 @@ func (m *Manager) saveState() {
 		m.log.Warn("risk: could not rename state file", zap.Error(err))
 	}
 }
-
 
 func todayUTC() time.Time {
 	now := time.Now().UTC()

@@ -42,7 +42,11 @@ func NewVolumeSpike(cfg VolumeSpikeConfig, log *zap.Logger) *VolumeSpikeStrategy
 }
 
 func (s *VolumeSpikeStrategy) RequiredIntervals() []string {
-	return []string{s.cfg.Timeframe}
+	tf := s.cfg.Timeframe
+	if tf == "" {
+		tf = "5m"
+	}
+	return []string{tf}
 }
 
 func (s *VolumeSpikeStrategy) Name() string      { return "volume_spike" }

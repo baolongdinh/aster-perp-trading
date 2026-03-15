@@ -17,7 +17,6 @@ type EMACrossConfig struct {
 	FastPeriod    int
 	SlowPeriod    int
 	Leverage      int
-	OrderSizeUSDT float64
 	Timeframe     string // e.g. "5m"
 	Symbols       []string
 	Enabled       bool
@@ -194,8 +193,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 
 	// New entry
 	if crossUp && lastSig != strategy.SideBuy {
-		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
-		
 		// Option A: Strategy-specific SL/TP
 		var sl, tp float64
 		e.mu.RLock()
@@ -215,7 +212,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 			Type:       strategy.SignalEnter,
 			Symbol:     symbol,
 			Side:       strategy.SideBuy,
-			Quantity:   qty,
 			StopLoss:   sl,
 			TakeProfit: tp,
 			Reason:     fmt.Sprintf("ema_cross_long fast=%.4f slow=%.4f", fastNow, slowNow),
@@ -223,8 +219,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 	}
 
 	if crossDown && lastSig != strategy.SideSell {
-		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
-		
 		// Option A: Strategy-specific SL/TP
 		var sl, tp float64
 		e.mu.RLock()
@@ -244,7 +238,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 			Type:       strategy.SignalEnter,
 			Symbol:     symbol,
 			Side:       strategy.SideSell,
-			Quantity:   qty,
 			StopLoss:   sl,
 			TakeProfit: tp,
 			Reason:     fmt.Sprintf("ema_cross_short fast=%.4f slow=%.4f", fastNow, slowNow),
@@ -253,7 +246,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 
 	// PHASE 5: Join Trend on Start
 	if e.cfg.JoinTrend && lastSig == "" && (currentPos == nil || currentPos.PositionAmt == 0) {
-		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
 		var sl, tp float64
 		e.mu.RLock()
 		if cf, ok := e.classifiers[symbol]; ok && cf != nil {
@@ -278,7 +270,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 				Type:       strategy.SignalEnter,
 				Symbol:     symbol,
 				Side:       strategy.SideBuy,
-				Quantity:   qty,
 				StopLoss:   sl,
 				TakeProfit: tp,
 				Reason:     fmt.Sprintf("ema_join_long (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
@@ -291,7 +282,6 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 				Type:       strategy.SignalEnter,
 				Symbol:     symbol,
 				Side:       strategy.SideSell,
-				Quantity:   qty,
 				StopLoss:   sl,
 				TakeProfit: tp,
 				Reason:     fmt.Sprintf("ema_join_short (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),

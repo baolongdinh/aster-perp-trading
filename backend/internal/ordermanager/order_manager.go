@@ -25,6 +25,7 @@ type LocalOrder struct {
 	TPID         string  // client order ID of paired take-profit order
 	Purpose      string  // PurposeEntry | PurposeExit | PurposeSL | PurposeTP
 	StrategyName string  // which strategy owns this order
+	IsChasing    bool    // whether this order should follow the Best Bid/Ask
 }
 
 const (
@@ -55,18 +56,50 @@ func NewManager(futures *client.FuturesClient, prec *client.PrecisionManager, lo
 }
 
 // Reconcile fetches all open orders from the exchange and syncs local state.
+// It preserves local metadata (Purpose, StrategyName) for existing orders.
 func (m *Manager) Reconcile(ctx context.Context) error {
 	orders, err := m.futures.GetOpenOrders(ctx, "")
 	if err != nil {
 		return fmt.Errorf("ordermanager: reconcile: %w", err)
 	}
+
 	m.mu.Lock()
-	m.orders = make(map[int64]*LocalOrder, len(orders))
+	defer m.mu.Unlock()
+
+	newMap := make(map[int64]*LocalOrder)
 	for i := range orders {
 		o := orders[i]
-		m.orders[o.OrderID] = &LocalOrder{Order: o}
+		if existing, ok := m.orders[o.OrderID]; ok {
+			// Update exchange fields but keep local metadata
+			existing.Order = o
+			newMap[o.OrderID] = existing
+		} else {
+			// New order found (maybe placed manually or missed)
+			lo := &LocalOrder{Order: o}
+			// Infer purpose for reconciled orders
+			switch o.Type {
+			case "LIMIT":
+				lo.Purpose = PurposeEntry
+			case "STOP_MARKET", "STOP":
+				lo.Purpose = PurposeSL
+			case "TAKE_PROFIT_MARKET", "TAKE_PROFIT":
+				lo.Purpose = PurposeTP
+			}
+			newMap[o.OrderID] = lo
+		}
 	}
-	m.mu.Unlock()
+
+	// Any order currently in m.orders but NOT in newMap is closed/canceled
+	// We can log these as "discovered closed via reconciliation"
+	for id, lo := range m.orders {
+		if _, ok := newMap[id]; !ok {
+			m.log.Debug("reconcile: purged closed order",
+				zap.Int64("orderId", id),
+				zap.String("symbol", lo.Symbol))
+		}
+	}
+
+	m.orders = newMap
 	m.log.Info("order manager reconciled", zap.Int("open_orders", len(orders)))
 	return nil
 }
@@ -327,12 +360,12 @@ func (m *Manager) CancelAllEntriesForSymbol(ctx context.Context, symbol string, 
 	}
 }
 
-// PlaceLimitEntry places a LIMIT entry order (GTC).
 func (m *Manager) PlaceLimitEntry(
 	ctx context.Context,
 	symbol, side, qty, price string,
 	slPrice, tpPrice float64,
 	strategyName string,
+	isChasing bool,
 ) (*LocalOrder, error) {
 	m.log.Info("[DEBUG ENTRY] PlaceLimitEntry called", zap.String("symbol", symbol), zap.String("side", side), zap.String("qty", qty), zap.String("price", price))
 	clientID := "bot_limit_" + uuid.New().String()[:8]
@@ -356,6 +389,7 @@ func (m *Manager) PlaceLimitEntry(
 		StrategyName: strategyName,
 		SLPrice:      slPrice,
 		TPPrice:      tpPrice,
+		IsChasing:    isChasing,
 	}
 	m.mu.Lock()
 	m.orders[order.OrderID] = lo
@@ -467,44 +501,76 @@ func (m *Manager) CancelAllSLTPForSymbol(ctx context.Context, symbol string) {
 }
 
 // EnsureProtectiveOrders checks if a position has SL and TP, and places them if missing.
-func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, side string, qty float64, slPrice, tpPrice float64) {
+// It validates that the price hasn't already passed the trigger level.
+func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, side string, qty float64, slPrice, tpPrice float64, currentPrice float64) {
+	// 1. Determine actual side from quantity (needed for One-Way mode where side might be "BOTH")
+	isLong := qty > 0
+	if qty == 0 {
+		return // No position to protect
+	}
+
+	oppositeSide := "SELL"
+	if !isLong {
+		oppositeSide = "BUY"
+	}
+
 	m.mu.RLock()
 	hasSL := false
 	hasTP := false
 	for _, lo := range m.orders {
 		if lo.Symbol == symbol && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
-			if lo.Purpose == PurposeSL {
-				hasSL = true
-			}
-			if lo.Purpose == PurposeTP {
-				hasTP = true
+			// Check if this order is on the correct side to be a protective order
+			if string(lo.Side) == oppositeSide {
+				if lo.Purpose == PurposeSL {
+					hasSL = true
+				}
+				if lo.Purpose == PurposeTP {
+					hasTP = true
+				}
 			}
 		}
 	}
 	m.mu.RUnlock()
 
-	oppositeSide := "SELL"
-	if side == "SHORT" { // Binance PositionSide or Side from Position object
-		oppositeSide = "BUY"
-	} else if side == "SELL" { // Simple side from Position object
-		oppositeSide = "BUY"
-	}
-	
 	qtyStr := strconv.FormatFloat(math.Abs(qty), 'f', -1, 64)
 
+	// Heal SL if missing
 	if !hasSL && slPrice > 0 {
-		m.log.Info("Safety Monitor: SL missing for position, healing...", zap.String("symbol", symbol), zap.Float64("price", slPrice))
-		_, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, slPrice, "STOP_MARKET")
-		if err != nil {
-			m.log.Error("Safety Monitor: failed to heal SL", zap.Error(err))
+		isValid := false
+		if isLong {
+			isValid = currentPrice > slPrice
+		} else {
+			isValid = currentPrice < slPrice
+		}
+
+		if isValid {
+			m.log.Info("Safety Monitor: SL missing for position, healing...", zap.String("symbol", symbol), zap.Float64("price", slPrice))
+			_, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, slPrice, "STOP_MARKET")
+			if err != nil {
+				m.log.Error("Safety Monitor: failed to heal SL", zap.Error(err))
+			}
+		} else {
+			m.log.Warn("Safety Monitor: SL healing skipped, price already past trigger", zap.String("symbol", symbol), zap.Float64("current", currentPrice), zap.Float64("sl", slPrice))
 		}
 	}
 
+	// Heal TP if missing
 	if !hasTP && tpPrice > 0 {
-		m.log.Info("Safety Monitor: TP missing for position, healing...", zap.String("symbol", symbol), zap.Float64("price", tpPrice))
-		_, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, tpPrice, "TAKE_PROFIT_MARKET")
-		if err != nil {
-			m.log.Error("Safety Monitor: failed to heal TP", zap.Error(err))
+		isValid := false
+		if isLong {
+			isValid = currentPrice < tpPrice
+		} else {
+			isValid = currentPrice > tpPrice
+		}
+
+		if isValid {
+			m.log.Info("Safety Monitor: TP missing for position, healing...", zap.String("symbol", symbol), zap.Float64("price", tpPrice))
+			_, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, tpPrice, "TAKE_PROFIT_MARKET")
+			if err != nil {
+				m.log.Error("Safety Monitor: failed to heal TP", zap.Error(err))
+			}
+		} else {
+			m.log.Warn("Safety Monitor: TP healing skipped, price already past trigger", zap.String("symbol", symbol), zap.Float64("current", currentPrice), zap.Float64("tp", tpPrice))
 		}
 	}
 }

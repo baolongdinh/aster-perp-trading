@@ -80,6 +80,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err := e.orders.Reconcile(ctx); err != nil {
 		return fmt.Errorf("engine: reconcile: %w", err)
 	}
+	e.syncRiskExposure()
 
 	// 2. Fetch current positions
 	if err := e.refreshPositions(ctx); err != nil {
@@ -108,7 +109,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.marketStream = stream.NewMarketStream(e.cfg.Exchange.FuturesWSBase, streams, handlers, e.log)
 
 	userHandlers := stream.UserStreamHandlers{
-		OnOrderUpdate:   e.orders.OnOrderUpdate,
+		OnOrderUpdate:   e.onOrderUpdate,
 		OnAccountUpdate: e.onAccountUpdate,
 	}
 	e.userStream = stream.NewUserStream(
@@ -137,11 +138,92 @@ func (e *Engine) Start(ctx context.Context) error {
 	// 9. Position refresh loop (every 30s for unrealized PnL)
 	go e.positionRefreshLoop(ctx)
 
-	// 10. Safety Monitor Loop (every 60s to heal "naked" positions)
+	// 10. Initial Safety Check & Safety Monitor Loop
+	e.runSafetyCheck(ctx)
 	go e.safetyMonitorLoop(ctx)
+
+	// 11. Periodic Order Reconciliation (every 30s)
+	go e.reconcileLoop(ctx)
+
+	// 12. Aggressive Order Chasing (every 2s)
+	go e.chaseLoop(ctx)
 
 	e.log.Info("engine started")
 	return nil
+}
+
+func (e *Engine) chaseLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			openOrders := e.orders.GetAll()
+			for _, lo := range openOrders {
+				if !lo.IsChasing || lo.Purpose != "ENTRY" {
+					continue
+				}
+				if lo.Status != "NEW" && lo.Status != "PARTIALLY_FILLED" {
+					continue
+				}
+
+				// Check Top of Book
+				e.mu.RLock()
+				ticker, ok := e.tickers[lo.Symbol]
+				e.mu.RUnlock()
+				if !ok {
+					continue
+				}
+
+				targetPrice := 0.0
+				if string(lo.Side) == "BUY" {
+					targetPrice = ticker.BidPrice
+				} else {
+					targetPrice = ticker.AskPrice
+				}
+
+				if targetPrice == 0 || targetPrice == lo.Price {
+					continue
+				}
+
+				// Price mismatch - trigger handleLimitEntry
+				// Reconstruct signal
+				sig := &strategy.Signal{
+					StrategyName: lo.StrategyName,
+					Symbol:       lo.Symbol,
+					Type:         strategy.SignalEnter,
+					Side:         strategy.Side(lo.Side),
+					Price:        strconv.FormatFloat(targetPrice, 'f', -1, 64),
+					Quantity:     strconv.FormatFloat(lo.OrigQty*lo.Price, 'f', -1, 64), // original notional
+					StopLoss:     lo.SLPrice,
+					TakeProfit:   lo.TPPrice,
+				}
+				// handleLimitEntry will handle the replacement/drift check (0.00001 threshold for chasing)
+				e.handleLimitEntry(ctx, sig, true)
+			}
+		}
+	}
+}
+
+func (e *Engine) reconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.orders.Reconcile(ctx); err != nil {
+				e.log.Warn("engine: periodic reconcile error", zap.Error(err))
+			} else {
+				e.syncRiskExposure()
+			}
+		}
+	}
 }
 
 // Stop gracefully shuts down the engine.
@@ -176,6 +258,41 @@ func (e *Engine) IsRunning() bool {
 	return e.running
 }
 
+func (e *Engine) syncRiskExposure() {
+	m := make(map[string]float64)
+	orders := e.orders.GetAll()
+	var totalPendingMargin float64
+
+	for _, lo := range orders {
+		if lo.Purpose == ordermanager.PurposeEntry && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			// Phase 13: Use remaining quantity to avoid double-counting
+			remaining := lo.OrigQty - lo.ExecutedQty
+			if remaining > 0 {
+				notional := lo.Price * remaining
+				m[lo.Symbol] += notional
+
+				// Fetch leverage for this strategy to calculate margin
+				leverage := 20.0
+				for _, sc := range e.cfg.Strategies {
+					if sc.Name == lo.StrategyName {
+						if l, ok := sc.Params["leverage"]; ok {
+							switch v := l.(type) {
+							case int:
+								leverage = float64(v)
+							case float64:
+								leverage = v
+							}
+						}
+						break
+					}
+				}
+				totalPendingMargin += (notional / leverage)
+			}
+		}
+	}
+	e.risk.SetPendingOrders(m, totalPendingMargin)
+}
+
 // --- Internal handlers ---
 
 func (e *Engine) onKline(k stream.WsKline) {
@@ -201,6 +318,12 @@ func (e *Engine) onMarkPrice(mp stream.WsMarkPrice) {
 	}
 }
 
+func (e *Engine) onOrderUpdate(ou stream.WsOrderUpdate) {
+	e.orders.OnOrderUpdate(ou)
+	// Reactive Sync: Update pending exposure immediately on any trade/cancel/fill
+	e.syncRiskExposure()
+}
+
 func (e *Engine) onBookTicker(bt stream.WsBookTicker) {
 	e.mu.Lock()
 	e.tickers[bt.Symbol] = bt
@@ -208,9 +331,18 @@ func (e *Engine) onBookTicker(bt stream.WsBookTicker) {
 }
 
 func (e *Engine) onAccountUpdate(u stream.WsAccountUpdate) {
+	// Phase 17: Sync Available Balance to RiskManager
+	for _, b := range u.Update.Balances {
+		if b.Asset == "USDT" {
+			e.risk.SetAvailableBalance(b.CrossWalletBalance)
+			break
+		}
+	}
+
 	for _, s := range e.strategies {
 		s.OnAccountUpdate(u)
 	}
+
 	// Update position state from account update
 	e.mu.Lock()
 	for _, pos := range u.Update.Positions {
@@ -231,6 +363,20 @@ func (e *Engine) onAccountUpdate(u stream.WsAccountUpdate) {
 		}
 	}
 	e.mu.Unlock()
+
+	// Sync risk manager with new position state
+	e.refreshRiskPositions()
+	e.syncRiskExposure()
+}
+
+func (e *Engine) refreshRiskPositions() {
+	e.mu.RLock()
+	m := make(map[string]*client.Position)
+	for sym, pos := range e.positions {
+		m[sym] = pos
+	}
+	e.mu.RUnlock()
+	e.risk.SetOpenPositions(m)
 }
 
 // Position refresh loop (every 30s for unrealized PnL)
@@ -269,18 +415,86 @@ func (e *Engine) positionRefreshLoop(ctx context.Context) {
 func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, currentPos *client.Position) {
 	switch sig.Type {
 	case strategy.SignalEnter:
-		// Check risk
-		notional := parseFloat(sig.Quantity)
-		e.log.Info("[DEBUG ENTRY] Received entry signal", zap.String("strategy", sig.StrategyName), zap.String("symbol", sig.Symbol), zap.Float64("raw_notional", notional))
-		
-		if err := e.risk.CanEnter(sig.Symbol, notional); err != nil {
+		// Phase 15 & 19: Centralized Position Sizing
+		// All entries now derive size from RiskManager (ATR-based or fallback %-based)
+		atr, _ := e.getMarketContext(sig.Symbol)
+		e.mu.RLock()
+		lastPrice := e.prices[sig.Symbol]
+		// Fallback to ticker mid if mark price missing
+		if lastPrice == 0 {
+			if t, ok := e.tickers[sig.Symbol]; ok && t.BidPrice > 0 {
+				lastPrice = (t.BidPrice + t.AskPrice) / 2
+			}
+		}
+		e.mu.RUnlock()
+
+		if lastPrice <= 0 {
+			e.log.Warn("IQ-ENGINE: Cannot size position, price unknown", zap.String("symbol", sig.Symbol))
+			return
+		}
+
+		notional, err := e.risk.CalculatePositionSize(sig.Symbol, lastPrice, atr)
+		if err != nil || notional <= 0 {
+			e.log.Warn("IQ-ENGINE: Risk sizing failed", zap.Error(err), zap.String("symbol", sig.Symbol))
+			return
+		}
+		sig.Quantity = strconv.FormatFloat(notional, 'f', -1, 64)
+
+		e.log.Info("[IQ-ENGINE] Final sized entry",
+			zap.String("strategy", sig.StrategyName),
+			zap.String("symbol", sig.Symbol),
+			zap.Float64("notional", notional),
+			zap.Float64("price", lastPrice),
+			zap.Float64("atr", atr),
+		)
+
+		// Phase 17: Margin Awareness - check if account can afford the trade
+		leverage := 20.0 // Default fallback
+		for _, sc := range e.cfg.Strategies {
+			if sc.Name == sig.StrategyName {
+				if l, ok := sc.Params["leverage"]; ok {
+					switch v := l.(type) {
+					case int:
+						leverage = float64(v)
+					case float64:
+						leverage = v
+					}
+				}
+				break
+			}
+		}
+
+		if err := e.risk.CanAfford(sig.Symbol, notional, leverage); err != nil {
+			e.log.Warn("margin blocked entry", zap.Error(err))
+			return
+		}
+
+		if err := e.risk.CanEnter(sig.Symbol, notional, leverage); err != nil {
 			e.log.Warn("risk blocked entry", zap.Error(err))
 			return
 		}
 
+		// MAKER PRIORITY: Convert empty price signals to Limit at Best Bid/Ask
+		isChasing := false
+		if sig.Price == "" && e.cfg.Risk.MakerPriority {
+			isChasing = true
+			e.mu.RLock()
+			ticker, ok := e.tickers[sig.Symbol]
+			e.mu.RUnlock()
+			if ok {
+				if sig.Side == strategy.SideBuy && ticker.BidPrice > 0 {
+					sig.Price = e.prec.RoundPrice(sig.Symbol, ticker.BidPrice)
+					e.log.Info("IQ-MAKER: Converting Market to Limit (Bid)", zap.String("symbol", sig.Symbol), zap.String("price", sig.Price))
+				} else if sig.Side == strategy.SideSell && ticker.AskPrice > 0 {
+					sig.Price = e.prec.RoundPrice(sig.Symbol, ticker.AskPrice)
+					e.log.Info("IQ-MAKER: Converting Market to Limit (Ask)", zap.String("symbol", sig.Symbol), zap.String("price", sig.Price))
+				}
+			}
+		}
+
 		// LIMIT ORDER PATH
 		if sig.Price != "" {
-			e.handleLimitEntry(ctx, sig)
+			e.handleLimitEntry(ctx, sig, isChasing)
 			return
 		}
 
@@ -288,6 +502,7 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		// PHASE 9: Position Awareness - If we already have a position, don't enter more (One-Way)
 		if currentPos != nil && math.Abs(currentPos.PositionAmt) > 0 {
 			e.log.Debug("IQ-ENGINE: Side already has position, skipping market entry", zap.String("symbol", sig.Symbol))
+			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 		// PHASE 3: Slippage/Spread Protection
@@ -301,13 +516,14 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 					zap.String("symbol", sig.Symbol),
 					zap.Float64("spread_pct", spread*100),
 				)
+				e.risk.RemovePending(sig.Symbol, notional, leverage)
 				return
 			}
 		}
 
 		// --- Quantity Conversion & Rounding ---
 		e.mu.RLock()
-		lastPrice := e.prices[sig.Symbol]
+		lastPrice = e.prices[sig.Symbol]
 		// Fallback: if mark price not yet received from stream, use book ticker mid-price
 		if lastPrice == 0 {
 			if t, ok := e.tickers[sig.Symbol]; ok && t.BidPrice > 0 {
@@ -318,6 +534,7 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		if lastPrice == 0 {
 			e.log.Warn("cannot enter: price unknown, skipping (will retry next tick)",
 				zap.String("symbol", sig.Symbol))
+			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 
@@ -332,6 +549,7 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 				zap.Float64("price", lastPrice),
 				zap.Float64("raw_qty", coinQty),
 			)
+			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 
@@ -348,9 +566,10 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 
 		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, tp, sig.StrategyName); err != nil {
 			e.log.Error("place entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
+			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
-		e.risk.OnPositionOpened(sig.Symbol)
+		e.risk.OnPositionOpened(sig.Symbol, notional)
 
 	case strategy.SignalExit:
 		if currentPos == nil || currentPos.PositionAmt == 0 {
@@ -364,7 +583,7 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 	}
 }
 
-func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
+func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isChasing bool) {
 	newPriceFloat, _ := strconv.ParseFloat(sig.Price, 64)
 	if newPriceFloat == 0 {
 		return
@@ -374,55 +593,80 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 	roundedPriceStr := e.prec.RoundPrice(sig.Symbol, newPriceFloat)
 	roundedPriceFloat, _ := strconv.ParseFloat(roundedPriceStr, 64)
 
-	// SLOT RULE 1: Global cap
-	maxGlobalPending := e.cfg.Risk.MaxGlobalPendingLimitOrders
-	if maxGlobalPending == 0 {
-		maxGlobalPending = 5 // fallback
-	}
-	if e.orders.CountAllPendingEntries() >= maxGlobalPending {
-		e.log.Warn("IQ-SLOT: Global limit order cap reached, skipping",
-			zap.String("symbol", sig.Symbol),
-			zap.Int("cap", maxGlobalPending),
-		)
-		return
-	}
-
-	// SLOT RULE 2 + DRIFT CHECK:
-	// If a pending entry already exists on this side, only proceed if price has drifted enough.
+	// SLOT RULE: If a pending entry already exists on this side for THIS strategy, only proceed if price has drifted.
+	// We check THIS first to allow "replacements" to bypass the global cap.
 	existing := e.orders.FindEntryByStrategy(sig.Symbol, sig.StrategyName, string(sig.Side))
 	if existing != nil {
-		// A pending order already holds this slot — only replace if price drifted > 0.1%
+		// Drift check
 		drift := math.Abs(roundedPriceFloat-existing.Price) / existing.Price
-		if drift < 0.001 {
-			return // same price, no action needed
+
+		// If chasing, any price change counts. If standard limit, needs 0.1% drift.
+		threshold := 0.001
+		if existing.IsChasing || isChasing {
+			threshold = 0.00001
 		}
-		e.log.Info("IQ-LIMIT: Price drift detected, updating limit order",
+
+		if drift < threshold {
+			e.log.Debug("IQ-LIMIT: Drift below threshold, skipping update",
+				zap.String("symbol", sig.Symbol),
+				zap.Float64("drift", drift),
+				zap.Float64("threshold", threshold),
+			)
+			return
+		}
+
+		e.log.Info("IQ-LIMIT: Price change detected, updating limit order",
 			zap.String("strategy", sig.StrategyName),
 			zap.String("symbol", sig.Symbol),
 			zap.Float64("old_price", existing.Price),
 			zap.Float64("new_price", roundedPriceFloat),
+			zap.Bool("is_chasing", existing.IsChasing || isChasing),
 		)
-		// Cancel the old order to free the slot before placing new one
+		// Cancel old before placing new
 		_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
 			Symbol:        sig.Symbol,
 			ClientOrderID: existing.ClientOrderID,
 		})
 		if cancelErr == nil {
 			e.orders.SetOrderStatus(existing.OrderID, "CANCELED")
-			e.risk.RemovePending(sig.Symbol, existing.Price*existing.OrigQty)
+			e.risk.RemovePending(sig.Symbol, existing.Price*existing.OrigQty, 20.0)
 		}
 	} else {
+		// New entry slot - check caps
+		maxGlobalPending := e.cfg.Risk.MaxGlobalPendingLimitOrders
+		if maxGlobalPending == 0 {
+			maxGlobalPending = 10 // Increased default
+		}
+		if e.orders.CountAllPendingEntries() >= maxGlobalPending {
+			e.log.Warn("IQ-SLOT: Global limit order cap reached, skipping",
+				zap.String("symbol", sig.Symbol),
+				zap.Int("cap", maxGlobalPending),
+			)
+			return
+		}
+
 		maxPerSide := e.cfg.Risk.MaxPendingPerSide
 		if maxPerSide == 0 {
-			maxPerSide = 1 // fallback
+			maxPerSide = 1 // default
 		}
 		if e.orders.CountPendingBySide(sig.Symbol, string(sig.Side)) >= maxPerSide {
-			// Another strategy already holds this side's slot
+			e.log.Info("IQ-SLOT: Per-side limit order cap reached, skipping",
+				zap.String("symbol", sig.Symbol),
+				zap.String("side", string(sig.Side)),
+				zap.Int("cap", maxPerSide),
+			)
 			return
 		}
 	}
 
-	notional := parseFloat(sig.Quantity)
+	// Phase 19: Centralized Sizing for Limit Orders
+	atr, _ := e.getMarketContext(sig.Symbol)
+	notional, err := e.risk.CalculatePositionSize(sig.Symbol, roundedPriceFloat, atr)
+	if err != nil || notional <= 0 {
+		e.log.Warn("IQ-LIMIT: Risk sizing failed", zap.Error(err), zap.String("symbol", sig.Symbol))
+		return
+	}
+
 	coinQty := notional / roundedPriceFloat
 	roundedQtyStr := e.prec.RoundQty(sig.Symbol, coinQty)
 
@@ -434,6 +678,7 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 			zap.Float64("price", roundedPriceFloat),
 			zap.Float64("raw_qty", coinQty),
 		)
+		e.risk.RemovePending(sig.Symbol, notional, 20.0)
 		return
 	}
 
@@ -448,14 +693,11 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 		tp = e.risk.TakeProfitPrice(roundedPriceFloat, string(sig.Side), sl, reg)
 	}
 
-	// PHASE 9: Risk Tracking - Add to pending BEFORE placing
-	e.risk.AddPending(sig.Symbol, notional)
-
 	// Place new limit order
-	_, err := e.orders.PlaceLimitEntry(ctx, sig.Symbol, string(sig.Side), roundedQtyStr, roundedPriceStr, sl, tp, sig.StrategyName)
+	_, err = e.orders.PlaceLimitEntry(ctx, sig.Symbol, string(sig.Side), roundedQtyStr, roundedPriceStr, sl, tp, sig.StrategyName, isChasing)
 	if err != nil {
 		e.log.Error("place limit entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
-		e.risk.RemovePending(sig.Symbol, notional)
+		e.risk.RemovePending(sig.Symbol, notional, 20.0)
 	}
 }
 
@@ -504,7 +746,7 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 				// Immediately hide from GC to prevent loop while waiting for WS update
 				e.orders.SetOrderStatus(lo.OrderID, "CANCELED")
 				// Only release pending exposure after confirmed cancel
-				e.risk.RemovePending(lo.Symbol, lo.Price*lo.OrigQty)
+				e.risk.RemovePending(lo.Symbol, lo.Price*lo.OrigQty, 20.0) // fallback leverage
 			}
 		}
 	}
@@ -525,12 +767,19 @@ func (e *Engine) refreshPositions(ctx context.Context) error {
 		}
 	}
 	e.mu.Unlock()
-	e.risk.SetOpenPositions(m)
+	e.refreshRiskPositions()
 
-	// Update starting equity for drawdown circuit breaker
+	// Update starting equity and available balance
 	account, err := e.futures.GetAccount(ctx)
 	if err == nil {
+		e.log.Info("IQ-RISK: Initializing account balance",
+			zap.Float64("total_margin", account.TotalMarginBalance),
+			zap.Float64("available", account.AvailableBalance),
+		)
 		e.risk.SetInitialEquity(account.TotalMarginBalance)
+		e.risk.SetAvailableBalance(account.AvailableBalance)
+	} else {
+		e.log.Warn("IQ-RISK: Failed to fetch account balance on startup", zap.Error(err))
 	}
 
 	return nil
@@ -547,11 +796,16 @@ func (e *Engine) initLeverage(ctx context.Context) {
 		var stratLvg int
 		if v, ok := sc.Params["leverage"]; ok {
 			switch t := v.(type) {
-			case int: stratLvg = t
-			case int32: stratLvg = int(t)
-			case int64: stratLvg = int(t)
-			case float64: stratLvg = int(t)
-			case float32: stratLvg = int(t)
+			case int:
+				stratLvg = t
+			case int32:
+				stratLvg = int(t)
+			case int64:
+				stratLvg = int(t)
+			case float64:
+				stratLvg = int(t)
+			case float32:
+				stratLvg = int(t)
 			case string:
 				if parsed, err := strconv.Atoi(t); err == nil {
 					stratLvg = parsed
@@ -610,7 +864,9 @@ func (e *Engine) requiredIntervals() []string {
 			continue
 		}
 		for _, interval := range s.RequiredIntervals() {
-			intervals[interval] = true
+			if interval != "" {
+				intervals[interval] = true
+			}
 		}
 	}
 
@@ -695,32 +951,43 @@ func abs(f float64) float64 {
 
 // safetyMonitorLoop checks every 60s if open positions have SL and TP, and heals them if not.
 func (e *Engine) safetyMonitorLoop(ctx context.Context) {
-ticker := time.NewTicker(60 * time.Second)
-defer ticker.Stop()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
 
-for {
-select {
-case <-ctx.Done():
-return
-case <-ticker.C:
-e.mu.RLock()
-positions := make([]*client.Position, 0, len(e.positions))
-for _, pos := range e.positions {
-cp := *pos
-positions = append(positions, &cp)
-}
-e.mu.RUnlock()
-
-for _, pos := range positions {
-atr, reg := e.getMarketContext(pos.Symbol)
-			sl := e.risk.StopLossPrice(pos.EntryPrice, string(pos.PositionSide), atr)
-			tp := e.risk.TakeProfitPrice(pos.EntryPrice, string(pos.PositionSide), sl, reg)
-
-e.orders.EnsureProtectiveOrders(ctx, pos.Symbol, string(pos.PositionSide), pos.PositionAmt, sl, tp)
-}
-}
-}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.runSafetyCheck(ctx)
+		}
+	}
 }
 
+func (e *Engine) runSafetyCheck(ctx context.Context) {
+	e.mu.RLock()
+	positions := make([]*client.Position, 0, len(e.positions))
+	for _, pos := range e.positions {
+		cp := *pos
+		positions = append(positions, &cp)
+	}
+	e.mu.RUnlock()
 
+	for _, pos := range positions {
+		side := "BUY"
+		if pos.PositionAmt < 0 {
+			side = "SELL"
+		}
 
+		atr, reg := e.getMarketContext(pos.Symbol)
+		sl := e.risk.StopLossPrice(pos.EntryPrice, side, atr)
+		tp := e.risk.TakeProfitPrice(pos.EntryPrice, side, sl, reg)
+
+		// Use MarkPrice for validation
+		e.mu.RLock()
+		curPrice := e.prices[pos.Symbol]
+		e.mu.RUnlock()
+
+		e.orders.EnsureProtectiveOrders(ctx, pos.Symbol, string(pos.PositionSide), pos.PositionAmt, sl, tp, curPrice)
+	}
+}

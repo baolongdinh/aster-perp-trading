@@ -25,12 +25,12 @@ type BotConfig struct {
 }
 
 type ExchangeConfig struct {
-	APIKey          string `mapstructure:"api_key"`
-	APISecret       string `mapstructure:"-"` // loaded from env only (ASTER_API_SECRET)
-	FuturesRESTBase string `mapstructure:"futures_rest_base"`
-	FuturesWSBase   string `mapstructure:"futures_ws_base"`
-	RecvWindow      int    `mapstructure:"recv_window"` // ms, default 5000
-	RequestsPerSecond int  `mapstructure:"requests_per_second"`
+	APIKey            string `mapstructure:"api_key"`
+	APISecret         string `mapstructure:"-"` // loaded from env only (ASTER_API_SECRET)
+	FuturesRESTBase   string `mapstructure:"futures_rest_base"`
+	FuturesWSBase     string `mapstructure:"futures_ws_base"`
+	RecvWindow        int    `mapstructure:"recv_window"` // ms, default 5000
+	RequestsPerSecond int    `mapstructure:"requests_per_second"`
 }
 
 type RiskConfig struct {
@@ -47,9 +47,8 @@ type RiskConfig struct {
 	ATRMultiplier               float64 `mapstructure:"atr_multiplier"`
 	PositionMode                string  `mapstructure:"position_mode"` // one_way | hedge
 	CorrelationThreshold        float64 `mapstructure:"correlation_threshold"`
+	MakerPriority               bool    `mapstructure:"maker_priority"`
 }
-
-
 
 type APIConfig struct {
 	Host string `mapstructure:"host"`
@@ -60,7 +59,6 @@ type LogConfig struct {
 	Level string `mapstructure:"level"` // debug | info | warn | error
 	File  string `mapstructure:"file"`  // path to log file
 }
-
 
 type StrategyConfig struct {
 	Name    string                 `mapstructure:"name"`
@@ -150,7 +148,7 @@ func validate(cfg *Config) error {
 	if cfg.Risk.ATRMultiplier <= 0 {
 		cfg.Risk.ATRMultiplier = 2.0 // Stop loss = 2 * ATR
 	}
-	_ = time.Now() // suppress import
+	cfg.Risk.MakerPriority = true // Default to true
+	_ = time.Now()                // suppress import
 	return nil
 }
-

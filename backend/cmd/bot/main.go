@@ -169,13 +169,12 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		switch sc.Name {
 		case "ema_cross":
 			emaCfg := trend.EMACrossConfig{
-				FastPeriod:    intParam(sc.Params, "fast_period", 9),
-				SlowPeriod:    intParam(sc.Params, "slow_period", 21),
-				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Timeframe:     stringParam(sc.Params, "timeframe", "5m"),
-				Symbols:       sc.Symbols,
-				Enabled:       sc.Enabled,
-				JoinTrend:     boolParam(sc.Params, "join_trend", false),
+				FastPeriod: intParam(sc.Params, "fast_period", 9),
+				SlowPeriod: intParam(sc.Params, "slow_period", 21),
+				Timeframe:  stringParam(sc.Params, "timeframe", "5m"),
+				Symbols:    sc.Symbols,
+				Enabled:    sc.Enabled,
+				JoinTrend:  boolParam(sc.Params, "join_trend", false),
 			}
 			activeSubs = append(activeSubs, trend.NewEMACross(emaCfg, log))
 			if sc.Enabled {
@@ -521,7 +520,7 @@ func floatParam(params map[string]interface{}, key string, def float64) float64 
 		fmt.Printf("[DEBUG CONFIG] %s missing, using default: %f\n", key, def)
 		return def
 	}
-	
+
 	var result float64 = def
 	var parsed bool = true
 
@@ -554,7 +553,7 @@ func floatParam(params map[string]interface{}, key string, def float64) float64 
 			parsed = false
 		}
 	}
-	
+
 	if parsed {
 		fmt.Printf("[DEBUG CONFIG] %s successfully parsed as: %f (raw type: %T, raw val: %v)\n", key, result, v, v)
 		return result

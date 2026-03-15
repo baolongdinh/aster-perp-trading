@@ -1,5 +1,5 @@
 bot:
-  dry_run: true # ⚠️ Set to false only when ready for live trading
+  dry_run: false # ⚠️ Set to false only when ready for live trading
 
 exchange:
   # Your Aster API Key (from exchange dashboard -> API Management)
@@ -9,12 +9,18 @@ exchange:
   futures_rest_base: "https://fapi.asterdex.com"
   futures_ws_base: "wss://fstream.asterdex.com"
   recv_window: 5000
+  requests_per_second: 5
 
 risk:
-  max_position_usdt: 50
-  max_open_positions: 3
+  max_position_usdt: 2000
+  max_open_positions: 5
+  max_global_pending_limit_orders: 10
+  max_pending_per_side: 2
   daily_loss_limit_usdt: 25
+  risk_per_trade_usdt: 5 # Risk $5 per trade (loss on SL hit)
+  atr_multiplier: 2.0 # SL distance = 2 * ATR
   per_trade_stop_loss_pct: 2.0
+  per_trade_take_profit_pct: 4.0 # 1:2 Risk-Reward ratio as default
   position_mode: one_way # one_way | hedge
 
 api:
@@ -23,6 +29,7 @@ api:
 
 log:
   level: info # debug | info | warn | error
+  file: "logs/bot.log"
 
 strategies:
   - name: ema_cross
@@ -37,9 +44,10 @@ strategies:
     params:
       fast_period: 9
       slow_period: 21
-      leverage: 5
+      leverage: 100
       order_size_usdt: 100
       timeframe: 5m
+      join_trend: true
 
   - name: rsi_divergence
     enabled: true
@@ -54,7 +62,7 @@ strategies:
       rsi_period: 14
       overbought: 70.0
       oversold: 30.0
-      leverage: 5
+      leverage: 100
       order_size_usdt: 100
       timeframe: 15m
 
@@ -70,7 +78,7 @@ strategies:
     params:
       dev_threshold_pct: 0.5
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 15m
 
   - name: bb_bounce
@@ -86,7 +94,7 @@ strategies:
       period: 20
       std_dev: 2.0
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 15m
 
   - name: sr_bounce
@@ -102,7 +110,7 @@ strategies:
       lookback: 50
       bounce_pct: 0.1
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h
 
   - name: momentum_roc
@@ -119,7 +127,7 @@ strategies:
       roc_period: 10
       roc_threshold: 1.0
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 15m
 
   - name: orb
@@ -135,7 +143,7 @@ strategies:
       - SOLUSDT
     params:
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 15m
 
   - name: volume_spike
@@ -154,6 +162,7 @@ strategies:
       volume_ma_period: 20
       spike_multiplier: 3.0
       order_size_usdt: 100
+      timeframe: 5m
 
   - name: breakout_retest
     enabled: true
@@ -169,7 +178,7 @@ strategies:
       breakout_vol_mult: 2.0
       retest_tolerance_pct: 0.1
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h
 
   - name: flag_pennant
@@ -187,7 +196,7 @@ strategies:
       flag_max_retrace_pct: 38.2
       flag_candles: 10
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h
 
   - name: trailing_sh
@@ -202,7 +211,7 @@ strategies:
     params:
       swing_period: 5
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h
 
   - name: structure_bos
@@ -217,7 +226,7 @@ strategies:
     params:
       swing_period: 5
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h
 
   - name: liquidity_sweep
@@ -233,7 +242,7 @@ strategies:
       lookback: 50
       tolerance_pct: 0.05
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h
 
   - name: fvg_fill
@@ -248,5 +257,5 @@ strategies:
     params:
       min_gap_pct: 0.1
       order_size_usdt: 100
-      leverage: 5
+      leverage: 100
       timeframe: 1h

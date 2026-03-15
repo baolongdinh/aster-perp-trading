@@ -98,10 +98,13 @@ func (r *Router) RequiredIntervals() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	seen := make(map[string]bool)
-	var out []string
+	// Phase 16: Always require 5m for ATR calculations
+	seen["5m"] = true
+	out := []string{"5m"}
+
 	for _, s := range r.strategies {
 		for _, interval := range s.RequiredIntervals() {
-			if !seen[interval] {
+			if interval != "" && !seen[interval] {
 				seen[interval] = true
 				out = append(out, interval)
 			}
@@ -380,23 +383,8 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 				}
 
 				// PHASE 2: Dynamic ATR Sizing
-				// ONLY calculate size if strategy didn't provide one
-				if sig.Quantity == "" || sig.Quantity == "0" {
-					atr := cf.GetATR("5m", 14)
-					closes := cf.GetCloses("5m")
-					if len(closes) > 0 {
-						price := closes[len(closes)-1]
-						notional, err := r.risk.CalculatePositionSize(symbol, price, atr)
-						if err == nil {
-							sig.Quantity = fmt.Sprintf("%.4f", notional)
-						} else {
-							r.log.Warn("IQ-RISK: Could not calculate ATR size", zap.String("symbol", symbol), zap.Error(err))
-						}
-					} else {
-						r.log.Warn("IQ-ROUTER: Missing price data for sizing", zap.String("symbol", symbol))
-					}
-				}
-
+				// [PHASE 16: Removed redundant sizing logic - now centralized in Engine.executeSignal]
+				
 				sig.StrategyName = name
 				allSignals = append(allSignals, sig)
 			}
