@@ -118,20 +118,21 @@ func (s *RSIDivergenceStrategy) Signals(symbol string, pos *client.Position) []*
 
 	// Exit Logic
 	if pos != nil && pos.PositionAmt != 0 {
-		if pos.PositionAmt > 0 && val >= 50.0 {
-			// Long exit when mean reverts to center
+		oversold, overbought := s.getThresholds(symbol)
+		// Long: exit when RSI reaches overbought (full mean reversion), not just 50
+		if pos.PositionAmt > 0 && val >= overbought {
 			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
-				Reason: "RSI Reverted to Mean (Long)",
+				Reason: fmt.Sprintf("RSI Mean Reverted to Overbought (%.1f >= %.0f)", val, overbought),
 			}}
 		}
-		if pos.PositionAmt < 0 && val <= 50.0 {
-			// Short exit when mean reverts to center
+		// Short: exit when RSI reaches oversold (full mean reversion), not just 50
+		if pos.PositionAmt < 0 && val <= oversold {
 			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
-				Reason: "RSI Reverted to Mean (Short)",
+				Reason: fmt.Sprintf("RSI Mean Reverted to Oversold (%.1f <= %.0f)", val, oversold),
 			}}
 		}
 		return nil

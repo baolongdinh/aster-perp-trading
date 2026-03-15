@@ -95,23 +95,29 @@ func (s *BBBounceStrategy) Signals(symbol string, pos *client.Position) []*strat
 		return nil
 	}
 
-	upper, mid, lower := s.bb.Calculate(closes)
+	upper, _, lower := s.bb.Calculate(closes)
 	last := closes[len(closes)-1]
 
-	// Exit Logic: Close when price returns to Mid Band
+	// Exit Logic: Close when price fully reverts to the opposite band
 	if pos != nil && pos.PositionAmt != 0 {
-		if pos.PositionAmt > 0 && last >= mid {
+		// Long opened at lower band → take profit at upper band
+		if pos.PositionAmt > 0 && last >= upper {
 			return []*strategy.Signal{{
-				Type:   strategy.SignalExit,
-				Symbol: symbol,
-				Reason: "BB Mean Reverted to Mid",
+				Type:         strategy.SignalExit,
+				Symbol:       symbol,
+				Side:         strategy.SideSell,
+				Reason:       fmt.Sprintf("BB Full Reversion to Upper @ %.2f", upper),
+				StrategyName: s.Name(),
 			}}
 		}
-		if pos.PositionAmt < 0 && last <= mid {
+		// Short opened at upper band → take profit at lower band
+		if pos.PositionAmt < 0 && last <= lower {
 			return []*strategy.Signal{{
-				Type:   strategy.SignalExit,
-				Symbol: symbol,
-				Reason: "BB Mean Reverted to Mid",
+				Type:         strategy.SignalExit,
+				Symbol:       symbol,
+				Side:         strategy.SideBuy,
+				Reason:       fmt.Sprintf("BB Full Reversion to Lower @ %.2f", lower),
+				StrategyName: s.Name(),
 			}}
 		}
 		return nil
@@ -119,28 +125,42 @@ func (s *BBBounceStrategy) Signals(symbol string, pos *client.Position) []*strat
 
 	var sigs []*strategy.Signal
 
-	// Proactive Entry Logic: Place Limit orders at Upper and Lower Bands
-	// Support (Buy Limit at Lower Band)
-	sigs = append(sigs, &strategy.Signal{
-		Type:         strategy.SignalEnter,
-		Symbol:       symbol,
-		Side:         strategy.SideBuy,
-		Price:        fmt.Sprintf("%.2f", lower),
-		Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-		Reason:       fmt.Sprintf("Proactive BB Lower Limit @ %.2f", lower),
-		StrategyName: s.Name(),
-	})
+	// Proximity filter: only signal the CLOSER side IF price is within 1.5% of the band.
+	// Don't spread both nets at the same time — only near misses are valid setups.
+	bandRange := upper - lower
+	if bandRange <= 0 {
+		return nil
+	}
+	lowerProximity := (last - lower) / bandRange  // 0.0 = AT lower, 1.0 = AT upper
+	upperProximity := (upper - last) / bandRange  // 0.0 = AT upper, 1.0 = AT lower
 
-	// Resistance (Sell Limit at Upper Band)
-	sigs = append(sigs, &strategy.Signal{
-		Type:         strategy.SignalEnter,
-		Symbol:       symbol,
-		Side:         strategy.SideSell,
-		Price:        fmt.Sprintf("%.2f", upper),
-		Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-		Reason:       fmt.Sprintf("Proactive BB Upper Limit @ %.2f", upper),
-		StrategyName: s.Name(),
-	})
+	// Only post a buy limit if we are in the lower 40% of the band
+	if lowerProximity < 0.4 {
+		sigs = append(sigs, &strategy.Signal{
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideBuy,
+			Price:        fmt.Sprintf("%.2f", lower),
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			TakeProfit:   upper,  // full mean reversion = TP
+			Reason:       fmt.Sprintf("BB Lower Limit @ %.2f (proximity: %.0f%%)", lower, lowerProximity*100),
+			StrategyName: s.Name(),
+		})
+	}
+
+	// Only post a sell limit if we are in the upper 40% of the band
+	if upperProximity < 0.4 {
+		sigs = append(sigs, &strategy.Signal{
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideSell,
+			Price:        fmt.Sprintf("%.2f", upper),
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			TakeProfit:   lower,  // full mean reversion = TP
+			Reason:       fmt.Sprintf("BB Upper Limit @ %.2f (proximity: %.0f%%)", upper, upperProximity*100),
+			StrategyName: s.Name(),
+		})
+	}
 
 	return sigs
 }

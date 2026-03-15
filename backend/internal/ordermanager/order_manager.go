@@ -218,6 +218,15 @@ func (m *Manager) GetAll() []LocalOrder {
 	return out
 }
 
+// SetOrderStatus forces a status update on a local order (useful for proactive cancellations).
+func (m *Manager) SetOrderStatus(orderID int64, status string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lo, ok := m.orders[orderID]; ok {
+		lo.Status = status
+	}
+}
+
 // CancelSLTP cancels paired SL and TP orders for a given local order.
 func (m *Manager) CancelSLTP(ctx context.Context, symbol string, lo *LocalOrder) {
 	m.mu.RLock()
@@ -380,4 +389,31 @@ func (m *Manager) FindEntryByStrategy(symbol, strategyName, side string) *LocalO
 		}
 	}
 	return nil
+}
+
+// CountPendingBySide returns the number of NEW/PARTIALLY_FILLED entry orders for a symbol+side.
+func (m *Manager) CountPendingBySide(symbol, side string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	count := 0
+	for _, lo := range m.orders {
+		if lo.Symbol == symbol && lo.Purpose == PurposeEntry &&
+			string(lo.Side) == side && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			count++
+		}
+	}
+	return count
+}
+
+// CountAllPendingEntries returns the total number of pending entry orders across all symbols.
+func (m *Manager) CountAllPendingEntries() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	count := 0
+	for _, lo := range m.orders {
+		if lo.Purpose == PurposeEntry && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			count++
+		}
+	}
+	return count
 }

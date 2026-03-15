@@ -34,15 +34,18 @@ type ExchangeConfig struct {
 }
 
 type RiskConfig struct {
-	MaxPositionUSDT     float64 `mapstructure:"max_position_usdt"`
-	MaxOpenPositions    int     `mapstructure:"max_open_positions"`
-	MaxTradesPerSymbol  int     `mapstructure:"max_trades_per_symbol"`
-	DailyLossLimitUSDT  float64 `mapstructure:"daily_loss_limit_usdt"`
-	DailyDrawdownPct    float64 `mapstructure:"daily_drawdown_pct"`
-	PerTradeStopLossPct float64 `mapstructure:"per_trade_stop_loss_pct"`
-	RiskPerTradeUSDT    float64 `mapstructure:"risk_per_trade_usdt"`
-	ATRMultiplier       float64 `mapstructure:"atr_multiplier"`
-	PositionMode        string  `mapstructure:"position_mode"` // one_way | hedge
+	MaxPositionUSDT             float64 `mapstructure:"max_position_usdt"`
+	MaxOpenPositions            int     `mapstructure:"max_open_positions"`
+	MaxTradesPerSymbol          int     `mapstructure:"max_trades_per_symbol"`
+	MaxGlobalPendingLimitOrders int     `mapstructure:"max_global_pending_limit_orders"`
+	MaxPendingPerSide           int     `mapstructure:"max_pending_per_side"`
+	DailyLossLimitUSDT          float64 `mapstructure:"daily_loss_limit_usdt"`
+	DailyDrawdownPct            float64 `mapstructure:"daily_drawdown_pct"`
+	PerTradeStopLossPct         float64 `mapstructure:"per_trade_stop_loss_pct"`
+	PerTradeTakeProfitPct       float64 `mapstructure:"per_trade_take_profit_pct"`
+	RiskPerTradeUSDT            float64 `mapstructure:"risk_per_trade_usdt"`
+	ATRMultiplier               float64 `mapstructure:"atr_multiplier"`
+	PositionMode                string  `mapstructure:"position_mode"` // one_way | hedge
 }
 
 

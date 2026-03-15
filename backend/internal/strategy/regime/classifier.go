@@ -281,6 +281,21 @@ func (c *Classifier) IsSqueezing() bool {
 	return percentile < 0.25
 }
 
+// isSqueezeWidth returns true if the given BBW value qualifies as a squeeze.
+func (c *Classifier) isSqueezeWidth(bw float64) bool {
+	if len(c.bbwHistory) < 50 {
+		return false
+	}
+	lowerCount := 0
+	for _, val := range c.bbwHistory {
+		if val < bw {
+			lowerCount++
+		}
+	}
+	percentile := float64(lowerCount) / float64(len(c.bbwHistory))
+	return percentile < 0.25
+}
+
 // HTFTrendBias returns 1 for Bullish, -1 for Bearish, 0 for Neutral using 1h timeframe.
 func (c *Classifier) HTFTrendBias() int {
 	closes1h := c.closes["1h"]
@@ -374,6 +389,22 @@ func (c *Classifier) SetFundingRate(rate float64) {
 func (c *Classifier) GetFundingRate() float64 {
 	return c.fundingRate
 }
-
-
+// WasSqueezingRecently returns true if BBW was below the squeeze threshold
+// in at least one of the last `lookback` bars. Used to guard breakout regime promotion.
+func (c *Classifier) WasSqueezingRecently(lookback int) bool {
+	n := len(c.bbwHistory)
+	if n == 0 {
+		return false
+	}
+	start := n - lookback
+	if start < 0 {
+		start = 0
+	}
+	for _, bw := range c.bbwHistory[start:] {
+		if c.isSqueezeWidth(bw) {
+			return true
+		}
+	}
+	return false
+}
 

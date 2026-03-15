@@ -304,9 +304,16 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		// --- Quantity Conversion & Rounding ---
 		e.mu.RLock()
 		lastPrice := e.prices[sig.Symbol]
+		// Fallback: if mark price not yet received from stream, use book ticker mid-price
+		if lastPrice == 0 {
+			if t, ok := e.tickers[sig.Symbol]; ok && t.BidPrice > 0 {
+				lastPrice = (t.BidPrice + t.AskPrice) / 2
+			}
+		}
 		e.mu.RUnlock()
 		if lastPrice == 0 {
-			e.log.Error("cannot enter: price unknown", zap.String("symbol", sig.Symbol))
+			e.log.Warn("cannot enter: price unknown, skipping (will retry next tick)",
+				zap.String("symbol", sig.Symbol))
 			return
 		}
 
@@ -329,6 +336,9 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		tp := sig.TakeProfit
 		if sl == 0 {
 			sl = e.risk.StopLossPrice(lastPrice, string(sig.Side))
+		}
+		if tp == 0 {
+			tp = e.risk.TakeProfitPrice(lastPrice, string(sig.Side))
 		}
 
 		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, tp, sig.StrategyName); err != nil {
@@ -355,33 +365,58 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 		return
 	}
 
-	// 1. Round Price
+	// 1. Round Price FIRST (needed for drift check)
 	roundedPriceStr := e.prec.RoundPrice(sig.Symbol, newPriceFloat)
 	roundedPriceFloat, _ := strconv.ParseFloat(roundedPriceStr, 64)
 
-	// Check if we already have an entry order for this strategy
+	// SLOT RULE 1: Global cap
+	maxGlobalPending := e.cfg.Risk.MaxGlobalPendingLimitOrders
+	if maxGlobalPending == 0 {
+		maxGlobalPending = 5 // fallback
+	}
+	if e.orders.CountAllPendingEntries() >= maxGlobalPending {
+		e.log.Warn("IQ-SLOT: Global limit order cap reached, skipping",
+			zap.String("symbol", sig.Symbol),
+			zap.Int("cap", maxGlobalPending),
+		)
+		return
+	}
+
+	// SLOT RULE 2 + DRIFT CHECK:
+	// If a pending entry already exists on this side, only proceed if price has drifted enough.
 	existing := e.orders.FindEntryByStrategy(sig.Symbol, sig.StrategyName, string(sig.Side))
 	if existing != nil {
-		// Drift Check: Only replace if price differs by > 0.1%
+		// A pending order already holds this slot — only replace if price drifted > 0.1%
 		drift := math.Abs(roundedPriceFloat-existing.Price) / existing.Price
-		if drift < 0.001 { // 0.1%
-			return
+		if drift < 0.001 {
+			return // same price, no action needed
 		}
-
 		e.log.Info("IQ-LIMIT: Price drift detected, updating limit order",
 			zap.String("strategy", sig.StrategyName),
 			zap.String("symbol", sig.Symbol),
 			zap.Float64("old_price", existing.Price),
 			zap.Float64("new_price", roundedPriceFloat),
 		)
-
-		e.futures.CancelOrder(ctx, client.CancelOrderRequest{
+		// Cancel the old order to free the slot before placing new one
+		_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
 			Symbol:        sig.Symbol,
 			ClientOrderID: existing.ClientOrderID,
 		})
+		if cancelErr == nil {
+			e.orders.SetOrderStatus(existing.OrderID, "CANCELED")
+			e.risk.RemovePending(sig.Symbol, existing.Price*existing.OrigQty)
+		}
+	} else {
+		maxPerSide := e.cfg.Risk.MaxPendingPerSide
+		if maxPerSide == 0 {
+			maxPerSide = 1 // fallback
+		}
+		if e.orders.CountPendingBySide(sig.Symbol, string(sig.Side)) >= maxPerSide {
+			// Another strategy already holds this side's slot
+			return
+		}
 	}
 
-	// 2. Convert & Round Quantity
 	notional := parseFloat(sig.Quantity)
 	coinQty := notional / roundedPriceFloat
 	roundedQtyStr := e.prec.RoundQty(sig.Symbol, coinQty)
@@ -397,11 +432,21 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 		return
 	}
 
+	// 3. Derive SL/TP from RiskManager if strategy didn't set them
+	sl := sig.StopLoss
+	tp := sig.TakeProfit
+	if sl == 0 {
+		sl = e.risk.StopLossPrice(roundedPriceFloat, string(sig.Side))
+	}
+	if tp == 0 {
+		tp = e.risk.TakeProfitPrice(roundedPriceFloat, string(sig.Side))
+	}
+
 	// PHASE 9: Risk Tracking - Add to pending BEFORE placing
 	e.risk.AddPending(sig.Symbol, notional)
 
 	// Place new limit order
-	_, err := e.orders.PlaceLimitEntry(ctx, sig.Symbol, string(sig.Side), roundedQtyStr, roundedPriceStr, sig.StopLoss, sig.TakeProfit, sig.StrategyName)
+	_, err := e.orders.PlaceLimitEntry(ctx, sig.Symbol, string(sig.Side), roundedQtyStr, roundedPriceStr, sl, tp, sig.StrategyName)
 	if err != nil {
 		e.log.Error("place limit entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
 		e.risk.RemovePending(sig.Symbol, notional)
@@ -428,6 +473,9 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 		if lo.Symbol != symbol || lo.Purpose != ordermanager.PurposeEntry {
 			continue
 		}
+		if lo.Type == "MARKET" {
+			continue // Never GC a market order
+		}
 		if lo.Status != "NEW" && lo.Status != "PARTIALLY_FILLED" {
 			continue
 		}
@@ -447,6 +495,8 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 				ClientOrderID: lo.ClientOrderID,
 			})
 			if cancelErr == nil {
+				// Immediately hide from GC to prevent loop while waiting for WS update
+				e.orders.SetOrderStatus(lo.OrderID, "CANCELED")
 				// Only release pending exposure after confirmed cancel
 				e.risk.RemovePending(lo.Symbol, lo.Price*lo.OrigQty)
 			}

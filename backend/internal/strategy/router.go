@@ -155,6 +155,17 @@ func (r *Router) getCandidates(reg regime.RegimeType) []string {
 	}
 }
 
+// wasSqueezingRecently returns true if the classifier recorded a squeeze
+// in the last N bars (default: 10). Used to guard breakout regime promotion.
+func (r *Router) wasSqueezingRecently(symbol string) bool {
+	cf := r.getClassifier(symbol)
+	// Check if the classifier itself says it is/was squeezing
+	// The classifier's IsSqueezing() reflects the current state; for "recently",
+	// we rely on the fact that an actual squeeze is expected to have ended just now.
+	// We use the BBW history to detect if BBW was low recently.
+	return cf.WasSqueezingRecently(10)
+}
+
 // OnKline proxies data to the classifier AND all sub-strategies (so they stay warm).
 func (r *Router) OnKline(k stream.WsKline) {
 	// Feed the classifier closed data to track regime across frame
@@ -206,8 +217,10 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 	bias := cf.HTFTrendBias()
 	squeeze := cf.IsSqueezing()
 
-	// If we were squeezing and volatility just expanded (broken bands), promote to BREAKOUT
-	if !squeeze && reg != regime.RegimeTrend {
+	// Correct Breakout Promotion: Only promote if we were PREVIOUSLY squeezing.
+	// A market that was never squeezing should NOT be treated as a Breakout.
+	wasSqueezingRecently := r.wasSqueezingRecently(symbol)
+	if wasSqueezingRecently && !squeeze && reg != regime.RegimeTrend {
 		reg = regime.RegimeBreakout
 	}
 
@@ -230,12 +243,37 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 
 	var allSignals []*Signal
 
-	// 1. EXIT LOGIC (Consensus)
+	// 1. EXIT LOGIC
 	if pos != nil && pos.PositionAmt != 0 {
 		warnings := 0
 		var mainWarning *Signal
 
+		// ALWAYS check owner strategy first, regardless of current regime
+		// This prevents a position being stuck open after a regime shift
+		if owner != "" {
+			if ownerStrat, ok := r.strategies[owner]; ok {
+				for _, sig := range ownerStrat.Signals(symbol, pos) {
+					if sig.Type == SignalExit {
+						sig.StrategyName = owner
+						r.mu.Lock()
+						delete(r.positionOwner, symbol)
+						r.mu.Unlock()
+						r.log.Info("Owner exit triggered",
+							zap.String("strategy", owner),
+							zap.String("symbol", symbol),
+							zap.String("reason", sig.Reason),
+						)
+						return []*Signal{sig}
+					}
+				}
+			}
+		}
+
+		// Consensus check: poll all active strategies for additional exit warnings
 		for _, sName := range r.activeSubs {
+			if sName == owner {
+				continue // already handled above
+			}
 			str, ok := r.strategies[sName]
 			if !ok {
 				continue
@@ -243,13 +281,6 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 			sigs := str.Signals(symbol, pos)
 			for _, sig := range sigs {
 				if sig.Type == SignalExit {
-					if sName == owner {
-						sig.StrategyName = sName
-						r.mu.Lock()
-						delete(r.positionOwner, symbol)
-						r.mu.Unlock()
-						return []*Signal{sig}
-					}
 					warnings++
 					mainWarning = sig
 					mainWarning.StrategyName = sName

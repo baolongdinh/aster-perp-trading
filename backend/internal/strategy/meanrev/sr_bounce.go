@@ -27,18 +27,20 @@ type SRBounceStrategy struct {
 	log     *zap.Logger
 	enabled bool
 
-	mu    sync.RWMutex
-	highs map[string][]float64
-	lows  map[string][]float64
+	mu        sync.RWMutex
+	highs     map[string][]float64
+	lows      map[string][]float64
+	lastClose map[string]float64 // last close for proximity filtering
 }
 
 func NewSRBounce(cfg SRBounceConfig, log *zap.Logger) *SRBounceStrategy {
 	return &SRBounceStrategy{
-		cfg:     cfg,
-		log:     log,
-		enabled: cfg.Enabled,
-		highs:   make(map[string][]float64),
-		lows:    make(map[string][]float64),
+		cfg:       cfg,
+		log:       log,
+		enabled:   cfg.Enabled,
+		highs:     make(map[string][]float64),
+		lows:      make(map[string][]float64),
+		lastClose: make(map[string]float64),
 	}
 }
 
@@ -73,6 +75,7 @@ func (s *SRBounceStrategy) OnKline(k stream.WsKline) {
 	}
 	sym := k.Symbol
 	s.mu.Lock()
+	s.lastClose[sym] = k.Kline.Close
 	defer s.mu.Unlock()
 
 	s.highs[sym] = append(s.highs[sym], k.Kline.High)
@@ -112,29 +115,48 @@ func (s *SRBounceStrategy) Signals(symbol string, pos *client.Position) []*strat
 
 	var sigs []*strategy.Signal
 
-	// Proactive Entry Logic: Spread the net at Support and Resistance
-	// Support (Buy Limit)
-	if sup > 0 && sup < math.MaxFloat64 {
+	// Proximity filter: Only signal the closer S/R level to avoid "noise" orders.
+	// For S/R levels, we use the range between support & resistance as the band.
+	srRange := res - sup
+	if srRange <= 0 || sup <= 0 || sup >= math.MaxFloat64 || res <= 0 {
+		return nil
+	}
+
+	// Get last close price for proximity check
+	s.mu.RLock()
+	lastClose := s.lastClose[symbol]
+	s.mu.RUnlock()
+
+	if lastClose == 0 {
+		return nil
+	}
+
+	relPos := (lastClose - sup) / srRange // 0.0 = at support, 1.0 = at resistance
+
+	// Only buy if price is in the lower 40% of the S/R range (close to support)
+	if relPos < 0.4 {
 		sigs = append(sigs, &strategy.Signal{
 			Type:         strategy.SignalEnter,
 			Symbol:       symbol,
 			Side:         strategy.SideBuy,
 			Price:        fmt.Sprintf("%.2f", sup),
 			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:       fmt.Sprintf("Proactive Support Limit @ %.2f", sup),
+			TakeProfit:   res, // full mean reversion = TP at resistance
+			Reason:       fmt.Sprintf("SR Support Limit @ %.2f (proximity: %.0f%%)", sup, relPos*100),
 			StrategyName: s.Name(),
 		})
 	}
 
-	// Resistance (Sell Limit)
-	if res > 0 {
+	// Only sell if price is in the upper 40% of the S/R range (close to resistance)
+	if relPos > 0.6 {
 		sigs = append(sigs, &strategy.Signal{
 			Type:         strategy.SignalEnter,
 			Symbol:       symbol,
 			Side:         strategy.SideSell,
 			Price:        fmt.Sprintf("%.2f", res),
 			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:       fmt.Sprintf("Proactive Resistance Limit @ %.2f", res),
+			TakeProfit:   sup, // full mean reversion = TP at support
+			Reason:       fmt.Sprintf("SR Resistance Limit @ %.2f (proximity: %.0f%%)", res, relPos*100),
 			StrategyName: s.Name(),
 		})
 	}

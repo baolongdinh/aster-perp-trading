@@ -42,6 +42,7 @@ func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
 
 // CanEnter checks if a new position can be opened given current risk state.
 // Returns an error describing why the trade is blocked, or nil if allowed.
+// NOTE: Pending limit order slot enforcement is handled separately in the Engine.
 func (m *Manager) CanEnter(symbol string, notionalUSDT float64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -53,15 +54,6 @@ func (m *Manager) CanEnter(symbol string, notionalUSDT float64) error {
 	}
 	if m.openPositions >= m.cfg.MaxOpenPositions {
 		return fmt.Errorf("risk: max open positions reached (%d)", m.cfg.MaxOpenPositions)
-	}
-	if m.symPositions[symbol] >= m.cfg.MaxTradesPerSymbol {
-		return fmt.Errorf("risk: max positions for %s reached (%d)", symbol, m.cfg.MaxTradesPerSymbol)
-	}
-
-	// PHASE 9 EXPOSURE: Current + Pending + New
-	totalExposure := m.pendingOrders[symbol] + notionalUSDT
-	if totalExposure > m.cfg.MaxPositionUSDT {
-		return fmt.Errorf("risk: %s potential exposure %.2f exceeds max %.2f", symbol, totalExposure, m.cfg.MaxPositionUSDT)
 	}
 
 	return nil
@@ -177,6 +169,19 @@ func (m *Manager) StopLossPrice(entryPrice float64, side string) float64 {
 		return entryPrice * (1 - pct)
 	}
 	return entryPrice * (1 + pct)
+}
+
+// TakeProfitPrice calculates the TP price given entry and side.
+func (m *Manager) TakeProfitPrice(entryPrice float64, side string) float64 {
+	pct := m.cfg.PerTradeTakeProfitPct / 100.0
+	if pct == 0 {
+		// Fallback to 1.5x Risk-Reward if not explicitly set
+		pct = (m.cfg.PerTradeStopLossPct * 1.5) / 100.0
+	}
+	if side == "BUY" {
+		return entryPrice * (1 + pct)
+	}
+	return entryPrice * (1 - pct)
 }
 
 // DailyPnL returns the current daily P&L.

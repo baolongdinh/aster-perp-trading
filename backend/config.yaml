@@ -14,8 +14,11 @@ exchange:
 risk:
   max_position_usdt: 50
   max_open_positions: 3
+  max_global_pending_limit_orders: 5
+  max_pending_per_side: 1
   daily_loss_limit_usdt: 25
   per_trade_stop_loss_pct: 2.0
+  per_trade_take_profit_pct: 4.0 # 1:2 Risk-Reward ratio as default
   position_mode: one_way # one_way | hedge
 
 api:
@@ -39,8 +42,8 @@ strategies:
     params:
       fast_period: 9
       slow_period: 21
-      leverage: 5
-      order_size_usdt: 5
+      leverage: 20
+      order_size_usdt: 10
       timeframe: 5m
       join_trend: true
 
@@ -57,8 +60,8 @@ strategies:
       rsi_period: 14
       overbought: 70.0
       oversold: 30.0
-      leverage: 5
-      order_size_usdt: 5
+      leverage: 20
+      order_size_usdt: 10
       timeframe: 15m
 
   - name: vwap_reversion
@@ -72,8 +75,8 @@ strategies:
       - ASTERUSDT
     params:
       dev_threshold_pct: 0.5
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 15m
 
   - name: bb_bounce
@@ -88,8 +91,8 @@ strategies:
     params:
       period: 20
       std_dev: 2.0
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 15m
 
   - name: sr_bounce
@@ -104,8 +107,8 @@ strategies:
     params:
       lookback: 50
       bounce_pct: 0.1
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
 
   - name: momentum_roc
@@ -121,8 +124,8 @@ strategies:
     params:
       roc_period: 10
       roc_threshold: 1.0
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 15m
 
   - name: orb
@@ -137,8 +140,8 @@ strategies:
       - BNBUSDT
       - SOLUSDT
     params:
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 15m
 
   - name: volume_spike
@@ -156,7 +159,7 @@ strategies:
     params:
       volume_ma_period: 20
       spike_multiplier: 3.0
-      order_size_usdt: 5
+      order_size_usdt: 10
 
   - name: breakout_retest
     enabled: true
@@ -171,8 +174,8 @@ strategies:
       consolidation_periods: 20
       breakout_vol_mult: 2.0
       retest_tolerance_pct: 0.1
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
 
   - name: flag_pennant
@@ -189,8 +192,8 @@ strategies:
       impulse_candles: 5
       flag_max_retrace_pct: 38.2
       flag_candles: 10
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
 
   - name: trailing_sh
@@ -204,8 +207,8 @@ strategies:
       - ASTERUSDT
     params:
       swing_period: 5
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
 
   - name: structure_bos
@@ -219,8 +222,8 @@ strategies:
       - ASTERUSDT
     params:
       swing_period: 5
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
 
   - name: liquidity_sweep
@@ -235,8 +238,8 @@ strategies:
     params:
       lookback: 50
       tolerance_pct: 0.05
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
 
   - name: fvg_fill
@@ -250,6 +253,6 @@ strategies:
       - ASTERUSDT
     params:
       min_gap_pct: 0.1
-      order_size_usdt: 5
-      leverage: 5
+      order_size_usdt: 10
+      leverage: 20
       timeframe: 1h
