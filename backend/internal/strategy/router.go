@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"sync"
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy/regime"
@@ -20,6 +21,11 @@ type Router struct {
 
 	log *zap.Logger
 	cfg RouterConfig
+
+	// positionOwner tracks which strategy entered a trade for a symbol.
+	// Used for consensus exit logic.
+	positionOwner map[string]string // symbol -> strategyName
+	mu            sync.RWMutex
 }
 
 type RouterConfig struct {
@@ -30,11 +36,12 @@ type RouterConfig struct {
 func NewRouter(cfg RouterConfig, log *zap.Logger) *Router {
 	return &Router{
 		// ADX is usually 14 periods, BB is 20 with 2 stddev
-		classifier: regime.NewClassifier(14, 20, 2.0),
-		strategies: make(map[string]Strategy),
-		activeSubs: make([]string, 0),
-		log:        log,
-		cfg:        cfg,
+		classifier:    regime.NewClassifier(14, 20, 2.0),
+		strategies:    make(map[string]Strategy),
+		activeSubs:    make([]string, 0),
+		positionOwner: make(map[string]string),
+		log:           log,
+		cfg:           cfg,
 	}
 }
 
@@ -57,6 +64,10 @@ func (r *Router) SetEnabled(v bool) { r.cfg.Enabled = v }
 
 // State returns the overarching regime state + details from the primary sub-strategy
 func (r *Router) State(symbol string) string {
+	r.mu.RLock()
+	owner := r.positionOwner[symbol]
+	r.mu.RUnlock()
+
 	reg, adx, bbw := r.classifier.Current()
 	candidates := r.getCandidates(reg)
 
@@ -68,7 +79,11 @@ func (r *Router) State(symbol string) string {
 		}
 	}
 
-	res := fmt.Sprintf("[%s] ADX:%.1f BBW:%.2f%% | Active: %v", reg, adx, bbw, activeNames)
+	res := fmt.Sprintf("[%s] ADX:%.1f BBW:%.2f%%", reg, adx, bbw)
+	if owner != "" {
+		res += fmt.Sprintf(" | OWNER:%s", owner)
+	}
+	res += fmt.Sprintf(" | Active: %v", activeNames)
 
 	// If we have an active candidate, show the status of the first one
 	if len(activeNames) > 0 {
@@ -141,8 +156,23 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 		return &Signal{Type: SignalNone}
 	}
 
-	// 1. EXIT LOGIC: Always allow any strategy to fire an exit for an open position
+	r.mu.RLock()
+	owner := r.positionOwner[symbol]
+	r.mu.RUnlock()
+
+	// 0. RESET: If no position exists, clear the owner just in case.
+	if pos == nil || pos.PositionAmt == 0 {
+		r.mu.Lock()
+		delete(r.positionOwner, symbol)
+		r.mu.Unlock()
+		owner = ""
+	}
+
+	// 1. EXIT LOGIC
 	if pos != nil && pos.PositionAmt != 0 {
+		warnings := 0
+		var mainWarning *Signal
+
 		for _, sName := range r.activeSubs {
 			str, ok := r.strategies[sName]
 			if !ok {
@@ -150,9 +180,34 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 			}
 			sig := str.Signal(symbol, pos)
 			if sig != nil && sig.Type == SignalExit {
-				sig.StrategyName = sName
-				return sig
+				if sName == owner {
+					// Primary Owner wants out - follow immediately.
+					sig.StrategyName = sName
+					r.mu.Lock()
+					delete(r.positionOwner, symbol)
+					r.mu.Unlock()
+					return sig
+				}
+
+				// External warning.
+				warnings++
+				mainWarning = sig
+				mainWarning.StrategyName = sName
 			}
+		}
+
+		// Quorum Exit: If at least 2 OTHER strategies say "Get out".
+		if warnings >= 2 {
+			mainWarning.Reason = fmt.Sprintf("Consensus Exit (%d warnings)", warnings)
+			r.log.Warn("🚨 CONSENSUS EXIT TRIGGERED",
+				zap.String("symbol", symbol),
+				zap.Int("warnings", warnings),
+				zap.String("owner", owner),
+			)
+			r.mu.Lock()
+			delete(r.positionOwner, symbol)
+			r.mu.Unlock()
+			return mainWarning
 		}
 	}
 
@@ -167,6 +222,9 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 		sig := strat.Signal(symbol, pos)
 		if sig != nil && sig.Type == SignalEnter {
 			sig.StrategyName = name
+			r.mu.Lock()
+			r.positionOwner[symbol] = name
+			r.mu.Unlock()
 			return sig
 		}
 	}
