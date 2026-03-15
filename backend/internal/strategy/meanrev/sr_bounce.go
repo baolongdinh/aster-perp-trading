@@ -88,14 +88,14 @@ func (s *SRBounceStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *SRBounceStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *SRBounceStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *SRBounceStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *SRBounceStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	highs := s.highs[symbol]
 	lows := s.lows[symbol]
 	s.mu.RUnlock()
 
 	if len(highs) < s.cfg.Lookback {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	// Simple S/R: highest high and lowest low of the lookback
@@ -110,26 +110,34 @@ func (s *SRBounceStrategy) Signal(symbol string, pos *client.Position) *strategy
 		}
 	}
 
-	lastClose := highs[len(highs)-1] // rough
+	var sigs []*strategy.Signal
 
-	// Entry Logic
-	if lastClose <= sup*(1+s.cfg.BouncePct/100) {
-		return &strategy.Signal{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideBuy,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   fmt.Sprintf("Support Bounce @ %.2f", sup),
-		}
-	} else if lastClose >= res*(1-s.cfg.BouncePct/100) {
-		return &strategy.Signal{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideSell,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   fmt.Sprintf("Resistance Bounce @ %.2f", res),
-		}
+	// Proactive Entry Logic: Spread the net at Support and Resistance
+	// Support (Buy Limit)
+	if sup > 0 && sup < math.MaxFloat64 {
+		sigs = append(sigs, &strategy.Signal{
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideBuy,
+			Price:        fmt.Sprintf("%.2f", sup),
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			Reason:       fmt.Sprintf("Proactive Support Limit @ %.2f", sup),
+			StrategyName: s.Name(),
+		})
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	// Resistance (Sell Limit)
+	if res > 0 {
+		sigs = append(sigs, &strategy.Signal{
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideSell,
+			Price:        fmt.Sprintf("%.2f", res),
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			Reason:       fmt.Sprintf("Proactive Resistance Limit @ %.2f", res),
+			StrategyName: s.Name(),
+		})
+	}
+
+	return sigs
 }

@@ -86,13 +86,13 @@ func (s *BBBounceStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *BBBounceStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *BBBounceStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *BBBounceStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *BBBounceStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	closes := s.closes[symbol]
 	s.mu.RUnlock()
 
 	if len(closes) < s.cfg.Period {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	upper, mid, lower := s.bb.Calculate(closes)
@@ -101,40 +101,46 @@ func (s *BBBounceStrategy) Signal(symbol string, pos *client.Position) *strategy
 	// Exit Logic: Close when price returns to Mid Band
 	if pos != nil && pos.PositionAmt != 0 {
 		if pos.PositionAmt > 0 && last >= mid {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Reason: "BB Mean Reverted to Mid",
-			}
+			}}
 		}
 		if pos.PositionAmt < 0 && last <= mid {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Reason: "BB Mean Reverted to Mid",
-			}
+			}}
 		}
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
-	// Entry Logic
-	if last <= lower {
-		return &strategy.Signal{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideBuy,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "BB Lower Band Touch",
-		}
-	} else if last >= upper {
-		return &strategy.Signal{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideSell,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "BB Upper Band Touch",
-		}
-	}
+	var sigs []*strategy.Signal
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	// Proactive Entry Logic: Place Limit orders at Upper and Lower Bands
+	// Support (Buy Limit at Lower Band)
+	sigs = append(sigs, &strategy.Signal{
+		Type:         strategy.SignalEnter,
+		Symbol:       symbol,
+		Side:         strategy.SideBuy,
+		Price:        fmt.Sprintf("%.2f", lower),
+		Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+		Reason:       fmt.Sprintf("Proactive BB Lower Limit @ %.2f", lower),
+		StrategyName: s.Name(),
+	})
+
+	// Resistance (Sell Limit at Upper Band)
+	sigs = append(sigs, &strategy.Signal{
+		Type:         strategy.SignalEnter,
+		Symbol:       symbol,
+		Side:         strategy.SideSell,
+		Price:        fmt.Sprintf("%.2f", upper),
+		Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+		Reason:       fmt.Sprintf("Proactive BB Upper Limit @ %.2f", upper),
+		StrategyName: s.Name(),
+	})
+
+	return sigs
 }

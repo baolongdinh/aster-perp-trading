@@ -23,6 +23,7 @@ type Manager struct {
 	dailyStartingEquity float64      // equity at the start of the day
 	openPositions  int               // current open total position count
 	symPositions   map[string]int    // symbol -> open position count
+	pendingOrders  map[string]float64 // symbol -> total pending notional (NEW/PARTIALLY_FILLED)
 	paused         bool              // true when daily loss limit hit
 }
 
@@ -34,6 +35,7 @@ func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
 		log:           log,
 		dailyPnLReset: todayUTC(),
 		symPositions:  make(map[string]int),
+		pendingOrders: make(map[string]float64),
 	}
 }
 
@@ -55,10 +57,31 @@ func (m *Manager) CanEnter(symbol string, notionalUSDT float64) error {
 	if m.symPositions[symbol] >= m.cfg.MaxTradesPerSymbol {
 		return fmt.Errorf("risk: max positions for %s reached (%d)", symbol, m.cfg.MaxTradesPerSymbol)
 	}
-	if notionalUSDT > m.cfg.MaxPositionUSDT {
-		return fmt.Errorf("risk: requested notional %.2f USDT exceeds max %.2f USDT", notionalUSDT, m.cfg.MaxPositionUSDT)
+
+	// PHASE 9 EXPOSURE: Current + Pending + New
+	totalExposure := m.pendingOrders[symbol] + notionalUSDT
+	if totalExposure > m.cfg.MaxPositionUSDT {
+		return fmt.Errorf("risk: %s potential exposure %.2f exceeds max %.2f", symbol, totalExposure, m.cfg.MaxPositionUSDT)
 	}
+
 	return nil
+}
+
+// AddPending records a new pending order's notional.
+func (m *Manager) AddPending(symbol string, notional float64) {
+	m.mu.Lock()
+	m.pendingOrders[symbol] += notional
+	m.mu.Unlock()
+}
+
+// RemovePending removes a pending order's notional.
+func (m *Manager) RemovePending(symbol string, notional float64) {
+	m.mu.Lock()
+	m.pendingOrders[symbol] -= notional
+	if m.pendingOrders[symbol] < 0 {
+		m.pendingOrders[symbol] = 0
+	}
+	m.mu.Unlock()
 }
 
 // OnPositionOpened records that a new position was opened.
@@ -110,31 +133,31 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 	}
 }
 
-// CalculatePositionSize returns the recommended quantity based on ATR and capital risk.
-func (m *Manager) CalculatePositionSize(symbol string, price float64, atr float64) (string, error) {
+// CalculatePositionSize returns the recommended notional size in USDT based on ATR and capital risk.
+func (m *Manager) CalculatePositionSize(symbol string, price float64, atr float64) (float64, error) {
 	if atr <= 0 {
-		return "", fmt.Errorf("invalid ATR (warming up?)")
+		return 0, fmt.Errorf("invalid ATR (warming up?)")
 	}
 
 	// Risk per unit = ATR * Multiplier
-	// e.g. if ATR is 50, and multiplier is 2, we risk 100 points per unit.
 	riskPerUnit := atr * m.cfg.ATRMultiplier
 	if riskPerUnit <= 0 {
-		return "", fmt.Errorf("invalid risk per unit calculation")
+		return 0, fmt.Errorf("invalid risk per unit calculation")
 	}
 
 	// Quantity = DollarRisk / RiskPerUnit
-	// e.g. if we risk $10, and riskPerUnit is $100, we buy 0.1 units.
 	qty := m.cfg.RiskPerTradeUSDT / riskPerUnit
 	
-	// Check against max position size limit
+	// Final size in notional
 	notional := qty * price
+
+	// Check against max position size limit
 	if notional > m.cfg.MaxPositionUSDT {
-		qty = m.cfg.MaxPositionUSDT / price
-		m.log.Debug("risk: capping quantity due to max_position_usdt", zap.String("symbol", symbol))
+		notional = m.cfg.MaxPositionUSDT
+		m.log.Debug("risk: capping notional due to max_position_usdt", zap.String("symbol", symbol))
 	}
 
-	return fmt.Sprintf("%.4f", qty), nil
+	return notional, nil
 }
 
 // SetInitialEquity sets the starting equity for drawdown calculations.

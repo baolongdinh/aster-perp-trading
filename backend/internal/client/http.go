@@ -40,16 +40,22 @@ type HTTPClient struct {
 	signer     *auth.Signer
 	log        *zap.Logger
 	maxRetries int
+	rateLimit  <-chan time.Time // NEW
 }
 
 // NewHTTPClient creates a new Aster HTTP client.
-func NewHTTPClient(baseURL string, signer *auth.Signer, log *zap.Logger) *HTTPClient {
+func NewHTTPClient(baseURL string, signer *auth.Signer, log *zap.Logger, rps int) *HTTPClient {
+	if rps <= 0 {
+		rps = 10 // Default
+	}
+	ticker := time.NewTicker(time.Second / time.Duration(rps))
 	return &HTTPClient{
 		base:       strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 		signer:     signer,
 		log:        log,
 		maxRetries: 3,
+		rateLimit:  ticker.C,
 	}
 }
 
@@ -144,6 +150,14 @@ func (c *HTTPClient) doWithRetry(req *http.Request, signed bool) ([]byte, error)
 				return nil, err
 			}
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		// --- Rate Limiting ---
+		select {
+		case <-c.rateLimit:
+			// wait for ticker
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
 		}
 
 		resp, err := c.httpClient.Do(req)

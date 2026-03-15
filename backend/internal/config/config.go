@@ -30,6 +30,7 @@ type ExchangeConfig struct {
 	FuturesRESTBase string `mapstructure:"futures_rest_base"`
 	FuturesWSBase   string `mapstructure:"futures_ws_base"`
 	RecvWindow      int    `mapstructure:"recv_window"` // ms, default 5000
+	RequestsPerSecond int  `mapstructure:"requests_per_second"`
 }
 
 type RiskConfig struct {
@@ -77,6 +78,7 @@ func Load(cfgPath string) (*Config, error) {
 	v.SetDefault("exchange.futures_rest_base", "https://fapi.asterdex.com")
 	v.SetDefault("exchange.futures_ws_base", "wss://fstream.asterdex.com")
 	v.SetDefault("exchange.recv_window", 5000)
+	v.SetDefault("exchange.requests_per_second", 10)
 	v.SetDefault("api.host", "0.0.0.0")
 	v.SetDefault("api.port", 8080)
 	v.SetDefault("log.level", "info")

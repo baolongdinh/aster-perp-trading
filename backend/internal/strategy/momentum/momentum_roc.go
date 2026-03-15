@@ -75,13 +75,13 @@ func (s *MomentumROCStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *MomentumROCStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *MomentumROCStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *MomentumROCStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *MomentumROCStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	closes := s.closes[symbol]
 	s.mu.RUnlock()
 
 	if len(closes) < s.cfg.ROCPeriod+2 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	rocNow := indicators.ROC(closes, s.cfg.ROCPeriod)
@@ -89,24 +89,24 @@ func (s *MomentumROCStrategy) Signal(symbol string, pos *client.Position) *strat
 
 	// Bullish: ROC is high and accelerating
 	if rocNow > s.cfg.ROCThreshold && rocNow > rocPrev {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("Momentum Accelerating: %.2f%%", rocNow),
-		}
+		}}
 	}
 	// Bearish: ROC is low and accelerating downwards
 	if rocNow < -s.cfg.ROCThreshold && rocNow < rocPrev {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("Momentum Accelerating: %.2f%%", rocNow),
-		}
+		}}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

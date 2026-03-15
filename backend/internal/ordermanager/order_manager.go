@@ -11,6 +11,7 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/stream"
+
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -18,9 +19,20 @@ import (
 // LocalOrder is the bot's local representation of an order.
 type LocalOrder struct {
 	client.Order
-	SLID string // client order ID of paired stop-loss order
-	TPID string // client order ID of paired take-profit order
+	SLPrice      float64 // Intended SL price for limits
+	TPPrice      float64 // Intended TP price for limits
+	SLID         string  // client order ID of paired stop-loss order
+	TPID         string  // client order ID of paired take-profit order
+	Purpose      string  // PurposeEntry | PurposeExit | PurposeSL | PurposeTP
+	StrategyName string  // which strategy owns this order
 }
+
+const (
+	PurposeEntry = "ENTRY"
+	PurposeExit  = "EXIT"
+	PurposeSL    = "SL"
+	PurposeTP    = "TP"
+)
 
 // Manager maintains local order state and handles SL/TP placement.
 type Manager struct {
@@ -29,14 +41,16 @@ type Manager struct {
 
 	mu     sync.RWMutex
 	orders map[int64]*LocalOrder // orderId -> order
+	prec   *client.PrecisionManager
 }
 
 // NewManager creates a new order manager.
-func NewManager(futures *client.FuturesClient, log *zap.Logger) *Manager {
+func NewManager(futures *client.FuturesClient, prec *client.PrecisionManager, log *zap.Logger) *Manager {
 	return &Manager{
 		futures: futures,
 		log:     log,
 		orders:  make(map[int64]*LocalOrder),
+		prec:    prec,
 	}
 }
 
@@ -77,7 +91,11 @@ func (m *Manager) PlaceMarketEntry(
 		return nil, fmt.Errorf("ordermanager: entry: %w", err)
 	}
 
-	lo := &LocalOrder{Order: *order}
+	lo := &LocalOrder{
+		Order:        *order,
+		Purpose:      PurposeEntry,
+		StrategyName: strategyName,
+	}
 	m.mu.Lock()
 	m.orders[order.OrderID] = lo
 	m.mu.Unlock()
@@ -166,6 +184,27 @@ func (m *Manager) OnOrderUpdate(u stream.WsOrderUpdate) {
 	lo.ExecutedQty = o.CumFilledQty
 	lo.AvgPrice = o.AvgPrice
 	lo.UpdateTime = u.EventTime
+
+	// 1. Bracket Order Logic: If an ENTRY limit order is filled, place SL/TP
+	if lo.Purpose == PurposeEntry && lo.Status == "FILLED" {
+		// Place SL/TP if they were specified for this limit order
+		if lo.SLPrice > 0 || lo.TPPrice > 0 {
+			m.log.Info("Bracket trigger: Limit entry filled, placing SL/TP",
+				zap.String("symbol", o.Symbol),
+				zap.Float64("price", o.AvgPrice),
+			)
+			go m.PlaceBracketForFilledEntry(context.Background(), lo)
+		}
+
+		// OFAC: One-Fills-All-Cancels
+		// If an ENTRY order is filled, cancel all other ENTRY orders for the same symbol/side
+		m.log.Info("OFAC: Entry order filled, triggering mass cancellation",
+			zap.String("symbol", o.Symbol),
+			zap.Int64("orderId", o.OrderID),
+		)
+		// Run cancellation in background to avoid blocking the update handler
+		go m.CancelAllEntriesForSymbol(context.Background(), o.Symbol, o.OrderID, string(o.Side))
+	}
 }
 
 // GetAll returns a snapshot of all local orders.
@@ -203,7 +242,7 @@ func (m *Manager) placeStopOrder(ctx context.Context, symbol, side, qty string, 
 		Symbol:        symbol,
 		Side:          side,
 		Type:          orderType,
-		StopPrice:     strconv.FormatFloat(stopPrice, 'f', 4, 64),
+		StopPrice:     m.prec.RoundPrice(symbol, stopPrice),
 		ClosePosition: true,
 		ClientOrderID: clientID,
 		WorkingType:   "MARK_PRICE",
@@ -225,6 +264,30 @@ func (m *Manager) cancelByClientID(ctx context.Context, symbol, clientID string)
 		ClientOrderID: clientID,
 	})
 	return err
+}
+
+// CancelAllEntriesForSymbol cancels all pending entry orders for a symbol.
+func (m *Manager) CancelAllEntriesForSymbol(ctx context.Context, symbol string, filledOrderID int64, side string) {
+	m.mu.RLock()
+	var toCancel []int64
+	for id, lo := range m.orders {
+		// In one-way mode, we usually cancel the opposite side too if it was an entry trap
+		if lo.Symbol == symbol && lo.Purpose == PurposeEntry && id != filledOrderID && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			toCancel = append(toCancel, id)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, id := range toCancel {
+		m.log.Info("OFAC: Canceling redundant entry order", zap.String("symbol", symbol), zap.Int64("orderId", id))
+		_, err := m.futures.CancelOrder(ctx, client.CancelOrderRequest{
+			Symbol:  symbol,
+			OrderID: id,
+		})
+		if err != nil {
+			m.log.Warn("OFAC: Failed to cancel order", zap.Int64("orderId", id), zap.Error(err))
+		}
+	}
 }
 
 // PlaceLimitEntry places a LIMIT entry order (GTC).
@@ -249,7 +312,13 @@ func (m *Manager) PlaceLimitEntry(
 		return nil, fmt.Errorf("ordermanager: limit entry: %w", err)
 	}
 
-	lo := &LocalOrder{Order: *order}
+	lo := &LocalOrder{
+		Order:        *order,
+		Purpose:      PurposeEntry,
+		StrategyName: strategyName,
+		SLPrice:      slPrice,
+		TPPrice:      tpPrice,
+	}
 	m.mu.Lock()
 	m.orders[order.OrderID] = lo
 	m.mu.Unlock()
@@ -265,3 +334,50 @@ func (m *Manager) PlaceLimitEntry(
 	return lo, nil
 }
 
+// PlaceBracketForFilledEntry places SL and TP orders for an already filled entry.
+func (m *Manager) PlaceBracketForFilledEntry(ctx context.Context, lo *LocalOrder) {
+	side := string(lo.Side)
+	symbol := lo.Symbol
+	qtyStr := strconv.FormatFloat(lo.ExecutedQty, 'f', -1, 64)
+
+	oppositeSide := "SELL"
+	if side == "SELL" {
+		oppositeSide = "BUY"
+	}
+
+	if lo.SLPrice > 0 {
+		slID, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, lo.SLPrice, "STOP_MARKET")
+		if err != nil {
+			m.log.Error("bracket SL error", zap.Error(err))
+		} else {
+			m.mu.Lock()
+			lo.SLID = slID
+			m.mu.Unlock()
+		}
+	}
+
+	if lo.TPPrice > 0 {
+		tpID, err := m.placeStopOrder(ctx, symbol, oppositeSide, qtyStr, lo.TPPrice, "TAKE_PROFIT_MARKET")
+		if err != nil {
+			m.log.Error("bracket TP error", zap.Error(err))
+		} else {
+			m.mu.Lock()
+			lo.TPID = tpID
+			m.mu.Unlock()
+		}
+	}
+}
+
+// FindEntryByStrategy returns the current open entry order for a strategy/symbol if it exists.
+func (m *Manager) FindEntryByStrategy(symbol, strategyName, side string) *LocalOrder {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, lo := range m.orders {
+		if lo.Symbol == symbol && lo.StrategyName == strategyName && lo.Purpose == PurposeEntry &&
+			string(lo.Side) == side && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			return lo
+		}
+	}
+	return nil
+}

@@ -86,17 +86,16 @@ func (s *LiquiditySweepStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *LiquiditySweepStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *LiquiditySweepStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *LiquiditySweepStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *LiquiditySweepStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	highs := s.highs[symbol]
 	lows := s.lows[symbol]
 	s.mu.RUnlock()
 
 	if len(highs) < s.cfg.Lookback {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
-	// 1. Find the local maximum/minimum in the lookback (Liquidity Pool)
 	maxHigh := 0.0
 	minLow := math.MaxFloat64
 	for i := 0; i < len(highs)-1; i++ {
@@ -108,7 +107,5 @@ func (s *LiquiditySweepStrategy) Signal(symbol string, pos *client.Position) *st
 		}
 	}
 
-	// 2. Detect Sweep
-	// Current candle's High/Low wicks through but Close stays inside
-	return &strategy.Signal{Type: strategy.SignalNone} // Logic requires Close data
+	return nil
 }

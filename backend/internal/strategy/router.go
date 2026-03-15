@@ -199,8 +199,8 @@ func (r *Router) OnAccountUpdate(u stream.WsAccountUpdate) {
 	}
 }
 
-// Signal routes the final decision based on Market Regime.
-func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
+// Signals routes the final decisions based on Market Regime.
+func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 	cf := r.getClassifier(symbol)
 	reg, _, _ := cf.Current()
 	bias := cf.HTFTrendBias()
@@ -208,15 +208,12 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 
 	// If we were squeezing and volatility just expanded (broken bands), promote to BREAKOUT
 	if !squeeze && reg != regime.RegimeTrend {
-		// Calculate current price relative to bands (simplified)
-		// For now, if we are not squeezing but were recently, it's a breakout opportunity
-		// More advanced: check if price > upper or < lower
 		reg = regime.RegimeBreakout
 	}
 
 	candidates := r.getCandidates(reg)
 	if candidates == nil {
-		return &Signal{Type: SignalNone}
+		return nil
 	}
 
 	r.mu.RLock()
@@ -231,6 +228,8 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 		owner = ""
 	}
 
+	var allSignals []*Signal
+
 	// 1. EXIT LOGIC (Consensus)
 	if pos != nil && pos.PositionAmt != 0 {
 		warnings := 0
@@ -241,18 +240,20 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 			if !ok {
 				continue
 			}
-			sig := str.Signal(symbol, pos)
-			if sig != nil && sig.Type == SignalExit {
-				if sName == owner {
-					sig.StrategyName = sName
-					r.mu.Lock()
-					delete(r.positionOwner, symbol)
-					r.mu.Unlock()
-					return sig
+			sigs := str.Signals(symbol, pos)
+			for _, sig := range sigs {
+				if sig.Type == SignalExit {
+					if sName == owner {
+						sig.StrategyName = sName
+						r.mu.Lock()
+						delete(r.positionOwner, symbol)
+						r.mu.Unlock()
+						return []*Signal{sig}
+					}
+					warnings++
+					mainWarning = sig
+					mainWarning.StrategyName = sName
 				}
-				warnings++
-				mainWarning = sig
-				mainWarning.StrategyName = sName
 			}
 		}
 
@@ -266,8 +267,9 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 			r.mu.Lock()
 			delete(r.positionOwner, symbol)
 			r.mu.Unlock()
-			return mainWarning
+			return []*Signal{mainWarning}
 		}
+		return nil // No exit consensus reached
 	}
 
 	// 2. ENTRY LOGIC: Only check strategies recommended for the current regime
@@ -283,72 +285,62 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 			mcr.SetMarketContext(symbol, adx)
 		}
 
-		sig := strat.Signal(symbol, pos)
-		if sig == nil || sig.Type == SignalNone {
-			// Periodically log why we are skipping if we want ultra-detail,
-			// but for now let's just log when a strategy reports NO signal.
-			continue
-		}
-
-		if sig.Type == SignalEnter {
-			// PHASE 1 IQ: HTF Trend Filter
-			if reg == regime.RegimeTrend {
-				if sig.Side == SideBuy && bias < 0 {
-					r.log.Info("IQ-FILTER: Long signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "Bearish 1h bias"))
-					continue
-				}
-				if sig.Side == SideSell && bias > 0 {
-					r.log.Info("IQ-FILTER: Short signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "Bullish 1h bias"))
-					continue
-				}
-			}
-
-			// PHASE 2: Dynamic ATR Sizing
-			atr := cf.GetATR("5m", 14)
-			closes := cf.GetCloses("5m")
-			if len(closes) == 0 {
-				r.log.Warn("IQ-ROUTER: Missing price data for sizing", zap.String("symbol", symbol))
-				continue
-			}
-			price := closes[len(closes)-1]
-
-			// PHASE 3: Funding Rate Filter
-			funding := cf.GetFundingRate()
-			if sig.Side == SideBuy && funding > 0.0003 { // 0.03%
-				r.log.Info("IQ-FILTER: Long signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "high funding"), zap.Float64("funding", funding))
-				continue
-			}
-			if sig.Side == SideSell && funding < -0.0003 { // -0.03%
-				r.log.Info("IQ-FILTER: Short signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "negative funding"), zap.Float64("funding", funding))
+		sigs := strat.Signals(symbol, pos)
+		for _, sig := range sigs {
+			if sig == nil || sig.Type == SignalNone {
 				continue
 			}
 
-			qty, err := r.risk.CalculatePositionSize(symbol, price, atr)
+			if sig.Type == SignalEnter {
+				// PHASE 1 IQ: HTF Trend Filter
+				if reg == regime.RegimeTrend {
+					if sig.Side == SideBuy && bias < 0 {
+						r.log.Info("IQ-FILTER: Long signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "Bearish 1h bias"))
+						continue
+					}
+					if sig.Side == SideSell && bias > 0 {
+						r.log.Info("IQ-FILTER: Short signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "Bullish 1h bias"))
+						continue
+					}
+				}
 
-			if err != nil {
-				r.log.Warn("IQ-RISK: Could not calculate ATR size", zap.String("symbol", symbol), zap.Error(err))
-				// fallback to sub-strategy's fixed qty if available
-				if sig.Quantity == "" || sig.Quantity == "0" {
+				// PHASE 2: Dynamic ATR Sizing
+				atr := cf.GetATR("5m", 14)
+				closes := cf.GetCloses("5m")
+				if len(closes) == 0 {
+					r.log.Warn("IQ-ROUTER: Missing price data for sizing", zap.String("symbol", symbol))
 					continue
 				}
-			} else {
-				r.log.Info("IQ-RISK: Dynamic sizing applied",
-					zap.String("symbol", symbol),
-					zap.String("qty", qty),
-					zap.Float64("atr", atr),
-				)
-				sig.Quantity = qty
-			}
+				price := closes[len(closes)-1]
 
-			sig.StrategyName = name
-			r.mu.Lock()
-			r.positionOwner[symbol] = name
-			r.mu.Unlock()
-			return sig
+				// PHASE 3: Funding Rate Filter
+				funding := cf.GetFundingRate()
+				if sig.Side == SideBuy && funding > 0.0003 { // 0.03%
+					r.log.Info("IQ-FILTER: Long signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "high funding"), zap.Float64("funding", funding))
+					continue
+				}
+				if sig.Side == SideSell && funding < -0.0003 { // -0.03%
+					r.log.Info("IQ-FILTER: Short signal blocked", zap.String("symbol", symbol), zap.String("strategy", name), zap.String("reason", "negative funding"), zap.Float64("funding", funding))
+					continue
+				}
+
+				notional, err := r.risk.CalculatePositionSize(symbol, price, atr)
+				if err != nil {
+					r.log.Warn("IQ-RISK: Could not calculate ATR size", zap.String("symbol", symbol), zap.Error(err))
+					if sig.Quantity == "" || sig.Quantity == "0" {
+						continue
+					}
+				} else {
+					sig.Quantity = fmt.Sprintf("%.4f", notional)
+				}
+
+				sig.StrategyName = name
+				allSignals = append(allSignals, sig)
+			}
 		}
 	}
 
-	return &Signal{Type: SignalNone}
+	return allSignals
 }
 
 func formatFloat(f float64) string {

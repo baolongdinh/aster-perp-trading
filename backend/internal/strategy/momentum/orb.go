@@ -85,30 +85,16 @@ func (s *ORBStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *ORBStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *ORBStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *ORBStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
-	// ORB breakout usually happens mid-bar, but since our engine 
-	// calls Signal after OnKline, we can check it here.
+func (s *ORBStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
-	high := s.orbHigh[symbol]
-	low := s.orbLow[symbol]
 	isSet := s.rangeSet[symbol]
 	s.mu.RUnlock()
 
 	if !isSet {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 	
-	// We need the latest price to check against the range.
-	// Since Signal doesn't receive the kline, we'd ideally store 
-	// the latest price in OnKline. For now, we'll return None 
-	// because we'll handle the actual trigger inside checkBreakout 
-	// if we refactor or just use a dummy check.
-	// Actually, let's just make it work:
-	
-	_ = high
-	_ = low
-
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }
 
 // In ORB, the breakout happens INTRADAY, so we check on every kline

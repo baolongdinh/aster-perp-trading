@@ -62,9 +62,12 @@ func main() {
 	cfg.Exchange.APISecret = ""
 
 	// --- HTTP client ---
-	httpClient := client.NewHTTPClient(cfg.Exchange.FuturesRESTBase, signer, log)
+	httpClient := client.NewHTTPClient(cfg.Exchange.FuturesRESTBase, signer, log, cfg.Exchange.RequestsPerSecond)
 	marketClient := client.NewMarketClient(httpClient)
 	futuresClient := client.NewFuturesClient(httpClient, cfg.Bot.DryRun, log)
+
+	// --- Precision Manager ---
+	prec := client.NewPrecisionManager()
 
 	// --- Server Time Sync ---
 	ctx := context.Background()
@@ -84,6 +87,15 @@ func main() {
 	offset := serverTime - localTimeEstimated
 	signer.SetTimeOffset(offset)
 
+	// --- Exchange Info & Precision ---
+	info, err := marketClient.ExchangeInfo(ctx)
+	if err != nil {
+		log.Fatal("failed to get exchange info", zap.Error(err))
+	}
+	if err := prec.UpdateFromExchangeInfo(info); err != nil {
+		log.Error("failed to parse precision info", zap.Error(err))
+	}
+
 	log.Info("exchange reachable, time synced",
 		zap.Int64("server_time", serverTime),
 		zap.Int64("offset_ms", offset),
@@ -93,7 +105,7 @@ func main() {
 	riskMgr := risk.NewManager(cfg.Risk, log)
 
 	// --- Order manager ---
-	orderMgr := ordermanager.NewManager(futuresClient, log)
+	orderMgr := ordermanager.NewManager(futuresClient, prec, log)
 
 	// --- Build strategies from config ---
 	strategies := buildStrategies(cfg, riskMgr, log)
@@ -103,7 +115,7 @@ func main() {
 	}
 
 	// --- Engine ---
-	eng := engine.New(cfg, futuresClient, marketClient, riskMgr, orderMgr, strategies, log)
+	eng := engine.New(cfg, futuresClient, marketClient, riskMgr, orderMgr, prec, strategies, log)
 
 	// --- API server ---
 	apiServer := api.NewServer(eng, riskMgr, log)

@@ -131,14 +131,15 @@ func (e *EMACrossStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (e *EMACrossStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
 // Signal checks EMA cross and returns entry/exit signal.
-func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *strategy.Signal {
+// Signals checks EMA cross and returns entry/exit signals.
+func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) []*strategy.Signal {
 	e.mu.RLock()
 	closes := e.closes[symbol]
 	lastSig := e.lastSig[symbol]
 	e.mu.RUnlock()
 
 	if len(closes) < e.cfg.SlowPeriod+1 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	fastNow := ema(closes, e.cfg.FastPeriod)
@@ -157,23 +158,23 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 			e.mu.Lock()
 			e.lastSig[symbol] = strategy.SideSell
 			e.mu.Unlock()
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideSell,
 				Reason: "ema_cross_exit_long",
-			}
+			}}
 		}
 		if currentPos.PositionAmt < 0 && crossUp {
 			e.mu.Lock()
 			e.lastSig[symbol] = strategy.SideBuy
 			e.mu.Unlock()
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideBuy,
 				Reason: "ema_cross_exit_short",
-			}
+			}}
 		}
 	}
 
@@ -183,13 +184,13 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 		e.mu.Lock()
 		e.lastSig[symbol] = strategy.SideBuy
 		e.mu.Unlock()
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: qty,
 			Reason:   fmt.Sprintf("ema_cross_long fast=%.4f slow=%.4f", fastNow, slowNow),
-		}
+		}}
 	}
 
 	if crossDown && lastSig != strategy.SideSell {
@@ -197,41 +198,40 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 		e.mu.Lock()
 		e.lastSig[symbol] = strategy.SideSell
 		e.mu.Unlock()
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: qty,
 			Reason:   fmt.Sprintf("ema_cross_short fast=%.4f slow=%.4f", fastNow, slowNow),
-		}
+		}}
 	}
 
 	// PHASE 5: Join Trend on Start
-	// If we haven't given a signal yet and JoinTrend is enabled, enter if trend is established
 	if e.cfg.JoinTrend && lastSig == "" && (currentPos == nil || currentPos.PositionAmt == 0) {
 		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
 		if fastNow > slowNow {
 			e.mu.Lock()
 			e.lastSig[symbol] = strategy.SideBuy
 			e.mu.Unlock()
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:     strategy.SignalEnter,
 				Symbol:   symbol,
 				Side:     strategy.SideBuy,
 				Quantity: qty,
 				Reason:   fmt.Sprintf("ema_join_long (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
-			}
+			}}
 		} else if fastNow < slowNow {
 			e.mu.Lock()
 			e.lastSig[symbol] = strategy.SideSell
 			e.mu.Unlock()
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:     strategy.SignalEnter,
 				Symbol:   symbol,
 				Side:     strategy.SideSell,
 				Quantity: qty,
 				Reason:   fmt.Sprintf("ema_join_short (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
-			}
+			}}
 		}
 	}
 
@@ -242,7 +242,7 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 		zap.String("state", e.State(symbol)),
 	)
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }
 
 // ema calculates the Exponential Moving Average of the last n values in data.

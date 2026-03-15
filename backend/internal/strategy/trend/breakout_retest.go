@@ -127,7 +127,7 @@ func (s *BreakoutRetestStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *BreakoutRetestStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *BreakoutRetestStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *BreakoutRetestStrategy) Signal(symbol string, currentPos *client.Position) *strategy.Signal {
+func (s *BreakoutRetestStrategy) Signals(symbol string, currentPos *client.Position) []*strategy.Signal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -137,7 +137,7 @@ func (s *BreakoutRetestStrategy) Signal(symbol string, currentPos *client.Positi
 	vols := s.volumes[symbol]
 
 	if len(closes) < s.cfg.ConsolidationPeriods+1 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	lastClose := closes[len(closes)-1]
@@ -145,12 +145,10 @@ func (s *BreakoutRetestStrategy) Signal(symbol string, currentPos *client.Positi
 
 	// 1. Logic for CONSOLIDATING -> BREAKOUT
 	if s.stage[symbol] == "" || s.stage[symbol] == StateConsolidating {
-		// Calculate range over the last N periods
 		boxHigh := 0.0
 		boxLow := math.MaxFloat64
 		volSum := 0.0
 
-		// Consolidation window (excluding the last candle)
 		startIdx := len(closes) - 1 - s.cfg.ConsolidationPeriods
 		for i := startIdx; i < len(closes)-1; i++ {
 			if highs[i] > boxHigh {
@@ -163,7 +161,6 @@ func (s *BreakoutRetestStrategy) Signal(symbol string, currentPos *client.Positi
 		}
 		avgVol := volSum / float64(s.cfg.ConsolidationPeriods)
 
-		// Check for breakout
 		if lastClose > boxHigh && lastVol > avgVol*s.cfg.BreakoutVolumeMult {
 			s.stage[symbol] = StateBreakout
 			s.boxHigh[symbol] = boxHigh
@@ -191,45 +188,41 @@ func (s *BreakoutRetestStrategy) Signal(symbol string, currentPos *client.Positi
 		dir := s.breakDir[symbol]
 
 		if dir == strategy.SideBuy {
-			// LONG Retest: price comes back near boxHigh
 			upperBound := s.boxHigh[symbol] * (1 + s.cfg.RetestTolerancePct/100)
 			lowerBound := s.boxHigh[symbol] * (1 - s.cfg.RetestTolerancePct/100)
 
 			if lastClose <= upperBound && lastClose >= lowerBound {
-				s.stage[symbol] = StateConsolidating // reset after trigger
-				return &strategy.Signal{
+				s.stage[symbol] = StateConsolidating
+				return []*strategy.Signal{{
 					Type:     strategy.SignalEnter,
 					Symbol:   symbol,
 					Side:     strategy.SideBuy,
 					Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 					Reason:   "Breakout + Retest UP",
-				}
+				}}
 			}
-			// Cancel wait if price goes way below box (failed breakout)
 			if lastClose < s.boxLow[symbol] {
 				s.stage[symbol] = StateConsolidating
 			}
 		} else if dir == strategy.SideSell {
-			// SHORT Retest: price comes back near boxLow
 			upperBound := s.boxLow[symbol] * (1 + s.cfg.RetestTolerancePct/100)
 			lowerBound := s.boxLow[symbol] * (1 - s.cfg.RetestTolerancePct/100)
 
 			if lastClose <= upperBound && lastClose >= lowerBound {
-				s.stage[symbol] = StateConsolidating // reset after trigger
-				return &strategy.Signal{
+				s.stage[symbol] = StateConsolidating
+				return []*strategy.Signal{{
 					Type:     strategy.SignalEnter,
 					Symbol:   symbol,
 					Side:     strategy.SideSell,
 					Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 					Reason:   "Breakout + Retest DOWN",
-				}
+				}}
 			}
-			// Cancel wait if price goes way above box (failed breakout)
 			if lastClose > s.boxHigh[symbol] {
 				s.stage[symbol] = StateConsolidating
 			}
 		}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

@@ -109,10 +109,10 @@ func (s *RSIDivergenceStrategy) SetMarketContext(symbol string, adx float64) {
 	s.adx[symbol] = adx
 }
 
-func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *RSIDivergenceStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	rsiState, ok := s.rsi[symbol]
 	if !ok {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 	val := rsiState.Value()
 
@@ -120,41 +120,41 @@ func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *str
 	if pos != nil && pos.PositionAmt != 0 {
 		if pos.PositionAmt > 0 && val >= 50.0 {
 			// Long exit when mean reverts to center
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Reason: "RSI Reverted to Mean (Long)",
-			}
+			}}
 		}
 		if pos.PositionAmt < 0 && val <= 50.0 {
 			// Short exit when mean reverts to center
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Reason: "RSI Reverted to Mean (Short)",
-			}
+			}}
 		}
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	oversold, overbought := s.getThresholds(symbol)
 
 	if val <= oversold {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("RSI Oversold Bounce (%.2f <= %.0f)", val, oversold),
-		}
+		}}
 	} else if val >= overbought {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("RSI Overbought Drop (%.2f >= %.0f)", val, overbought),
-		}
+		}}
 	}
 
 	// Transparency: Log why we didn't Enter if we are getting close (within 5 points)
@@ -175,7 +175,7 @@ func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *str
 		zap.String("state", s.State(symbol)),
 	)
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }
 
 func formatFloat(f float64) string {

@@ -96,7 +96,7 @@ func (s *TrailingSHStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *TrailingSHStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *TrailingSHStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *TrailingSHStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *TrailingSHStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -104,11 +104,10 @@ func (s *TrailingSHStrategy) Signal(symbol string, pos *client.Position) *strate
 	lows := s.lows[symbol]
 
 	if len(highs) < s.cfg.SwingPeriod*2+1 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	// Detect Swing Points
-	// A swing high is a high point with lower highs on both sides
 	idx := len(highs) - 1 - s.cfg.SwingPeriod
 	isSwingHigh := true
 	isSwingLow := true
@@ -150,26 +149,25 @@ func (s *TrailingSHStrategy) Signal(symbol string, pos *client.Position) *strate
 
 	// Bullish: Price breaks above last HH after a HL was formed
 	if lastClose > s.lastHH[symbol] && s.lastHL[symbol] > s.lastLL[symbol] && s.lastHH[symbol] > 0 {
-		// Reset to prevent double triggers? Or let the engine handle it.
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   "HH/HL Bullish Breakout",
-		}
+		}}
 	}
 
 	// Bearish: Price breaks below last LL after a LH was formed
 	if lastClose < s.lastLL[symbol] && s.lastLH[symbol] < s.lastHH[symbol] && s.lastLL[symbol] > 0 {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   "LH/LL Bearish Breakout",
-		}
+		}}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

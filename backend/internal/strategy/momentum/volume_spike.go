@@ -79,10 +79,10 @@ func (s *VolumeSpikeStrategy) OnMarkPrice(mp stream.WsMarkPrice)        {}
 func (s *VolumeSpikeStrategy) OnOrderUpdate(u stream.WsOrderUpdate)     {}
 func (s *VolumeSpikeStrategy) OnAccountUpdate(u stream.WsAccountUpdate) {}
 
-func (s *VolumeSpikeStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *VolumeSpikeStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	vols := s.volumes[symbol]
 	if len(vols) < s.cfg.VolumeMaPeriod+1 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	volMA := indicators.SMA(vols[:len(vols)-1], s.cfg.VolumeMaPeriod)
@@ -96,50 +96,47 @@ func (s *VolumeSpikeStrategy) Signal(symbol string, pos *client.Position) *strat
 	candleSize := currentHigh - currentLow
 
 	var side strategy.Side
-	// Bullish spike: closed in the top 30% of the candle
 	if isSpike && currentClose > currentLow+(candleSize*0.7) {
 		side = strategy.SideBuy
 	}
-	// Bearish spike: closed in the bottom 30% of the candle
 	if isSpike && currentClose < currentLow+(candleSize*0.3) {
 		side = strategy.SideSell
 	}
 
 	// Exit Logic
 	if pos != nil && pos.PositionAmt != 0 {
-		// Example naive exit: close trade if a massive opposite spike occurs
 		if pos.PositionAmt > 0 && side == strategy.SideSell {
 			s.lastSig[symbol] = strategy.SideSell
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideSell,
 				Reason: "Counter Volume Spike",
-			}
+			}}
 		}
 		if pos.PositionAmt < 0 && side == strategy.SideBuy {
 			s.lastSig[symbol] = strategy.SideBuy
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideBuy,
 				Reason: "Counter Volume Spike",
-			}
+			}}
 		}
-		return &strategy.Signal{Type: strategy.SignalNone} // Don't enter while holding
+		return nil
 	}
 
 	// Entry Logic
 	if isSpike && side != "" && s.lastSig[symbol] != side {
 		s.lastSig[symbol] = side
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     side,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("Volume Spike %.1fx", currentVol/volMA),
-		}
+		}}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

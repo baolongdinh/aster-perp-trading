@@ -111,21 +111,19 @@ func (s *FlagPennantStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *FlagPennantStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *FlagPennantStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *FlagPennantStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *FlagPennantStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	closes := s.closes[symbol]
 	if len(closes) < 20 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	// 1. Detect Impulse
-	// Look for a move greater than cfg.ImpulseMinPct over cfg.ImpulseCandles
-	// We scan backwards from a few candles ago to allow room for a "flag"
 	flagStart := len(closes) - s.cfg.FlagCandles
 	if flagStart < s.cfg.ImpulseCandles {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	foundImpulse := false
@@ -151,7 +149,7 @@ func (s *FlagPennantStrategy) Signal(symbol string, pos *client.Position) *strat
 
 	if !foundImpulse {
 		s.impulseDir[symbol] = ""
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	// 2. Validate Flag (Retracement < 38.2%)
@@ -175,41 +173,39 @@ func (s *FlagPennantStrategy) Signal(symbol string, pos *client.Position) *strat
 		retrace := impHigh - flagLow
 		retracePct := (retrace / impSize) * 100
 		if retracePct > s.cfg.FlagMaxRetracePct || flagLow < impLow {
-			// Failed flag
-			return &strategy.Signal{Type: strategy.SignalNone}
+			return nil
 		}
 
 		// 3. Breakout of Flag High
 		lastClose := closes[len(closes)-1]
 		if lastClose > flagHigh {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:     strategy.SignalEnter,
 				Symbol:   symbol,
 				Side:     strategy.SideBuy,
 				Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 				Reason:   fmt.Sprintf("Flag Breakout UP (Retrace: %.1f%%)", retracePct),
-			}
+			}}
 		}
 	} else if dir == strategy.SideSell {
 		retrace := flagHigh - impLow
 		retracePct := (retrace / impSize) * 100
 		if retracePct > s.cfg.FlagMaxRetracePct || flagHigh > impHigh {
-			// Failed flag
-			return &strategy.Signal{Type: strategy.SignalNone}
+			return nil
 		}
 
 		// 3. Breakout of Flag Low
 		lastClose := closes[len(closes)-1]
 		if lastClose < flagLow {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:     strategy.SignalEnter,
 				Symbol:   symbol,
 				Side:     strategy.SideSell,
 				Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 				Reason:   fmt.Sprintf("Flag Breakout DOWN (Retrace: %.1f%%)", retracePct),
-			}
+			}}
 		}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

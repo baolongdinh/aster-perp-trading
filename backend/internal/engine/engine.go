@@ -4,6 +4,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -26,20 +27,20 @@ type Engine struct {
 	risk       *risk.Manager
 	orders     *ordermanager.Manager
 	strategies []strategy.Strategy
+	prec       *client.PrecisionManager
 	log        *zap.Logger
 
 	marketStream *stream.MarketStream
 	userStream   *stream.UserStream
 
 	mu        sync.RWMutex
-	positions map[string]*client.Position // symbol -> current position
-	prices    map[string]float64          // symbol -> latest mark price
+	positions map[string]*client.Position    // symbol -> current position
+	prices    map[string]float64             // symbol -> latest mark price
 	tickers   map[string]stream.WsBookTicker // symbol -> latest best bid/ask
-	workers   map[string]*MarketWorker    // symbol -> worker
+	workers   map[string]*MarketWorker       // symbol -> worker
 
-	running   bool
+	running bool
 }
-
 
 // New creates a new Engine.
 func New(
@@ -48,6 +49,7 @@ func New(
 	market *client.MarketClient,
 	riskMgr *risk.Manager,
 	orderMgr *ordermanager.Manager,
+	prec *client.PrecisionManager, // NEW
 	strategies []strategy.Strategy,
 	log *zap.Logger,
 ) *Engine {
@@ -57,16 +59,15 @@ func New(
 		market:     market,
 		risk:       riskMgr,
 		orders:     orderMgr,
+		prec:       prec, // Assigned prec
 		strategies: strategies,
 		log:        log,
 		positions:  make(map[string]*client.Position),
 		prices:     make(map[string]float64),
 		tickers:    make(map[string]stream.WsBookTicker),
 		workers:    make(map[string]*MarketWorker),
-
 	}
 }
-
 
 // Start initialises everything and begins the trading loop.
 func (e *Engine) Start(ctx context.Context) error {
@@ -198,13 +199,11 @@ func (e *Engine) onMarkPrice(mp stream.WsMarkPrice) {
 	}
 }
 
-
 func (e *Engine) onBookTicker(bt stream.WsBookTicker) {
 	e.mu.Lock()
 	e.tickers[bt.Symbol] = bt
 	e.mu.Unlock()
 }
-
 
 func (e *Engine) onAccountUpdate(u stream.WsAccountUpdate) {
 	for _, s := range e.strategies {
@@ -231,8 +230,6 @@ func (e *Engine) onAccountUpdate(u stream.WsAccountUpdate) {
 	}
 	e.mu.Unlock()
 }
-
-
 
 // Position refresh loop (every 30s for unrealized PnL)
 func (e *Engine) positionRefreshLoop(ctx context.Context) {
@@ -268,7 +265,6 @@ func (e *Engine) positionRefreshLoop(ctx context.Context) {
 }
 
 func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, currentPos *client.Position) {
-
 	switch sig.Type {
 	case strategy.SignalEnter:
 		// Check risk
@@ -278,6 +274,18 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 			return
 		}
 
+		// LIMIT ORDER PATH
+		if sig.Price != "" {
+			e.handleLimitEntry(ctx, sig)
+			return
+		}
+
+		// MARKET ORDER PATH
+		// PHASE 9: Position Awareness - If we already have a position, don't enter more (One-Way)
+		if currentPos != nil && math.Abs(currentPos.PositionAmt) > 0 {
+			e.log.Debug("IQ-ENGINE: Side already has position, skipping market entry", zap.String("symbol", sig.Symbol))
+			return
+		}
 		// PHASE 3: Slippage/Spread Protection
 		e.mu.RLock()
 		ticker, ok := e.tickers[sig.Symbol]
@@ -285,32 +293,160 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		if ok && ticker.AskPrice > 0 {
 			spread := (ticker.AskPrice - ticker.BidPrice) / ticker.AskPrice
 			if spread > 0.002 { // 0.2%
-				e.log.Warn("IQ-FILTER: Entry blocked due to high spread", 
-					zap.String("symbol", sig.Symbol), 
+				e.log.Warn("IQ-FILTER: Entry blocked due to high spread",
+					zap.String("symbol", sig.Symbol),
 					zap.Float64("spread_pct", spread*100),
 				)
 				return
 			}
 		}
 
-		slPrice := 0.0
+		// --- Quantity Conversion & Rounding ---
+		e.mu.RLock()
+		lastPrice := e.prices[sig.Symbol]
+		e.mu.RUnlock()
+		if lastPrice == 0 {
+			e.log.Error("cannot enter: price unknown", zap.String("symbol", sig.Symbol))
+			return
+		}
 
-		// SL will be computed after fill for MARKET orders (we don't know entry price yet)
-		// For now, pass 0 and the order manager handles it post-fill
-		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), sig.Quantity, slPrice, sig.TakeProfit, sig.StrategyName); err != nil {
+		coinQty := notional / lastPrice
+		roundedQty := e.prec.RoundQty(sig.Symbol, coinQty)
+
+		// check if quantity is zero after rounding (order too small)
+		if q, _ := strconv.ParseFloat(roundedQty, 64); q <= 0 {
+			e.log.Warn("IQ-FILTER: Order too small after rounding, skipping",
+				zap.String("symbol", sig.Symbol),
+				zap.Float64("notional", notional),
+				zap.Float64("price", lastPrice),
+				zap.Float64("raw_qty", coinQty),
+			)
+			return
+		}
+
+		sl := 0.0
+		if sig.StopLoss > 0 {
+			// Round SL/TP prices too
+			sl = sig.StopLoss
+		}
+
+		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, sig.TakeProfit, sig.StrategyName); err != nil {
 			e.log.Error("place entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
 			return
 		}
 		e.risk.OnPositionOpened(sig.Symbol)
 
-
 	case strategy.SignalExit:
 		if currentPos == nil || currentPos.PositionAmt == 0 {
 			return
 		}
-		qty := strconv.FormatFloat(abs(currentPos.PositionAmt), 'f', 8, 64)
+		// Quantity for exit is current position amount
+		qty := e.prec.RoundQty(sig.Symbol, math.Abs(currentPos.PositionAmt))
 		if _, err := e.orders.PlaceCloseOrder(ctx, sig.Symbol, string(sig.Side), qty); err != nil {
 			e.log.Error("place close failed", zap.Error(err), zap.String("symbol", sig.Symbol))
+		}
+	}
+}
+
+func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
+	newPriceFloat, _ := strconv.ParseFloat(sig.Price, 64)
+	if newPriceFloat == 0 {
+		return
+	}
+
+	// 1. Round Price
+	roundedPriceStr := e.prec.RoundPrice(sig.Symbol, newPriceFloat)
+	roundedPriceFloat, _ := strconv.ParseFloat(roundedPriceStr, 64)
+
+	// Check if we already have an entry order for this strategy
+	existing := e.orders.FindEntryByStrategy(sig.Symbol, sig.StrategyName, string(sig.Side))
+	if existing != nil {
+		// Drift Check: Only replace if price differs by > 0.1%
+		drift := math.Abs(roundedPriceFloat-existing.Price) / existing.Price
+		if drift < 0.001 { // 0.1%
+			return
+		}
+
+		e.log.Info("IQ-LIMIT: Price drift detected, updating limit order",
+			zap.String("strategy", sig.StrategyName),
+			zap.String("symbol", sig.Symbol),
+			zap.Float64("old_price", existing.Price),
+			zap.Float64("new_price", roundedPriceFloat),
+		)
+
+		e.futures.CancelOrder(ctx, client.CancelOrderRequest{
+			Symbol:        sig.Symbol,
+			ClientOrderID: existing.ClientOrderID,
+		})
+	}
+
+	// 2. Convert & Round Quantity
+	notional := parseFloat(sig.Quantity)
+	coinQty := notional / roundedPriceFloat
+	roundedQtyStr := e.prec.RoundQty(sig.Symbol, coinQty)
+
+	// check if quantity is zero after rounding (order too small)
+	if q, _ := strconv.ParseFloat(roundedQtyStr, 64); q <= 0 {
+		e.log.Warn("IQ-LIMIT: Order too small after rounding, skipping",
+			zap.String("symbol", sig.Symbol),
+			zap.Float64("notional", notional),
+			zap.Float64("price", roundedPriceFloat),
+			zap.Float64("raw_qty", coinQty),
+		)
+		return
+	}
+
+	// PHASE 9: Risk Tracking - Add to pending BEFORE placing
+	e.risk.AddPending(sig.Symbol, notional)
+
+	// Place new limit order
+	_, err := e.orders.PlaceLimitEntry(ctx, sig.Symbol, string(sig.Side), roundedQtyStr, roundedPriceStr, sig.StopLoss, sig.TakeProfit, sig.StrategyName)
+	if err != nil {
+		e.log.Error("place limit entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
+		e.risk.RemovePending(sig.Symbol, notional)
+	}
+}
+
+// gcOrders cross-references open entry orders with current signals.
+// If a signal for a symbol/side/price is no longer there, pull the order.
+func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*strategy.Signal) {
+	openOrders := e.orders.GetAll()
+	
+	// Create a map of "Active Signal Signatures" to see what should remain
+	activeSigs := make(map[string]bool)
+	for _, s := range latestSignals {
+		if s.Type == strategy.SignalEnter && s.Price != "" {
+			// Price rounding here to match order price
+			rounded := e.prec.RoundPrice(s.Symbol, parseFloat(s.Price))
+			key := fmt.Sprintf("%s|%s|%s", s.Symbol, s.Side, rounded)
+			activeSigs[key] = true
+		}
+	}
+
+	for _, lo := range openOrders {
+		if lo.Symbol != symbol || lo.Purpose != ordermanager.PurposeEntry {
+			continue
+		}
+		if lo.Status != "NEW" && lo.Status != "PARTIALLY_FILLED" {
+			continue
+		}
+
+		orderPriceStr := strconv.FormatFloat(lo.Price, 'f', -1, 64)
+		key := fmt.Sprintf("%s|%s|%s", lo.Symbol, lo.Side, orderPriceStr)
+
+		if !activeSigs[key] {
+			e.log.Info("IQ-GC: Pulling invalid limit order (no longer signaled)",
+				zap.String("symbol", lo.Symbol),
+				zap.Float64("price", lo.Price),
+				zap.String("id", lo.ClientOrderID),
+			)
+			e.futures.CancelOrder(ctx, client.CancelOrderRequest{
+				Symbol:        lo.Symbol,
+				ClientOrderID: lo.ClientOrderID,
+			})
+			// RiskManager will be updated via WebSocket order update eventually, 
+			// but we can release pending here too if we want immediate capacity.
+			e.risk.RemovePending(lo.Symbol, lo.Price*lo.OrigQty)
 		}
 	}
 }
@@ -340,10 +476,6 @@ func (e *Engine) refreshPositions(ctx context.Context) error {
 
 	return nil
 }
-
-
-
-
 
 func (e *Engine) initLeverage(ctx context.Context) {
 
@@ -390,11 +522,11 @@ func (e *Engine) requiredIntervals() []string {
 		// A better way is to add a GetIntervals() method to Strategy interface if we have many.
 		// However, Router already knows his sub-strategies.
 		// Let's check them specifically or add a way to query them.
-		
+
 		// For now, we'll brute force common ones or better: ask strategies for their symbols/intervals.
 		// Wait, most of our strategies have a Timeframe field in their config.
 		// Let's assume we can get it or we keep a list of common ones.
-		
+
 		// Actually, let's just subscribe to the most common ones used in config.yaml:
 		intervals["5m"] = true
 		intervals["15m"] = true
@@ -411,12 +543,12 @@ func (e *Engine) requiredIntervals() []string {
 func (e *Engine) prewarmStrategies(ctx context.Context) {
 	e.log.Info("pre-warming strategies with historical data")
 	intervals := e.requiredIntervals()
-	
+
 	for _, strat := range e.strategies {
 		if !strat.IsEnabled() {
 			continue
 		}
-		
+
 		for _, interval := range intervals {
 			limit := 100
 			if interval == "1h" {
@@ -426,9 +558,9 @@ func (e *Engine) prewarmStrategies(ctx context.Context) {
 			for _, sym := range strat.Symbols() {
 				klines, err := e.market.Klines(ctx, sym, interval, limit)
 				if err != nil {
-					e.log.Warn("failed to fetch historical klines", 
-						zap.String("symbol", sym), 
-						zap.String("interval", interval), 
+					e.log.Warn("failed to fetch historical klines",
+						zap.String("symbol", sym),
+						zap.String("interval", interval),
 						zap.Error(err),
 					)
 					continue
@@ -444,9 +576,9 @@ func (e *Engine) prewarmStrategies(ctx context.Context) {
 					wk.Kline.IsClosed = isClosed
 					strat.OnKline(wk)
 				}
-				e.log.Info("pre-warmed symbol", 
-					zap.String("strategy", strat.Name()), 
-					zap.String("symbol", sym), 
+				e.log.Info("pre-warmed symbol",
+					zap.String("strategy", strat.Name()),
+					zap.String("symbol", sym),
 					zap.String("interval", interval),
 					zap.Int("klines", len(klines)),
 				)
@@ -458,8 +590,6 @@ func (e *Engine) prewarmStrategies(ctx context.Context) {
 func buildStreams(symbols []string, _ *config.Config, intervals []string) []string {
 	return stream.BuildStreams(symbols, intervals)
 }
-
-
 
 func parseFloat(s string) float64 {
 	f, _ := strconv.ParseFloat(s, 64)

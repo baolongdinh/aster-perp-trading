@@ -75,21 +75,25 @@ func (e *Engine) evaluateSignalsForSymbol(ctx context.Context, sym string, ticks
 			)
 		}
 
-		sig := s.Signal(sym, pos)
+		sigs := s.Signals(sym, pos)
 
-		if sig == nil || sig.Type == strategy.SignalNone {
-			// If we are debugging, we might want to log why, but Signal() already logs evaluation
-			continue
+		// PHASE 9: Dynamic Order GC - Cancel pendings that are no longer signaled
+		e.gcOrders(ctx, sym, sigs)
+
+		for _, sig := range sigs {
+			if sig == nil || sig.Type == strategy.SignalNone {
+				continue
+			}
+
+			e.log.Info("signal",
+				zap.String("strategy", sig.StrategyName),
+				zap.String("symbol", sym),
+				zap.String("type", string(sig.Type)),
+				zap.String("side", string(sig.Side)),
+				zap.String("reason", sig.Reason),
+			)
+			e.executeSignal(ctx, sig, pos)
 		}
-
-		e.log.Info("signal",
-			zap.String("strategy", sig.StrategyName),
-			zap.String("symbol", sym),
-			zap.String("type", string(sig.Type)),
-			zap.String("side", string(sig.Side)),
-			zap.String("reason", sig.Reason),
-		)
-		e.executeSignal(ctx, sig, pos)
 	}
 }
 

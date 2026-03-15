@@ -93,14 +93,14 @@ func (s *VWAPReversionStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *VWAPReversionStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *VWAPReversionStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *VWAPReversionStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *VWAPReversionStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	vwapState, ok := s.vwaps[symbol]
 	price := s.lastPrice[symbol]
 	s.mu.RUnlock()
 
 	if !ok || vwapState.Value() == 0 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	vwap := vwapState.Value()
@@ -109,42 +109,44 @@ func (s *VWAPReversionStrategy) Signal(symbol string, pos *client.Position) *str
 	// Exit Logic: Close when price returns to VWAP
 	if pos != nil && pos.PositionAmt != 0 {
 		if pos.PositionAmt > 0 && price >= vwap {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideSell,
 				Reason: "VWAP Target Reached (Long)",
-			}
+			}}
 		}
 		if pos.PositionAmt < 0 && price <= vwap {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideBuy,
 				Reason: "VWAP Target Reached (Short)",
-			}
+			}}
 		}
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
+
+	var sigs []*strategy.Signal
 
 	// Entry Logic
 	if deviation <= -s.cfg.DevThreshold {
-		return &strategy.Signal{
+		sigs = append(sigs, &strategy.Signal{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("VWAP Oversold Dev: %.2f%%", deviation),
-		}
+		})
 	} else if deviation >= s.cfg.DevThreshold {
-		return &strategy.Signal{
+		sigs = append(sigs, &strategy.Signal{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   fmt.Sprintf("VWAP Overbought Dev: %.2f%%", deviation),
-		}
+		})
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return sigs
 }

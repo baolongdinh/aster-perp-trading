@@ -118,7 +118,7 @@ func (s *BOSStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *BOSStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *BOSStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *BOSStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *BOSStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	hh := s.lastHH[symbol]
 	ll := s.lastLL[symbol]
@@ -126,32 +126,30 @@ func (s *BOSStrategy) Signal(symbol string, pos *client.Position) *strategy.Sign
 	s.mu.RUnlock()
 
 	if len(highs) == 0 || hh == 0 || ll == 0 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
 	lastClose := highs[len(highs)-1]
 
-	// Bullish BOS: price closes above last swing high
 	if lastClose > hh {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   "Bullish BOS (Break of Swing High)",
-		}
+		}}
 	}
 
-	// Bearish BOS: price closes below last swing low
 	if lastClose < ll {
-		return &strategy.Signal{
+		return []*strategy.Signal{{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
 			Reason:   "Bearish BOS (Break of Swing Low)",
-		}
+		}}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

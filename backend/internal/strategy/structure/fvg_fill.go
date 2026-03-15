@@ -76,20 +76,16 @@ func (s *FVGStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *FVGStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (s *FVGStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
-func (s *FVGStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
+func (s *FVGStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	highs := s.highs[symbol]
 	lows := s.lows[symbol]
 	s.mu.RUnlock()
 
 	if len(highs) < 3 {
-		return &strategy.Signal{Type: strategy.SignalNone}
+		return nil
 	}
 
-	// FVG Detection (sequence of 3 candles):
-	// Bullish FVG: Candle 1 High < Candle 3 Low (Gap is between them)
-	// Bearish FVG: Candle 1 Low > Candle 3 High
-	
 	c1h := highs[len(highs)-3]
 	c1l := lows[len(lows)-3]
 	c3h := highs[len(highs)-1]
@@ -100,13 +96,13 @@ func (s *FVGStrategy) Signal(symbol string, pos *client.Position) *strategy.Sign
 		gap := c3l - c1h
 		gapPct := (gap / c1h) * 100
 		if gapPct >= s.cfg.MinGapPct {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:     strategy.SignalEnter,
 				Symbol:   symbol,
 				Side:     strategy.SideBuy,
 				Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-				Reason:   fmt.Sprintf("Bullish FVG Detected (%.2f%% Gap)", gapPct),
-			}
+				Reason:   "Bullish FVG",
+			}}
 		}
 	}
 
@@ -115,15 +111,15 @@ func (s *FVGStrategy) Signal(symbol string, pos *client.Position) *strategy.Sign
 		gap := c1l - c3h
 		gapPct := (gap / c1l) * 100
 		if gapPct >= s.cfg.MinGapPct {
-			return &strategy.Signal{
+			return []*strategy.Signal{{
 				Type:     strategy.SignalEnter,
 				Symbol:   symbol,
 				Side:     strategy.SideSell,
 				Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-				Reason:   fmt.Sprintf("Bearish FVG Detected (%.2f%% Gap)", gapPct),
-			}
+				Reason:   "Bearish FVG",
+			}}
 		}
 	}
 
-	return &strategy.Signal{Type: strategy.SignalNone}
+	return nil
 }

@@ -9,6 +9,7 @@ exchange:
   futures_rest_base: "https://fapi.asterdex.com"
   futures_ws_base: "wss://fstream.asterdex.com"
   recv_window: 5000
+  requests_per_second: 5
 
 risk:
   max_position_usdt: 50

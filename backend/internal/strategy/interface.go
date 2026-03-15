@@ -54,8 +54,8 @@ type Strategy interface {
 	// OnAccountUpdate is called when balances/positions change.
 	OnAccountUpdate(u stream.WsAccountUpdate)
 
-	// Signal returns the current signal (may return SignalNone).
-	Signal(symbol string, currentPos *client.Position) *Signal
+	// Signals returns the current signals (may return empty slice).
+	Signals(symbol string, currentPos *client.Position) []*Signal
 
 	// Symbols returns which symbols this strategy watches.
 	Symbols() []string
