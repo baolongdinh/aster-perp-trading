@@ -1,0 +1,96 @@
+# =============================================================================
+# Aster Bot — Config
+# Sau khi chỉnh sửa xong, copy file này thành config.yaml để chạy.
+# Credentials (private key, wallet) đặt trong file .env, KHÔNG đặt ở đây.
+# =============================================================================
+
+bot:
+  # true  → chạy giả lập, log lệnh ra màn hình, KHÔNG gửi lệnh thật lên sàn (an toàn khi test)
+  # false → trading thật, cẩn thận!
+  dry_run: true
+
+# ---------------------------------------------------------------------------
+# Kết nối sàn Aster Finance
+# ---------------------------------------------------------------------------
+exchange:
+  # Địa chỉ ví chính của tài khoản Aster (main account wallet, dạng 0x...)
+  # Có thể để trống ở đây và set qua env: ASTER_EXCHANGE_USER_WALLET=0x...
+  user_wallet: ""
+
+  # Địa chỉ ví API (signer wallet) — đăng ký theo hướng dẫn aster-api-key-registration.md
+  # Env: ASTER_EXCHANGE_SIGNER_WALLET=0x...
+  signer_wallet: ""
+
+  # ⛔ Private key của signer wallet: KHÔNG BAO GIỜ để ở đây
+  # Chỉ set qua env: ASTER_SIGNER_KEY=0x<64 ký tự hex>
+
+  # Base URL REST API futures — không cần thay đổi
+  futures_rest_base: "https://fapi.asterdex.com"
+
+  # Base URL WebSocket — không cần thay đổi
+  futures_ws_base: "wss://fstream.asterdex.com"
+
+  # Cửa sổ thời gian hợp lệ của request (milliseconds).
+  # Server từ chối request đến trễ hơn giá trị này. Tối đa 5000ms.
+  recv_window: 5000
+
+# ---------------------------------------------------------------------------
+# Risk Management — giới hạn rủi ro
+# ---------------------------------------------------------------------------
+risk:
+  # Size tối đa mỗi lệnh (USDT notional). Bot từ chối vào lệnh nếu vượt quá.
+  max_position_usdt: 50
+
+  # Số vị thế mở đồng thời tối đa (trên tất cả symbol).
+  max_open_positions: 3
+
+  # Nếu tổng lỗ trong ngày >= giá trị này (USDT), bot tự động DỪNG.
+  # Reset lại lúc 00:00 UTC hàng ngày.
+  daily_loss_limit_usdt: 25
+
+  # Stop-loss tự động đặt cách giá entry bao nhiêu %.
+  # Ví dụ 2.0 → BUY BTC tại 80,000 thì SL đặt tại 78,400.
+  per_trade_stop_loss_pct: 2.0
+
+  # Chế độ vị thế:
+  #   one_way → mỗi symbol chỉ có 1 vị thế (BOTH side), đơn giản hơn
+  #   hedge   → giữ LONG và SHORT cùng lúc, cần bật Hedge Mode trên Aster
+  position_mode: one_way
+
+# ---------------------------------------------------------------------------
+# API Server nội bộ (dùng cho Dashboard FE sau này)
+# ---------------------------------------------------------------------------
+api:
+  # Interface lắng nghe. 0.0.0.0 = tất cả interface (localhost + LAN).
+  host: "0.0.0.0"
+
+  # Port REST API + WebSocket. Ví dụ: http://localhost:8080/api/v1/status
+  port: 8080
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log:
+  # Mức log: debug → info → warn → error (càng thấp càng nhiều log)
+  #   debug → log tất cả, kể cả request/response chi tiết
+  #   info  → log sự kiện quan trọng: lệnh đặt/huỷ, WS kết nối, signal
+  #   warn  → chỉ cảnh báo + lỗi
+  level: info
+
+# ---------------------------------------------------------------------------
+# Strategies — danh sách chiến lược giao dịch
+# ---------------------------------------------------------------------------
+strategies:
+  - name: ema_cross          # Tên strategy (phải khớp với code trong engine)
+    enabled: true            # true/false — bật/tắt. Có thể toggle qua API runtime.
+    symbols:                 # Danh sách cặp giao dịch strategy này theo dõi
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      fast_period: 9         # EMA nhanh: số nến. EMA(9) phản ứng nhanh với giá.
+      slow_period: 21        # EMA chậm: số nến. EMA(21) là xu hướng trung hạn.
+                             # → Tín hiệu LONG khi EMA(9) cắt lên trên EMA(21)
+                             # → Tín hiệu SHORT khi EMA(9) cắt xuống dưới EMA(21)
+      leverage: 5            # Đòn bẩy (x). 5x = mỗi 1 USDT margin → 5 USDT vị thế.
+      order_size_usdt: 5     # Kích thước lệnh (USDT). Phải <= max_position_usdt ở trên.
+      timeframe: 5m          # Khung thời gian nến: 1m 3m 5m 15m 30m 1h 4h 1d

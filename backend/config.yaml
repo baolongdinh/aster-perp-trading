@@ -1,0 +1,38 @@
+bot:
+  dry_run: true # ⚠️ Set to false only when ready for live trading
+
+exchange:
+  # Your Aster API Key (from exchange dashboard -> API Management)
+  # (also set via env: ASTER_EXCHANGE_API_KEY)
+  api_key: ""
+  # Private key: NEVER set here — use env var ASTER_API_SECRET only
+  futures_rest_base: "https://fapi.asterdex.com"
+  futures_ws_base: "wss://fstream.asterdex.com"
+  recv_window: 5000
+
+risk:
+  max_position_usdt: 50
+  max_open_positions: 3
+  daily_loss_limit_usdt: 25
+  per_trade_stop_loss_pct: 2.0
+  position_mode: one_way # one_way | hedge
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+
+log:
+  level: info # debug | info | warn | error
+
+strategies:
+  - name: ema_cross
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      fast_period: 9
+      slow_period: 21
+      leverage: 5
+      order_size_usdt: 5
+      timeframe: 5m
