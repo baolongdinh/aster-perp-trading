@@ -20,66 +20,101 @@ type Classifier struct {
 	bbPeriod  int
 	bbStdDev  float64
 
-	highs  []float64
-	lows   []float64
-	closes []float64
+	// Multi-timeframe data
+	highs  map[string][]float64 // timeframe -> history
+	lows   map[string][]float64
+	closes map[string][]float64
 
-	// Cached values
+	// Cached values for 5m (primary timeframe)
 	tr  []float64 // True Range
 	pDM []float64 // +DM
 	nDM []float64 // -DM
+
+	// BB Width history for squeeze detection (primary timeframe)
+	bbwHistory []float64
+
+	// Sentiment/Context data for this specific symbol
+	fundingRate float64
 }
+
 
 // NewClassifier creates a new regime classifier. Typical settings: ADX(14) and BB(20, 2).
 func NewClassifier(adxPeriod, bbPeriod int, bbStdDev float64) *Classifier {
-	// Need enough data to calculate smoothed ADX. Typically 2 * adxPeriod + 10 is safe.
 	return &Classifier{
-		adxPeriod: adxPeriod,
-		bbPeriod:  bbPeriod,
-		bbStdDev:  bbStdDev,
-		highs:     make([]float64, 0),
-		lows:      make([]float64, 0),
-		closes:    make([]float64, 0),
-		tr:        make([]float64, 0),
-		pDM:       make([]float64, 0),
-		nDM:       make([]float64, 0),
+		adxPeriod:    adxPeriod,
+		bbPeriod:     bbPeriod,
+		bbStdDev:     bbStdDev,
+		highs:        make(map[string][]float64),
+		lows:         make(map[string][]float64),
+		closes:       make(map[string][]float64),
+		tr:           make([]float64, 0),
+		pDM:          make([]float64, 0),
+		nDM:          make([]float64, 0),
+		bbwHistory:   make([]float64, 0),
 	}
 }
+
+
+
 
 // AddKline inserts a CLOSED kline into the classifier.
-func (c *Classifier) AddKline(high, low, closePrice float64) {
-	c.highs = append(c.highs, high)
-	c.lows = append(c.lows, low)
-	c.closes = append(c.closes, closePrice)
-
-	// Keep buffer sizing bounded (e.g. max 100 periods)
-	maxLen := 100
-	if len(c.closes) > maxLen {
-		c.highs = c.highs[1:]
-		c.lows = c.lows[1:]
-		c.closes = c.closes[1:]
+func (c *Classifier) AddKline(timeframe string, high, low, closePrice float64) {
+	if _, ok := c.closes[timeframe]; !ok {
+		c.highs[timeframe] = make([]float64, 0)
+		c.lows[timeframe] = make([]float64, 0)
+		c.closes[timeframe] = make([]float64, 0)
 	}
 
-	c.recalcDM()
+	c.highs[timeframe] = append(c.highs[timeframe], high)
+	c.lows[timeframe] = append(c.lows[timeframe], low)
+	c.closes[timeframe] = append(c.closes[timeframe], closePrice)
+
+	// Keep buffer sizing bounded
+	maxLen := 200
+	if timeframe == "1h" {
+		maxLen = 100 // usually enough for filtering
+	}
+
+	if len(c.closes[timeframe]) > maxLen {
+		c.highs[timeframe] = c.highs[timeframe][1:]
+		c.lows[timeframe] = c.lows[timeframe][1:]
+		c.closes[timeframe] = c.closes[timeframe][1:]
+	}
+
+	if timeframe == "5m" {
+		c.recalcDM()
+		// Record BB Width for squeeze detection
+		if len(c.closes["5m"]) >= c.bbPeriod {
+			bw := c.calcBBWidth("5m")
+			c.bbwHistory = append(c.bbwHistory, bw)
+			if len(c.bbwHistory) > 200 {
+				c.bbwHistory = c.bbwHistory[1:]
+			}
+		}
+	}
 }
 
-// recalcDM updates True Range and Directional Movement arrays.
+
+// recalcDM updates True Range and Directional Movement arrays for the primary (5m) timeframe.
 func (c *Classifier) recalcDM() {
-	if len(c.closes) < 2 {
+	closes := c.closes["5m"]
+	highs := c.highs["5m"]
+	lows := c.lows["5m"]
+
+	if len(closes) < 2 {
 		return
 	}
 
-	c.tr = make([]float64, len(c.closes))
-	c.pDM = make([]float64, len(c.closes))
-	c.nDM = make([]float64, len(c.closes))
+	c.tr = make([]float64, len(closes))
+	c.pDM = make([]float64, len(closes))
+	c.nDM = make([]float64, len(closes))
 
-	// TR and DM start at index 1
-	for i := 1; i < len(c.closes); i++ {
-		high := c.highs[i]
-		low := c.lows[i]
-		prevHigh := c.highs[i-1]
-		prevLow := c.lows[i-1]
-		prevClose := c.closes[i-1]
+	for i := 1; i < len(closes); i++ {
+		high := highs[i]
+		low := lows[i]
+		prevHigh := highs[i-1]
+		prevLow := lows[i-1]
+		prevClose := closes[i-1]
 
 		// True Range
 		tr1 := high - low
@@ -105,29 +140,34 @@ func (c *Classifier) recalcDM() {
 	}
 }
 
-// CurrentReturns the regime, ADX, and BB Width
+
+// Current returns the regime, ADX, and BB Width for the primary timeframe.
 func (c *Classifier) Current() (RegimeType, float64, float64) {
-	if len(c.closes) < c.adxPeriod*2 {
+	closes5m := c.closes["5m"]
+	if len(closes5m) < c.adxPeriod*2 {
 		return RegimeUnknown, 0, 0
 	}
 
 	adx := c.calcADX()
-	bbw := c.calcBBWidth()
+	bbw := c.calcBBWidth("5m")
 
 	// Heuristics for Regime Classification
-	// ADX > 25 indicates a strong trend.
-	// Low BBW indicates squeeze (consolidation/ranging)
 	if adx > 25 {
 		return RegimeTrend, adx, bbw
 	}
 
-	// For simplicity, if not trending, it's ranging.
-	// You can add more complex BB Squeeze logic here for "Breakout" later.
+	// Squeeze Detection Logic
+	if c.IsSqueezing() {
+		// If volatility is abnormally low, we are in a pre-breakout state
+		return RegimeRanging, adx, bbw // Still RANGING until it breaks, but IsSqueezing() will be used by Router
+	}
+
 	return RegimeRanging, adx, bbw
 }
 
-// calcADX computes the Wilder's Smoothing ADX value.
+// calcADX computes the Wilder's Smoothing ADX value for 5m.
 func (c *Classifier) calcADX() float64 {
+	closes := c.closes["5m"]
 	// 1. Initial smoothed TR, +DM, -DM over 14 periods
 	str := 0.0
 	spDM := 0.0
@@ -139,13 +179,18 @@ func (c *Classifier) calcADX() float64 {
 		snDM += c.nDM[i]
 	}
 
-	dx := make([]float64, len(c.closes))
+	dx := make([]float64, len(closes))
 	// 2. Loop to calculate subsequent smoothed values and DX
-	for i := c.adxPeriod; i < len(c.closes); i++ {
+	for i := c.adxPeriod; i < len(closes); i++ {
 		if i > c.adxPeriod {
 			str = str - (str / float64(c.adxPeriod)) + c.tr[i]
 			spDM = spDM - (spDM / float64(c.adxPeriod)) + c.pDM[i]
 			snDM = snDM - (snDM / float64(c.adxPeriod)) + c.nDM[i]
+		}
+
+		if str == 0 {
+			dx[i] = 0
+			continue
 		}
 
 		pDI := 100 * (spDM / str)
@@ -160,9 +205,9 @@ func (c *Classifier) calcADX() float64 {
 		}
 	}
 
+
 	// 3. Smooth DX to get ADX
 	adx := 0.0
-	// Initial ADX is simple average of first 14 DX values
 	startIdx := c.adxPeriod
 	endIdx := startIdx + c.adxPeriod - 1
 	if endIdx >= len(dx) {
@@ -186,13 +231,15 @@ func (c *Classifier) calcADX() float64 {
 	return adx
 }
 
-// calcBBWidth calculates Bollinger Band Width = (Upper - Lower) / SMA
-func (c *Classifier) calcBBWidth() float64 {
-	if len(c.closes) < c.bbPeriod {
+
+// calcBBWidth calculates Bollinger Band Width for a given timeframe.
+func (c *Classifier) calcBBWidth(tf string) float64 {
+	closes := c.closes[tf]
+	if len(closes) < c.bbPeriod {
 		return 0
 	}
 
-	periodData := c.closes[len(c.closes)-c.bbPeriod:]
+	periodData := closes[len(closes)-c.bbPeriod:]
 
 	sum := 0.0
 	for _, val := range periodData {
@@ -213,5 +260,120 @@ func (c *Classifier) calcBBWidth() float64 {
 	if sma == 0 {
 		return 0
 	}
-	return (upper - lower) / sma * 100 // return percentage width
+	return (upper - lower) / sma * 100
 }
+
+// IsSqueezing returns true if BB Width is in the bottom 25% of history.
+func (c *Classifier) IsSqueezing() bool {
+	if len(c.bbwHistory) < 50 { // need some history
+		return false
+	}
+	current := c.bbwHistory[len(c.bbwHistory)-1]
+	
+	// Poor man's percentile: count how many historical values are lower than current
+	lowerCount := 0
+	for _, val := range c.bbwHistory {
+		if val < current {
+			lowerCount++
+		}
+	}
+	percentile := float64(lowerCount) / float64(len(c.bbwHistory))
+	return percentile < 0.25
+}
+
+// HTFTrendBias returns 1 for Bullish, -1 for Bearish, 0 for Neutral using 1h timeframe.
+func (c *Classifier) HTFTrendBias() int {
+	closes1h := c.closes["1h"]
+	if len(closes1h) < 50 { // need enough data for EMA 50
+		return 0
+	}
+
+	ema20 := calcEMA(closes1h, 20)
+	ema50 := calcEMA(closes1h, 50)
+
+	if ema20 > ema50 {
+		return 1
+	} else if ema20 < ema50 {
+		return -1
+	}
+	return 0
+}
+
+func calcEMA(data []float64, n int) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	k := 2.0 / float64(n+1)
+	result := data[0]
+	for i := 1; i < len(data); i++ {
+		result = data[i]*k + result*(1-k)
+	}
+	return result
+}
+
+// GetATR returns the Average True Range (Wilder's Smoothing) for a given timeframe and period.
+func (c *Classifier) GetATR(tf string, period int) float64 {
+	if _, ok := c.closes[tf]; !ok {
+		return 0
+	}
+	
+	// We need TR data. If it's the 5m timeframe, we use c.tr
+	// If it's another timeframe, we'd need to calculate TR on the fly.
+	// For now, most sizing uses the primary execution timeframe (5m).
+	var trs []float64
+	if tf == "5m" {
+		trs = c.tr
+	} else {
+		// Calculate TR on the fly for other timeframes if needed
+		h := c.highs[tf]
+		l := c.lows[tf]
+		cl := c.closes[tf]
+		if len(cl) < 2 {
+			return 0
+		}
+		trs = make([]float64, len(cl))
+		for i := 1; i < len(cl); i++ {
+			tr1 := h[i] - l[i]
+			tr2 := math.Abs(h[i] - cl[i-1])
+			tr3 := math.Abs(l[i] - cl[i-1])
+			trs[i] = math.Max(math.Max(tr1, tr2), tr3)
+		}
+	}
+
+	if len(trs) < period+1 {
+		return 0
+	}
+
+	// Wilder's Smoothing for ATR
+	atr := 0.0
+	// Initial sum
+	for i := 1; i <= period; i++ {
+		atr += trs[i]
+	}
+	atr /= float64(period)
+
+	// Subsequent smoothed values
+	for i := period + 1; i < len(trs); i++ {
+		atr = (atr*float64(period-1) + trs[i]) / float64(period)
+	}
+
+	return atr
+}
+
+// GetCloses returns the historical close prices for a given timeframe.
+func (c *Classifier) GetCloses(tf string) []float64 {
+	return c.closes[tf]
+}
+
+// SetFundingRate updates the current funding rate for this symbol.
+func (c *Classifier) SetFundingRate(rate float64) {
+	c.fundingRate = rate
+}
+
+// GetFundingRate returns the current funding rate for this symbol.
+func (c *Classifier) GetFundingRate() float64 {
+	return c.fundingRate
+}
+
+
+

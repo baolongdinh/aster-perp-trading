@@ -93,7 +93,8 @@ func main() {
 	orderMgr := ordermanager.NewManager(futuresClient, log)
 
 	// --- Build strategies from config ---
-	strategies := buildStrategies(cfg, log)
+	strategies := buildStrategies(cfg, riskMgr, log)
+
 	if len(strategies) == 0 {
 		log.Warn("no strategies enabled — bot will run but not trade")
 	}
@@ -144,7 +145,8 @@ func main() {
 }
 
 // buildStrategies constructs the StrategyRouter meta-strategy.
-func buildStrategies(cfg *config.Config, log *zap.Logger) []strategy.Strategy {
+func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger) []strategy.Strategy {
+
 	var activeSymbols []string
 	var activeSubs []strategy.Strategy
 
@@ -431,7 +433,8 @@ func buildStrategies(cfg *config.Config, log *zap.Logger) []strategy.Strategy {
 		Enabled: len(finalSymbols) > 0,
 		Symbols: finalSymbols,
 	}
-	router := strategy.NewRouter(routerCfg, log)
+	router := strategy.NewRouter(routerCfg, riskMgr, log)
+
 
 	for _, sub := range activeSubs {
 		router.Register(sub)

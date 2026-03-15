@@ -113,8 +113,17 @@ func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *str
 		}
 	}
 
+	// No signal, log the reason/state for user transparency
+	s.log.Info("strategy evaluation",
+		zap.String("strategy", s.Name()),
+		zap.String("symbol", symbol),
+		zap.String("state", s.State(symbol)),
+	)
+
 	return &strategy.Signal{Type: strategy.SignalNone}
 }
+
+
 
 func formatFloat(f float64) string {
 	return fmt.Sprintf("%.2f", f)

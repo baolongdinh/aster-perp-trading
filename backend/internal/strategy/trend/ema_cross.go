@@ -205,8 +205,16 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 		}
 	}
 
+	// No entry/exit signal, log result for user transparency
+	e.log.Info("strategy evaluation",
+		zap.String("strategy", e.Name()),
+		zap.String("symbol", symbol),
+		zap.String("state", e.State(symbol)),
+	)
+
 	return &strategy.Signal{Type: strategy.SignalNone}
 }
+
 
 // ema calculates the Exponential Moving Average of the last n values in data.
 func ema(data []float64, n int) float64 {

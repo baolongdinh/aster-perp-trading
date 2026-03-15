@@ -55,12 +55,16 @@ func (s *BOSStrategy) State(symbol string) string {
 	defer s.mu.RUnlock()
 	hh := s.lastHH[symbol]
 	ll := s.lastLL[symbol]
+	highs := s.highs[symbol]
+	
+	req := s.cfg.SwingPeriod*2 + 1
 	if hh == 0 && ll == 0 {
-		return "mapping structure"
+		return fmt.Sprintf("mapping structure (%d/%d bars)", len(highs), req)
 	}
 	wait := fmt.Sprintf("Wait for BOS > %.2f or < %.2f", hh, ll)
 	return fmt.Sprintf("Range:[%.2f|%.2f] | %s", ll, hh, wait)
 }
+
 
 func (s *BOSStrategy) OnKline(k stream.WsKline) {
 	if !k.Kline.IsClosed || k.Kline.Interval != s.cfg.Timeframe {

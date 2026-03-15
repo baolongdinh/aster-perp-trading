@@ -113,12 +113,14 @@ func NewMarketStream(wsBase string, streams []string, handlers MarketHandlers, l
 }
 
 // BuildStreams returns default stream names for given symbols and timeframe.
-func BuildStreams(symbols []string, klineInterval string) []string {
+func BuildStreams(symbols []string, klineIntervals []string) []string {
 	var s []string
 	for _, sym := range symbols {
 		lower := strings.ToLower(sym)
+		for _, interval := range klineIntervals {
+			s = append(s, fmt.Sprintf("%s@kline_%s", lower, interval))
+		}
 		s = append(s,
-			fmt.Sprintf("%s@kline_%s", lower, klineInterval),
 			fmt.Sprintf("%s@markPrice@1s", lower),
 			fmt.Sprintf("%s@aggTrade", lower),
 			fmt.Sprintf("%s@bookTicker", lower),

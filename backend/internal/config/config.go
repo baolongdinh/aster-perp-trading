@@ -35,10 +35,16 @@ type ExchangeConfig struct {
 type RiskConfig struct {
 	MaxPositionUSDT     float64 `mapstructure:"max_position_usdt"`
 	MaxOpenPositions    int     `mapstructure:"max_open_positions"`
+	MaxTradesPerSymbol  int     `mapstructure:"max_trades_per_symbol"`
 	DailyLossLimitUSDT  float64 `mapstructure:"daily_loss_limit_usdt"`
+	DailyDrawdownPct    float64 `mapstructure:"daily_drawdown_pct"`
 	PerTradeStopLossPct float64 `mapstructure:"per_trade_stop_loss_pct"`
+	RiskPerTradeUSDT    float64 `mapstructure:"risk_per_trade_usdt"`
+	ATRMultiplier       float64 `mapstructure:"atr_multiplier"`
 	PositionMode        string  `mapstructure:"position_mode"` // one_way | hedge
 }
+
+
 
 type APIConfig struct {
 	Host string `mapstructure:"host"`
@@ -115,12 +121,23 @@ func validate(cfg *Config) error {
 	if cfg.Risk.MaxOpenPositions <= 0 {
 		cfg.Risk.MaxOpenPositions = 3
 	}
+	if cfg.Risk.MaxTradesPerSymbol <= 0 {
+		cfg.Risk.MaxTradesPerSymbol = 1
+	}
+
 	if cfg.Risk.DailyLossLimitUSDT <= 0 {
 		cfg.Risk.DailyLossLimitUSDT = 100
 	}
-	if cfg.Risk.PerTradeStopLossPct <= 0 {
-		cfg.Risk.PerTradeStopLossPct = 2.0
+	if cfg.Risk.DailyDrawdownPct <= 0 {
+		cfg.Risk.DailyDrawdownPct = 5.0 // 5% max daily drawdown
+	}
+	if cfg.Risk.RiskPerTradeUSDT <= 0 {
+		cfg.Risk.RiskPerTradeUSDT = 10.0 // Risk $10 per signal by default
+	}
+	if cfg.Risk.ATRMultiplier <= 0 {
+		cfg.Risk.ATRMultiplier = 2.0 // Stop loss = 2 * ATR
 	}
 	_ = time.Now() // suppress import
 	return nil
 }
+

@@ -226,3 +226,42 @@ func (m *Manager) cancelByClientID(ctx context.Context, symbol, clientID string)
 	})
 	return err
 }
+
+// PlaceLimitEntry places a LIMIT entry order (GTC).
+func (m *Manager) PlaceLimitEntry(
+	ctx context.Context,
+	symbol, side, qty, price string,
+	slPrice, tpPrice float64,
+	strategyName string,
+) (*LocalOrder, error) {
+	clientID := "bot_limit_" + uuid.New().String()[:8]
+
+	order, err := m.futures.PlaceOrder(ctx, client.PlaceOrderRequest{
+		Symbol:        symbol,
+		Side:          side,
+		Type:          "LIMIT",
+		Quantity:      qty,
+		Price:         price,
+		TimeInForce:   "GTC",
+		ClientOrderID: clientID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ordermanager: limit entry: %w", err)
+	}
+
+	lo := &LocalOrder{Order: *order}
+	m.mu.Lock()
+	m.orders[order.OrderID] = lo
+	m.mu.Unlock()
+
+	m.log.Info("🎯 LIMIT ORDER POSTED",
+		zap.String("strategy", strategyName),
+		zap.String("symbol", symbol),
+		zap.String("side", side),
+		zap.String("price", price),
+		zap.String("qty", qty),
+	)
+
+	return lo, nil
+}
+
