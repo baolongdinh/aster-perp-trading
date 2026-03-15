@@ -6,47 +6,42 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
 )
 
 type TrailingSHConfig struct {
-	Enabled       bool
-	Symbols       []string
-	SwingPeriod   int // Lookback to define a swing high/low
-	OrderSizeUSDT float64
-	Leverage      int
-	Timeframe     string
+	Enabled       bool     `yaml:"enabled"`
+	Symbols       []string `yaml:"symbols"`
+	SwingPeriod   int      `yaml:"swing_period"` // Lookback to define a swing high/low
+	OrderSizeUSDT float64  `yaml:"order_size_usdt"`
+	Timeframe     string   `yaml:"timeframe"`
 }
 
 type TrailingSHStrategy struct {
-	cfg     TrailingSHConfig
-	log     *zap.Logger
-	enabled bool
-
-	mu      sync.RWMutex
-	highs   map[string][]float64
-	lows    map[string][]float64
-
-	// Structure state
-	lastHH map[string]float64
-	lastHL map[string]float64
-	lastLH map[string]float64
-	lastLL map[string]float64
+	cfg         TrailingSHConfig
+	log         *zap.Logger
+	enabled     bool
+	mu          sync.RWMutex
+	lastHH      map[string]float64
+	lastHL      map[string]float64
+	lastLH      map[string]float64
+	lastLL      map[string]float64
+	classifiers map[string]*regime.Classifier
 }
 
 func NewTrailingSH(cfg TrailingSHConfig, log *zap.Logger) *TrailingSHStrategy {
 	return &TrailingSHStrategy{
-		cfg:     cfg,
-		log:     log,
-		enabled: cfg.Enabled,
-		highs:   make(map[string][]float64),
-		lows:    make(map[string][]float64),
-		lastHH:  make(map[string]float64),
-		lastHL:  make(map[string]float64),
-		lastLH:  make(map[string]float64),
-		lastLL:  make(map[string]float64),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		lastHH:      make(map[string]float64),
+		lastHL:      make(map[string]float64),
+		lastLH:      make(map[string]float64),
+		lastLL:      make(map[string]float64),
+		classifiers: make(map[string]*regime.Classifier),
 	}
 }
 
@@ -63,6 +58,12 @@ func (s *TrailingSHStrategy) SetEnabled(v bool) {
 	s.mu.Unlock()
 }
 
+func (s *TrailingSHStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	s.mu.Lock()
+	s.classifiers[symbol] = c
+	s.mu.Unlock()
+}
+
 func (s *TrailingSHStrategy) State(symbol string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -75,22 +76,7 @@ func (s *TrailingSHStrategy) State(symbol string) string {
 	return fmt.Sprintf("HH:%.2f LL:%.2f | %s", hh, ll, wait)
 }
 
-func (s *TrailingSHStrategy) OnKline(k stream.WsKline) {
-	if !k.Kline.IsClosed || k.Kline.Interval != s.cfg.Timeframe {
-		return
-	}
-	sym := k.Symbol
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.highs[sym] = append(s.highs[sym], k.Kline.High)
-	s.lows[sym] = append(s.lows[sym], k.Kline.Low)
-
-	if len(s.highs[sym]) > 50 {
-		s.highs[sym] = s.highs[sym][1:]
-		s.lows[sym] = s.lows[sym][1:]
-	}
-}
+func (s *TrailingSHStrategy) OnKline(k stream.WsKline) {} // Classifier handles history
 
 func (s *TrailingSHStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *TrailingSHStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
@@ -100,8 +86,14 @@ func (s *TrailingSHStrategy) Signals(symbol string, pos *client.Position) []*str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	highs := s.highs[symbol]
-	lows := s.lows[symbol]
+	cf, ok := s.classifiers[symbol]
+	if !ok || cf == nil {
+		return nil
+	}
+
+	highs := cf.GetHighs(s.cfg.Timeframe)
+	lows := cf.GetLows(s.cfg.Timeframe)
+	closes := cf.GetCloses(s.cfg.Timeframe)
 
 	if len(highs) < s.cfg.SwingPeriod*2+1 {
 		return nil
@@ -113,25 +105,19 @@ func (s *TrailingSHStrategy) Signals(symbol string, pos *client.Position) []*str
 	isSwingLow := true
 
 	for j := idx - s.cfg.SwingPeriod; j <= idx+s.cfg.SwingPeriod; j++ {
-		if j == idx {
-			continue
-		}
-		if highs[j] >= highs[idx] {
-			isSwingHigh = false
-		}
-		if lows[j] <= lows[idx] {
-			isSwingLow = false
-		}
+		if j == idx { continue }
+		if highs[j] >= highs[idx] { isSwingHigh = false }
+		if lows[j] <= lows[idx] { isSwingLow = false }
 	}
 
 	currentHigh := highs[idx]
 	currentLow := lows[idx]
+	atr := cf.GetATR(s.cfg.Timeframe, 14)
 
 	// Update Structure
 	if isSwingHigh {
 		if currentHigh > s.lastHH[symbol] {
 			s.lastHH[symbol] = currentHigh
-			s.log.Debug("new HH", zap.String("sym", symbol), zap.Float64("price", currentHigh))
 		} else if currentHigh < s.lastHH[symbol] {
 			s.lastLH[symbol] = currentHigh
 		}
@@ -144,28 +130,39 @@ func (s *TrailingSHStrategy) Signals(symbol string, pos *client.Position) []*str
 		}
 	}
 
-	// Signal Logic
-	lastClose := highs[len(highs)-1] // rough approx
+	lastClose := closes[len(closes)-1]
 
-	// Bullish: Price breaks above last HH after a HL was formed
+	// Bullish Signal
 	if lastClose > s.lastHH[symbol] && s.lastHL[symbol] > s.lastLL[symbol] && s.lastHH[symbol] > 0 {
+		sl := s.lastHL[symbol]
+		if atr > 0 { sl -= (atr * 0.5) }
+		risk := lastClose - sl
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideBuy,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "HH/HL Bullish Breakout",
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideBuy,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   lastClose + (risk * 2.0),
+			Reason:       "HH/HL Bullish Breakout",
+			StrategyName: s.Name(),
 		}}
 	}
 
-	// Bearish: Price breaks below last LL after a LH was formed
+	// Bearish Signal
 	if lastClose < s.lastLL[symbol] && s.lastLH[symbol] < s.lastHH[symbol] && s.lastLL[symbol] > 0 {
+		sl := s.lastLH[symbol]
+		if atr > 0 { sl += (atr * 0.5) }
+		risk := sl - lastClose
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideSell,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "LH/LL Bearish Breakout",
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideSell,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   lastClose - (risk * 2.0),
+			Reason:       "LH/LL Bearish Breakout",
+			StrategyName: s.Name(),
 		}}
 	}
 

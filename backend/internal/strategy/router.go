@@ -68,11 +68,20 @@ func (r *Router) GetATR(symbol string) float64 {
 	return r.getClassifier(symbol).GetATR("5m", 14)
 }
 
-// Register adds a sub-strategy to the router.
+// SetClassifier for Router is a no-op because Router manages its own symbol-specific classifiers.
+func (r *Router) SetClassifier(_ string, _ *regime.Classifier) {}
+
+// Register adds a sub-strategy to the router and connects it to relevant classifiers.
 func (r *Router) Register(s Strategy) {
 	r.strategies[s.Name()] = s
 	if s.IsEnabled() {
 		r.activeSubs = append(r.activeSubs, s.Name())
+	}
+	// Propagate classifiers for the symbols this strategy cares about
+	for _, sym := range s.Symbols() {
+		if cf, ok := r.classifiers[sym]; ok {
+			s.SetClassifier(sym, cf)
+		}
 	}
 }
 
@@ -168,12 +177,15 @@ func (r *Router) wasSqueezingRecently(symbol string) bool {
 
 // OnKline proxies data to the classifier AND all sub-strategies (so they stay warm).
 func (r *Router) OnKline(k stream.WsKline) {
-	// Feed the classifier closed data to track regime across frame
-	if k.Kline.IsClosed {
-		r.getClassifier(k.Symbol).AddKline(k.Kline.Interval, k.Kline.High, k.Kline.Low, k.Kline.Close)
+	if !k.Kline.IsClosed {
+		return
 	}
 
-	// Forward all intervals to sub-strategies (they will filter internally)
+	sym := k.Symbol
+	cf := r.getClassifier(sym)
+	cf.AddKline(k.Kline.Interval, k.Kline.High, k.Kline.Low, k.Kline.Close, k.Kline.Volume)
+
+	// Propagate to sub-strategies (they will filter internally)
 
 	for _, sName := range r.activeSubs {
 		strat, ok := r.strategies[sName]

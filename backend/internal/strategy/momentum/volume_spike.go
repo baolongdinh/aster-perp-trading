@@ -2,85 +2,97 @@ package momentum
 
 import (
 	"fmt"
+	"sync"
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
 	"aster-bot/internal/strategy/indicators"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
 )
 
 type VolumeSpikeConfig struct {
-	Enabled         bool
-	Symbols         []string
-	VolumeMaPeriod  int
-	SpikeMultiplier float64 // Volume must be > MA * Multiplier
-	OrderSizeUSDT   float64
+	Enabled         bool     `yaml:"enabled"`
+	Symbols         []string `yaml:"symbols"`
+	VolumeMaPeriod  int      `yaml:"volume_ma_period"`
+	SpikeMultiplier float64  `yaml:"spike_multiplier"` // Volume must be > MA * Multiplier
+	OrderSizeUSDT   float64  `yaml:"order_size_usdt"`
 }
 
 type VolumeSpikeStrategy struct {
-	cfg     VolumeSpikeConfig
-	log     *zap.Logger
-	volumes map[string][]float64
-	closes  map[string][]float64
-	highs   map[string][]float64
-	lows    map[string][]float64
-	lastSig map[string]strategy.Side
+	cfg         VolumeSpikeConfig
+	log         *zap.Logger
+	enabled     bool
+	mu          sync.RWMutex
+	lastSig     map[string]strategy.Side
+	classifiers map[string]*regime.Classifier
 }
 
 func NewVolumeSpike(cfg VolumeSpikeConfig, log *zap.Logger) *VolumeSpikeStrategy {
 	return &VolumeSpikeStrategy{
-		cfg:     cfg,
-		log:     log,
-		volumes: make(map[string][]float64),
-		closes:  make(map[string][]float64),
-		highs:   make(map[string][]float64),
-		lows:    make(map[string][]float64),
-		lastSig: make(map[string]strategy.Side),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		lastSig:     make(map[string]strategy.Side),
+		classifiers: make(map[string]*regime.Classifier),
 	}
 }
 
 func (s *VolumeSpikeStrategy) Name() string      { return "volume_spike" }
 func (s *VolumeSpikeStrategy) Symbols() []string { return s.cfg.Symbols }
-func (s *VolumeSpikeStrategy) IsEnabled() bool   { return s.cfg.Enabled }
-func (s *VolumeSpikeStrategy) SetEnabled(v bool) { s.cfg.Enabled = v }
+func (s *VolumeSpikeStrategy) IsEnabled() bool   { return s.enabled }
+func (s *VolumeSpikeStrategy) SetEnabled(v bool) { s.enabled = v }
+
+func (s *VolumeSpikeStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	s.mu.Lock()
+	s.classifiers[symbol] = c
+	s.mu.Unlock()
+}
 
 func (s *VolumeSpikeStrategy) State(symbol string) string {
-	volList, ok := s.volumes[symbol]
-	if !ok || len(volList) < s.cfg.VolumeMaPeriod {
-		return fmt.Sprintf("warming up (%d/%d)", len(volList), s.cfg.VolumeMaPeriod)
+	s.mu.RLock()
+	cf, ok := s.classifiers[symbol]
+	s.mu.RUnlock()
+
+	if !ok || cf == nil {
+		return "warming up (no classifier)"
 	}
-	avgVol := indicators.SMA(volList, s.cfg.VolumeMaPeriod)
-	lastVol := volList[len(volList)-1]
+
+	// Volume spike doesn't define TF, it usually works on 5m
+	vols := cf.GetVolumes("5m")
+	if len(vols) < s.cfg.VolumeMaPeriod {
+		return fmt.Sprintf("warming up (%d/%d)", len(vols), s.cfg.VolumeMaPeriod)
+	}
+	avgVol := indicators.SMA(vols, s.cfg.VolumeMaPeriod)
+	lastVol := vols[len(vols)-1]
 	wait := fmt.Sprintf("Wait for Vol > %.2f (%.1fx spike)", avgVol*s.cfg.SpikeMultiplier, s.cfg.SpikeMultiplier)
 	return fmt.Sprintf("AvgVol:%.2f LastVol:%.2f (%.1fx) | %s", avgVol, lastVol, lastVol/avgVol, wait)
 }
 
-func (s *VolumeSpikeStrategy) OnKline(k stream.WsKline) {
-	if !k.Kline.IsClosed {
-		return
-	}
-	sym := k.Symbol
-	s.volumes[sym] = append(s.volumes[sym], k.Kline.Volume)
-	s.closes[sym] = append(s.closes[sym], k.Kline.Close)
-	s.highs[sym] = append(s.highs[sym], k.Kline.High)
-	s.lows[sym] = append(s.lows[sym], k.Kline.Low)
+func (s *VolumeSpikeStrategy) OnKline(k stream.WsKline) {} // Classifier handles history
 
-	if len(s.volumes[sym]) > 100 {
-		s.volumes[sym] = s.volumes[sym][1:]
-		s.closes[sym] = s.closes[sym][1:]
-		s.highs[sym] = s.highs[sym][1:]
-		s.lows[sym] = s.lows[sym][1:]
-	}
-}
-
-func (s *VolumeSpikeStrategy) OnMarkPrice(mp stream.WsMarkPrice)        {}
-func (s *VolumeSpikeStrategy) OnOrderUpdate(u stream.WsOrderUpdate)     {}
-func (s *VolumeSpikeStrategy) OnAccountUpdate(u stream.WsAccountUpdate) {}
+func (s *VolumeSpikeStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
+func (s *VolumeSpikeStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
+func (s *VolumeSpikeStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
 func (s *VolumeSpikeStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
-	vols := s.volumes[symbol]
+	s.mu.RLock()
+	cf, ok := s.classifiers[symbol]
+	s.mu.RUnlock()
+
+	if !ok || cf == nil {
+		return nil
+	}
+
+	// Using 5m as default timeframe for volume spikes
+	tf := "5m"
+	vols := cf.GetVolumes(tf)
+	closes := cf.GetCloses(tf)
+	highs := cf.GetHighs(tf)
+	lows := cf.GetLows(tf)
+
 	if len(vols) < s.cfg.VolumeMaPeriod+1 {
 		return nil
 	}
@@ -90,10 +102,11 @@ func (s *VolumeSpikeStrategy) Signals(symbol string, pos *client.Position) []*st
 
 	isSpike := currentVol > (volMA * s.cfg.SpikeMultiplier)
 
-	currentHigh := s.highs[symbol][len(vols)-1]
-	currentLow := s.lows[symbol][len(vols)-1]
-	currentClose := s.closes[symbol][len(vols)-1]
+	currentHigh := highs[len(highs)-1]
+	currentLow := lows[len(lows)-1]
+	currentClose := closes[len(closes)-1]
 	candleSize := currentHigh - currentLow
+	atr := cf.GetATR(tf, 14)
 
 	var side strategy.Side
 	if isSpike && currentClose > currentLow+(candleSize*0.7) {
@@ -106,20 +119,16 @@ func (s *VolumeSpikeStrategy) Signals(symbol string, pos *client.Position) []*st
 	// Exit Logic
 	if pos != nil && pos.PositionAmt != 0 {
 		if pos.PositionAmt > 0 && side == strategy.SideSell {
-			s.lastSig[symbol] = strategy.SideSell
 			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
-				Side:   strategy.SideSell,
 				Reason: "Counter Volume Spike",
 			}}
 		}
 		if pos.PositionAmt < 0 && side == strategy.SideBuy {
-			s.lastSig[symbol] = strategy.SideBuy
 			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
-				Side:   strategy.SideBuy,
 				Reason: "Counter Volume Spike",
 			}}
 		}
@@ -128,13 +137,30 @@ func (s *VolumeSpikeStrategy) Signals(symbol string, pos *client.Position) []*st
 
 	// Entry Logic
 	if isSpike && side != "" && s.lastSig[symbol] != side {
+		var sl, tp float64
+		if atr > 0 {
+			if side == strategy.SideBuy {
+				sl = currentClose - (atr * 2.0)
+				tp = currentClose + (atr * 4.0)
+			} else {
+				sl = currentClose + (atr * 2.0)
+				tp = currentClose - (atr * 4.0)
+			}
+		}
+
+		s.mu.Lock()
 		s.lastSig[symbol] = side
+		s.mu.Unlock()
+
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     side,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   fmt.Sprintf("Volume Spike %.1fx", currentVol/volMA),
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         side,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   tp,
+			Reason:       fmt.Sprintf("Volume Spike %.1fx", currentVol/volMA),
+			StrategyName: s.Name(),
 		}}
 	}
 

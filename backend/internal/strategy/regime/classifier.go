@@ -24,6 +24,7 @@ type Classifier struct {
 	highs  map[string][]float64 // timeframe -> history
 	lows   map[string][]float64
 	closes map[string][]float64
+	volumes map[string][]float64
 
 	// Cached values for 5m (primary timeframe)
 	tr  []float64 // True Range
@@ -47,6 +48,7 @@ func NewClassifier(adxPeriod, bbPeriod int, bbStdDev float64) *Classifier {
 		highs:        make(map[string][]float64),
 		lows:         make(map[string][]float64),
 		closes:       make(map[string][]float64),
+		volumes:      make(map[string][]float64),
 		tr:           make([]float64, 0),
 		pDM:          make([]float64, 0),
 		nDM:          make([]float64, 0),
@@ -58,16 +60,18 @@ func NewClassifier(adxPeriod, bbPeriod int, bbStdDev float64) *Classifier {
 
 
 // AddKline inserts a CLOSED kline into the classifier.
-func (c *Classifier) AddKline(timeframe string, high, low, closePrice float64) {
+func (c *Classifier) AddKline(timeframe string, high, low, closePrice, volume float64) {
 	if _, ok := c.closes[timeframe]; !ok {
 		c.highs[timeframe] = make([]float64, 0)
 		c.lows[timeframe] = make([]float64, 0)
 		c.closes[timeframe] = make([]float64, 0)
+		c.volumes[timeframe] = make([]float64, 0)
 	}
 
 	c.highs[timeframe] = append(c.highs[timeframe], high)
 	c.lows[timeframe] = append(c.lows[timeframe], low)
 	c.closes[timeframe] = append(c.closes[timeframe], closePrice)
+	c.volumes[timeframe] = append(c.volumes[timeframe], volume)
 
 	// Keep buffer sizing bounded
 	maxLen := 200
@@ -79,6 +83,7 @@ func (c *Classifier) AddKline(timeframe string, high, low, closePrice float64) {
 		c.highs[timeframe] = c.highs[timeframe][1:]
 		c.lows[timeframe] = c.lows[timeframe][1:]
 		c.closes[timeframe] = c.closes[timeframe][1:]
+		c.volumes[timeframe] = c.volumes[timeframe][1:]
 	}
 
 	if timeframe == "5m" {
@@ -378,6 +383,21 @@ func (c *Classifier) GetATR(tf string, period int) float64 {
 // GetCloses returns the historical close prices for a given timeframe.
 func (c *Classifier) GetCloses(tf string) []float64 {
 	return c.closes[tf]
+}
+
+// GetLows returns the historical low prices for a given timeframe.
+func (c *Classifier) GetLows(tf string) []float64 {
+	return c.lows[tf]
+}
+
+// GetHighs returns the historical high prices for a given timeframe.
+func (c *Classifier) GetHighs(tf string) []float64 {
+	return c.highs[tf]
+}
+
+// GetVolumes returns the historical volume for a given timeframe.
+func (c *Classifier) GetVolumes(tf string) []float64 {
+	return c.volumes[tf]
 }
 
 // SetFundingRate updates the current funding rate for this symbol.

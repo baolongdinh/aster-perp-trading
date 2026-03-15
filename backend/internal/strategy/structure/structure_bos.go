@@ -6,42 +6,38 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
 )
 
 type BOSConfig struct {
-	Enabled       bool
-	Symbols       []string
-	SwingPeriod   int
-	OrderSizeUSDT float64
-	Leverage      int
-	Timeframe     string
+	Enabled       bool     `yaml:"enabled"`
+	Symbols       []string `yaml:"symbols"`
+	SwingPeriod   int      `yaml:"swing_period"`
+	OrderSizeUSDT float64  `yaml:"order_size_usdt"`
+	Timeframe     string   `yaml:"timeframe"`
 }
 
 type BOSStrategy struct {
-	cfg     BOSConfig
-	log     *zap.Logger
-	enabled bool
-
-	mu    sync.RWMutex
-	highs map[string][]float64
-	lows  map[string][]float64
-
-	lastHH map[string]float64
-	lastLL map[string]float64
+	cfg         BOSConfig
+	log         *zap.Logger
+	enabled     bool
+	mu          sync.RWMutex
+	lastHH      map[string]float64
+	lastLL      map[string]float64
+	classifiers map[string]*regime.Classifier
 }
 
 func NewBOS(cfg BOSConfig, log *zap.Logger) *BOSStrategy {
 	return &BOSStrategy{
-		cfg:     cfg,
-		log:     log,
-		enabled: cfg.Enabled,
-		highs:   make(map[string][]float64),
-		lows:    make(map[string][]float64),
-		lastHH:  make(map[string]float64),
-		lastLL:  make(map[string]float64),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		lastHH:      make(map[string]float64),
+		lastLL:      make(map[string]float64),
+		classifiers: make(map[string]*regime.Classifier),
 	}
 }
 
@@ -50,13 +46,24 @@ func (s *BOSStrategy) Symbols() []string { return s.cfg.Symbols }
 func (s *BOSStrategy) IsEnabled() bool   { return s.enabled }
 func (s *BOSStrategy) SetEnabled(v bool) { s.enabled = v }
 
+func (s *BOSStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	s.mu.Lock()
+	s.classifiers[symbol] = c
+	s.mu.Unlock()
+}
+
 func (s *BOSStrategy) State(symbol string) string {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	cf, ok := s.classifiers[symbol]
 	hh := s.lastHH[symbol]
 	ll := s.lastLL[symbol]
-	highs := s.highs[symbol]
-	
+	s.mu.RUnlock()
+
+	if !ok || cf == nil {
+		return "warming up (no classifier)"
+	}
+
+	highs := cf.GetHighs(s.cfg.Timeframe)
 	req := s.cfg.SwingPeriod*2 + 1
 	if hh == 0 && ll == 0 {
 		return fmt.Sprintf("mapping structure (%d/%d bars)", len(highs), req)
@@ -65,51 +72,45 @@ func (s *BOSStrategy) State(symbol string) string {
 	return fmt.Sprintf("Range:[%.2f|%.2f] | %s", ll, hh, wait)
 }
 
-
 func (s *BOSStrategy) OnKline(k stream.WsKline) {
 	if !k.Kline.IsClosed || k.Kline.Interval != s.cfg.Timeframe {
 		return
 	}
 	sym := k.Symbol
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	cf, ok := s.classifiers[sym]
+	s.mu.Unlock()
 
-	s.highs[sym] = append(s.highs[sym], k.Kline.High)
-	s.lows[sym] = append(s.lows[sym], k.Kline.Low)
-
-	if len(s.highs[sym]) > 50 {
-		s.highs[sym] = s.highs[sym][1:]
-		s.lows[sym] = s.lows[sym][1:]
-	}
-
-	// Update Swing High/Low
-	if len(s.highs[sym]) < s.cfg.SwingPeriod*2+1 {
+	if !ok || cf == nil {
 		return
 	}
 
-	idx := len(s.highs[sym]) - 1 - s.cfg.SwingPeriod
+	highs := cf.GetHighs(s.cfg.Timeframe)
+	lows := cf.GetLows(s.cfg.Timeframe)
+
+	if len(highs) < s.cfg.SwingPeriod*2+1 {
+		return
+	}
+
+	idx := len(highs) - 1 - s.cfg.SwingPeriod
 	isSH := true
 	isSL := true
 	for i := idx - s.cfg.SwingPeriod; i <= idx+s.cfg.SwingPeriod; i++ {
-		if i == idx {
-			continue
-		}
-		if s.highs[sym][i] >= s.highs[sym][idx] {
-			isSH = false
-		}
-		if s.lows[sym][i] <= s.lows[sym][idx] {
-			isSL = false
-		}
+		if i == idx { continue }
+		if highs[i] >= highs[idx] { isSH = false }
+		if lows[i] <= lows[idx] { isSL = false }
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if isSH {
-		if s.highs[sym][idx] > s.lastHH[sym] {
-			s.lastHH[sym] = s.highs[sym][idx]
+		if highs[idx] > s.lastHH[sym] {
+			s.lastHH[sym] = highs[idx]
 		}
 	}
 	if isSL {
-		if s.lastLL[sym] == 0 || s.lows[sym][idx] < s.lastLL[sym] {
-			s.lastLL[sym] = s.lows[sym][idx]
+		if s.lastLL[sym] == 0 || lows[idx] < s.lastLL[sym] {
+			s.lastLL[sym] = lows[idx]
 		}
 	}
 }
@@ -122,32 +123,47 @@ func (s *BOSStrategy) Signals(symbol string, pos *client.Position) []*strategy.S
 	s.mu.RLock()
 	hh := s.lastHH[symbol]
 	ll := s.lastLL[symbol]
-	highs := s.highs[symbol]
+	cf, ok := s.classifiers[symbol]
 	s.mu.RUnlock()
 
-	if len(highs) == 0 || hh == 0 || ll == 0 {
+	if !ok || cf == nil || hh == 0 || ll == 0 {
 		return nil
 	}
 
-	lastClose := highs[len(highs)-1]
+	cl := cf.GetCloses(s.cfg.Timeframe)
+	if len(cl) == 0 { return nil }
+	lastClose := cl[len(cl)-1]
+	atr := cf.GetATR(s.cfg.Timeframe, 14)
 
 	if lastClose > hh {
+		sl := ll
+		if atr > 0 { sl -= (atr * 0.5) }
+		risk := lastClose - sl
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideBuy,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "Bullish BOS (Break of Swing High)",
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideBuy,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   lastClose + (risk * 2.0),
+			Reason:       "Bullish BOS (Break of Swing High)",
+			StrategyName: s.Name(),
 		}}
 	}
 
 	if lastClose < ll {
+		sl := hh
+		if atr > 0 { sl += (atr * 0.5) }
+		risk := sl - lastClose
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideSell,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "Bearish BOS (Break of Swing Low)",
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideSell,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   lastClose - (risk * 2.0),
+			Reason:       "Bearish BOS (Break of Swing Low)",
+			StrategyName: s.Name(),
 		}}
 	}
 

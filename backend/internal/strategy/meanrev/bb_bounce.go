@@ -7,38 +7,39 @@ import (
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
 	"aster-bot/internal/strategy/indicators"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
 )
 
 type BBBounceConfig struct {
-	Enabled       bool
-	Symbols       []string
-	Period        int
-	StdDev        float64
-	OrderSizeUSDT float64
-	Leverage      int
-	Timeframe     string
+	Enabled       bool     `yaml:"enabled"`
+	Symbols       []string `yaml:"symbols"`
+	Period        int      `yaml:"period"`
+	StdDev        float64  `yaml:"std_dev"`
+	OrderSizeUSDT float64  `yaml:"order_size_usdt"`
+	Timeframe     string   `yaml:"timeframe"`
 }
 
 type BBBounceStrategy struct {
-	cfg     BBBounceConfig
-	log     *zap.Logger
-	enabled bool
-
-	mu     sync.RWMutex
-	closes map[string][]float64
-	bb     *indicators.BBState
+	cfg         BBBounceConfig
+	log         *zap.Logger
+	enabled     bool
+	mu          sync.RWMutex
+	closes      map[string][]float64
+	bb          *indicators.BBState
+	classifiers map[string]*regime.Classifier
 }
 
 func NewBBBounce(cfg BBBounceConfig, log *zap.Logger) *BBBounceStrategy {
 	return &BBBounceStrategy{
-		cfg:     cfg,
-		log:     log,
-		enabled: cfg.Enabled,
-		closes:  make(map[string][]float64),
-		bb:      indicators.NewBBState(cfg.Period, cfg.StdDev),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		closes:      make(map[string][]float64),
+		bb:          indicators.NewBBState(cfg.Period, cfg.StdDev),
+		classifiers: make(map[string]*regime.Classifier),
 	}
 }
 
@@ -52,6 +53,12 @@ func (s *BBBounceStrategy) IsEnabled() bool {
 func (s *BBBounceStrategy) SetEnabled(v bool) {
 	s.mu.Lock()
 	s.enabled = v
+	s.mu.Unlock()
+}
+
+func (s *BBBounceStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	s.mu.Lock()
+	s.classifiers[symbol] = c
 	s.mu.Unlock()
 }
 
@@ -89,75 +96,85 @@ func (s *BBBounceStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 func (s *BBBounceStrategy) Signals(symbol string, pos *client.Position) []*strategy.Signal {
 	s.mu.RLock()
 	closes := s.closes[symbol]
+	cf, cfOk := s.classifiers[symbol]
 	s.mu.RUnlock()
 
 	if len(closes) < s.cfg.Period {
 		return nil
 	}
 
-	upper, _, lower := s.bb.Calculate(closes)
+	upper, mid, lower := s.bb.Calculate(closes)
 	last := closes[len(closes)-1]
 
-	// Exit Logic: Close when price fully reverts to the opposite band
+	// Exit Logic: Close when price reverts to the mean (Middle Band)
 	if pos != nil && pos.PositionAmt != 0 {
-		// Long opened at lower band → take profit at upper band
-		if pos.PositionAmt > 0 && last >= upper {
+		if pos.PositionAmt > 0 && last >= mid {
 			return []*strategy.Signal{{
 				Type:         strategy.SignalExit,
 				Symbol:       symbol,
 				Side:         strategy.SideSell,
-				Reason:       fmt.Sprintf("BB Full Reversion to Upper @ %.2f", upper),
+				Reason:       fmt.Sprintf("BB Mean Reversion to Mid @ %.2f", mid),
 				StrategyName: s.Name(),
 			}}
 		}
-		// Short opened at upper band → take profit at lower band
-		if pos.PositionAmt < 0 && last <= lower {
+		if pos.PositionAmt < 0 && last <= mid {
 			return []*strategy.Signal{{
 				Type:         strategy.SignalExit,
 				Symbol:       symbol,
 				Side:         strategy.SideBuy,
-				Reason:       fmt.Sprintf("BB Full Reversion to Lower @ %.2f", lower),
+				Reason:       fmt.Sprintf("BB Mean Reversion to Mid @ %.2f", mid),
 				StrategyName: s.Name(),
 			}}
 		}
 		return nil
 	}
 
+	atr := 0.0
+	if cfOk && cf != nil {
+		atr = cf.GetATR(s.cfg.Timeframe, 14)
+	}
+
 	var sigs []*strategy.Signal
 
-	// Proximity filter: only signal the CLOSER side IF price is within 1.5% of the band.
-	// Don't spread both nets at the same time — only near misses are valid setups.
 	bandRange := upper - lower
 	if bandRange <= 0 {
 		return nil
 	}
-	lowerProximity := (last - lower) / bandRange  // 0.0 = AT lower, 1.0 = AT upper
-	upperProximity := (upper - last) / bandRange  // 0.0 = AT upper, 1.0 = AT lower
+	lowerProximity := (last - lower) / bandRange 
+	upperProximity := (upper - last) / bandRange 
 
-	// Only post a buy limit if we are in the lower 40% of the band
 	if lowerProximity < 0.4 {
+		var sl float64
+		if atr > 0 {
+			sl = lower - (atr * 2.0)
+		}
 		sigs = append(sigs, &strategy.Signal{
 			Type:         strategy.SignalEnter,
 			Symbol:       symbol,
 			Side:         strategy.SideBuy,
-			Price:        fmt.Sprintf("%.2f", lower),
+			Price:        fmt.Sprintf("%.4f", lower),
 			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			TakeProfit:   upper,  // full mean reversion = TP
-			Reason:       fmt.Sprintf("BB Lower Limit @ %.2f (proximity: %.0f%%)", lower, lowerProximity*100),
+			StopLoss:     sl,
+			TakeProfit:   mid,
+			Reason:       fmt.Sprintf("BB Lower Bounce @ %.4f", lower),
 			StrategyName: s.Name(),
 		})
 	}
 
-	// Only post a sell limit if we are in the upper 40% of the band
 	if upperProximity < 0.4 {
+		var sl float64
+		if atr > 0 {
+			sl = upper + (atr * 2.0)
+		}
 		sigs = append(sigs, &strategy.Signal{
 			Type:         strategy.SignalEnter,
 			Symbol:       symbol,
 			Side:         strategy.SideSell,
-			Price:        fmt.Sprintf("%.2f", upper),
+			Price:        fmt.Sprintf("%.4f", upper),
 			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			TakeProfit:   lower,  // full mean reversion = TP
-			Reason:       fmt.Sprintf("BB Upper Limit @ %.2f (proximity: %.0f%%)", upper, upperProximity*100),
+			StopLoss:     sl,
+			TakeProfit:   mid,
+			Reason:       fmt.Sprintf("BB Upper Bounce @ %.4f", upper),
 			StrategyName: s.Name(),
 		})
 	}

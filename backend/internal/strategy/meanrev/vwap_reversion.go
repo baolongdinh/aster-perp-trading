@@ -7,38 +7,45 @@ import (
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
 	"aster-bot/internal/strategy/indicators"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
 )
 
 type VWAPReversionConfig struct {
-	Enabled       bool
-	Symbols       []string
-	DevThreshold  float64 // price deviation from VWAP in %
-	OrderSizeUSDT float64
-	Leverage      int
-	Timeframe     string
+	Enabled       bool     `yaml:"enabled"`
+	Symbols       []string `yaml:"symbols"`
+	DevThreshold  float64  `yaml:"dev_threshold_pct"` // price deviation from VWAP in %
+	OrderSizeUSDT float64  `yaml:"order_size_usdt"`
+	Timeframe     string   `yaml:"timeframe"`
 }
 
 type VWAPReversionStrategy struct {
-	cfg     VWAPReversionConfig
-	log     *zap.Logger
-	enabled bool
-
-	mu    sync.RWMutex
-	vwaps map[string]*indicators.VWAPState
-	lastPrice map[string]float64
+	cfg         VWAPReversionConfig
+	log         *zap.Logger
+	enabled     bool
+	mu          sync.RWMutex
+	vwaps       map[string]*indicators.VWAPState
+	lastPrice   map[string]float64
+	classifiers map[string]*regime.Classifier
 }
 
 func NewVWAPReversion(cfg VWAPReversionConfig, log *zap.Logger) *VWAPReversionStrategy {
 	return &VWAPReversionStrategy{
-		cfg:     cfg,
-		log:     log,
-		enabled: cfg.Enabled,
-		vwaps:   make(map[string]*indicators.VWAPState),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		vwaps:       make(map[string]*indicators.VWAPState),
 		lastPrice:   make(map[string]float64),
+		classifiers: make(map[string]*regime.Classifier),
 	}
+}
+
+func (s *VWAPReversionStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	s.mu.Lock()
+	s.classifiers[symbol] = c
+	s.mu.Unlock()
 }
 
 func (s *VWAPReversionStrategy) Name() string      { return "vwap_reversion" }
@@ -63,17 +70,14 @@ func (s *VWAPReversionStrategy) State(symbol string) string {
 	}
 	val := vwap.Value()
 	price := s.lastPrice[symbol]
+	if val == 0 { return "waiting for vwap" }
 	diff := (price - val) / val * 100
 	wait := fmt.Sprintf("Wait for Dev >= %.1f%% or <= -%.1f%%", s.cfg.DevThreshold, s.cfg.DevThreshold)
 	return fmt.Sprintf("VWAP:%.2f Price:%.2f Dev:%+.2f%% | %s", val, price, diff, wait)
 }
 
 func (s *VWAPReversionStrategy) OnKline(k stream.WsKline) {
-	if !k.Kline.IsClosed {
-		return
-	}
-	// Only care about our timeframe
-	if k.Kline.Interval != s.cfg.Timeframe {
+	if !k.Kline.IsClosed || k.Kline.Interval != s.cfg.Timeframe {
 		return
 	}
 	sym := k.Symbol
@@ -97,6 +101,7 @@ func (s *VWAPReversionStrategy) Signals(symbol string, pos *client.Position) []*
 	s.mu.RLock()
 	vwapState, ok := s.vwaps[symbol]
 	price := s.lastPrice[symbol]
+	cf, cfOk := s.classifiers[symbol]
 	s.mu.RUnlock()
 
 	if !ok || vwapState.Value() == 0 {
@@ -127,24 +132,43 @@ func (s *VWAPReversionStrategy) Signals(symbol string, pos *client.Position) []*
 		return nil
 	}
 
+	atr := 0.0
+	if cfOk && cf != nil {
+		atr = cf.GetATR(s.cfg.Timeframe, 14)
+	}
+
 	var sigs []*strategy.Signal
 
 	// Entry Logic
 	if deviation <= -s.cfg.DevThreshold {
+		var sl float64
+		if atr > 0 {
+			sl = price - (atr * 2.0)
+		}
 		sigs = append(sigs, &strategy.Signal{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideBuy,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   fmt.Sprintf("VWAP Oversold Dev: %.2f%%", deviation),
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideBuy,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   vwap,
+			Reason:       fmt.Sprintf("VWAP Oversold Dev: %.2f%%", deviation),
+			StrategyName: s.Name(),
 		})
 	} else if deviation >= s.cfg.DevThreshold {
+		var sl float64
+		if atr > 0 {
+			sl = price + (atr * 2.0)
+		}
 		sigs = append(sigs, &strategy.Signal{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideSell,
-			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   fmt.Sprintf("VWAP Overbought Dev: %.2f%%", deviation),
+			Type:         strategy.SignalEnter,
+			Symbol:       symbol,
+			Side:         strategy.SideSell,
+			Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+			StopLoss:     sl,
+			TakeProfit:   vwap,
+			Reason:       fmt.Sprintf("VWAP Overbought Dev: %.2f%%", deviation),
+			StrategyName: s.Name(),
 		})
 	}
 

@@ -6,6 +6,7 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
@@ -30,25 +31,34 @@ type EMACrossStrategy struct {
 	log     *zap.Logger
 	enabled bool
 
-	mu      sync.RWMutex
-	closes  map[string][]float64     // symbol -> recent close prices (ring buffer)
-	lastSig map[string]strategy.Side // last signal per symbol to avoid re-entry
+	mu          sync.RWMutex
+	closes      map[string][]float64     // symbol -> recent close prices (ring buffer)
+	lastSig     map[string]strategy.Side // last signal per symbol to avoid re-entry
+	classifiers map[string]*regime.Classifier
 }
 
 // NewEMACross creates a new EMA cross strategy.
 func NewEMACross(cfg EMACrossConfig, log *zap.Logger) *EMACrossStrategy {
 	s := &EMACrossStrategy{
-		cfg:     cfg,
-		log:     log,
-		enabled: cfg.Enabled,
-		closes:  make(map[string][]float64),
-		lastSig: make(map[string]strategy.Side),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		closes:      make(map[string][]float64),
+		lastSig:     make(map[string]strategy.Side),
+		classifiers: make(map[string]*regime.Classifier),
 	}
 	// Pre-allocate buffers
 	for _, sym := range cfg.Symbols {
 		s.closes[sym] = make([]float64, 0, cfg.SlowPeriod*2)
 	}
 	return s
+}
+
+// SetClassifier sets the regime classifier for the strategy for a specific symbol.
+func (e *EMACrossStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	e.mu.Lock()
+	e.classifiers[symbol] = c
+	e.mu.Unlock()
 }
 
 func (e *EMACrossStrategy) Name() string      { return "ema_cross" }
@@ -181,56 +191,106 @@ func (e *EMACrossStrategy) Signals(symbol string, currentPos *client.Position) [
 	// New entry
 	if crossUp && lastSig != strategy.SideBuy {
 		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
+		
+		// Option A: Strategy-specific SL/TP
+		var sl, tp float64
+		e.mu.RLock()
+		if cf, ok := e.classifiers[symbol]; ok && cf != nil {
+			atr := cf.GetATR(e.cfg.Timeframe, 14)
+			if atr > 0 {
+				sl = fastNow - (atr * 2.0)
+				tp = fastNow + (atr * 4.0) // 1:2 RR
+			}
+		}
+		e.mu.RUnlock()
+
 		e.mu.Lock()
 		e.lastSig[symbol] = strategy.SideBuy
 		e.mu.Unlock()
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideBuy,
-			Quantity: qty,
-			Reason:   fmt.Sprintf("ema_cross_long fast=%.4f slow=%.4f", fastNow, slowNow),
+			Type:       strategy.SignalEnter,
+			Symbol:     symbol,
+			Side:       strategy.SideBuy,
+			Quantity:   qty,
+			StopLoss:   sl,
+			TakeProfit: tp,
+			Reason:     fmt.Sprintf("ema_cross_long fast=%.4f slow=%.4f", fastNow, slowNow),
 		}}
 	}
 
 	if crossDown && lastSig != strategy.SideSell {
 		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
+		
+		// Option A: Strategy-specific SL/TP
+		var sl, tp float64
+		e.mu.RLock()
+		if cf, ok := e.classifiers[symbol]; ok && cf != nil {
+			atr := cf.GetATR(e.cfg.Timeframe, 14)
+			if atr > 0 {
+				sl = fastNow + (atr * 2.0)
+				tp = fastNow - (atr * 4.0) // 1:2 RR
+			}
+		}
+		e.mu.RUnlock()
+
 		e.mu.Lock()
 		e.lastSig[symbol] = strategy.SideSell
 		e.mu.Unlock()
 		return []*strategy.Signal{{
-			Type:     strategy.SignalEnter,
-			Symbol:   symbol,
-			Side:     strategy.SideSell,
-			Quantity: qty,
-			Reason:   fmt.Sprintf("ema_cross_short fast=%.4f slow=%.4f", fastNow, slowNow),
+			Type:       strategy.SignalEnter,
+			Symbol:     symbol,
+			Side:       strategy.SideSell,
+			Quantity:   qty,
+			StopLoss:   sl,
+			TakeProfit: tp,
+			Reason:     fmt.Sprintf("ema_cross_short fast=%.4f slow=%.4f", fastNow, slowNow),
 		}}
 	}
 
 	// PHASE 5: Join Trend on Start
 	if e.cfg.JoinTrend && lastSig == "" && (currentPos == nil || currentPos.PositionAmt == 0) {
 		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
+		var sl, tp float64
+		e.mu.RLock()
+		if cf, ok := e.classifiers[symbol]; ok && cf != nil {
+			atr := cf.GetATR(e.cfg.Timeframe, 14)
+			if atr > 0 {
+				if fastNow > slowNow {
+					sl = fastNow - (atr * 2.0)
+					tp = fastNow + (atr * 4.0)
+				} else {
+					sl = fastNow + (atr * 2.0)
+					tp = fastNow - (atr * 4.0)
+				}
+			}
+		}
+		e.mu.RUnlock()
+
 		if fastNow > slowNow {
 			e.mu.Lock()
 			e.lastSig[symbol] = strategy.SideBuy
 			e.mu.Unlock()
 			return []*strategy.Signal{{
-				Type:     strategy.SignalEnter,
-				Symbol:   symbol,
-				Side:     strategy.SideBuy,
-				Quantity: qty,
-				Reason:   fmt.Sprintf("ema_join_long (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
+				Type:       strategy.SignalEnter,
+				Symbol:     symbol,
+				Side:       strategy.SideBuy,
+				Quantity:   qty,
+				StopLoss:   sl,
+				TakeProfit: tp,
+				Reason:     fmt.Sprintf("ema_join_long (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
 			}}
 		} else if fastNow < slowNow {
 			e.mu.Lock()
 			e.lastSig[symbol] = strategy.SideSell
 			e.mu.Unlock()
 			return []*strategy.Signal{{
-				Type:     strategy.SignalEnter,
-				Symbol:   symbol,
-				Side:     strategy.SideSell,
-				Quantity: qty,
-				Reason:   fmt.Sprintf("ema_join_short (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
+				Type:       strategy.SignalEnter,
+				Symbol:     symbol,
+				Side:       strategy.SideSell,
+				Quantity:   qty,
+				StopLoss:   sl,
+				TakeProfit: tp,
+				Reason:     fmt.Sprintf("ema_join_short (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
 			}}
 		}
 	}

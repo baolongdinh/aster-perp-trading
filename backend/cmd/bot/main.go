@@ -170,7 +170,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			emaCfg := trend.EMACrossConfig{
 				FastPeriod:    intParam(sc.Params, "fast_period", 9),
 				SlowPeriod:    intParam(sc.Params, "slow_period", 21),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Timeframe:     stringParam(sc.Params, "timeframe", "5m"),
 				Symbols:       sc.Symbols,
@@ -191,7 +190,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				RsiPeriod:     intParam(sc.Params, "rsi_period", 14),
 				Overbought:    floatParam(sc.Params, "overbought", 70.0),
 				Oversold:      floatParam(sc.Params, "oversold", 30.0),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
 				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
 				Symbols:       sc.Symbols,
@@ -210,7 +208,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			vCfg := meanrev.VWAPReversionConfig{
 				DevThreshold:  floatParam(sc.Params, "dev_threshold_pct", 0.5),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
@@ -229,7 +226,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				Period:        intParam(sc.Params, "period", 20),
 				StdDev:        floatParam(sc.Params, "std_dev", 2.0),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
@@ -248,7 +244,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				Lookback:      intParam(sc.Params, "lookback", 50),
 				BouncePct:     floatParam(sc.Params, "bounce_pct", 0.1),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
@@ -268,7 +263,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				BreakoutVolumeMult:   floatParam(sc.Params, "breakout_vol_mult", 2.0),
 				RetestTolerancePct:   floatParam(sc.Params, "retest_tolerance_pct", 0.1),
 				OrderSizeUSDT:        floatParam(sc.Params, "order_size_usdt", 50),
-				Leverage:             intParam(sc.Params, "leverage", 5),
 				Symbols:              sc.Symbols,
 				Enabled:              sc.Enabled,
 				Timeframe:            stringParam(sc.Params, "timeframe", "1h"),
@@ -289,7 +283,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				FlagMaxRetracePct: floatParam(sc.Params, "flag_max_retrace_pct", 38.2),
 				FlagCandles:       intParam(sc.Params, "flag_candles", 10),
 				OrderSizeUSDT:     floatParam(sc.Params, "order_size_usdt", 50),
-				Leverage:          intParam(sc.Params, "leverage", 5),
 				Symbols:           sc.Symbols,
 				Enabled:           sc.Enabled,
 				Timeframe:         stringParam(sc.Params, "timeframe", "1h"),
@@ -307,7 +300,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			shCfg := trend.TrailingSHConfig{
 				SwingPeriod:   intParam(sc.Params, "swing_period", 5),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
@@ -326,7 +318,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				ROCPeriod:     intParam(sc.Params, "roc_period", 10),
 				ROCThreshold:  floatParam(sc.Params, "roc_threshold", 1.0),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
@@ -343,7 +334,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 		case "orb":
 			orbCfg := momentum.ORBConfig{
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
@@ -378,7 +368,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			bosCfg := structure.BOSConfig{
 				SwingPeriod:   intParam(sc.Params, "swing_period", 5),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
@@ -397,7 +386,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				Lookback:      intParam(sc.Params, "lookback", 50),
 				TolerancePct:  floatParam(sc.Params, "tolerance_pct", 0.05),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
@@ -415,7 +403,6 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 			fvgCfg := structure.FVGConfig{
 				MinGapPct:     floatParam(sc.Params, "min_gap_pct", 0.1),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 100),
-				Leverage:      intParam(sc.Params, "leverage", 5),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
 				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),

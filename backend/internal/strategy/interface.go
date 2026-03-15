@@ -3,6 +3,7 @@ package strategy
 
 import (
 	"aster-bot/internal/client"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 )
 
@@ -68,6 +69,9 @@ type Strategy interface {
 
 	// SetEnabled sets the enabled state.
 	SetEnabled(bool)
+
+	// SetClassifier gives the strategy access to market regime context for a specific symbol.
+	SetClassifier(symbol string, c *regime.Classifier)
 }
 
 // MarketContextReceiver allows a strategy to receive external market metrics.

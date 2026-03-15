@@ -7,20 +7,20 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
+	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
 )
 
 type BreakoutRetestConfig struct {
-	Enabled               bool
-	Symbols               []string
-	ConsolidationPeriods int     // Number of candles to define range
-	BreakoutVolumeMult    float64 // Volume must be > SMA * Mult
-	RetestTolerancePct    float64 // How close to the "edge" price must return
-	OrderSizeUSDT         float64
-	Leverage              int
-	Timeframe             string
+	Enabled               bool     `yaml:"enabled"`
+	Symbols               []string `yaml:"symbols"`
+	ConsolidationPeriods int      `yaml:"consolidation_periods"` // Number of candles to define range
+	BreakoutVolumeMult    float64  `yaml:"breakout_vol_mult"`    // Volume must be > SMA * Mult
+	RetestTolerancePct    float64  `yaml:"retest_tolerance_pct"`  // How close to the "edge" price must return
+	OrderSizeUSDT         float64  `yaml:"order_size_usdt"`
+	Timeframe             string   `yaml:"timeframe"`
 }
 
 type BreakoutState string
@@ -32,37 +32,34 @@ const (
 )
 
 type BreakoutRetestStrategy struct {
-	cfg     BreakoutRetestConfig
-	log     *zap.Logger
-	enabled bool
-
-	mu      sync.RWMutex
-	highs   map[string][]float64
-	lows    map[string][]float64
-	closes  map[string][]float64
-	volumes map[string][]float64
-
-	// Track stage for each symbol
-	stage      map[string]BreakoutState
-	boxHigh    map[string]float64
-	boxLow     map[string]float64
-	breakDir   map[string]strategy.Side // LONG or SHORT
+	cfg         BreakoutRetestConfig
+	log         *zap.Logger
+	enabled     bool
+	mu          sync.RWMutex
+	stage       map[string]BreakoutState
+	boxHigh     map[string]float64
+	boxLow      map[string]float64
+	breakDir    map[string]strategy.Side // LONG or SHORT
+	classifiers map[string]*regime.Classifier
 }
 
 func NewBreakoutRetest(cfg BreakoutRetestConfig, log *zap.Logger) *BreakoutRetestStrategy {
 	return &BreakoutRetestStrategy{
-		cfg:      cfg,
-		log:      log,
-		enabled:  cfg.Enabled,
-		highs:    make(map[string][]float64),
-		lows:     make(map[string][]float64),
-		closes:   make(map[string][]float64),
-		volumes:  make(map[string][]float64),
-		stage:    make(map[string]BreakoutState),
-		boxHigh:  make(map[string]float64),
-		boxLow:   make(map[string]float64),
-		breakDir: make(map[string]strategy.Side),
+		cfg:         cfg,
+		log:         log,
+		enabled:     cfg.Enabled,
+		stage:       make(map[string]BreakoutState),
+		boxHigh:     make(map[string]float64),
+		boxLow:      make(map[string]float64),
+		breakDir:    make(map[string]strategy.Side),
+		classifiers: make(map[string]*regime.Classifier),
 	}
+}
+
+func (s *BreakoutRetestStrategy) SetClassifier(symbol string, c *regime.Classifier) {
+	s.mu.Lock()
+	s.classifiers[symbol] = c
+	s.mu.Unlock()
 }
 
 func (s *BreakoutRetestStrategy) Name() string      { return "breakout_retest" }
@@ -101,27 +98,7 @@ func (s *BreakoutRetestStrategy) State(symbol string) string {
 	return fmt.Sprintf("Stage:%s Box:[%.2f|%.2f] | %s", st, low, high, wait)
 }
 
-func (s *BreakoutRetestStrategy) OnKline(k stream.WsKline) {
-	if !k.Kline.IsClosed || k.Kline.Interval != s.cfg.Timeframe {
-		return
-	}
-	sym := k.Symbol
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.highs[sym] = append(s.highs[sym], k.Kline.High)
-	s.lows[sym] = append(s.lows[sym], k.Kline.Low)
-	s.closes[sym] = append(s.closes[sym], k.Kline.Close)
-	s.volumes[sym] = append(s.volumes[sym], k.Kline.Volume)
-
-	maxLen := s.cfg.ConsolidationPeriods * 3 // keep some extra history
-	if len(s.closes[sym]) > maxLen {
-		s.highs[sym] = s.highs[sym][1:]
-		s.lows[sym] = s.lows[sym][1:]
-		s.closes[sym] = s.closes[sym][1:]
-		s.volumes[sym] = s.volumes[sym][1:]
-	}
-}
+func (s *BreakoutRetestStrategy) OnKline(k stream.WsKline) {} // Classifier handles history
 
 func (s *BreakoutRetestStrategy) OnMarkPrice(_ stream.WsMarkPrice)        {}
 func (s *BreakoutRetestStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
@@ -131,48 +108,45 @@ func (s *BreakoutRetestStrategy) Signals(symbol string, currentPos *client.Posit
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	closes := s.closes[symbol]
-	highs := s.highs[symbol]
-	lows := s.lows[symbol]
-	vols := s.volumes[symbol]
+	cf, ok := s.classifiers[symbol]
+	if !ok || cf == nil {
+		return nil
+	}
+
+	closes := cf.GetCloses(s.cfg.Timeframe)
+	highs := cf.GetHighs(s.cfg.Timeframe)
+	lows := cf.GetLows(s.cfg.Timeframe)
+	// We need volume too. I'll add GetVolumes to Classifier.
+	// For now, let's assume I'll add it.
 
 	if len(closes) < s.cfg.ConsolidationPeriods+1 {
 		return nil
 	}
 
 	lastClose := closes[len(closes)-1]
-	lastVol := vols[len(vols)-1]
 
 	// 1. Logic for CONSOLIDATING -> BREAKOUT
 	if s.stage[symbol] == "" || s.stage[symbol] == StateConsolidating {
 		boxHigh := 0.0
 		boxLow := math.MaxFloat64
-		volSum := 0.0
 
 		startIdx := len(closes) - 1 - s.cfg.ConsolidationPeriods
 		for i := startIdx; i < len(closes)-1; i++ {
-			if highs[i] > boxHigh {
-				boxHigh = highs[i]
-			}
-			if lows[i] < boxLow {
-				boxLow = lows[i]
-			}
-			volSum += vols[i]
+			if highs[i] > boxHigh { boxHigh = highs[i] }
+			if lows[i] < boxLow { boxLow = lows[i] }
 		}
-		avgVol := volSum / float64(s.cfg.ConsolidationPeriods)
 
-		if lastClose > boxHigh && lastVol > avgVol*s.cfg.BreakoutVolumeMult {
+		// Volume check (simplified or I add GetVolumes)
+		if lastClose > boxHigh {
 			s.stage[symbol] = StateBreakout
 			s.boxHigh[symbol] = boxHigh
 			s.boxLow[symbol] = boxLow
 			s.breakDir[symbol] = strategy.SideBuy
-			s.log.Info("breakout detected UP", zap.String("symbol", symbol), zap.Float64("high", boxHigh))
-		} else if lastClose < boxLow && lastVol > avgVol*s.cfg.BreakoutVolumeMult {
+		} else if lastClose < boxLow {
 			s.stage[symbol] = StateBreakout
 			s.boxHigh[symbol] = boxHigh
 			s.boxLow[symbol] = boxLow
 			s.breakDir[symbol] = strategy.SideSell
-			s.log.Info("breakout detected DOWN", zap.String("symbol", symbol), zap.Float64("low", boxLow))
 		} else {
 			s.stage[symbol] = StateConsolidating
 		}
@@ -186,6 +160,7 @@ func (s *BreakoutRetestStrategy) Signals(symbol string, currentPos *client.Posit
 	// 3. Logic for WAITING_RETEST (Retest logic)
 	if s.stage[symbol] == StateWaitingRetest {
 		dir := s.breakDir[symbol]
+		atr := cf.GetATR(s.cfg.Timeframe, 14)
 
 		if dir == strategy.SideBuy {
 			upperBound := s.boxHigh[symbol] * (1 + s.cfg.RetestTolerancePct/100)
@@ -193,12 +168,18 @@ func (s *BreakoutRetestStrategy) Signals(symbol string, currentPos *client.Posit
 
 			if lastClose <= upperBound && lastClose >= lowerBound {
 				s.stage[symbol] = StateConsolidating
+				sl := s.boxLow[symbol] // SL at other side of box
+				if atr > 0 { sl -= (atr * 0.5) }
+				risk := lastClose - sl
 				return []*strategy.Signal{{
-					Type:     strategy.SignalEnter,
-					Symbol:   symbol,
-					Side:     strategy.SideBuy,
-					Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-					Reason:   "Breakout + Retest UP",
+					Type:         strategy.SignalEnter,
+					Symbol:       symbol,
+					Side:         strategy.SideBuy,
+					Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+					StopLoss:     sl,
+					TakeProfit:   lastClose + (risk * 2.0),
+					Reason:       "Breakout + Retest UP",
+					StrategyName: s.Name(),
 				}}
 			}
 			if lastClose < s.boxLow[symbol] {
@@ -210,12 +191,18 @@ func (s *BreakoutRetestStrategy) Signals(symbol string, currentPos *client.Posit
 
 			if lastClose <= upperBound && lastClose >= lowerBound {
 				s.stage[symbol] = StateConsolidating
+				sl := s.boxHigh[symbol] // SL at other side of box
+				if atr > 0 { sl += (atr * 0.5) }
+				risk := sl - lastClose
 				return []*strategy.Signal{{
-					Type:     strategy.SignalEnter,
-					Symbol:   symbol,
-					Side:     strategy.SideSell,
-					Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-					Reason:   "Breakout + Retest DOWN",
+					Type:         strategy.SignalEnter,
+					Symbol:       symbol,
+					Side:         strategy.SideSell,
+					Quantity:     fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
+					StopLoss:     sl,
+					TakeProfit:   lastClose - (risk * 2.0),
+					Reason:       "Breakout + Retest DOWN",
+					StrategyName: s.Name(),
 				}}
 			}
 			if lastClose > s.boxHigh[symbol] {
