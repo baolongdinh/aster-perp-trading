@@ -324,13 +324,14 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 			return
 		}
 
-		sl := 0.0
-		if sig.StopLoss > 0 {
-			// Round SL/TP prices too
-			sl = sig.StopLoss
+		// --- Derive SL/TP from RiskManager if strategy didn't set them ---
+		sl := sig.StopLoss
+		tp := sig.TakeProfit
+		if sl == 0 {
+			sl = e.risk.StopLossPrice(lastPrice, string(sig.Side))
 		}
 
-		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, sig.TakeProfit, sig.StrategyName); err != nil {
+		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, tp, sig.StrategyName); err != nil {
 			e.log.Error("place entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
 			return
 		}
@@ -411,14 +412,14 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal) {
 // If a signal for a symbol/side/price is no longer there, pull the order.
 func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*strategy.Signal) {
 	openOrders := e.orders.GetAll()
-	
-	// Create a map of "Active Signal Signatures" to see what should remain
+
+	// Build a set of "active signal keys" using exchange-rounded prices for exact match
 	activeSigs := make(map[string]bool)
 	for _, s := range latestSignals {
 		if s.Type == strategy.SignalEnter && s.Price != "" {
-			// Price rounding here to match order price
+			// Round to exchange precision to match stored order price
 			rounded := e.prec.RoundPrice(s.Symbol, parseFloat(s.Price))
-			key := fmt.Sprintf("%s|%s|%s", s.Symbol, s.Side, rounded)
+			key := fmt.Sprintf("%s|%s|%s", s.Symbol, string(s.Side), rounded)
 			activeSigs[key] = true
 		}
 	}
@@ -431,22 +432,24 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 			continue
 		}
 
-		orderPriceStr := strconv.FormatFloat(lo.Price, 'f', -1, 64)
-		key := fmt.Sprintf("%s|%s|%s", lo.Symbol, lo.Side, orderPriceStr)
+		// Use same rounded representation to ensure key matches
+		orderPriceStr := e.prec.RoundPrice(lo.Symbol, lo.Price)
+		key := fmt.Sprintf("%s|%s|%s", lo.Symbol, string(lo.Side), orderPriceStr)
 
 		if !activeSigs[key] {
-			e.log.Info("IQ-GC: Pulling invalid limit order (no longer signaled)",
+			e.log.Info("IQ-GC: Pulling stale limit order",
 				zap.String("symbol", lo.Symbol),
 				zap.Float64("price", lo.Price),
-				zap.String("id", lo.ClientOrderID),
+				zap.String("strategy", lo.StrategyName),
 			)
-			e.futures.CancelOrder(ctx, client.CancelOrderRequest{
+			_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
 				Symbol:        lo.Symbol,
 				ClientOrderID: lo.ClientOrderID,
 			})
-			// RiskManager will be updated via WebSocket order update eventually, 
-			// but we can release pending here too if we want immediate capacity.
-			e.risk.RemovePending(lo.Symbol, lo.Price*lo.OrigQty)
+			if cancelErr == nil {
+				// Only release pending exposure after confirmed cancel
+				e.risk.RemovePending(lo.Symbol, lo.Price*lo.OrigQty)
+			}
 		}
 	}
 }
