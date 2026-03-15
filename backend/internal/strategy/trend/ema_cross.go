@@ -20,6 +20,7 @@ type EMACrossConfig struct {
 	Timeframe     string // e.g. "5m"
 	Symbols       []string
 	Enabled       bool
+	JoinTrend     bool // If true, enter an existing trend on bot start
 }
 
 // EMACrossStrategy enters LONG when fast EMA crosses above slow EMA,
@@ -30,8 +31,8 @@ type EMACrossStrategy struct {
 	enabled bool
 
 	mu      sync.RWMutex
-	closes  map[string][]float64 // symbol -> recent close prices (ring buffer)
-	lastSig map[string]strategy.Side      // last signal per symbol to avoid re-entry
+	closes  map[string][]float64     // symbol -> recent close prices (ring buffer)
+	lastSig map[string]strategy.Side // last signal per symbol to avoid re-entry
 }
 
 // NewEMACross creates a new EMA cross strategy.
@@ -205,6 +206,35 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 		}
 	}
 
+	// PHASE 5: Join Trend on Start
+	// If we haven't given a signal yet and JoinTrend is enabled, enter if trend is established
+	if e.cfg.JoinTrend && lastSig == "" && (currentPos == nil || currentPos.PositionAmt == 0) {
+		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
+		if fastNow > slowNow {
+			e.mu.Lock()
+			e.lastSig[symbol] = strategy.SideBuy
+			e.mu.Unlock()
+			return &strategy.Signal{
+				Type:     strategy.SignalEnter,
+				Symbol:   symbol,
+				Side:     strategy.SideBuy,
+				Quantity: qty,
+				Reason:   fmt.Sprintf("ema_join_long (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
+			}
+		} else if fastNow < slowNow {
+			e.mu.Lock()
+			e.lastSig[symbol] = strategy.SideSell
+			e.mu.Unlock()
+			return &strategy.Signal{
+				Type:     strategy.SignalEnter,
+				Symbol:   symbol,
+				Side:     strategy.SideSell,
+				Quantity: qty,
+				Reason:   fmt.Sprintf("ema_join_short (established trend) fast=%.4f slow=%.4f", fastNow, slowNow),
+			}
+		}
+	}
+
 	// No entry/exit signal, log result for user transparency
 	e.log.Info("strategy evaluation",
 		zap.String("strategy", e.Name()),
@@ -214,7 +244,6 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *s
 
 	return &strategy.Signal{Type: strategy.SignalNone}
 }
-
 
 // ema calculates the Exponential Moving Average of the last n values in data.
 func ema(data []float64, n int) float64 {

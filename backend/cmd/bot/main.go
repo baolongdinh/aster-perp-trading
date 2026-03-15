@@ -164,6 +164,7 @@ func buildStrategies(cfg *config.Config, riskMgr *risk.Manager, log *zap.Logger)
 				Timeframe:     stringParam(sc.Params, "timeframe", "5m"),
 				Symbols:       sc.Symbols,
 				Enabled:       sc.Enabled,
+				JoinTrend:     boolParam(sc.Params, "join_trend", false),
 			}
 			activeSubs = append(activeSubs, trend.NewEMACross(emaCfg, log))
 			if sc.Enabled {
@@ -535,6 +536,16 @@ func stringParam(params map[string]interface{}, key string, def string) string {
 	}
 	if s, ok := v.(string); ok {
 		return s
+	}
+	return def
+}
+func boolParam(params map[string]interface{}, key string, def bool) bool {
+	v, ok := params[key]
+	if !ok {
+		return def
+	}
+	if b, ok := v.(bool); ok {
+		return b
 	}
 	return def
 }

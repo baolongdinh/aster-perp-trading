@@ -2,6 +2,7 @@ package meanrev
 
 import (
 	"fmt"
+	"sync"
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/strategy"
@@ -26,6 +27,10 @@ type RSIDivergenceStrategy struct {
 	cfg RSIDivergenceConfig
 	log *zap.Logger
 	rsi map[string]*indicators.RSIState
+
+	// Market context for dynamic adjustments
+	muCtx sync.RWMutex
+	adx   map[string]float64
 }
 
 func NewRSIDivergence(cfg RSIDivergenceConfig, log *zap.Logger) *RSIDivergenceStrategy {
@@ -33,13 +38,30 @@ func NewRSIDivergence(cfg RSIDivergenceConfig, log *zap.Logger) *RSIDivergenceSt
 		cfg: cfg,
 		log: log,
 		rsi: make(map[string]*indicators.RSIState),
+		adx: make(map[string]float64),
 	}
 }
 
-func (s *RSIDivergenceStrategy) Name() string        { return "rsi_divergence" }
-func (s *RSIDivergenceStrategy) Symbols() []string   { return s.cfg.Symbols }
-func (s *RSIDivergenceStrategy) IsEnabled() bool     { return s.cfg.Enabled }
-func (s *RSIDivergenceStrategy) SetEnabled(v bool)   { s.cfg.Enabled = v }
+func (s *RSIDivergenceStrategy) Name() string      { return "rsi_divergence" }
+func (s *RSIDivergenceStrategy) Symbols() []string { return s.cfg.Symbols }
+func (s *RSIDivergenceStrategy) IsEnabled() bool   { return s.cfg.Enabled }
+func (s *RSIDivergenceStrategy) SetEnabled(v bool) { s.cfg.Enabled = v }
+
+func (s *RSIDivergenceStrategy) getThresholds(symbol string) (float64, float64) {
+	s.muCtx.RLock()
+	adx := s.adx[symbol]
+	s.muCtx.RUnlock()
+
+	oversold := s.cfg.Oversold
+	overbought := s.cfg.Overbought
+
+	// Dynamic Thresholds: If ADX < 15 (quiet market), widen the entry criteria to 35/65
+	if adx > 0 && adx < 15.0 {
+		oversold = 35.0
+		overbought = 65.0
+	}
+	return oversold, overbought
+}
 
 func (s *RSIDivergenceStrategy) State(symbol string) string {
 	rsiState, ok := s.rsi[symbol]
@@ -47,13 +69,28 @@ func (s *RSIDivergenceStrategy) State(symbol string) string {
 		return "waiting for data"
 	}
 	val := rsiState.Value()
-	wait := fmt.Sprintf("Wait for RSI <= %.0f or >= %.0f", s.cfg.Oversold, s.cfg.Overbought)
-	return fmt.Sprintf("RSI: %.2f | %s", val, wait)
+	oversold, overbought := s.getThresholds(symbol)
+
+	s.muCtx.RLock()
+	adx := s.adx[symbol]
+	s.muCtx.RUnlock()
+
+	ctxStr := ""
+	if adx > 0 && adx < 15.0 {
+		ctxStr = fmt.Sprintf(" | LowVol (ADX:%.1f) dynamic thresholds enabled", adx)
+	}
+
+	wait := fmt.Sprintf("Wait for RSI <= %.0f or >= %.0f", oversold, overbought)
+	return fmt.Sprintf("RSI: %.2f | %s%s", val, wait, ctxStr)
 }
 
 func (s *RSIDivergenceStrategy) OnKline(k stream.WsKline) {
 	if !k.Kline.IsClosed {
 		return // only feed closed candles to RSI
+	}
+	// Only care about our timeframe
+	if k.Kline.Interval != s.cfg.Timeframe {
+		return
 	}
 	sym := k.Symbol
 	if _, ok := s.rsi[sym]; !ok {
@@ -62,9 +99,15 @@ func (s *RSIDivergenceStrategy) OnKline(k stream.WsKline) {
 	s.rsi[sym].Add(k.Kline.Close)
 }
 
-func (s *RSIDivergenceStrategy) OnMarkPrice(mp stream.WsMarkPrice)     {}
-func (s *RSIDivergenceStrategy) OnOrderUpdate(u stream.WsOrderUpdate)  {}
+func (s *RSIDivergenceStrategy) OnMarkPrice(mp stream.WsMarkPrice)        {}
+func (s *RSIDivergenceStrategy) OnOrderUpdate(u stream.WsOrderUpdate)     {}
 func (s *RSIDivergenceStrategy) OnAccountUpdate(u stream.WsAccountUpdate) {}
+
+func (s *RSIDivergenceStrategy) SetMarketContext(symbol string, adx float64) {
+	s.muCtx.Lock()
+	defer s.muCtx.Unlock()
+	s.adx[symbol] = adx
+}
 
 func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *strategy.Signal {
 	rsiState, ok := s.rsi[symbol]
@@ -94,23 +137,35 @@ func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *str
 		return &strategy.Signal{Type: strategy.SignalNone}
 	}
 
-	// Entry Logic (Mean Reversion assumes chopping market)
-	if val <= s.cfg.Oversold {
+	oversold, overbought := s.getThresholds(symbol)
+
+	if val <= oversold {
 		return &strategy.Signal{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideBuy,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "RSI Oversold Bounce",
+			Reason:   fmt.Sprintf("RSI Oversold Bounce (%.2f <= %.0f)", val, oversold),
 		}
-	} else if val >= s.cfg.Overbought {
+	} else if val >= overbought {
 		return &strategy.Signal{
 			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
 			Side:     strategy.SideSell,
 			Quantity: fmt.Sprintf("%.4f", s.cfg.OrderSizeUSDT),
-			Reason:   "RSI Overbought Drop",
+			Reason:   fmt.Sprintf("RSI Overbought Drop (%.2f >= %.0f)", val, overbought),
 		}
+	}
+
+	// Transparency: Log why we didn't Enter if we are getting close (within 5 points)
+	if val <= oversold+5.0 || val >= overbought-5.0 {
+		s.log.Info("strategy evaluation (near boundary)",
+			zap.String("strategy", s.Name()),
+			zap.String("symbol", symbol),
+			zap.Float64("rsi", val),
+			zap.Float64("oversold", oversold),
+			zap.Float64("overbought", overbought),
+		)
 	}
 
 	// No signal, log the reason/state for user transparency
@@ -122,8 +177,6 @@ func (s *RSIDivergenceStrategy) Signal(symbol string, pos *client.Position) *str
 
 	return &strategy.Signal{Type: strategy.SignalNone}
 }
-
-
 
 func formatFloat(f float64) string {
 	return fmt.Sprintf("%.2f", f)

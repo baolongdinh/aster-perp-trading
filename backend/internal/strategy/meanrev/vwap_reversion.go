@@ -72,6 +72,10 @@ func (s *VWAPReversionStrategy) OnKline(k stream.WsKline) {
 	if !k.Kline.IsClosed {
 		return
 	}
+	// Only care about our timeframe
+	if k.Kline.Interval != s.cfg.Timeframe {
+		return
+	}
 	sym := k.Symbol
 	s.mu.Lock()
 	defer s.mu.Unlock()

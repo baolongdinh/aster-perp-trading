@@ -162,10 +162,7 @@ func (r *Router) OnKline(k stream.WsKline) {
 		r.getClassifier(k.Symbol).AddKline(k.Kline.Interval, k.Kline.High, k.Kline.Low, k.Kline.Close)
 	}
 
-	// Strategies typically trade on 5m
-	if k.Kline.Interval != "5m" {
-		return
-	}
+	// Forward all intervals to sub-strategies (they will filter internally)
 
 	for _, sName := range r.activeSubs {
 		strat, ok := r.strategies[sName]
@@ -278,6 +275,12 @@ func (r *Router) Signal(symbol string, pos *client.Position) *Signal {
 		strat, ok := r.strategies[name]
 		if !ok || !strat.IsEnabled() {
 			continue
+		}
+
+		// PHASE 5: Feed context for dynamic thresholds
+		if mcr, ok := strat.(MarketContextReceiver); ok {
+			_, adx, _ := cf.Current()
+			mcr.SetMarketContext(symbol, adx)
 		}
 
 		sig := strat.Signal(symbol, pos)

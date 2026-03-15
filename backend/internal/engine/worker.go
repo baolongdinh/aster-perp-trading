@@ -78,6 +78,7 @@ func (e *Engine) evaluateSignalsForSymbol(ctx context.Context, sym string, ticks
 		sig := s.Signal(sym, pos)
 
 		if sig == nil || sig.Type == strategy.SignalNone {
+			// If we are debugging, we might want to log why, but Signal() already logs evaluation
 			continue
 		}
 

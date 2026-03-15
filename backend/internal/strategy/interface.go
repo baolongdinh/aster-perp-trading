@@ -69,3 +69,8 @@ type Strategy interface {
 	// SetEnabled sets the enabled state.
 	SetEnabled(bool)
 }
+
+// MarketContextReceiver allows a strategy to receive external market metrics.
+type MarketContextReceiver interface {
+	SetMarketContext(symbol string, adx float64)
+}

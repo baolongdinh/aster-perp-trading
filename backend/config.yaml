@@ -1,5 +1,5 @@
 bot:
-  dry_run: true # ⚠️ Set to false only when ready for live trading
+  dry_run: false # ⚠️ Set to false only when ready for live trading
 
 exchange:
   # Your Aster API Key (from exchange dashboard -> API Management)
@@ -25,7 +25,6 @@ log:
   level: info # debug | info | warn | error
   file: "logs/bot.log"
 
-
 strategies:
   - name: ema_cross
     enabled: true
@@ -42,6 +41,7 @@ strategies:
       leverage: 5
       order_size_usdt: 5
       timeframe: 5m
+      join_trend: true
 
   - name: rsi_divergence
     enabled: true

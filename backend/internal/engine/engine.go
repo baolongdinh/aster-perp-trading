@@ -93,7 +93,8 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 5. Build stream subscriptions (all symbols across all strategies)
 	symbols := e.allSymbols()
-	streams := buildStreams(symbols, e.cfg)
+	intervals := e.requiredIntervals()
+	streams := buildStreams(symbols, e.cfg, intervals)
 
 	// 6. Wire WebSocket handlers
 	handlers := stream.MarketHandlers{
@@ -377,61 +378,85 @@ func (e *Engine) allSymbols() []string {
 	return out
 }
 
+func (e *Engine) requiredIntervals() []string {
+	intervals := map[string]bool{"1h": true} // 1h is always required for HTF filtering
+
+	for _, s := range e.strategies {
+		if !s.IsEnabled() {
+			continue
+		}
+		// Try to find timeframe in strategy config via reflection or well-known interface
+		// For now, since we know our strategies, we can just assume they might use different ones.
+		// A better way is to add a GetIntervals() method to Strategy interface if we have many.
+		// However, Router already knows his sub-strategies.
+		// Let's check them specifically or add a way to query them.
+		
+		// For now, we'll brute force common ones or better: ask strategies for their symbols/intervals.
+		// Wait, most of our strategies have a Timeframe field in their config.
+		// Let's assume we can get it or we keep a list of common ones.
+		
+		// Actually, let's just subscribe to the most common ones used in config.yaml:
+		intervals["5m"] = true
+		intervals["15m"] = true
+		intervals["1h"] = true
+	}
+
+	var out []string
+	for k := range intervals {
+		out = append(out, k)
+	}
+	return out
+}
+
 func (e *Engine) prewarmStrategies(ctx context.Context) {
 	e.log.Info("pre-warming strategies with historical data")
+	intervals := e.requiredIntervals()
+	
 	for _, strat := range e.strategies {
 		if !strat.IsEnabled() {
 			continue
 		}
 		
-		// 1. Pre-warm primary execution timeframe (5m)
-		limit := 100 
-		interval := "5m" 
-
-		for _, sym := range strat.Symbols() {
-			klines, err := e.market.Klines(ctx, sym, interval, limit)
-			if err != nil {
-				e.log.Warn("failed to fetch historical 5m klines", zap.String("symbol", sym), zap.Error(err))
-				continue
+		for _, interval := range intervals {
+			limit := 100
+			if interval == "1h" {
+				limit = 60
 			}
 
-			for i, k := range klines {
-				isClosed := i < len(klines)-1
-				wk := stream.WsKline{Symbol: sym}
-				wk.Kline.Interval = interval
-				wk.Kline.High = k.High
-				wk.Kline.Low = k.Low
-				wk.Kline.Close = k.Close
-				wk.Kline.IsClosed = isClosed
-				strat.OnKline(wk)
-			}
-			e.log.Info("pre-warmed symbol (5m)", zap.String("strategy", strat.Name()), zap.String("symbol", sym), zap.Int("klines", len(klines)))
+			for _, sym := range strat.Symbols() {
+				klines, err := e.market.Klines(ctx, sym, interval, limit)
+				if err != nil {
+					e.log.Warn("failed to fetch historical klines", 
+						zap.String("symbol", sym), 
+						zap.String("interval", interval), 
+						zap.Error(err),
+					)
+					continue
+				}
 
-			// 2. Pre-warm HTF timeframe (1h) for filtering
-			hLimit := 60 // 60 hours is enough for EMA 50
-			hInterval := "1h"
-			hKlines, err := e.market.Klines(ctx, sym, hInterval, hLimit)
-			if err == nil {
-				for i, k := range hKlines {
-					isClosed := i < len(hKlines)-1
+				for i, k := range klines {
+					isClosed := i < len(klines)-1
 					wk := stream.WsKline{Symbol: sym}
-					wk.Kline.Interval = hInterval
+					wk.Kline.Interval = interval
 					wk.Kline.High = k.High
 					wk.Kline.Low = k.Low
 					wk.Kline.Close = k.Close
 					wk.Kline.IsClosed = isClosed
 					strat.OnKline(wk)
 				}
-				e.log.Info("pre-warmed symbol (1h)", zap.String("strategy", strat.Name()), zap.String("symbol", sym), zap.Int("klines", len(hKlines)))
+				e.log.Info("pre-warmed symbol", 
+					zap.String("strategy", strat.Name()), 
+					zap.String("symbol", sym), 
+					zap.String("interval", interval),
+					zap.Int("klines", len(klines)),
+				)
 			}
 		}
 	}
 }
 
-
-func buildStreams(symbols []string, _ *config.Config) []string {
-	// Default kline intervals: 5m for signals, 1h for HTF trend filtering
-	return stream.BuildStreams(symbols, []string{"5m", "1h"})
+func buildStreams(symbols []string, _ *config.Config, intervals []string) []string {
+	return stream.BuildStreams(symbols, intervals)
 }
 
 
