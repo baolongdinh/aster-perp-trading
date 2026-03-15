@@ -36,3 +36,155 @@ strategies:
       leverage: 5
       order_size_usdt: 5
       timeframe: 5m
+
+  - name: rsi_divergence
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      rsi_period: 14
+      overbought: 70.0
+      oversold: 30.0
+      leverage: 5
+      order_size_usdt: 5
+      timeframe: 15m
+
+  - name: vwap_reversion
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      dev_threshold_pct: 0.5
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 15m
+
+  - name: bb_bounce
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      period: 20
+      std_dev: 2.0
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 15m
+
+  - name: sr_bounce
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      lookback: 50
+      bounce_pct: 0.1
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h
+
+  - name: momentum_roc
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      roc_period: 10
+      roc_threshold: 1.0
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 15m
+
+  - name: orb
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 15m
+
+  - name: volume_spike
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      volume_ma_period: 20
+      spike_multiplier: 3.0
+      order_size_usdt: 5
+
+  - name: breakout_retest
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      consolidation_periods: 20
+      breakout_vol_mult: 2.0
+      retest_tolerance_pct: 0.1
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h
+
+  - name: flag_pennant
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      impulse_min_pct: 3.0
+      impulse_candles: 5
+      flag_max_retrace_pct: 38.2
+      flag_candles: 10
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h
+
+  - name: trailing_sh
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      swing_period: 5
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h
+
+  - name: structure_bos
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      swing_period: 5
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h
+
+  - name: liquidity_sweep
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      lookback: 50
+      tolerance_pct: 0.05
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h
+
+  - name: fvg_fill
+    enabled: true
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    params:
+      min_gap_pct: 0.1
+      order_size_usdt: 5
+      leverage: 5
+      timeframe: 1h

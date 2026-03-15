@@ -1,10 +1,11 @@
-package strategy
+package trend
 
 import (
 	"fmt"
 	"sync"
 
 	"aster-bot/internal/client"
+	"aster-bot/internal/strategy"
 	"aster-bot/internal/stream"
 
 	"go.uber.org/zap"
@@ -30,7 +31,7 @@ type EMACrossStrategy struct {
 
 	mu      sync.RWMutex
 	closes  map[string][]float64 // symbol -> recent close prices (ring buffer)
-	lastSig map[string]Side      // last signal per symbol to avoid re-entry
+	lastSig map[string]strategy.Side      // last signal per symbol to avoid re-entry
 }
 
 // NewEMACross creates a new EMA cross strategy.
@@ -40,7 +41,7 @@ func NewEMACross(cfg EMACrossConfig, log *zap.Logger) *EMACrossStrategy {
 		log:     log,
 		enabled: cfg.Enabled,
 		closes:  make(map[string][]float64),
-		lastSig: make(map[string]Side),
+		lastSig: make(map[string]strategy.Side),
 	}
 	// Pre-allocate buffers
 	for _, sym := range cfg.Symbols {
@@ -129,14 +130,14 @@ func (e *EMACrossStrategy) OnOrderUpdate(_ stream.WsOrderUpdate)     {}
 func (e *EMACrossStrategy) OnAccountUpdate(_ stream.WsAccountUpdate) {}
 
 // Signal checks EMA cross and returns entry/exit signal.
-func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *Signal {
+func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *strategy.Signal {
 	e.mu.RLock()
 	closes := e.closes[symbol]
 	lastSig := e.lastSig[symbol]
 	e.mu.RUnlock()
 
 	if len(closes) < e.cfg.SlowPeriod+1 {
-		return &Signal{Type: SignalNone}
+		return &strategy.Signal{Type: strategy.SignalNone}
 	}
 
 	fastNow := ema(closes, e.cfg.FastPeriod)
@@ -153,58 +154,58 @@ func (e *EMACrossStrategy) Signal(symbol string, currentPos *client.Position) *S
 	if currentPos != nil && currentPos.PositionAmt != 0 {
 		if currentPos.PositionAmt > 0 && crossDown {
 			e.mu.Lock()
-			e.lastSig[symbol] = SideSell
+			e.lastSig[symbol] = strategy.SideSell
 			e.mu.Unlock()
-			return &Signal{
-				Type:   SignalExit,
+			return &strategy.Signal{
+				Type:   strategy.SignalExit,
 				Symbol: symbol,
-				Side:   SideSell,
+				Side:   strategy.SideSell,
 				Reason: "ema_cross_exit_long",
 			}
 		}
 		if currentPos.PositionAmt < 0 && crossUp {
 			e.mu.Lock()
-			e.lastSig[symbol] = SideBuy
+			e.lastSig[symbol] = strategy.SideBuy
 			e.mu.Unlock()
-			return &Signal{
-				Type:   SignalExit,
+			return &strategy.Signal{
+				Type:   strategy.SignalExit,
 				Symbol: symbol,
-				Side:   SideBuy,
+				Side:   strategy.SideBuy,
 				Reason: "ema_cross_exit_short",
 			}
 		}
 	}
 
 	// New entry
-	if crossUp && lastSig != SideBuy {
+	if crossUp && lastSig != strategy.SideBuy {
 		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
 		e.mu.Lock()
-		e.lastSig[symbol] = SideBuy
+		e.lastSig[symbol] = strategy.SideBuy
 		e.mu.Unlock()
-		return &Signal{
-			Type:     SignalEnter,
+		return &strategy.Signal{
+			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
-			Side:     SideBuy,
+			Side:     strategy.SideBuy,
 			Quantity: qty,
 			Reason:   fmt.Sprintf("ema_cross_long fast=%.4f slow=%.4f", fastNow, slowNow),
 		}
 	}
 
-	if crossDown && lastSig != SideSell {
+	if crossDown && lastSig != strategy.SideSell {
 		qty := fmt.Sprintf("%.4f", e.cfg.OrderSizeUSDT)
 		e.mu.Lock()
-		e.lastSig[symbol] = SideSell
+		e.lastSig[symbol] = strategy.SideSell
 		e.mu.Unlock()
-		return &Signal{
-			Type:     SignalEnter,
+		return &strategy.Signal{
+			Type:     strategy.SignalEnter,
 			Symbol:   symbol,
-			Side:     SideSell,
+			Side:     strategy.SideSell,
 			Quantity: qty,
 			Reason:   fmt.Sprintf("ema_cross_short fast=%.4f slow=%.4f", fastNow, slowNow),
 		}
 	}
 
-	return &Signal{Type: SignalNone}
+	return &strategy.Signal{Type: strategy.SignalNone}
 }
 
 // ema calculates the Exponential Moving Average of the last n values in data.

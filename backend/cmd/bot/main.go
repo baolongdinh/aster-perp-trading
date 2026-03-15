@@ -17,6 +17,10 @@ import (
 	"aster-bot/internal/ordermanager"
 	"aster-bot/internal/risk"
 	"aster-bot/internal/strategy"
+	"aster-bot/internal/strategy/meanrev"
+	"aster-bot/internal/strategy/momentum"
+	"aster-bot/internal/strategy/structure"
+	"aster-bot/internal/strategy/trend"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -139,23 +143,271 @@ func main() {
 	log.Info("bot shutdown complete")
 }
 
-// buildStrategies constructs strategy instances from config.
+// buildStrategies constructs the StrategyRouter meta-strategy.
 func buildStrategies(cfg *config.Config, log *zap.Logger) []strategy.Strategy {
-	var out []strategy.Strategy
+	var activeSymbols []string
+	var activeSubs []strategy.Strategy
+
 	for _, sc := range cfg.Strategies {
 		switch sc.Name {
 		case "ema_cross":
-			emaCfg := strategy.EMACrossConfig{
-				Enabled:       sc.Enabled,
-				Symbols:       sc.Symbols,
+			emaCfg := trend.EMACrossConfig{
 				FastPeriod:    intParam(sc.Params, "fast_period", 9),
 				SlowPeriod:    intParam(sc.Params, "slow_period", 21),
 				Leverage:      intParam(sc.Params, "leverage", 5),
 				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
 				Timeframe:     stringParam(sc.Params, "timeframe", "5m"),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
 			}
-			out = append(out, strategy.NewEMACross(emaCfg, log))
-			log.Info("strategy loaded",
+			activeSubs = append(activeSubs, trend.NewEMACross(emaCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "rsi_divergence":
+			rsiCfg := meanrev.RSIDivergenceConfig{
+				RsiPeriod:     intParam(sc.Params, "rsi_period", 14),
+				Overbought:    floatParam(sc.Params, "overbought", 70.0),
+				Oversold:      floatParam(sc.Params, "oversold", 30.0),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+			}
+			activeSubs = append(activeSubs, meanrev.NewRSIDivergence(rsiCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "vwap_reversion":
+			vCfg := meanrev.VWAPReversionConfig{
+				DevThreshold:  floatParam(sc.Params, "dev_threshold_pct", 0.5),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
+			}
+			activeSubs = append(activeSubs, meanrev.NewVWAPReversion(vCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "bb_bounce":
+			bbCfg := meanrev.BBBounceConfig{
+				Period:        intParam(sc.Params, "period", 20),
+				StdDev:        floatParam(sc.Params, "std_dev", 2.0),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
+			}
+			activeSubs = append(activeSubs, meanrev.NewBBBounce(bbCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "sr_bounce":
+			srCfg := meanrev.SRBounceConfig{
+				Lookback:      intParam(sc.Params, "lookback", 50),
+				BouncePct:     floatParam(sc.Params, "bounce_pct", 0.1),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, meanrev.NewSRBounce(srCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "breakout_retest":
+			brCfg := trend.BreakoutRetestConfig{
+				ConsolidationPeriods: intParam(sc.Params, "consolidation_periods", 20),
+				BreakoutVolumeMult:    floatParam(sc.Params, "breakout_vol_mult", 2.0),
+				RetestTolerancePct:    floatParam(sc.Params, "retest_tolerance_pct", 0.1),
+				OrderSizeUSDT:         floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:              intParam(sc.Params, "leverage", 5),
+				Symbols:               sc.Symbols,
+				Enabled:               sc.Enabled,
+				Timeframe:             stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, trend.NewBreakoutRetest(brCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "flag_pennant":
+			fpCfg := trend.FlagPennantConfig{
+				ImpulseMinPct:     floatParam(sc.Params, "impulse_min_pct", 3.0),
+				ImpulseCandles:   intParam(sc.Params, "impulse_candles", 5),
+				FlagMaxRetracePct: floatParam(sc.Params, "flag_max_retrace_pct", 38.2),
+				FlagCandles:      intParam(sc.Params, "flag_candles", 10),
+				OrderSizeUSDT:     floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:          intParam(sc.Params, "leverage", 5),
+				Symbols:               sc.Symbols,
+				Enabled:               sc.Enabled,
+				Timeframe:             stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, trend.NewFlagPennant(fpCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "trailing_sh":
+			shCfg := trend.TrailingSHConfig{
+				SwingPeriod:   intParam(sc.Params, "swing_period", 5),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, trend.NewTrailingSH(shCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "momentum_roc":
+			rocCfg := momentum.MomentumROCConfig{
+				ROCPeriod:      intParam(sc.Params, "roc_period", 10),
+				ROCThreshold:   floatParam(sc.Params, "roc_threshold", 1.0),
+				OrderSizeUSDT:  floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:       intParam(sc.Params, "leverage", 5),
+				Symbols:        sc.Symbols,
+				Enabled:        sc.Enabled,
+				Timeframe:      stringParam(sc.Params, "timeframe", "15m"),
+			}
+			activeSubs = append(activeSubs, momentum.NewMomentumROC(rocCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "orb":
+			orbCfg := momentum.ORBConfig{
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "15m"),
+			}
+			activeSubs = append(activeSubs, momentum.NewORB(orbCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "volume_spike":
+			volCfg := momentum.VolumeSpikeConfig{
+				VolumeMaPeriod:  intParam(sc.Params, "volume_ma_period", 20),
+				SpikeMultiplier: floatParam(sc.Params, "spike_multiplier", 3.0),
+				OrderSizeUSDT:   floatParam(sc.Params, "order_size_usdt", 50),
+				Symbols:         sc.Symbols,
+				Enabled:         sc.Enabled,
+			}
+			activeSubs = append(activeSubs, momentum.NewVolumeSpike(volCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "structure_bos":
+			bosCfg := structure.BOSConfig{
+				SwingPeriod:   intParam(sc.Params, "swing_period", 5),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, structure.NewBOS(bosCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "liquidity_sweep":
+			lqCfg := structure.LiquiditySweepConfig{
+				Lookback:      intParam(sc.Params, "lookback", 50),
+				TolerancePct:  floatParam(sc.Params, "tolerance_pct", 0.05),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, structure.NewLiquiditySweep(lqCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
+				zap.String("name", sc.Name),
+				zap.Bool("enabled", sc.Enabled),
+				zap.Strings("symbols", sc.Symbols),
+			)
+		case "fvg_fill":
+			fvgCfg := structure.FVGConfig{
+				MinGapPct:     floatParam(sc.Params, "min_gap_pct", 0.1),
+				OrderSizeUSDT: floatParam(sc.Params, "order_size_usdt", 50),
+				Leverage:      intParam(sc.Params, "leverage", 5),
+				Symbols:       sc.Symbols,
+				Enabled:       sc.Enabled,
+				Timeframe:     stringParam(sc.Params, "timeframe", "1h"),
+			}
+			activeSubs = append(activeSubs, structure.NewFVG(fvgCfg, log))
+			if sc.Enabled {
+				activeSymbols = append(activeSymbols, sc.Symbols...)
+			}
+			log.Info("sub-strategy loaded",
 				zap.String("name", sc.Name),
 				zap.Bool("enabled", sc.Enabled),
 				zap.Strings("symbols", sc.Symbols),
@@ -164,7 +416,31 @@ func buildStrategies(cfg *config.Config, log *zap.Logger) []strategy.Strategy {
 			log.Warn("unknown strategy in config", zap.String("name", sc.Name))
 		}
 	}
-	return out
+
+	// De-duplicate active symbols for the Router
+	seen := make(map[string]bool)
+	var finalSymbols []string
+	for _, s := range activeSymbols {
+		if !seen[s] {
+			seen[s] = true
+			finalSymbols = append(finalSymbols, s)
+		}
+	}
+
+	routerCfg := strategy.RouterConfig{
+		Enabled: len(finalSymbols) > 0,
+		Symbols: finalSymbols,
+	}
+	router := strategy.NewRouter(routerCfg, log)
+
+	for _, sub := range activeSubs {
+		router.Register(sub)
+	}
+
+	log.Info("strategy router loaded", zap.Int("active_subs", len(activeSubs)), zap.Strings("symbols", finalSymbols))
+
+	// Engine expects an array of strategies, but we only give it the Router
+	return []strategy.Strategy{router}
 }
 
 func buildLogger(level string) *zap.Logger {
