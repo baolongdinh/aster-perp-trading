@@ -3,6 +3,7 @@ package strategy
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/risk"
@@ -26,8 +27,9 @@ type Router struct {
 
 	// positionOwner tracks which strategy entered a trade for a symbol.
 	// Used for consensus exit logic.
-	positionOwner map[string]string // symbol -> strategyName
-	mu            sync.RWMutex
+	positionOwner  map[string]string    // symbol -> strategyName
+	lastTradeClose map[string]time.Time // symbol -> time of last position close
+	mu             sync.RWMutex
 }
 
 type RouterConfig struct {
@@ -37,13 +39,14 @@ type RouterConfig struct {
 
 func NewRouter(cfg RouterConfig, riskMgr *risk.Manager, log *zap.Logger) *Router {
 	r := &Router{
-		classifiers:   make(map[string]*regime.Classifier),
-		strategies:    make(map[string]Strategy),
-		activeSubs:    make([]string, 0),
-		positionOwner: make(map[string]string),
-		log:           log,
-		cfg:           cfg,
-		risk:          riskMgr,
+		classifiers:    make(map[string]*regime.Classifier),
+		strategies:     make(map[string]Strategy),
+		activeSubs:     make([]string, 0),
+		positionOwner:  make(map[string]string),
+		lastTradeClose: make(map[string]time.Time),
+		log:            log,
+		cfg:            cfg,
+		risk:           riskMgr,
 	}
 	// Pre-initialize for configured symbols
 	for _, sym := range cfg.Symbols {
@@ -265,81 +268,26 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 		return nil
 	}
 
-	r.mu.RLock()
-	owner := r.positionOwner[symbol]
-	r.mu.RUnlock()
-
-	// 0. RESET: If no position exists, clear the owner just in case.
-	if pos == nil || pos.PositionAmt == 0 {
-		r.mu.Lock()
-		delete(r.positionOwner, symbol)
-		r.mu.Unlock()
-		owner = ""
-	}
-
-	var allSignals []*Signal
-
-	// 1. EXIT LOGIC
+	// EXIT LOGIC REMOVED: Positions are closed exclusively via SL/TP orders placed on the exchange.
+	// Bot does NOT issue software market-order exits. If a position is open, skip entry evaluation.
 	if pos != nil && pos.PositionAmt != 0 {
-		warnings := 0
-		var mainWarning *Signal
-
-		// ALWAYS check owner strategy first, regardless of current regime
-		// This prevents a position being stuck open after a regime shift
-		if owner != "" {
-			if ownerStrat, ok := r.strategies[owner]; ok {
-				for _, sig := range ownerStrat.Signals(symbol, pos) {
-					if sig.Type == SignalExit {
-						sig.StrategyName = owner
-						r.mu.Lock()
-						delete(r.positionOwner, symbol)
-						r.mu.Unlock()
-						r.log.Info("Owner exit triggered",
-							zap.String("strategy", owner),
-							zap.String("symbol", symbol),
-							zap.String("reason", sig.Reason),
-						)
-						return []*Signal{sig}
-					}
-				}
-			}
-		}
-
-		// Consensus check: poll all active strategies for additional exit warnings
-		for _, sName := range r.activeSubs {
-			if sName == owner {
-				continue // already handled above
-			}
-			str, ok := r.strategies[sName]
-			if !ok {
-				continue
-			}
-			sigs := str.Signals(symbol, pos)
-			for _, sig := range sigs {
-				if sig.Type == SignalExit {
-					warnings++
-					mainWarning = sig
-					mainWarning.StrategyName = sName
-				}
-			}
-		}
-
-		if warnings >= 2 {
-			mainWarning.Reason = fmt.Sprintf("Consensus Exit (%d warnings)", warnings)
-			r.log.Warn("🚨 CONSENSUS EXIT TRIGGERED",
-				zap.String("symbol", symbol),
-				zap.Int("warnings", warnings),
-				zap.String("owner", owner),
-			)
-			r.mu.Lock()
-			delete(r.positionOwner, symbol)
-			r.mu.Unlock()
-			return []*Signal{mainWarning}
-		}
-		return nil // No exit consensus reached
+		return nil
 	}
 
 	// 2. ENTRY LOGIC: Only check strategies recommended for the current regime
+	// Post-trade cooldown: block new entries for 60s after close to let position state settle.
+	const tradeCooldown = 60 * time.Second
+	r.mu.RLock()
+	lastClose, hasClose := r.lastTradeClose[symbol]
+	r.mu.RUnlock()
+	if hasClose && time.Since(lastClose) < tradeCooldown {
+		r.log.Info("IQ-COOLDOWN: Entry blocked (post-trade cooldown active)",
+			zap.String("symbol", symbol),
+			zap.Duration("remaining", tradeCooldown-time.Since(lastClose)),
+		)
+		return nil
+	}
+	var allSignals []*Signal
 	for _, name := range candidates {
 		strat, ok := r.strategies[name]
 		if !ok || !strat.IsEnabled() {
@@ -384,7 +332,7 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 
 				// PHASE 2: Dynamic ATR Sizing
 				// [PHASE 16: Removed redundant sizing logic - now centralized in Engine.executeSignal]
-				
+
 				sig.StrategyName = name
 				allSignals = append(allSignals, sig)
 			}
@@ -397,4 +345,3 @@ func (r *Router) Signals(symbol string, pos *client.Position) []*Signal {
 func formatFloat(f float64) string {
 	return fmt.Sprintf("%.2f", f)
 }
-

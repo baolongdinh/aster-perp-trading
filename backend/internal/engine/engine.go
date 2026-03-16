@@ -40,6 +40,10 @@ type Engine struct {
 	workers   map[string]*MarketWorker       // symbol -> worker
 
 	running bool
+
+	// closingSymbols prevents duplicate market-close orders for the same symbol.
+	closingMu      sync.Mutex
+	closingSymbols map[string]bool
 }
 
 // New creates a new Engine.
@@ -62,10 +66,11 @@ func New(
 		prec:       prec, // Assigned prec
 		strategies: strategies,
 		log:        log,
-		positions:  make(map[string]*client.Position),
-		prices:     make(map[string]float64),
-		tickers:    make(map[string]stream.WsBookTicker),
-		workers:    make(map[string]*MarketWorker),
+		positions:      make(map[string]*client.Position),
+		prices:         make(map[string]float64),
+		tickers:        make(map[string]stream.WsBookTicker),
+		workers:        make(map[string]*MarketWorker),
+		closingSymbols: make(map[string]bool),
 	}
 }
 
@@ -86,6 +91,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err := e.refreshPositions(ctx); err != nil {
 		e.log.Warn("engine: could not refresh positions on start", zap.Error(err))
 	}
+
+	// 2b. Clean up orphan SL/TP orders on startup
+	e.cleanupOrphanOrders(ctx)
 
 	// 3. Set leverage for all symbols
 	e.initLeverage(ctx)
@@ -221,6 +229,7 @@ func (e *Engine) reconcileLoop(ctx context.Context) {
 				e.log.Warn("engine: periodic reconcile error", zap.Error(err))
 			} else {
 				e.syncRiskExposure()
+				e.cleanupOrphanOrders(ctx)
 			}
 		}
 	}
@@ -322,7 +331,40 @@ func (e *Engine) onOrderUpdate(ou stream.WsOrderUpdate) {
 	e.orders.OnOrderUpdate(ou)
 	// Reactive Sync: Update pending exposure immediately on any trade/cancel/fill
 	e.syncRiskExposure()
+
+	// Proactive Balance Sync: If a SL, TP, or EXIT order is FILLED, the position is now closed.
+	// Don't wait for the ACCOUNT_UPDATE WS event which can lag — fetch immediately via REST.
+	order := ou.Order
+	isFilled := order.OrderStatus == "FILLED"
+	isSLTP := order.OrderType == "STOP_MARKET" || order.OrderType == "TAKE_PROFIT_MARKET" ||
+		order.OrderType == "STOP" || order.OrderType == "TAKE_PROFIT"
+	isReduceOnly := order.IsReduceOnly
+
+	if isFilled && (isSLTP || isReduceOnly) {
+		go func() {
+			ctx := context.Background()
+			// 1. Fetch fresh account balance
+			if account, err := e.futures.GetAccount(ctx); err == nil {
+				e.risk.SetAvailableBalance(account.AvailableBalance)
+				e.log.Info("SYNC: Balance refreshed after position close",
+					zap.String("symbol", string(order.Symbol)),
+					zap.Float64("available_balance", account.AvailableBalance),
+				)
+			} else {
+				e.log.Warn("SYNC: Failed to refresh balance after close", zap.Error(err))
+			}
+
+			// 2. Fetch fresh positions to clear stale local state
+			if err := e.refreshPositions(ctx); err != nil {
+				e.log.Warn("SYNC: Failed to refresh positions after close", zap.Error(err))
+			} else {
+				e.refreshRiskPositions()
+				e.syncRiskExposure()
+			}
+		}()
+	}
 }
+
 
 func (e *Engine) onBookTicker(bt stream.WsBookTicker) {
 	e.mu.Lock()
@@ -358,6 +400,9 @@ func (e *Engine) onAccountUpdate(u stream.WsAccountUpdate) {
 			// Check if we just closed a position to record PnL
 			if old, ok := e.positions[pos.Symbol]; ok && old.PositionAmt != 0 {
 				e.risk.OnPositionClosed(pos.Symbol, pos.AccumulatedRealPnL) // Note: this is a total, not a delta. TODO: refine delta calculation.
+				
+				// Immediate cleanup of SL/TP when position is fully closed
+				go e.orders.CancelAllSLTPForSymbol(context.Background(), pos.Symbol)
 			}
 			delete(e.positions, pos.Symbol)
 		}
@@ -579,6 +624,25 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		if currentPos == nil || currentPos.PositionAmt == 0 {
 			return
 		}
+
+		// Exit In-Flight Lock: prevent duplicate ReduceOnly orders for the same symbol.
+		e.closingMu.Lock()
+		if e.closingSymbols[sig.Symbol] {
+			e.closingMu.Unlock()
+			e.log.Debug("IQ-EXIT: Duplicate exit blocked (close already in flight)", zap.String("symbol", sig.Symbol))
+			return
+		}
+		e.closingSymbols[sig.Symbol] = true
+		e.closingMu.Unlock()
+
+		// Schedule automatic release of the lock after 3s (time for WS position update to arrive).
+		go func(sym string) {
+			time.Sleep(3 * time.Second)
+			e.closingMu.Lock()
+			delete(e.closingSymbols, sym)
+			e.closingMu.Unlock()
+		}(sig.Symbol)
+
 		// Quantity for exit is current position amount
 		qty := e.prec.RoundQty(sig.Symbol, math.Abs(currentPos.PositionAmt))
 		if _, err := e.orders.PlaceCloseOrder(ctx, sig.Symbol, string(sig.Side), qty); err != nil {
@@ -1030,5 +1094,30 @@ func (e *Engine) runSafetyCheck(ctx context.Context) {
 		e.mu.RUnlock()
 
 		e.orders.EnsureProtectiveOrders(ctx, pos.Symbol, string(pos.PositionSide), pos.PositionAmt, sl, tp, curPrice)
+	}
+}
+
+// cleanupOrphanOrders cancels any SL/TP orders that exist for symbols where we have no open position.
+func (e *Engine) cleanupOrphanOrders(ctx context.Context) {
+	e.mu.RLock()
+	var symbolsNoPosition []string
+	symbolsWithProtective := make(map[string]bool)
+	orders := e.orders.GetAll()
+	for _, lo := range orders {
+		if (lo.Purpose == ordermanager.PurposeSL || lo.Purpose == ordermanager.PurposeTP) && (lo.Status == "NEW" || lo.Status == "PARTIALLY_FILLED") {
+			symbolsWithProtective[lo.Symbol] = true
+		}
+	}
+
+	for sym := range symbolsWithProtective {
+		if pos, ok := e.positions[sym]; !ok || pos.PositionAmt == 0 {
+			symbolsNoPosition = append(symbolsNoPosition, sym)
+		}
+	}
+	e.mu.RUnlock()
+
+	for _, sym := range symbolsNoPosition {
+		e.log.Info("IQ-GC: Cleaning up orphan SL/TP orders for symbol without position", zap.String("symbol", sym))
+		e.orders.CancelAllSLTPForSymbol(ctx, sym)
 	}
 }

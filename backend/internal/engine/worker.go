@@ -25,7 +25,9 @@ func NewMarketWorker(symbol string, engine *Engine, log *zap.Logger) *MarketWork
 
 func (w *MarketWorker) Run(ctx context.Context) {
 
-	ticker := time.NewTicker(1 * time.Second)
+	// 5s tick: gives WebSocket position updates time to propagate before the next eval.
+	// 1s was too fast — a new entry could fire before the position-closed event arrived.
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	w.log.Debug("market worker started", zap.String("symbol", w.symbol))

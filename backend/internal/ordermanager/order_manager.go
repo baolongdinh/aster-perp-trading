@@ -534,13 +534,17 @@ func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, sid
 
 	qtyStr := strconv.FormatFloat(math.Abs(qty), 'f', -1, 64)
 
+	// API Rule: Stop orders cannot be placed too close to the current market price.
+	// Add a 0.2% buffer to prevent "Order would immediately trigger" error (-2021).
+	buffer := currentPrice * 0.002
+
 	// Heal SL if missing
 	if !hasSL && slPrice > 0 {
 		isValid := false
 		if isLong {
-			isValid = currentPrice > slPrice
+			isValid = currentPrice > slPrice+buffer
 		} else {
-			isValid = currentPrice < slPrice
+			isValid = currentPrice < slPrice-buffer
 		}
 
 		if isValid {
@@ -550,7 +554,7 @@ func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, sid
 				m.log.Error("Safety Monitor: failed to heal SL", zap.Error(err))
 			}
 		} else {
-			m.log.Warn("Safety Monitor: SL healing skipped, price already past trigger", zap.String("symbol", symbol), zap.Float64("current", currentPrice), zap.Float64("sl", slPrice))
+			m.log.Warn("Safety Monitor: SL healing skipped, price too close to trigger or past it", zap.String("symbol", symbol), zap.Float64("current", currentPrice), zap.Float64("sl", slPrice))
 		}
 	}
 
@@ -558,9 +562,9 @@ func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, sid
 	if !hasTP && tpPrice > 0 {
 		isValid := false
 		if isLong {
-			isValid = currentPrice < tpPrice
+			isValid = currentPrice < tpPrice-buffer
 		} else {
-			isValid = currentPrice > tpPrice
+			isValid = currentPrice > tpPrice+buffer
 		}
 
 		if isValid {
@@ -570,7 +574,7 @@ func (m *Manager) EnsureProtectiveOrders(ctx context.Context, symbol string, sid
 				m.log.Error("Safety Monitor: failed to heal TP", zap.Error(err))
 			}
 		} else {
-			m.log.Warn("Safety Monitor: TP healing skipped, price already past trigger", zap.String("symbol", symbol), zap.Float64("current", currentPrice), zap.Float64("tp", tpPrice))
+			m.log.Warn("Safety Monitor: TP healing skipped, price too close to trigger or past it", zap.String("symbol", symbol), zap.Float64("current", currentPrice), zap.Float64("tp", tpPrice))
 		}
 	}
 }

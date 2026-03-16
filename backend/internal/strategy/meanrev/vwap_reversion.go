@@ -115,22 +115,23 @@ func (s *VWAPReversionStrategy) Signals(symbol string, pos *client.Position) []*
 	vwap := vwapState.Value()
 	deviation := (price - vwap) / vwap * 100
 
-	// Exit Logic: Close when price returns to VWAP
+	// Exit Logic: Close when price returns to VWAP.
+	// Guard: only exit if the position is in profit (price moved in the trade's direction from entry).
 	if pos != nil && pos.PositionAmt != 0 {
-		if pos.PositionAmt > 0 && price >= vwap {
+		if pos.PositionAmt > 0 && price >= vwap && price > pos.EntryPrice {
 			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideSell,
-				Reason: "VWAP Target Reached (Long)",
+				Reason: fmt.Sprintf("VWAP Target Reached (Long @ %.2f, entry: %.2f)", vwap, pos.EntryPrice),
 			}}
 		}
-		if pos.PositionAmt < 0 && price <= vwap {
+		if pos.PositionAmt < 0 && price <= vwap && price < pos.EntryPrice {
 			return []*strategy.Signal{{
 				Type:   strategy.SignalExit,
 				Symbol: symbol,
 				Side:   strategy.SideBuy,
-				Reason: "VWAP Target Reached (Short)",
+				Reason: fmt.Sprintf("VWAP Target Reached (Short @ %.2f, entry: %.2f)", vwap, pos.EntryPrice),
 			}}
 		}
 		return nil

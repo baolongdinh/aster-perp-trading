@@ -110,23 +110,25 @@ func (s *BBBounceStrategy) Signals(symbol string, pos *client.Position) []*strat
 	upper, mid, lower := s.bb.Calculate(closes)
 	last := closes[len(closes)-1]
 
-	// Exit Logic: Close when price reverts to the mean (Middle Band)
+	// Exit Logic: Close when price reverts to the mean (Middle Band).
+	// We only exit if the trade has moved in the correct direction (in profit relative to entry).
+	// This prevents premature exits immediately after entry when price is already near the mid.
 	if pos != nil && pos.PositionAmt != 0 {
-		if pos.PositionAmt > 0 && last >= mid {
+		if pos.PositionAmt > 0 && last >= mid && last > pos.EntryPrice {
 			return []*strategy.Signal{{
 				Type:         strategy.SignalExit,
 				Symbol:       symbol,
 				Side:         strategy.SideSell,
-				Reason:       fmt.Sprintf("BB Mean Reversion to Mid @ %.2f", mid),
+				Reason:       fmt.Sprintf("BB Mean Reversion to Mid @ %.2f (entry: %.2f)", mid, pos.EntryPrice),
 				StrategyName: s.Name(),
 			}}
 		}
-		if pos.PositionAmt < 0 && last <= mid {
+		if pos.PositionAmt < 0 && last <= mid && last < pos.EntryPrice {
 			return []*strategy.Signal{{
 				Type:         strategy.SignalExit,
 				Symbol:       symbol,
 				Side:         strategy.SideBuy,
-				Reason:       fmt.Sprintf("BB Mean Reversion to Mid @ %.2f", mid),
+				Reason:       fmt.Sprintf("BB Mean Reversion to Mid @ %.2f (entry: %.2f)", mid, pos.EntryPrice),
 				StrategyName: s.Name(),
 			}}
 		}
