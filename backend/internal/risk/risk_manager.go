@@ -87,9 +87,7 @@ func (m *Manager) CanEnter(symbol string, notional float64, leverage float64) er
 	if m.symPositions[symbol] > 0 {
 		return fmt.Errorf("risk: stacking blocked — %s already has an open position", symbol)
 	}
-	if m.pendingOrders[symbol] > 0 {
-		return fmt.Errorf("risk: stacking blocked — %s already has a pending entry", symbol)
-	}
+	// We no longer check m.pendingOrders here. We rely on engine.VerifyNoStackingServer.
 
 	// 3. Correlation Check
 	if m.corrTracker != nil {
@@ -118,17 +116,21 @@ func (m *Manager) CanEnter(symbol string, notional float64, leverage float64) er
 			marginReq, m.pendingMargin, m.availableBalance)
 	}
 
-	// ATOMIC RESERVATION: Locking in the notional exposure and margin immediately
-	m.pendingOrders[symbol] += notional
-	m.pendingMargin += marginReq
+	// ATOMIC RESERVATION: Locking in the notional exposure and margin immediately will occur in the Engine via AddPending when the order actually fires.
+	// We no longer mutate m.pendingOrders here to avoid memory leaks on filtered signals.
 	return nil
 }
 
-// AddPending records a new pending order's notional.
-func (m *Manager) AddPending(symbol string, notional float64) {
+// AddPending explicitely reserves notional/margin when an order is definitely sent to the exchange.
+func (m *Manager) AddPending(symbol string, notional float64, leverage float64) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pendingOrders[symbol] += notional
-	m.mu.Unlock()
+
+	if leverage <= 0 {
+		leverage = 20.0
+	}
+	m.pendingMargin += (notional / leverage)
 }
 
 // RemovePending removes a pending order's notional and margin.
@@ -226,32 +228,33 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 	m.saveState()
 }
 
-// CalculatePositionSize returns the recommended notional size in USDT based on ATR and capital risk.
-func (m *Manager) CalculatePositionSize(symbol string, price float64, atr float64) (float64, error) {
+// CalculatePositionSize returns the recommended notional size in USDT based on the exact Stop Loss distance.
+func (m *Manager) CalculatePositionSize(symbol string, entryPrice float64, slPrice float64) (float64, error) {
 	var notional float64
 
-	if atr > 0 {
-		// Risk per unit = ATR * Multiplier
-		riskPerUnit := atr * m.cfg.ATRMultiplier
-		if riskPerUnit <= 0 {
-			return 0, fmt.Errorf("invalid risk per unit calculation")
-		}
+	if slPrice > 0 && slPrice != entryPrice {
+		// Risk per unit is the absolute price diff between entry and stop loss
+		riskPerUnit := math.Abs(entryPrice - slPrice)
 
 		// Quantity = DollarRisk / RiskPerUnit
 		qty := m.cfg.RiskPerTradeUSDT / riskPerUnit
 
 		// Final size in notional
-		notional = qty * price
-		m.log.Debug("IQ-RISK: ATR-based sizing", zap.String("symbol", symbol), zap.Float64("notional", notional), zap.Float64("atr", atr))
+		notional = qty * entryPrice
+		m.log.Debug("IQ-RISK: SL-based sizing",
+			zap.String("symbol", symbol),
+			zap.Float64("notional", notional),
+			zap.Float64("risk_distance", riskPerUnit),
+			zap.Float64("target_risk_usd", m.cfg.RiskPerTradeUSDT))
 	} else {
-		// FALLBACK: Use %-based SL logic if ATR is warming up
-		// Asset size = RiskPerTrade / (Price * SLPct) * Price = RiskPerTrade / SLPct
+		// FALLBACK: Use %-based SL logic if no explicit valid SL was provided
+		// Asset size = RiskPerTrade / SLPct
 		slPct := m.cfg.PerTradeStopLossPct / 100.0
 		if slPct <= 0 {
 			slPct = 0.02 // Default 2%
 		}
 		notional = m.cfg.RiskPerTradeUSDT / slPct
-		m.log.Info("IQ-RISK: ATR warming up - using fallback %-based sizing",
+		m.log.Info("IQ-RISK: Strategy SL missing - using fallback %-based sizing",
 			zap.String("symbol", symbol),
 			zap.Float64("notional", notional),
 			zap.Float64("sl_pct", slPct*100),

@@ -17,10 +17,10 @@ risk:
   max_global_pending_limit_orders: 10
   max_pending_per_side: 2
   daily_loss_limit_usdt: 25
-  risk_per_trade_usdt: 2 # Risk $5 per trade (loss on SL hit)
-  atr_multiplier: 2.0 # SL distance = 2 * ATR
-  per_trade_stop_loss_pct: 2.0
-  per_trade_take_profit_pct: 4.0 # 1:2 Risk-Reward ratio as default
+  risk_per_trade_usdt: 5 # Risk $5 per trade (loss on SL hit)
+  atr_multiplier: 1.5 # SL distance = 1.5 * ATR
+  per_trade_stop_loss_pct: 1.5 # Giữ cho đồng đều với ATR
+  per_trade_take_profit_pct: 3.0 # TP mặc định tỷ lệ 1:2
   position_mode: one_way # one_way | hedge
 
 api:

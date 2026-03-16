@@ -428,12 +428,23 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		}
 		e.mu.RUnlock()
 
+		// --- Derive SL/TP from RiskManager if strategy didn't set them ---
+		sl := sig.StopLoss
+		tp := sig.TakeProfit
+		atr, reg := e.getMarketContext(sig.Symbol)
+		if sl == 0 {
+			sl = e.risk.StopLossPrice(lastPrice, string(sig.Side), atr)
+		}
+		if tp == 0 {
+			tp = e.risk.TakeProfitPrice(lastPrice, string(sig.Side), sl, reg)
+		}
+
 		if lastPrice <= 0 {
 			e.log.Warn("IQ-ENGINE: Cannot size position, price unknown", zap.String("symbol", sig.Symbol))
 			return
 		}
 
-		notional, err := e.risk.CalculatePositionSize(sig.Symbol, lastPrice, atr)
+		notional, err := e.risk.CalculatePositionSize(sig.Symbol, lastPrice, sl)
 		if err != nil || notional <= 0 {
 			e.log.Warn("IQ-ENGINE: Risk sizing failed", zap.Error(err), zap.String("symbol", sig.Symbol))
 			return
@@ -445,7 +456,8 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 			zap.String("symbol", sig.Symbol),
 			zap.Float64("notional", notional),
 			zap.Float64("price", lastPrice),
-			zap.Float64("atr", atr),
+			zap.Float64("sl_price", sl),
+			zap.Float64("tp_price", tp),
 		)
 
 		// Phase 17: Margin Awareness - check if account can afford the trade
@@ -502,7 +514,6 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		// PHASE 9: Position Awareness - If we already have a position, don't enter more (One-Way)
 		if currentPos != nil && math.Abs(currentPos.PositionAmt) > 0 {
 			e.log.Debug("IQ-ENGINE: Side already has position, skipping market entry", zap.String("symbol", sig.Symbol))
-			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 		// PHASE 3: Slippage/Spread Protection
@@ -516,7 +527,6 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 					zap.String("symbol", sig.Symbol),
 					zap.Float64("spread_pct", spread*100),
 				)
-				e.risk.RemovePending(sig.Symbol, notional, leverage)
 				return
 			}
 		}
@@ -534,7 +544,6 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 		if lastPrice == 0 {
 			e.log.Warn("cannot enter: price unknown, skipping (will retry next tick)",
 				zap.String("symbol", sig.Symbol))
-			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 
@@ -549,24 +558,19 @@ func (e *Engine) executeSignal(ctx context.Context, sig *strategy.Signal, curren
 				zap.Float64("price", lastPrice),
 				zap.Float64("raw_qty", coinQty),
 			)
-			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 
-		// --- Derive SL/TP from RiskManager if strategy didn't set them ---
-		sl := sig.StopLoss
-		tp := sig.TakeProfit
-		atr, reg := e.getMarketContext(sig.Symbol)
-		if sl == 0 {
-			sl = e.risk.StopLossPrice(lastPrice, string(sig.Side), atr)
-		}
-		if tp == 0 {
-			tp = e.risk.TakeProfitPrice(lastPrice, string(sig.Side), sl, reg)
+		// SL/TP are already calculated at the top before sizing.
+
+		// --- REALTIME SERVER CHECK BEFORE PLACEMENT ---
+		if err := e.VerifyNoStackingServer(ctx, sig.Symbol); err != nil {
+			e.log.Warn("IQ-SERVER: Server blocked entry (stacking)", zap.Error(err), zap.String("symbol", sig.Symbol))
+			return
 		}
 
 		if _, err := e.orders.PlaceMarketEntry(ctx, sig.Symbol, string(sig.Side), roundedQty, sl, tp, sig.StrategyName); err != nil {
 			e.log.Error("place entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
-			e.risk.RemovePending(sig.Symbol, notional, leverage)
 			return
 		}
 		e.risk.OnPositionOpened(sig.Symbol, notional)
@@ -629,7 +633,6 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isC
 		})
 		if cancelErr == nil {
 			e.orders.SetOrderStatus(existing.OrderID, "CANCELED")
-			e.risk.RemovePending(sig.Symbol, existing.Price*existing.OrigQty, 20.0)
 		}
 	} else {
 		// New entry slot - check caps
@@ -659,9 +662,19 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isC
 		}
 	}
 
-	// Phase 19: Centralized Sizing for Limit Orders
-	atr, _ := e.getMarketContext(sig.Symbol)
-	notional, err := e.risk.CalculatePositionSize(sig.Symbol, roundedPriceFloat, atr)
+	// 3. Derive SL/TP BEFORE sizing
+	sl := sig.StopLoss
+	tp := sig.TakeProfit
+	atr, reg := e.getMarketContext(sig.Symbol)
+	if sl == 0 {
+		sl = e.risk.StopLossPrice(roundedPriceFloat, string(sig.Side), atr)
+	}
+	if tp == 0 {
+		tp = e.risk.TakeProfitPrice(roundedPriceFloat, string(sig.Side), sl, reg)
+	}
+
+	// Phase 19: Centralized Sizing for Limit Orders based on true SL distance
+	notional, err := e.risk.CalculatePositionSize(sig.Symbol, roundedPriceFloat, sl)
 	if err != nil || notional <= 0 {
 		e.log.Warn("IQ-LIMIT: Risk sizing failed", zap.Error(err), zap.String("symbol", sig.Symbol))
 		return
@@ -678,27 +691,55 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isC
 			zap.Float64("price", roundedPriceFloat),
 			zap.Float64("raw_qty", coinQty),
 		)
-		e.risk.RemovePending(sig.Symbol, notional, 20.0)
 		return
 	}
 
-	// 3. Derive SL/TP from RiskManager if strategy didn't set them
-	sl := sig.StopLoss
-	tp := sig.TakeProfit
-	atr, reg := e.getMarketContext(sig.Symbol)
-	if sl == 0 {
-		sl = e.risk.StopLossPrice(roundedPriceFloat, string(sig.Side), atr)
-	}
-	if tp == 0 {
-		tp = e.risk.TakeProfitPrice(roundedPriceFloat, string(sig.Side), sl, reg)
+	// --- REALTIME SERVER CHECK BEFORE PLACEMENT ---
+	if err := e.VerifyNoStackingServer(ctx, sig.Symbol); err != nil {
+		e.log.Warn("IQ-SERVER: Server blocked limit entry (stacking)", zap.Error(err), zap.String("symbol", sig.Symbol))
+		return
 	}
 
 	// Place new limit order
 	_, err = e.orders.PlaceLimitEntry(ctx, sig.Symbol, string(sig.Side), roundedQtyStr, roundedPriceStr, sl, tp, sig.StrategyName, isChasing)
 	if err != nil {
 		e.log.Error("place limit entry failed", zap.Error(err), zap.String("symbol", sig.Symbol))
-		e.risk.RemovePending(sig.Symbol, notional, 20.0)
 	}
+}
+
+// VerifyNoStackingServer queries the exchange to absolutely guarantee no stacking occurs.
+func (e *Engine) VerifyNoStackingServer(ctx context.Context, symbol string) error {
+	// 1. Check Positions
+	positions, err := e.futures.GetPositions(ctx, symbol)
+	if err != nil {
+		return fmt.Errorf("failed to verify positions: %w", err)
+	}
+	for _, p := range positions {
+		if math.Abs(p.PositionAmt) > 0 {
+			return fmt.Errorf("active position already exists on server")
+		}
+	}
+
+	// 2. Check Open Orders
+	openOrders, err := e.futures.GetOpenOrders(ctx, symbol)
+	if err != nil {
+		return fmt.Errorf("failed to verify open orders: %w", err)
+	}
+	
+	entryFound := false
+	for _, o := range openOrders {
+		// Stop/Take profit orders are fine, but limit entries are not
+		if o.Type == "LIMIT" || o.Type == "MARKET" {
+			entryFound = true
+			break
+		}
+	}
+
+	if entryFound {
+		return fmt.Errorf("active limit/market entry order already exists on server")
+	}
+
+	return nil
 }
 
 // gcOrders cross-references open entry orders with current signals.
