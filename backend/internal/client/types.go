@@ -18,11 +18,11 @@ type Kline struct {
 
 // MarkPrice is the mark/index price snapshot.
 type MarkPrice struct {
-	Symbol               string  `json:"symbol"`
-	MarkPrice            float64 `json:"markPrice,string"`
-	IndexPrice           float64 `json:"indexPrice,string"`
-	LastFundingRate      float64 `json:"lastFundingRate,string"`
-	NextFundingTime      int64   `json:"nextFundingTime"`
+	Symbol          string  `json:"symbol"`
+	MarkPrice       float64 `json:"markPrice,string"`
+	IndexPrice      float64 `json:"indexPrice,string"`
+	LastFundingRate float64 `json:"lastFundingRate,string"`
+	NextFundingTime int64   `json:"nextFundingTime"`
 }
 
 // BookTicker is the best bid/ask.
@@ -65,47 +65,47 @@ type Position struct {
 
 // Order represents a placed order.
 type Order struct {
-	OrderID        int64   `json:"orderId"`
-	ClientOrderID  string  `json:"clientOrderId"`
-	Symbol         string  `json:"symbol"`
-	Side           string  `json:"side"`
-	PositionSide   string  `json:"positionSide"`
-	Type           string  `json:"type"`
-	Status         string  `json:"status"`
-	Price          float64 `json:"price,string"`
-	OrigQty        float64 `json:"origQty,string"`
-	ExecutedQty    float64 `json:"executedQty,string"`
-	AvgPrice       float64 `json:"avgPrice,string"`
-	TimeInForce    string  `json:"timeInForce"`
-	ReduceOnly     bool    `json:"reduceOnly"`
-	ClosePosition  bool    `json:"closePosition"`
-	StopPrice      float64 `json:"stopPrice,string"`
-	UpdateTime     int64   `json:"updateTime"`
+	OrderID       int64   `json:"orderId"`
+	ClientOrderID string  `json:"clientOrderId"`
+	Symbol        string  `json:"symbol"`
+	Side          string  `json:"side"`
+	PositionSide  string  `json:"positionSide"`
+	Type          string  `json:"type"`
+	Status        string  `json:"status"`
+	Price         float64 `json:"price,string"`
+	OrigQty       float64 `json:"origQty,string"`
+	ExecutedQty   float64 `json:"executedQty,string"`
+	AvgPrice      float64 `json:"avgPrice,string"`
+	TimeInForce   string  `json:"timeInForce"`
+	ReduceOnly    bool    `json:"reduceOnly"`
+	ClosePosition bool    `json:"closePosition"`
+	StopPrice     float64 `json:"stopPrice,string"`
+	UpdateTime    int64   `json:"updateTime"`
 }
 
 // PlaceOrderRequest holds parameters for placing a new order.
 type PlaceOrderRequest struct {
-	Symbol           string
-	Side             string  // BUY | SELL
-	PositionSide     string  // BOTH | LONG | SHORT (hedge mode)
-	Type             string  // LIMIT | MARKET | STOP | TAKE_PROFIT | STOP_MARKET | TAKE_PROFIT_MARKET | TRAILING_STOP_MARKET
-	TimeInForce      string  // GTC | IOC | FOK | GTX
-	Quantity         string
-	Price            string
-	StopPrice        string
-	ReduceOnly       bool
-	ClosePosition    bool
-	CallbackRate     string
-	ActivationPrice  string
-	WorkingType      string // MARK_PRICE | CONTRACT_PRICE
-	ClientOrderID    string
+	Symbol          string
+	Side            string // BUY | SELL
+	PositionSide    string // BOTH | LONG | SHORT (hedge mode)
+	Type            string // LIMIT | MARKET | STOP | TAKE_PROFIT | STOP_MARKET | TAKE_PROFIT_MARKET | TRAILING_STOP_MARKET
+	TimeInForce     string // GTC | IOC | FOK | GTX
+	Quantity        string
+	Price           string
+	StopPrice       string
+	ReduceOnly      bool
+	ClosePosition   bool
+	CallbackRate    string
+	ActivationPrice string
+	WorkingType     string // MARK_PRICE | CONTRACT_PRICE
+	ClientOrderID   string
 }
 
 // CancelOrderRequest holds parameters for canceling an order.
 type CancelOrderRequest struct {
-	Symbol          string
-	OrderID         int64
-	ClientOrderID   string
+	Symbol        string
+	OrderID       int64
+	ClientOrderID string
 }
 
 // SetLeverageRequest sets leverage for a symbol.
@@ -116,9 +116,68 @@ type SetLeverageRequest struct {
 
 // AccountInfo is a partial account snapshot.
 type AccountInfo struct {
-	TotalWalletBalance     float64     `json:"totalWalletBalance,string"`
-	TotalUnrealizedProfit  float64     `json:"totalUnrealizedProfit,string"`
-	TotalMarginBalance     float64     `json:"totalMarginBalance,string"`
-	AvailableBalance       float64     `json:"availableBalance,string"`
-	Positions              []Position  `json:"positions"`
+	TotalWalletBalance    float64    `json:"totalWalletBalance,string"`
+	TotalUnrealizedProfit float64    `json:"totalUnrealizedProfit,string"`
+	TotalMarginBalance    float64    `json:"totalMarginBalance,string"`
+	AvailableBalance      float64    `json:"availableBalance,string"`
+	Positions             []Position `json:"positions"`
+}
+
+// Ticker represents 24hr ticker price change statistics.
+type Ticker struct {
+	Symbol             string  `json:"symbol"`
+	PriceChange        float64 `json:"priceChange,string"`
+	PriceChangePercent float64 `json:"priceChangePercent,string"`
+	WeightedAvgPrice   float64 `json:"weightedAvgPrice,string"`
+	PrevClosePrice     float64 `json:"prevClosePrice,string"`
+	LastPrice          float64 `json:"lastPrice,string"`
+	LastQty            float64 `json:"lastQty,string"`
+	BidPrice           float64 `json:"bidPrice,string"`
+	BidQty             float64 `json:"bidQty,string"`
+	AskPrice           float64 `json:"askPrice,string"`
+	AskQty             float64 `json:"askQty,string"`
+	OpenPrice          float64 `json:"openPrice,string"`
+	HighPrice          float64 `json:"highPrice,string"`
+	LowPrice           float64 `json:"lowPrice,string"`
+	Volume             float64 `json:"volume,string"`
+	QuoteVolume        float64 `json:"quoteVolume,string"`
+	OpenTime           int64   `json:"openTime"`
+	CloseTime          int64   `json:"closeTime"`
+	FirstID            int64   `json:"firstId"`
+	LastID             int64   `json:"lastId"`
+	Count              int64   `json:"count"`
+}
+
+// DepthResponse represents order book depth.
+type DepthResponse struct {
+	LastUpdateID int64       `json:"lastUpdateId"`
+	Bids         [][]float64 `json:"bids"`
+	Asks         [][]float64 `json:"asks"`
+}
+
+// NewOrderRequest holds parameters for placing a new order (for volume farming).
+type NewOrderRequest struct {
+	Symbol           string
+	Side             string
+	Type             string
+	TimeInForce      string
+	Quantity         string
+	Price            string
+	NewClientOrderId string
+}
+
+// OrderResponse represents the response from placing/canceling an order.
+type OrderResponse struct {
+	OrderID       int64   `json:"orderId"`
+	ClientOrderID string  `json:"clientOrderId"`
+	Symbol        string  `json:"symbol"`
+	Side          string  `json:"side"`
+	Type          string  `json:"type"`
+	Status        string  `json:"status"`
+	Price         float64 `json:"price,string"`
+	OrigQty       float64 `json:"origQty,string"`
+	ExecutedQty   float64 `json:"executedQty,string"`
+	AvgPrice      float64 `json:"avgPrice,string"`
+	TimeInForce   string  `json:"timeInForce"`
+	UpdateTime    int64   `json:"updateTime"`
 }

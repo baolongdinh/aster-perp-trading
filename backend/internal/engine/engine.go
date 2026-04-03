@@ -58,14 +58,14 @@ func New(
 	log *zap.Logger,
 ) *Engine {
 	return &Engine{
-		cfg:        cfg,
-		futures:    futures,
-		market:     market,
-		risk:       riskMgr,
-		orders:     orderMgr,
-		prec:       prec, // Assigned prec
-		strategies: strategies,
-		log:        log,
+		cfg:            cfg,
+		futures:        futures,
+		market:         market,
+		risk:           riskMgr,
+		orders:         orderMgr,
+		prec:           prec, // Assigned prec
+		strategies:     strategies,
+		log:            log,
 		positions:      make(map[string]*client.Position),
 		prices:         make(map[string]float64),
 		tickers:        make(map[string]stream.WsBookTicker),
@@ -365,7 +365,6 @@ func (e *Engine) onOrderUpdate(ou stream.WsOrderUpdate) {
 	}
 }
 
-
 func (e *Engine) onBookTicker(bt stream.WsBookTicker) {
 	e.mu.Lock()
 	e.tickers[bt.Symbol] = bt
@@ -400,7 +399,7 @@ func (e *Engine) onAccountUpdate(u stream.WsAccountUpdate) {
 			// Check if we just closed a position to record PnL
 			if old, ok := e.positions[pos.Symbol]; ok && old.PositionAmt != 0 {
 				e.risk.OnPositionClosed(pos.Symbol, pos.AccumulatedRealPnL) // Note: this is a total, not a delta. TODO: refine delta calculation.
-				
+
 				// Immediate cleanup of SL/TP when position is fully closed
 				go e.orders.CancelAllSLTPForSymbol(context.Background(), pos.Symbol)
 			}
@@ -691,7 +690,7 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isC
 			zap.Bool("is_chasing", existing.IsChasing || isChasing),
 		)
 		// Cancel old before placing new
-		_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
+		_, cancelErr := e.futures.CancelOrder(&client.CancelOrderRequest{
 			Symbol:        sig.Symbol,
 			ClientOrderID: existing.ClientOrderID,
 		})
@@ -789,7 +788,7 @@ func (e *Engine) VerifyNoStackingServer(ctx context.Context, symbol string) erro
 	if err != nil {
 		return fmt.Errorf("failed to verify open orders: %w", err)
 	}
-	
+
 	entryFound := false
 	for _, o := range openOrders {
 		// Stop/Take profit orders are fine, but limit entries are not
@@ -843,7 +842,7 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 				zap.Float64("price", lo.Price),
 				zap.String("strategy", lo.StrategyName),
 			)
-			_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
+			_, cancelErr := e.futures.CancelOrder(&client.CancelOrderRequest{
 				Symbol:        lo.Symbol,
 				ClientOrderID: lo.ClientOrderID,
 			})

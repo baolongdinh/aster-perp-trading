@@ -63,7 +63,7 @@ func main() {
 	// --- HTTP client ---
 	httpClient := client.NewHTTPClient(cfg.Exchange.FuturesRESTBase, signer, log, cfg.Exchange.RequestsPerSecond)
 	marketClient := client.NewMarketClient(httpClient)
-	futuresClient := client.NewFuturesClient(httpClient, cfg.Bot.DryRun, log)
+	futuresClient := client.NewFuturesClient(httpClient, cfg.Bot.DryRun, log, cfg.Exchange.RequestsPerSecond)
 
 	// --- Precision Manager ---
 	prec := client.NewPrecisionManager()

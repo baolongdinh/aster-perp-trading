@@ -31,6 +31,59 @@ log:
   level: info # debug | info | warn | error
   file: "logs/bot.log"
 
+# Volume Farming Configuration
+volume_farming:
+  enabled: true
+  max_daily_loss_usdt: 50
+  max_total_drawdown_pct: 5.0
+  order_size_usdt: 100
+  grid_spread_pct: 0.05
+  max_orders_per_side: 2
+  replace_immediately: true
+  position_timeout_minutes: 30
+
+  bot:
+    dry_run: true # Set to false for live trading
+
+  symbols:
+    auto_discover: true
+    quote_currency_mode: "flexible" # strict | flexible
+    min_volume_24h: 10000000
+    max_spread_pct: 0.1
+    boosted_only: false
+    max_symbols_per_quote: 10
+    spread_ranking: true
+    volume_weighting: 0.7
+    min_liquidity_score: 0.5
+    optimal_spread_range: [0.01, 0.05]
+    spread_volatility_threshold: 0.02
+    exclude_high_fee_symbols: true
+    quote_currencies: ["USDT", "USD1"]
+    allow_mixed_quotes: true
+    whitelist: [] # Optional: ["BTCUSDT", "ETHUSDT"]
+
+  exchange:
+    futures_rest_base: "https://fapi.asterdex.com"
+    futures_ws_base: "wss://fstream.asterdex.com"
+    recv_window: 5000
+    requests_per_second: 10
+
+  risk:
+    max_position_usdt: 2000
+    max_open_positions: 5
+    max_global_pending_limit_orders: 10
+    max_pending_per_side: 2
+    daily_loss_limit_usdt: 25
+    risk_per_trade_usdt: 5
+    atr_multiplier: 2.0
+    per_trade_stop_loss_pct: 2.0
+    per_trade_take_profit_pct: 4.0
+    position_mode: one_way
+
+  api:
+    host: "0.0.0.0"
+    port: 8081
+
 strategies:
   - name: ema_cross
     enabled: true
