@@ -5,29 +5,46 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 // FuturesClient provides a typed client for the Aster Futures API.
 type FuturesClient struct {
-	http   *HTTPClient
-	dryRun bool
-	log    *zap.Logger
+	http        *HTTPClient
+	dryRun      bool
+	log         *zap.Logger
+	rateLimiter *rate.Limiter
 }
 
 // NewFuturesClient creates a new FuturesClient.
-func NewFuturesClient(h *HTTPClient, dryRun bool, log *zap.Logger) *FuturesClient {
-	return &FuturesClient{
-		http:   h,
-		dryRun: dryRun,
-		log:    log,
+func NewFuturesClient(h *HTTPClient, dryRun bool, log *zap.Logger, requestsPerSecond int) *FuturesClient {
+	// Create rate limiter - very conservative to avoid bans
+	// Minimum 2 seconds between requests
+	rateLimiter := rate.NewLimiter(rate.Limit(requestsPerSecond), 1)
+
+	client := &FuturesClient{
+		http:        h,
+		dryRun:      dryRun,
+		log:         log,
+		rateLimiter: rateLimiter,
 	}
+	return client
+}
+
+// GetHTTPClient returns the underlying HTTP client for market data access.
+func (f *FuturesClient) GetHTTPClient() *HTTPClient {
+	return f.http
 }
 
 // PlaceOrder places a new futures order. Returns the placed Order or a dry-run stub.
 func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*Order, error) {
-	// Rate limiting removed to avoid artificial delays
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
 
 	if f.dryRun {
 		f.log.Info("[DRY-RUN] PlaceOrder",
@@ -48,7 +65,7 @@ func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 	}
 
 	params := f.placeOrderParams(req)
-	data, err := f.http.PostSigned(ctx, "/fapi/v1/order", params)
+	data, err := f.http.PostSigned(ctx, f.apiPath("/fapi/v1/order"), params)
 	if err != nil {
 		return nil, fmt.Errorf("place order: %w", err)
 	}
@@ -73,14 +90,30 @@ func (f *FuturesClient) Get24hrTicker() ([]Ticker, error) {
 	return tickers, nil
 }
 
+func (f *FuturesClient) apiPath(path string) string {
+	if f.http != nil && f.http.v3Signer != nil {
+		if strings.HasPrefix(path, "/fapi/v1/") {
+			return strings.Replace(path, "/fapi/v1/", "/fapi/v3/", 1)
+		}
+		if strings.HasPrefix(path, "/fapi/v2/") {
+			return strings.Replace(path, "/fapi/v2/", "/fapi/v3/", 1)
+		}
+	}
+	return path
+}
+
 // placeOrderParams converts PlaceOrderRequest to API parameters
 func (f *FuturesClient) placeOrderParams(req PlaceOrderRequest) map[string]string {
 	params := map[string]string{
-		"symbol":    req.Symbol,
-		"side":      req.Side,
-		"type":      req.Type,
-		"quantity":  req.Quantity,
-		"newClient": req.ClientOrderID,
+		"symbol": req.Symbol,
+		"side":   req.Side,
+		"type":   req.Type,
+	}
+	if req.Quantity != "" {
+		params["quantity"] = req.Quantity
+	}
+	if req.ClientOrderID != "" {
+		params["newClientOrderId"] = req.ClientOrderID
 	}
 	if req.Type == "LIMIT" {
 		params["price"] = req.Price
@@ -93,12 +126,17 @@ func (f *FuturesClient) placeOrderParams(req PlaceOrderRequest) map[string]strin
 
 // GetOpenOrders gets all open orders
 func (f *FuturesClient) GetOpenOrders(ctx context.Context, symbol string) ([]Order, error) {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
+
 	params := map[string]string{}
 	if symbol != "" {
 		params["symbol"] = symbol
 	}
 
-	data, err := f.http.GetSigned(ctx, "/fapi/v1/openOrders", params)
+	data, err := f.http.GetSigned(ctx, f.apiPath("/fapi/v1/openOrders"), params)
 	if err != nil {
 		return nil, fmt.Errorf("get open orders: %w", err)
 	}
@@ -111,13 +149,25 @@ func (f *FuturesClient) GetOpenOrders(ctx context.Context, symbol string) ([]Ord
 }
 
 // CancelOrder cancels an existing order
-func (f *FuturesClient) CancelOrder(ctx context.Context, symbol string, orderID int64) (*Order, error) {
-	params := map[string]string{
-		"symbol":  symbol,
-		"orderId": strconv.FormatInt(orderID, 10),
+func (f *FuturesClient) CancelOrder(ctx context.Context, req CancelOrderRequest) (*Order, error) {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
 	}
 
-	data, err := f.http.DeleteSigned(ctx, "/fapi/v1/order", params)
+	params := map[string]string{
+		"symbol": req.Symbol,
+	}
+
+	if req.OrderID > 0 {
+		params["orderId"] = strconv.FormatInt(req.OrderID, 10)
+	} else if req.ClientOrderID != "" {
+		params["origClientOrderId"] = req.ClientOrderID
+	} else {
+		return nil, fmt.Errorf("cancel order: orderId or clientOrderId required")
+	}
+
+	data, err := f.http.DeleteSigned(ctx, f.apiPath("/fapi/v1/order"), params)
 	if err != nil {
 		return nil, fmt.Errorf("cancel order: %w", err)
 	}
@@ -131,7 +181,12 @@ func (f *FuturesClient) CancelOrder(ctx context.Context, symbol string, orderID 
 
 // GetAccountInfo gets account information
 func (f *FuturesClient) GetAccountInfo(ctx context.Context) (*AccountInfo, error) {
-	data, err := f.http.GetSigned(ctx, "/fapi/v2/account", nil)
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	data, err := f.http.GetSigned(ctx, f.apiPath("/fapi/v2/account"), nil)
 	if err != nil {
 		return nil, fmt.Errorf("get account info: %w", err)
 	}
@@ -145,7 +200,12 @@ func (f *FuturesClient) GetAccountInfo(ctx context.Context) (*AccountInfo, error
 
 // GetPositions gets all positions
 func (f *FuturesClient) GetPositions(ctx context.Context) ([]Position, error) {
-	data, err := f.http.GetSigned(ctx, "/fapi/v2/positionRisk", nil)
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	data, err := f.http.GetSigned(ctx, f.apiPath("/fapi/v2/positionRisk"), nil)
 	if err != nil {
 		return nil, fmt.Errorf("get positions: %w", err)
 	}

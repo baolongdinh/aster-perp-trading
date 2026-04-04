@@ -33,8 +33,9 @@ func TestSymbolSelector_MeetsBasicCriteria(t *testing.T) {
 	// Create test config
 	cfg := &config.VolumeFarmConfig{
 		Symbols: config.SymbolsConfig{
-			MinVolume24h: 1000000,
-			Whitelist:    []string{},
+			MinVolume24h:    1000000,
+			QuoteCurrencies: []string{"USDT", "USD1"},
+			Whitelist:       []string{},
 		},
 	}
 
@@ -139,7 +140,7 @@ func TestSymbolSelector_IsQuoteCurrencyAllowed(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.quoteCurrency, func(t *testing.T) {
-			result := selector.isQuoteCurrencyAllowed(tc.quoteCurrency)
+			result := selector.isQuoteCurrencySupported(tc.quoteCurrency)
 			assert.Equal(t, tc.expected, result)
 		})
 	}

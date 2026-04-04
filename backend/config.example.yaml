@@ -9,7 +9,7 @@ exchange:
   futures_rest_base: "https://fapi.asterdex.com"
   futures_ws_base: "wss://fstream.asterdex.com"
   recv_window: 5000
-  requests_per_second: 5
+  requests_per_second: 1
 
 risk:
   max_position_usdt: 2000
@@ -36,11 +36,17 @@ volume_farming:
   enabled: true
   max_daily_loss_usdt: 50
   max_total_drawdown_pct: 5.0
-  order_size_usdt: 100
-  grid_spread_pct: 0.05
-  max_orders_per_side: 2
-  replace_immediately: true
-  position_timeout_minutes: 30
+  order_size_usdt: 25
+  grid_spread_pct: 0.12
+  max_orders_per_side: 1
+  replace_immediately: false
+  position_timeout_minutes: 45
+  ticker_stream: "!ticker@arr"
+  symbol_refresh_interval_seconds: 120
+  grid_placement_cooldown_seconds: 90
+  rate_limit_cooldown_seconds: 300
+  supported_quote_currencies: ["USD1"]
+  min_volume_24h: 5000000
 
   bot:
     dry_run: true # Set to false for live trading
@@ -48,33 +54,33 @@ volume_farming:
   symbols:
     auto_discover: true
     quote_currency_mode: "flexible" # strict | flexible
-    min_volume_24h: 10000000
-    max_spread_pct: 0.1
+    min_volume_24h: 5000000
+    max_spread_pct: 5.0
     boosted_only: false
-    max_symbols_per_quote: 10
+    max_symbols_per_quote: 2
     spread_ranking: true
     volume_weighting: 0.7
-    min_liquidity_score: 0.5
+    min_liquidity_score: 0.0
     optimal_spread_range: [0.01, 0.05]
     spread_volatility_threshold: 0.02
     exclude_high_fee_symbols: true
-    quote_currencies: ["USDT", "USD1"]
-    allow_mixed_quotes: true
+    quote_currencies: ["USD1"]
+    allow_mixed_quotes: false
     whitelist: [] # Optional: ["BTCUSDT", "ETHUSDT"]
 
   exchange:
     futures_rest_base: "https://fapi.asterdex.com"
     futures_ws_base: "wss://fstream.asterdex.com"
     recv_window: 5000
-    requests_per_second: 10
+    requests_per_second: 1
 
   risk:
-    max_position_usdt: 2000
-    max_open_positions: 5
-    max_global_pending_limit_orders: 10
-    max_pending_per_side: 2
+    max_position_usdt: 500
+    max_open_positions: 2
+    max_global_pending_limit_orders: 4
+    max_pending_per_side: 1
     daily_loss_limit_usdt: 25
-    risk_per_trade_usdt: 5
+    risk_per_trade_usdt: 3
     atr_multiplier: 2.0
     per_trade_stop_loss_pct: 2.0
     per_trade_take_profit_pct: 4.0

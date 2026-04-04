@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // MarketClient wraps public (unsigned) market data endpoints.
@@ -19,13 +20,13 @@ func NewMarketClient(h *HTTPClient) *MarketClient {
 
 // Ping checks server connectivity.
 func (m *MarketClient) Ping(ctx context.Context) error {
-	_, err := m.http.GetPublic(ctx, "/fapi/v1/ping", nil)
+	_, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/ping"), nil)
 	return err
 }
 
 // ServerTime returns the server time in milliseconds.
 func (m *MarketClient) ServerTime(ctx context.Context) (int64, error) {
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/time", nil)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/time"), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -45,7 +46,7 @@ func (m *MarketClient) Klines(ctx context.Context, symbol, interval string, limi
 		"interval": interval,
 		"limit":    strconv.Itoa(limit),
 	}
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/klines", params)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/klines"), params)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +78,7 @@ func (m *MarketClient) Klines(ctx context.Context, symbol, interval string, limi
 // MarkPrice fetches the current mark price and funding rate for a symbol.
 func (m *MarketClient) MarkPrice(ctx context.Context, symbol string) (*MarkPrice, error) {
 	params := map[string]string{"symbol": symbol}
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/premiumIndex", params)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/premiumIndex"), params)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +91,7 @@ func (m *MarketClient) MarkPrice(ctx context.Context, symbol string) (*MarkPrice
 
 // AllMarkPrices fetches mark prices for all symbols.
 func (m *MarketClient) AllMarkPrices(ctx context.Context) ([]MarkPrice, error) {
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/premiumIndex", nil)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/premiumIndex"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +105,7 @@ func (m *MarketClient) AllMarkPrices(ctx context.Context) ([]MarkPrice, error) {
 // BookTicker fetches best bid/ask for a symbol.
 func (m *MarketClient) BookTicker(ctx context.Context, symbol string) (*BookTicker, error) {
 	params := map[string]string{"symbol": symbol}
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/ticker/bookTicker", params)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/ticker/bookTicker"), params)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +122,7 @@ func (m *MarketClient) FundingRates(ctx context.Context, symbol string, limit in
 		"symbol": symbol,
 		"limit":  strconv.Itoa(limit),
 	}
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/fundingRate", params)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/fundingRate"), params)
 	if err != nil {
 		return nil, err
 	}
@@ -146,9 +147,16 @@ func parseFloatJSON(raw json.RawMessage, dst *float64) {
 
 // ExchangeInfo fetches exchange info (symbols, filters, rate limits).
 func (m *MarketClient) ExchangeInfo(ctx context.Context) (json.RawMessage, error) {
-	data, err := m.http.GetPublic(ctx, "/fapi/v1/exchangeInfo", nil)
+	data, err := m.http.GetPublic(ctx, m.apiPath("/fapi/v1/exchangeInfo"), nil)
 	if err != nil {
 		return nil, fmt.Errorf("exchange info: %w", err)
 	}
 	return json.RawMessage(data), nil
+}
+
+func (m *MarketClient) apiPath(path string) string {
+	if m.http != nil && m.http.v3Signer != nil {
+		return strings.Replace(path, "/fapi/v1/", "/fapi/v3/", 1)
+	}
+	return path
 }

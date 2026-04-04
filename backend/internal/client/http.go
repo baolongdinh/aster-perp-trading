@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -89,7 +90,7 @@ func (c *HTTPClient) GetPublic(ctx context.Context, path string, params map[stri
 func (c *HTTPClient) Get(ctx context.Context, path string, params map[string]string) ([]byte, error) {
 	var signedParams map[string]string
 	var err error
-	
+
 	if c.v3Signer != nil {
 		signedParams, err = c.v3Signer.SignRequest(params)
 	} else if c.v1Signer != nil {
@@ -97,21 +98,21 @@ func (c *HTTPClient) Get(ctx context.Context, path string, params map[string]str
 	} else {
 		return nil, fmt.Errorf("no signer available")
 	}
-	
+
 	if err != nil {
 		return nil, err
 	}
-	
+
 	u := c.buildURL(path, signedParams)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if c.v1Signer != nil {
 		req.Header.Set("X-MBX-APIKEY", c.v1Signer.APIKey())
 	}
-	
+
 	return c.do(req)
 }
 
@@ -124,7 +125,7 @@ func (c *HTTPClient) GetSigned(ctx context.Context, path string, params map[stri
 func (c *HTTPClient) PostSigned(ctx context.Context, path string, params map[string]string) ([]byte, error) {
 	var signedParams map[string]string
 	var err error
-	
+
 	if c.v3Signer != nil {
 		signedParams, err = c.v3Signer.SignRequest(params)
 	} else if c.v1Signer != nil {
@@ -132,22 +133,22 @@ func (c *HTTPClient) PostSigned(ctx context.Context, path string, params map[str
 	} else {
 		return nil, fmt.Errorf("no signer available")
 	}
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("client: sign POST: %w", err)
 	}
-	
+
 	body := encodeFormParams(signedParams)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	
+
 	if c.v1Signer != nil {
 		req.Header.Set("X-MBX-APIKEY", c.v1Signer.APIKey())
 	}
-	
+
 	return c.do(req)
 }
 
@@ -155,7 +156,7 @@ func (c *HTTPClient) PostSigned(ctx context.Context, path string, params map[str
 func (c *HTTPClient) PutSigned(ctx context.Context, path string, params map[string]string) ([]byte, error) {
 	var signedParams map[string]string
 	var err error
-	
+
 	if c.v3Signer != nil {
 		signedParams, err = c.v3Signer.SignRequest(params)
 	} else if c.v1Signer != nil {
@@ -163,22 +164,22 @@ func (c *HTTPClient) PutSigned(ctx context.Context, path string, params map[stri
 	} else {
 		return nil, fmt.Errorf("no signer available")
 	}
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("client: sign PUT: %w", err)
 	}
-	
+
 	body := encodeFormParams(signedParams)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+path, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	
+
 	if c.v1Signer != nil {
 		req.Header.Set("X-MBX-APIKEY", c.v1Signer.APIKey())
 	}
-	
+
 	return c.do(req)
 }
 
@@ -186,7 +187,7 @@ func (c *HTTPClient) PutSigned(ctx context.Context, path string, params map[stri
 func (c *HTTPClient) DeleteSigned(ctx context.Context, path string, params map[string]string) ([]byte, error) {
 	var signedParams map[string]string
 	var err error
-	
+
 	if c.v3Signer != nil {
 		signedParams, err = c.v3Signer.SignRequest(params)
 	} else if c.v1Signer != nil {
@@ -194,22 +195,22 @@ func (c *HTTPClient) DeleteSigned(ctx context.Context, path string, params map[s
 	} else {
 		return nil, fmt.Errorf("no signer available")
 	}
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("client: sign DELETE: %w", err)
 	}
-	
+
 	body := encodeFormParams(signedParams)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.base+path, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	
+
 	if c.v1Signer != nil {
 		req.Header.Set("X-MBX-APIKEY", c.v1Signer.APIKey())
 	}
-	
+
 	return c.do(req)
 }
 
@@ -253,14 +254,24 @@ func (c *HTTPClient) buildURL(path string, params map[string]string) string {
 
 // encodeFormParams encodes parameters as application/x-www-form-urlencoded.
 func encodeFormParams(params map[string]string) string {
+	if len(params) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var buf bytes.Buffer
-	for k, v := range params {
-		if buf.Len() > 0 {
+	for i, k := range keys {
+		if i > 0 {
 			buf.WriteByte('&')
 		}
 		buf.WriteString(url.QueryEscape(k))
 		buf.WriteByte('=')
-		buf.WriteString(url.QueryEscape(v))
+		buf.WriteString(url.QueryEscape(params[k]))
 	}
 	return buf.String()
 }

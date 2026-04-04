@@ -104,6 +104,12 @@ func Load(cfgPath string) (*Config, error) {
 	v.SetDefault("volume_farming.max_orders_per_side", 2)
 	v.SetDefault("volume_farming.replace_immediately", true)
 	v.SetDefault("volume_farming.position_timeout_minutes", 30)
+	v.SetDefault("volume_farming.ticker_stream", "!ticker@arr")
+	v.SetDefault("volume_farming.symbol_refresh_interval_seconds", 120)
+	v.SetDefault("volume_farming.grid_placement_cooldown_seconds", 90)
+	v.SetDefault("volume_farming.rate_limit_cooldown_seconds", 300)
+	v.SetDefault("volume_farming.supported_quote_currencies", []string{"USD1"})
+	v.SetDefault("volume_farming.min_volume_24h", 1000000)
 	v.SetDefault("volume_farming.symbols.auto_discover", true)
 	v.SetDefault("volume_farming.symbols.quote_currency_mode", "flexible")
 	v.SetDefault("volume_farming.symbols.min_volume_24h", 1000000)
@@ -115,7 +121,7 @@ func Load(cfgPath string) (*Config, error) {
 	v.SetDefault("volume_farming.symbols.min_liquidity_score", 0.0) // Allow all by default
 	v.SetDefault("volume_farming.symbols.exclude_high_fee_symbols", true)
 	v.SetDefault("volume_farming.symbols.allow_mixed_quotes", true)
-	v.SetDefault("volume_farming.symbols.quote_currencies", []string{"USDT", "USD1"})
+	v.SetDefault("volume_farming.symbols.quote_currencies", []string{"USD1"})
 	v.SetDefault("volume_farming.symbols.whitelist", []string{})
 
 	// YAML file
@@ -206,6 +212,12 @@ type VolumeFarmConfig struct {
 	MaxOrdersPerSide         int            `mapstructure:"max_orders_per_side"`
 	ReplaceImmediately       bool           `mapstructure:"replace_immediately"`
 	PositionTimeoutMinutes   int            `mapstructure:"position_timeout_minutes"`
+	TickerStream             string         `mapstructure:"ticker_stream"`
+	SymbolRefreshIntervalSec int            `mapstructure:"symbol_refresh_interval_seconds"`
+	GridPlacementCooldownSec int            `mapstructure:"grid_placement_cooldown_seconds"`
+	RateLimitCooldownSec     int            `mapstructure:"rate_limit_cooldown_seconds"`
+	RateLimiterCapacity      int            `mapstructure:"rate_limiter_capacity"`
+	RateLimiterRefillRate    float64        `mapstructure:"rate_limiter_refill_rate"`
 	SupportedQuoteCurrencies []string       `mapstructure:"supported_quote_currencies"`
 	MinVolume24h             float64        `mapstructure:"min_volume_24h"`
 	Bot                      BotConfig      `mapstructure:"bot"`
@@ -269,6 +281,12 @@ func setVolumeFarmDefaults() {
 	viper.SetDefault("max_orders_per_side", 2)
 	viper.SetDefault("replace_immediately", true)
 	viper.SetDefault("position_timeout_minutes", 30)
+	viper.SetDefault("ticker_stream", "!ticker@arr")
+	viper.SetDefault("symbol_refresh_interval_seconds", 120)
+	viper.SetDefault("grid_placement_cooldown_seconds", 90)
+	viper.SetDefault("rate_limit_cooldown_seconds", 300)
+	viper.SetDefault("supported_quote_currencies", []string{"USD1"})
+	viper.SetDefault("min_volume_24h", 1000000)
 
 	// Bot defaults
 	viper.SetDefault("bot.dry_run", true)
@@ -286,7 +304,7 @@ func setVolumeFarmDefaults() {
 	viper.SetDefault("symbols.optimal_spread_range", []float64{0.01, 0.05})
 	viper.SetDefault("symbols.spread_volatility_threshold", 0.02)
 	viper.SetDefault("symbols.exclude_high_fee_symbols", true)
-	viper.SetDefault("symbols.quote_currencies", []string{"USDT", "USD1"})
+	viper.SetDefault("symbols.quote_currencies", []string{"USD1"})
 	viper.SetDefault("symbols.allow_mixed_quotes", true)
 
 	// Exchange defaults (reuse from main config)

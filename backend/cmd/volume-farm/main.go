@@ -40,11 +40,25 @@ func main() {
 
 	logger.Info("🚀 Starting Aster Volume Farming Bot (Integrated)")
 
-	// Load configuration
+	// Load main configuration
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Fatal("Failed to load configuration", zap.Error(err))
 	}
+
+	// Load volume farming configuration
+	volumeFarmConfigPath := "config/volume-farm-config.yaml"
+	volumeCfg, err := config.LoadVolumeFarming(volumeFarmConfigPath)
+	if err != nil {
+		logger.Warn("Failed to load volume farming config, using defaults", zap.Error(err))
+		// Don't create default, let the engine use its defaults
+		volumeCfg = nil
+	} else {
+		logger.Info("Loaded volume farming config", zap.String("path", volumeFarmConfigPath))
+	}
+
+	// Set volume farming config in main config
+	cfg.VolumeFarming = volumeCfg
 
 	// Override dry-run if flag is set
 	if *dryRun {

@@ -690,7 +690,7 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isC
 			zap.Bool("is_chasing", existing.IsChasing || isChasing),
 		)
 		// Cancel old before placing new
-		_, cancelErr := e.futures.CancelOrder(&client.CancelOrderRequest{
+		_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
 			Symbol:        sig.Symbol,
 			ClientOrderID: existing.ClientOrderID,
 		})

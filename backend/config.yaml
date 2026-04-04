@@ -43,15 +43,19 @@ volume_farming:
   enabled: true # ENABLED WITH REAL API DATA
   max_daily_loss_usdt: 50
   max_total_drawdown_pct: 5.0
-  order_size_usdt: 50 # Reduced from 100 to 50 for "slow & steady"
-  grid_spread_pct: 0.1 # Increased from 0.05 to 0.1 (wider spreads = fewer orders)
-  max_orders_per_side: 1 # Reduced from 2 to 1 for simplicity
-  replace_immediately: false # Changed to false to reduce order churn
-  position_timeout_minutes: 60 # Increased from 30 to 60 for longer holds
+  order_size_usdt: 100 # Increased for better volume farming efficiency
+  grid_spread_pct: 0.12 # Wider maker grid reduces churn and request pressure
+  max_orders_per_side: 1 # Seed only 1 passive order per side
+  replace_immediately: false # Do not chase immediate replacement
+  position_timeout_minutes: 45 # Let passive orders sit longer before rotating
+  ticker_stream: "!ticker@arr"
+  symbol_refresh_interval_seconds: 120
+  grid_placement_cooldown_seconds: 90
+  rate_limit_cooldown_seconds: 300
 
   # Trading configuration
-  supported_quote_currencies: ["USDT", "USDC", "BUSD", "USD1"]
-  min_volume_24h: 1000000 # Min 1M volume requirement
+  supported_quote_currencies: ["USD1"]
+  min_volume_24h: 5000000 # Focus only on deeper books
 
   bot:
     dry_run: false # Set to false for live trading
@@ -59,33 +63,33 @@ volume_farming:
   symbols:
     auto_discover: true
     quote_currency_mode: "flexible" # strict | flexible
-    min_volume_24h: 500000 # Reduced to 500K for testing
-    max_spread_pct: 10.0 # 10% spread threshold (fixed from 0.1%)
+    min_volume_24h: 5000000
+    max_spread_pct: 5.0
     boosted_only: false
-    max_symbols_per_quote: 1 # Reduced from 10 to 1 to avoid rate limiting
+    max_symbols_per_quote: 2 # Keep universe tight but still enough to rotate volume
     spread_ranking: true
     volume_weighting: 0.7
-    min_liquidity_score: 0.1 # Reduced from 0.5 for testing
+    min_liquidity_score: 0.0
     optimal_spread_range: [0.01, 0.05]
     spread_volatility_threshold: 0.02
     exclude_high_fee_symbols: true
     quote_currencies: ["USD1"]
-    allow_mixed_quotes: true
-    whitelist: [] # Optional: ["BTCUSDT", "ETHUSDT"]
+    allow_mixed_quotes: false
+    whitelist: ["BTCUSDT", "ETHUSDT"] # Optional: ["BTCUSDT", "ETHUSDT"]
 
   exchange:
     futures_rest_base: "https://fapi.asterdex.com"
     futures_ws_base: "wss://fstream.asterdex.com"
     recv_window: 5000
-    requests_per_second: 5 # Ultra-conservative: 1 req/sec to avoid IP ban
+    requests_per_second: 1
 
   risk:
-    max_position_usdt: 2000
-    max_open_positions: 5
-    max_global_pending_limit_orders: 10
-    max_pending_per_side: 2
+    max_position_usdt: 500
+    max_open_positions: 2
+    max_global_pending_limit_orders: 4
+    max_pending_per_side: 1
     daily_loss_limit_usdt: 25
-    risk_per_trade_usdt: 5
+    risk_per_trade_usdt: 3
     atr_multiplier: 1.5
     per_trade_stop_loss_pct: 1.5
     per_trade_take_profit_pct: 3.0

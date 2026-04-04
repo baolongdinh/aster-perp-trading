@@ -5,29 +5,37 @@
 enabled: true
 max_daily_loss_usdt: 50
 max_total_drawdown_pct: 5.0
-order_size_usdt: 100
-grid_spread_pct: 0.05
-max_orders_per_side: 2
+order_size_usdt: 5  # Giảm xuống 5 USD1 để tạo nhiều lệnh hơn
+grid_spread_pct: 0.02  # Giảm spread xuống 0.02% để lệnh gần giá hơn
+max_orders_per_side: 3  # Tăng lên 3 lệnh mỗi bên
 replace_immediately: true
-position_timeout_minutes: 30
+position_timeout_minutes: 45
+ticker_stream: "!ticker@arr"
+symbol_refresh_interval_seconds: 120
+grid_placement_cooldown_seconds: 2  # Giảm cooldown xuống 2 giây cho trading liên tục
+rate_limit_cooldown_seconds: 5  # Giảm rate limit cooldown
+rate_limiter_capacity: 50  # Tăng capacity lên 50
+rate_limiter_refill_rate: 10.0  # Tăng refill rate lên 10
+supported_quote_currencies: ["USD1"]
+min_volume_24h: 1000  # Giảm xuống 1000 để dễ farming hơn
 
 # Symbol Selection & Management
 symbols:
-  auto_discover: true
-  quote_currency_mode: "flexible"  # "USDT" | "USD1" | "flexible" | "all"
-  min_volume_24h: 10000000  # Minimum $10M daily volume
-  max_spread_pct: 0.1  # Maximum spread 0.1%
-  boosted_only: false  # Prioritize boosted symbols
-  max_symbols_per_quote: 10  # Max 10 symbols per quote currency
-  spread_ranking: true  # Rank by lowest spread first
-  volume_weighting: 0.7  # 70% weight to volume, 30% to spread
-  min_liquidity_score: 0.5  # Minimum liquidity score (0-1)
-  optimal_spread_range: [0.01, 0.05]  # Prefer 0.01% - 0.05% spread
-  spread_volatility_threshold: 0.02  # Max spread change 0.02% in 5min
-  exclude_high_fee_symbols: true  # Exclude symbols with unusual fee structures
-  quote_currencies: ["USDT", "USD1"]  # Available quote currencies
-  allow_mixed_quotes: true  # Allow mixing USDT and USD1 pairs
-  whitelist: []  # Optional whitelist - empty means auto-discover
+  auto_discover: true  # Bật auto discover để tìm nhiều symbol hơn
+  quote_currency_mode: "USD1"
+  min_volume_24h: 1000  # Giảm xuống 1000 để dễ qualify
+  max_spread_pct: 10.0  # Tăng max spread để chấp nhận nhiều symbol hơn
+  boosted_only: false
+  max_symbols_per_quote: 10  # Tăng lên 10 symbols mỗi quote currency
+  spread_ranking: false  # Tắt spread ranking để tập trung volume
+  volume_weighting: 0.3  # Giảm volume weighting để dễ qualify
+  min_liquidity_score: 0.0
+  optimal_spread_range: [0.0, 1.0]  # Mở rộng range spread
+  spread_volatility_threshold: 0.1  # Tăng threshold
+  exclude_high_fee_symbols: false  # Không exclude symbol có phí cao
+  quote_currencies: ["USD1"]  # Thêm USD1
+  allow_mixed_quotes: true  # Cho phép mixed quotes
+  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1", "XRPUSD1", "ADAUSD1", "DOGEUSD1", "BNBUSD1"]  # Thêm nhiều symbol hơn
 
 # Exchange Configuration (reuse from main config)
 exchange:
@@ -35,23 +43,23 @@ exchange:
   futures_rest_base: "https://fapi.asterdex.com"
   futures_ws_base: "wss://fstream.asterdex.com"
   recv_window: 5000
-  requests_per_second: 10
+  requests_per_second: 20  # Tăng lên 20 requests/second
 
 # Risk Management (reuse from main config but with farming-specific limits)
 risk:
-  max_position_usdt_per_symbol: 500
-  max_total_positions_usdt: 2000
+  max_position_usdt_per_symbol: 250
+  max_total_positions_usdt: 500
   fee_loss_threshold_pct: 0.1
-  position_timeout_minutes: 30
+  position_timeout_minutes: 45
   max_daily_loss_usdt: 50
   daily_drawdown_pct: 5.0
-  max_open_positions: 10
+  max_open_positions: 2
   max_trades_per_symbol: 100
-  max_global_pending_limit_orders: 20
-  max_pending_per_side: 5
+  max_global_pending_limit_orders: 4
+  max_pending_per_side: 1
   per_trade_stop_loss_pct: 2.0
   per_trade_take_profit_pct: 1.0
-  risk_per_trade_usdt: 10.0
+  risk_per_trade_usdt: 3.0
   atr_multiplier: 2.0
   position_mode: "one_way"
   correlation_threshold: 0.8

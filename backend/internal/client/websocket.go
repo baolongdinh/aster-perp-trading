@@ -225,7 +225,7 @@ func (ws *WebSocketClient) processArrayMessage(msgArray []interface{}) {
 
 	select {
 	case ws.tickerCh <- wrapperMsg:
-		ws.logger.Debug("Array ticker message processed", zap.Int("count", len(msgArray)))
+		// ws.logger.Debug("Array ticker message processed", zap.Int("count", len(msgArray)))
 	default:
 		ws.logger.Warn("Ticker channel full, dropping array message")
 	}

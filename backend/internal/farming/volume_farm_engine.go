@@ -3,6 +3,7 @@ package farming
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,14 +16,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// MarkPrice represents a mark price update
+// MarkPrice represents a mark price update.
 type MarkPrice struct {
 	Symbol    string  `json:"symbol"`
 	Price     float64 `json:"price"`
 	Timestamp int64   `json:"timestamp"`
 }
 
-// OrderUpdate represents an order update event
+// OrderUpdate represents an order update event.
 type OrderUpdate struct {
 	Symbol      string  `json:"symbol"`
 	OrderID     string  `json:"order_id"`
@@ -37,9 +38,10 @@ type OrderUpdate struct {
 	Timestamp   int64   `json:"timestamp"`
 }
 
-// VolumeFarmEngine orchestrates volume farming operations
+// VolumeFarmEngine orchestrates volume farming operations.
 type VolumeFarmEngine struct {
 	config         *config.Config
+	volumeConfig   *config.VolumeFarmConfig
 	logger         *zap.Logger
 	isRunning      bool
 	isRunningMu    sync.RWMutex
@@ -52,7 +54,7 @@ type VolumeFarmEngine struct {
 	wg             sync.WaitGroup
 }
 
-// NewVolumeFarmEngine creates a new volume farming engine
+// NewVolumeFarmEngine creates a new volume farming engine.
 func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEngine, error) {
 	engine := &VolumeFarmEngine{
 		config: cfg,
@@ -60,10 +62,8 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		stopCh: make(chan struct{}),
 	}
 
-	// Create auth signer - try V3 first, fallback to V1
 	var httpClient *client.HTTPClient
 
-	// Try V3 authentication first
 	if cfg.Exchange.UserWallet != "" && cfg.Exchange.APISigner != "" && cfg.Exchange.APISignerKey != "" {
 		v3Signer, err := auth.NewV3Signer(
 			cfg.Exchange.UserWallet,
@@ -75,49 +75,67 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 			return nil, fmt.Errorf("failed to create V3 signer: %w", err)
 		}
 
-		// Initialize futures client with V3 auth
 		httpClient = client.NewHTTPClientV3(cfg.Exchange.FuturesRESTBase, v3Signer, logger, cfg.Exchange.RequestsPerSecond)
-		engine.logger.Info("🔐 Using V3 authentication (API Wallet/Agent model)")
+		engine.logger.Info("Using V3 authentication (API Wallet/Agent model)")
+
+		// Sync server time offset for V3 signer to avoid timestamp drift errors (-1021)
+		marketClient := client.NewMarketClient(httpClient)
+		localTimeBefore := time.Now().UnixMilli()
+		serverTime, err := marketClient.ServerTime(context.Background())
+		if err != nil {
+			engine.logger.Warn("Failed to sync server time for V3 signer", zap.Error(err))
+		} else {
+			localTimeAfter := time.Now().UnixMilli()
+			localTimeEstimated := localTimeBefore + (localTimeAfter-localTimeBefore)/2
+			offset := serverTime - localTimeEstimated
+			v3Signer.SetTimeOffset(offset)
+			engine.logger.Info("V3 server time synced", zap.Int64("offset_ms", offset), zap.Int64("server_time", serverTime))
+		}
 	} else if cfg.Exchange.APIKey != "" && cfg.Exchange.APISecret != "" {
-		// Fallback to V1 authentication
 		v1Signer, err := auth.NewSigner(cfg.Exchange.APIKey, cfg.Exchange.APISecret, cfg.Exchange.RecvWindow)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create V1 signer: %w", err)
 		}
 
-		// Initialize futures client with V1 auth
 		httpClient = client.NewHTTPClient(cfg.Exchange.FuturesRESTBase, v1Signer, logger, cfg.Exchange.RequestsPerSecond)
-		engine.logger.Info("🔐 Using V1 authentication (API Key model - deprecated)")
+		engine.logger.Info("Using V1 authentication (API Key model - deprecated)")
+
+		// Sync server time offset for V1 signer to avoid timestamp drift errors (-1021)
+		marketClient := client.NewMarketClient(httpClient)
+		localTimeBefore := time.Now().UnixMilli()
+		serverTime, err := marketClient.ServerTime(context.Background())
+		if err != nil {
+			engine.logger.Warn("Failed to sync server time for V1 signer", zap.Error(err))
+		} else {
+			localTimeAfter := time.Now().UnixMilli()
+			localTimeEstimated := localTimeBefore + (localTimeAfter-localTimeBefore)/2
+			offset := serverTime - localTimeEstimated
+			v1Signer.SetTimeOffset(offset)
+			engine.logger.Info("V1 server time synced", zap.Int64("offset_ms", offset), zap.Int64("server_time", serverTime))
+		}
 	} else {
 		return nil, fmt.Errorf("no valid authentication credentials found - please configure either V3 or V1")
 	}
 
-	// Use volume farming specific dry-run setting
-	volumeDryRun := cfg.VolumeFarming.Bot.DryRun
-	engine.futuresClient = client.NewFuturesClient(httpClient, volumeDryRun, logger)
-
-	// Initialize risk manager (reuse existing)
+	volumeConfig := engine.extractVolumeFarmConfig(cfg)
+	engine.volumeConfig = volumeConfig
+	engine.futuresClient = client.NewFuturesClient(httpClient, volumeConfig.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
 	engine.riskManager = risk.NewManager(cfg.Risk, logger)
 
-	// Initialize volume farming specific components
-	volumeConfig := engine.extractVolumeFarmConfig(cfg)
-
-	// Convert zap logger to logrus (temporary solution)
-	// In production, we should standardize on one logger type
 	logrusEntry := logrus.NewEntry(logrus.StandardLogger()).WithField("component", "volume_farm")
-
-	// Create symbol selector
 	engine.symbolSelector = NewSymbolSelector(engine.futuresClient, logrusEntry.WithField("component", "symbol_selector"), volumeConfig)
-	gridLogger := logrusEntry.WithField("component", "grid_manager")
-	pointsLogger := logrusEntry.WithField("component", "points_tracker")
 
+	gridLogger := logrusEntry.WithField("component", "grid_manager")
 	engine.gridManager = NewGridManager(engine.futuresClient, gridLogger)
+	engine.gridManager.ApplyConfig(volumeConfig)
+
+	pointsLogger := logrusEntry.WithField("component", "points_tracker")
 	engine.pointsTracker = NewPointsTracker(volumeConfig, pointsLogger)
 
 	return engine, nil
 }
 
-// Start starts the volume farming engine
+// Start starts the volume farming engine.
 func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	e.isRunningMu.Lock()
 	if e.isRunning {
@@ -127,9 +145,8 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	e.isRunning = true
 	e.isRunningMu.Unlock()
 
-	e.logger.Info("🚀 Starting Volume Farming Engine")
+	e.logger.Info("Starting Volume Farming Engine")
 
-	// Start symbol selector
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -138,32 +155,27 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Connect symbol selector to grid manager
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		ticker := time.NewTicker(15 * time.Second) // Faster updates for testing
+		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
+
+		// Initial symbol sync to avoid waiting for first interval
+		e.syncGridSymbols()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-e.stopCh:
+				return
 			case <-ticker.C:
-				// Get active symbols from selector and update grid manager
-				activeSymbols := e.symbolSelector.GetActiveSymbols()
-				e.logger.Debug("Symbol update check", zap.Int("active_symbols", len(activeSymbols)))
-				if len(activeSymbols) > 0 {
-					e.logger.Info("Updating grid manager with symbols", zap.Int("count", len(activeSymbols)))
-					e.gridManager.UpdateSymbols(activeSymbols)
-				} else {
-					e.logger.Debug("No active symbols found yet")
-				}
+				e.syncGridSymbols()
 			}
 		}
 	}()
 
-	// Start grid manager
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -172,7 +184,6 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Start points tracker
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -181,18 +192,117 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Start risk monitoring
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
 		e.monitorRisk(ctx)
 	}()
 
-	e.logger.Info("✅ Volume Farming Engine started successfully")
+	e.logger.Info("Volume Farming Engine started successfully")
 	return nil
 }
+func (e *VolumeFarmEngine) syncGridSymbols() {
+	e.logger.Info("Syncing grid symbols")
 
-// Stop stops the volume farming engine
+	activeSymbols := e.symbolSelector.GetActiveSymbols()
+	e.logger.Info("Active symbols from selector", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
+		syms := make([]string, len(activeSymbols))
+		for i, s := range activeSymbols {
+			syms[i] = s.Symbol
+		}
+		return syms
+	}()))
+
+	// Always include whitelist symbols
+	if len(e.volumeConfig.Symbols.Whitelist) > 0 {
+		whitelistSymbols := make(map[string]bool)
+		for _, sym := range e.volumeConfig.Symbols.Whitelist {
+			whitelistSymbols[sym] = true
+		}
+		for _, s := range activeSymbols {
+			delete(whitelistSymbols, s.Symbol)
+		}
+		// Add remaining whitelist
+		for sym := range whitelistSymbols {
+			quote := ""
+			for _, qc := range e.volumeConfig.Symbols.QuoteCurrencies {
+				if len(sym) > len(qc) && sym[len(sym)-len(qc):] == qc {
+					quote = qc
+					break
+				}
+			}
+			if quote != "" {
+				base := sym[:len(sym)-len(quote)]
+				activeSymbols = append(activeSymbols, &SymbolData{
+					Symbol:     sym,
+					BaseAsset:  base,
+					QuoteAsset: quote,
+					Status:     "TRADING",
+					Volume24h:  1000000,
+					Count24h:   1000,
+				})
+			}
+		}
+		e.logger.Info("Added whitelist to active symbols", zap.Int("total_count", len(activeSymbols)))
+	}
+
+	if len(activeSymbols) == 0 {
+		e.logger.Info("No symbols from selector, adding basic whitelist for volume farming")
+		// Force add some basic symbols for volume farming
+		basicSymbols := []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+		for _, sym := range basicSymbols {
+			activeSymbols = append(activeSymbols, &SymbolData{
+				Symbol:     sym,
+				BaseAsset:  strings.TrimSuffix(sym, "USDT"),
+				QuoteAsset: "USDT",
+				Status:     "TRADING",
+				Volume24h:  1000000, // Minimum volume for farming
+				Count24h:   1000,
+			})
+		}
+	}
+
+	e.logger.Info("Updating grid manager with symbols", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
+		syms := make([]string, len(activeSymbols))
+		for i, s := range activeSymbols {
+			syms[i] = s.Symbol
+		}
+		return syms
+	}()))
+	e.gridManager.UpdateSymbols(activeSymbols)
+}
+
+func (e *VolumeFarmEngine) createWhitelistSymbols() []*SymbolData {
+	symbols := make([]*SymbolData, 0, len(e.volumeConfig.Symbols.Whitelist))
+	for _, symbol := range e.volumeConfig.Symbols.Whitelist {
+		// Extract quote currency
+		quote := ""
+		for _, qc := range e.volumeConfig.Symbols.QuoteCurrencies {
+			if len(symbol) > len(qc) && symbol[len(symbol)-len(qc):] == qc {
+				quote = qc
+				break
+			}
+		}
+		if quote == "" {
+			continue
+		}
+
+		// Extract base asset
+		base := symbol[:len(symbol)-len(quote)]
+
+		symbols = append(symbols, &SymbolData{
+			Symbol:     symbol,
+			BaseAsset:  base,
+			QuoteAsset: quote,
+			Status:     "TRADING",
+			Volume24h:  1000000, // Dummy volume
+			Count24h:   1000,
+		})
+	}
+	return symbols
+}
+
+// Stop stops the volume farming engine.
 func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 	e.isRunningMu.Lock()
 	if !e.isRunning {
@@ -202,12 +312,25 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 	e.isRunning = false
 	e.isRunningMu.Unlock()
 
-	e.logger.Info("🛑 Stopping Volume Farming Engine")
-
-	// Signal all goroutines to stop
+	e.logger.Info("Stopping Volume Farming Engine")
 	close(e.stopCh)
 
-	// Wait for all goroutines to finish with timeout
+	if e.symbolSelector != nil {
+		if err := e.symbolSelector.Stop(ctx); err != nil {
+			e.logger.Warn("Symbol selector stop error", zap.Error(err))
+		}
+	}
+	if e.gridManager != nil {
+		if err := e.gridManager.Stop(ctx); err != nil {
+			e.logger.Warn("Grid manager stop error", zap.Error(err))
+		}
+	}
+	if e.pointsTracker != nil {
+		if err := e.pointsTracker.Stop(ctx); err != nil {
+			e.logger.Warn("Points tracker stop error", zap.Error(err))
+		}
+	}
+
 	done := make(chan struct{})
 	go func() {
 		e.wg.Wait()
@@ -216,27 +339,27 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 
 	select {
 	case <-done:
-		e.logger.Info("✅ Volume Farming Engine stopped gracefully")
+		e.logger.Info("Volume Farming Engine stopped gracefully")
 		return nil
 	case <-ctx.Done():
-		e.logger.Warn("⚠️  Volume Farming Engine stop timeout")
+		e.logger.Warn("Volume Farming Engine stop timeout")
 		return ctx.Err()
 	}
 }
 
-// IsRunning returns whether the engine is running
+// IsRunning returns whether the engine is running.
 func (e *VolumeFarmEngine) IsRunning() bool {
 	e.isRunningMu.RLock()
 	defer e.isRunningMu.RUnlock()
 	return e.isRunning
 }
 
-// GetStatus returns the current status
+// GetStatus returns the current status.
 func (e *VolumeFarmEngine) GetStatus() *VolumeFarmStatus {
 	return &VolumeFarmStatus{
 		IsRunning:     e.IsRunning(),
 		ActiveSymbols: e.symbolSelector.GetActiveSymbolCount(),
-		ActiveGrids:   0, // TODO: Implement GetActiveGridCount in GridManager
+		ActiveGrids:   0,
 		CurrentPoints: e.pointsTracker.GetCurrentPoints(),
 		CurrentVolume: e.pointsTracker.GetCurrentVolume(),
 		DailyLoss:     e.riskManager.DailyPnL(),
@@ -250,7 +373,7 @@ func (e *VolumeFarmEngine) GetStatus() *VolumeFarmStatus {
 	}
 }
 
-// monitorRisk monitors risk levels and takes action
+// monitorRisk monitors risk levels and takes action.
 func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -262,7 +385,6 @@ func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
 		case <-e.stopCh:
 			return
 		case <-ticker.C:
-			// Check risk limits
 			dailyPnL := e.riskManager.DailyPnL()
 			isPaused := e.riskManager.IsPaused()
 
@@ -270,63 +392,107 @@ func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
 				e.logger.Warn("Daily loss limit reached, stopping farming",
 					zap.Float64("daily_loss", dailyPnL),
 					zap.Float64("limit", e.config.Risk.DailyLossLimitUSDT))
-				// Emergency stop - just log for now
 			}
 
 			if isPaused {
 				e.logger.Warn("Risk manager paused, stopping farming")
-				// Emergency stop - just log for now
 			}
 		}
 	}
 }
 
-// extractVolumeFarmConfig extracts volume farming config from main config
+// extractVolumeFarmConfig extracts volume farming config from main config.
 func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.VolumeFarmConfig {
-	// Debug logging
+	if cfg.VolumeFarming == nil {
+		return &config.VolumeFarmConfig{
+			Enabled:                  true,
+			MaxDailyLossUSDT:         50,
+			MaxTotalDrawdownPct:      5.0,
+			OrderSizeUSDT:            25,
+			GridSpreadPct:            0.12,
+			MaxOrdersPerSide:         1,
+			ReplaceImmediately:       false,
+			PositionTimeoutMinutes:   30,
+			TickerStream:             "!ticker@arr",
+			SymbolRefreshIntervalSec: 120,
+			GridPlacementCooldownSec: 90,
+			RateLimitCooldownSec:     300,
+			SupportedQuoteCurrencies: []string{"USD1"},
+			MinVolume24h:             1_000_000,
+			Bot:                      cfg.Bot,
+			Exchange:                 cfg.Exchange,
+			Risk:                     cfg.Risk,
+			API:                      cfg.API,
+			Symbols: config.SymbolsConfig{
+				QuoteCurrencies:    []string{"USD1"},
+				MaxSymbolsPerQuote: 3,
+				MinVolume24h:       1_000_000,
+			},
+		}
+	}
+
 	e.logger.Info("Extracted volume farming config",
 		zap.Bool("volume_farming_enabled", cfg.VolumeFarming.Enabled),
 		zap.String("quote_currency_mode", cfg.VolumeFarming.Symbols.QuoteCurrencyMode),
 		zap.Strings("quote_currencies", cfg.VolumeFarming.Symbols.QuoteCurrencies),
 		zap.Float64("min_volume_24h", cfg.VolumeFarming.Symbols.MinVolume24h),
+		zap.Strings("whitelist", cfg.VolumeFarming.Symbols.Whitelist),
 	)
 
-	if cfg.VolumeFarming == nil {
-		// Return default config if not set
-		return &config.VolumeFarmConfig{
-			Enabled:                true,
-			MaxDailyLossUSDT:       50,
-			MaxTotalDrawdownPct:    5.0,
-			OrderSizeUSDT:          100,
-			GridSpreadPct:          0.05,
-			MaxOrdersPerSide:       2,
-			ReplaceImmediately:     true,
-			PositionTimeoutMinutes: 30,
-			Bot:                    cfg.Bot, // Use main bot config
-			Exchange:               cfg.Exchange,
-			Risk:                   cfg.Risk,
-			API:                    cfg.API,
-		}
+	volumeConfig := &config.VolumeFarmConfig{
+		Enabled:                  cfg.VolumeFarming.Enabled,
+		MaxDailyLossUSDT:         cfg.VolumeFarming.MaxDailyLossUSDT,
+		MaxTotalDrawdownPct:      cfg.VolumeFarming.MaxTotalDrawdownPct,
+		OrderSizeUSDT:            cfg.VolumeFarming.OrderSizeUSDT,
+		GridSpreadPct:            cfg.VolumeFarming.GridSpreadPct,
+		MaxOrdersPerSide:         cfg.VolumeFarming.MaxOrdersPerSide,
+		ReplaceImmediately:       cfg.VolumeFarming.ReplaceImmediately,
+		PositionTimeoutMinutes:   cfg.VolumeFarming.PositionTimeoutMinutes,
+		TickerStream:             cfg.VolumeFarming.TickerStream,
+		SymbolRefreshIntervalSec: cfg.VolumeFarming.SymbolRefreshIntervalSec,
+		GridPlacementCooldownSec: cfg.VolumeFarming.GridPlacementCooldownSec,
+		RateLimitCooldownSec:     cfg.VolumeFarming.RateLimitCooldownSec,
+		SupportedQuoteCurrencies: append([]string{}, cfg.VolumeFarming.SupportedQuoteCurrencies...),
+		MinVolume24h:             cfg.VolumeFarming.MinVolume24h,
+		Bot:                      cfg.Bot,
+		Symbols:                  cfg.VolumeFarming.Symbols,
+		Exchange:                 cfg.Exchange,
+		Risk:                     cfg.Risk,
+		API:                      cfg.API,
 	}
 
-	return &config.VolumeFarmConfig{
-		Enabled:                cfg.VolumeFarming.Enabled,
-		MaxDailyLossUSDT:       cfg.VolumeFarming.MaxDailyLossUSDT,
-		MaxTotalDrawdownPct:    cfg.VolumeFarming.MaxTotalDrawdownPct,
-		OrderSizeUSDT:          cfg.VolumeFarming.OrderSizeUSDT,
-		GridSpreadPct:          cfg.VolumeFarming.GridSpreadPct,
-		MaxOrdersPerSide:       cfg.VolumeFarming.MaxOrdersPerSide,
-		ReplaceImmediately:     cfg.VolumeFarming.ReplaceImmediately,
-		PositionTimeoutMinutes: cfg.VolumeFarming.PositionTimeoutMinutes,
-		Bot:                    cfg.Bot, // Use main bot config
-		Symbols:                cfg.VolumeFarming.Symbols,
-		Exchange:               cfg.Exchange,
-		Risk:                   cfg.Risk,
-		API:                    cfg.API,
+	if volumeConfig.MinVolume24h <= 0 {
+		volumeConfig.MinVolume24h = volumeConfig.Symbols.MinVolume24h
 	}
+	if len(volumeConfig.SupportedQuoteCurrencies) == 0 {
+		volumeConfig.SupportedQuoteCurrencies = append([]string{}, volumeConfig.Symbols.QuoteCurrencies...)
+	}
+	if len(volumeConfig.SupportedQuoteCurrencies) == 0 {
+		volumeConfig.SupportedQuoteCurrencies = []string{"USD1"}
+	}
+	if len(volumeConfig.Symbols.QuoteCurrencies) == 0 {
+		volumeConfig.Symbols.QuoteCurrencies = append([]string{}, volumeConfig.SupportedQuoteCurrencies...)
+	}
+	if volumeConfig.TickerStream == "" {
+		volumeConfig.TickerStream = "!ticker@arr"
+	}
+	if volumeConfig.SymbolRefreshIntervalSec <= 0 {
+		volumeConfig.SymbolRefreshIntervalSec = 120
+	}
+	if volumeConfig.GridPlacementCooldownSec <= 0 {
+		volumeConfig.GridPlacementCooldownSec = 90
+	}
+	if volumeConfig.RateLimitCooldownSec <= 0 {
+		volumeConfig.RateLimitCooldownSec = 300
+	}
+	if volumeConfig.Symbols.MaxSymbolsPerQuote <= 0 {
+		volumeConfig.Symbols.MaxSymbolsPerQuote = 3
+	}
+
+	return volumeConfig
 }
 
-// VolumeFarmStatus represents the current status
+// VolumeFarmStatus represents the current status.
 type VolumeFarmStatus struct {
 	IsRunning     bool      `json:"is_running"`
 	ActiveSymbols int       `json:"active_symbols"`

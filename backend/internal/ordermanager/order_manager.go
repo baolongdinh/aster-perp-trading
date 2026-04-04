@@ -329,7 +329,7 @@ func (m *Manager) placeStopOrder(ctx context.Context, symbol, side, qty string, 
 }
 
 func (m *Manager) cancelByClientID(ctx context.Context, symbol, clientID string) error {
-	_, err := m.futures.CancelOrder(&client.CancelOrderRequest{
+	_, err := m.futures.CancelOrder(ctx, client.CancelOrderRequest{
 		Symbol:        symbol,
 		ClientOrderID: clientID,
 	})
@@ -350,7 +350,7 @@ func (m *Manager) CancelAllEntriesForSymbol(ctx context.Context, symbol string, 
 
 	for _, id := range toCancel {
 		m.log.Info("OFAC: Canceling redundant entry order", zap.String("symbol", symbol), zap.Int64("orderId", id))
-		_, err := m.futures.CancelOrder(&client.CancelOrderRequest{
+		_, err := m.futures.CancelOrder(ctx, client.CancelOrderRequest{
 			Symbol:  symbol,
 			OrderID: id,
 		})
