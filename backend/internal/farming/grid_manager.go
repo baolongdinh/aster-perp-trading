@@ -36,6 +36,10 @@ type GridManager struct {
 	pendingOrders map[string]*GridOrder
 	ordersMu      sync.RWMutex
 
+	// Active orders tracking for fill detection
+	activeOrders map[string]*GridOrder // OrderID -> GridOrder
+	filledOrders map[string]*GridOrder // OrderID -> GridOrder
+
 	// Configuration.
 	orderSizeUSDT float64
 	gridSpreadPct float64
@@ -57,6 +61,12 @@ type GridManager struct {
 	// Dynamic cooldown tracking
 	consecutiveFailures int
 	lastFailureTime     time.Time
+
+	// Volume farming metrics
+	totalVolumeUSDT   float64
+	totalOrdersPlaced int
+	totalOrdersFilled int
+	volumeMetricsMu   sync.RWMutex
 }
 
 // SymbolGrid represents a grid for a specific symbol.
@@ -98,6 +108,8 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry) *
 		logger:                logger,
 		activeGrids:           make(map[string]*SymbolGrid),
 		pendingOrders:         make(map[string]*GridOrder),
+		activeOrders:          make(map[string]*GridOrder),
+		filledOrders:          make(map[string]*GridOrder),
 		stopCh:                make(chan struct{}),
 		orderSizeUSDT:         25.0,
 		gridSpreadPct:         0.12,
@@ -178,6 +190,9 @@ func (g *GridManager) Start(ctx context.Context) error {
 	go g.websocketProcessor(ctx)
 
 	g.wg.Add(1)
+	go g.metricsReporter(ctx)
+
+	g.wg.Add(1)
 	go g.placementWorker(ctx)
 
 	g.wg.Add(1)
@@ -219,7 +234,7 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 		return
 	}
 
-	g.logger.WithField("ticker_count", len(data)).Info("Processing WebSocket ticker data")
+	g.logger.WithField("ticker_count", len(data)).Debug("Processing WebSocket ticker data")
 
 	var symbolsToEnqueue []string
 
@@ -248,9 +263,9 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 		g.gridsMu.Lock()
 		grid, exists := g.activeGrids[symbol]
 		if exists {
-			g.logger.WithField("symbol", symbol).Info("Processing ticker for existing grid")
+			g.logger.WithField("symbol", symbol).Debug("Processing ticker for existing grid")
 		} else {
-			g.logger.WithField("symbol", symbol).Info("Ignoring ticker for non-active symbol")
+			g.logger.WithField("symbol", symbol).Debug("Ignoring ticker for non-active symbol")
 			g.gridsMu.Unlock()
 			continue
 		}
@@ -390,10 +405,10 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 		return 0
 	}
 
-	// For volume farming, use smaller spreads to place orders closer to market
+	// For volume farming, use ultra-small spreads for maximum fills
 	spreadAmount := grid.CurrentPrice * (grid.GridSpreadPct / 100)
-	if spreadAmount < 0.01 { // Minimum spread of $0.01
-		spreadAmount = 0.01
+	if spreadAmount < 0.001 { // Minimum spread of $0.001 for volume farming
+		spreadAmount = 0.001
 	}
 
 	placedOrders := 0
@@ -422,14 +437,16 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 					"calc_size":    orderSize,
 					"rounded_size": parsedSize,
 					"notional":     notional,
-				}).Debug("Order size calculated with precision manager")
+				}).Info("Order size calculated successfully")
 				finalSize = parsedSize
 			}
 		}
 
-		// Fallback 1: Ensure minimum notional (5.0 USD)
+		// Fallback 1: Ensure minimum notional (5.0 USD with safety margin)
 		if finalSize == 0 || notional < 5.0 {
-			minSize := 5.0 / buyPrice
+			// Add 2% safety margin to ensure no -4164 errors
+			minRequired := 5.0 * 1.02 // 5.1 USD minimum
+			minSize := minRequired / buyPrice
 			if minSize > 0 {
 				// Apply reasonable precision based on price range
 				var precision int
@@ -455,12 +472,12 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 				g.logger.WithFields(logrus.Fields{
 					"symbol":       symbol,
 					"price":        buyPrice,
-					"min_required": 5.0,
+					"min_required": minRequired,
 					"calc_size":    minSize,
 					"rounded_size": roundedSize,
 					"notional":     adjustedNotional,
 					"precision":    precision,
-				}).Info("Applied minimum notional with price-based precision")
+				}).Info("Applied minimum notional with safety margin")
 				finalSize = roundedSize
 			}
 		}
@@ -518,14 +535,16 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 					"calc_size":    orderSize,
 					"rounded_size": parsedSize,
 					"notional":     notional,
-				}).Debug("Order size calculated with precision manager")
+				}).Info("Order size calculated successfully")
 				finalSize = parsedSize
 			}
 		}
 
-		// Fallback 1: Ensure minimum notional (5.0 USD)
+		// Fallback 1: Ensure minimum notional (5.0 USD with safety margin)
 		if finalSize == 0 || notional < 5.0 {
-			minSize := 5.0 / sellPrice
+			// Add 2% safety margin to ensure no -4164 errors
+			minRequired := 5.0 * 1.02 // 5.1 USD minimum
+			minSize := minRequired / sellPrice
 			if minSize > 0 {
 				// Apply reasonable precision based on price range
 				var precision int
@@ -551,12 +570,12 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 				g.logger.WithFields(logrus.Fields{
 					"symbol":       symbol,
 					"price":        sellPrice,
-					"min_required": 5.0,
+					"min_required": minRequired,
 					"calc_size":    minSize,
 					"rounded_size": roundedSize,
 					"notional":     adjustedNotional,
 					"precision":    precision,
-				}).Info("Applied minimum notional with price-based precision")
+				}).Info("Applied minimum notional with safety margin")
 				finalSize = roundedSize
 			}
 		}
@@ -643,6 +662,17 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	order.OrderID = fmt.Sprintf("%d", response.OrderID)
 	order.Status = response.Status
 
+	// Track the order for fill monitoring
+	g.ordersMu.Lock()
+	g.activeOrders[order.OrderID] = order
+	g.ordersMu.Unlock()
+
+	// Update volume metrics
+	g.volumeMetricsMu.Lock()
+	g.totalOrdersPlaced++
+	g.totalVolumeUSDT += order.Size * order.Price
+	g.volumeMetricsMu.Unlock()
+
 	g.logger.WithFields(logrus.Fields{
 		"symbol":  order.Symbol,
 		"side":    order.Side,
@@ -651,6 +681,85 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	}).Info("Grid order placed successfully")
 
 	return nil
+}
+
+// handleOrderFill handles when an order is filled and triggers rebalancing
+func (g *GridManager) handleOrderFill(orderID string, symbol string) {
+	g.ordersMu.Lock()
+	order, exists := g.activeOrders[orderID]
+	if !exists {
+		g.ordersMu.Unlock()
+		g.logger.WithField("orderID", orderID).Warn("Order not found in active orders")
+		return
+	}
+
+	// Move to filled orders
+	order.Status = "FILLED"
+	order.FilledAt = time.Now()
+	g.filledOrders[orderID] = order
+	delete(g.activeOrders, orderID)
+	g.ordersMu.Unlock()
+
+	// Update filled orders metrics
+	g.volumeMetricsMu.Lock()
+	g.totalOrdersFilled++
+	g.volumeMetricsMu.Unlock()
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":  symbol,
+		"orderID": orderID,
+		"side":    order.Side,
+		"size":    order.Size,
+		"price":   order.Price,
+	}).Info("Order filled - triggering rebalancing")
+
+	// Trigger immediate rebalancing for this symbol
+	go g.enqueuePlacement(symbol)
+}
+
+// GetVolumeMetrics returns current volume farming metrics
+func (g *GridManager) GetVolumeMetrics() (float64, int, int, float64) {
+	g.volumeMetricsMu.RLock()
+	defer g.volumeMetricsMu.RUnlock()
+
+	fillRate := 0.0
+	if g.totalOrdersPlaced > 0 {
+		fillRate = float64(g.totalOrdersFilled) / float64(g.totalOrdersPlaced)
+	}
+
+	return g.totalVolumeUSDT, g.totalOrdersPlaced, g.totalOrdersFilled, fillRate
+}
+
+// LogVolumeMetrics logs current volume farming performance
+func (g *GridManager) LogVolumeMetrics() {
+	volume, placed, filled, fillRate := g.GetVolumeMetrics()
+
+	g.logger.WithFields(logrus.Fields{
+		"total_volume_usdt": volume,
+		"orders_placed":     placed,
+		"orders_filled":     filled,
+		"fill_rate":         fmt.Sprintf("%.2f%%", fillRate*100),
+		"active_orders":     len(g.activeOrders),
+	}).Info("Volume Farming Metrics")
+}
+
+// metricsReporter reports volume farming metrics periodically
+func (g *GridManager) metricsReporter(ctx context.Context) {
+	defer g.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second) // Report every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.LogVolumeMetrics()
+		}
+	}
 }
 
 func (g *GridManager) placementWorker(ctx context.Context) {

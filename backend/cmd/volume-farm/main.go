@@ -18,27 +18,17 @@ func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	dryRun := flag.Bool("dry-run", false, "Run in dry-run mode (no real orders)")
-	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	port := flag.Int("port", 8081, "API server port (different from main bot)")
 	flag.Parse()
 
-	// Initialize logger
+	// Initialize production logger (no debug spam)
 	logger, err := zap.NewProduction()
 	if err != nil {
 		panic("failed to initialize logger")
 	}
 	defer logger.Sync()
 
-	// Adjust log level if needed
-	if *logLevel == "debug" {
-		logger, err = zap.NewDevelopment()
-		if err != nil {
-			panic("failed to initialize debug logger")
-		}
-		defer logger.Sync()
-	}
-
-	logger.Info("🚀 Starting Aster Volume Farming Bot (Integrated)")
+	logger.Info("🚀 Starting Aster Volume Farming Bot (Production Mode)")
 
 	// Load main configuration
 	cfg, err := config.Load(*configPath)

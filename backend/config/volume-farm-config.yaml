@@ -35,7 +35,7 @@ symbols:
   exclude_high_fee_symbols: false  # Không exclude symbol có phí cao
   quote_currencies: ["USD1"]  # Thêm USD1
   allow_mixed_quotes: true  # Cho phép mixed quotes
-  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1", "XRPUSD1", "ADAUSD1", "DOGEUSD1", "BNBUSD1"]  # Thêm nhiều symbol hơn
+  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1"]  # Thêm nhiều symbol hơn
 
 # Exchange Configuration (reuse from main config)
 exchange:
