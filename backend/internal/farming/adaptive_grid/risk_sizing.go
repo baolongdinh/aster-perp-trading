@@ -13,90 +13,17 @@ import (
 	"go.uber.org/zap"
 )
 
-// ATRCalculator tính ATR (Average True Range) để đo volatility
-type ATRCalculator struct {
-	period int
-	prices []float64
-	highs  []float64
-	lows   []float64
-	mu     sync.RWMutex
-}
-
-// NewATRCalculator creates new ATR calculator
-func NewATRCalculator(period int) *ATRCalculator {
-	return &ATRCalculator{
-		period: period,
-		prices: make([]float64, 0, period),
-		highs:  make([]float64, 0, period),
-		lows:   make([]float64, 0, period),
-	}
-}
-
-// AddPrice adds new price data point
-func (a *ATRCalculator) AddPrice(high, low, close float64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.highs = append(a.highs, high)
-	a.lows = append(a.lows, low)
-	a.prices = append(a.prices, close)
-
-	// Keep only last N periods
-	if len(a.prices) > a.period {
-		a.prices = a.prices[1:]
-		a.highs = a.highs[1:]
-		a.lows = a.lows[1:]
-	}
-}
-
-// GetATR returns current ATR value
-func (a *ATRCalculator) GetATR() float64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	if len(a.prices) < 2 {
-		return 0
-	}
-
-	var trSum float64
-	for i := 1; i < len(a.prices); i++ {
-		// True Range = max(high-low, |high-close_prev|, |low-close_prev|)
-		highLow := a.highs[i] - a.lows[i]
-		highClose := math.Abs(a.highs[i] - a.prices[i-1])
-		lowClose := math.Abs(a.lows[i] - a.prices[i-1])
-
-		tr := highLow
-		if highClose > tr {
-			tr = highClose
-		}
-		if lowClose > tr {
-			tr = lowClose
-		}
-		trSum += tr
-	}
-
-	return trSum / float64(len(a.prices)-1)
-}
-
-// GetATRPct returns ATR as percentage of current price
-func (a *ATRCalculator) GetATRPct(currentPrice float64) float64 {
-	if currentPrice == 0 {
-		return 0
-	}
-	return a.GetATR() / currentPrice
-}
-
 // DynamicSizeCalculator calculates order size based on multiple factors
 type DynamicSizeCalculator struct {
-	baseNotional    float64       // Base order size in USD (e.g., $100)
-	minNotional     float64       // Minimum order size (e.g., $20)
-	maxNotional     float64       // Maximum order size (e.g., $500)
-	atrMultiplier   float64       // How much ATR affects size (0.5 = reduce size when volatile)
-	maxTotalExposurePct float64   // Max exposure as % of equity (e.g., 0.3 = 30%)
-	equity          float64       // Current account equity
-	atrCalc         *ATRCalculator
-	logger          *zap.Logger
-	mu              sync.RWMutex
+	baseNotional        float64 // Base order size in USD (e.g., $100)
+	minNotional         float64 // Minimum order size (e.g., $20)
+	maxNotional         float64 // Maximum order size (e.g., $500)
+	atrMultiplier       float64 // How much ATR affects size (0.5 = reduce size when volatile)
+	maxTotalExposurePct float64 // Max exposure as % of equity (e.g., 0.3 = 30%)
+	equity              float64 // Current account equity
+	atrCalc             *ATRCalculator
+	logger              *zap.Logger
+	mu                  sync.RWMutex
 }
 
 // NewDynamicSizeCalculator creates new size calculator
@@ -218,10 +145,10 @@ func (d *DynamicSizeCalculator) GetCurrentUtilization(currentExposure float64) f
 
 // DirectionalBiasChecker checks if we should trade against the trend
 type DirectionalBiasChecker struct {
-	shortTermMA  []float64 // Short-term moving average (e.g., 5-period)
-	longTermMA   []float64 // Long-term moving average (e.g., 20-period)
-	maxHistory   int
-	mu           sync.RWMutex
+	shortTermMA []float64 // Short-term moving average (e.g., 5-period)
+	longTermMA  []float64 // Long-term moving average (e.g., 20-period)
+	maxHistory  int
+	mu          sync.RWMutex
 }
 
 // NewDirectionalBiasChecker creates new bias checker
@@ -321,16 +248,16 @@ type EnhancedRiskConfig struct {
 	TrendingThreshold       float64
 
 	// New fields for dynamic sizing
-	BaseOrderNotional       float64       // Base order size in USD (e.g., $100)
-	MinOrderNotional        float64       // Minimum order size (e.g., $20)
-	MaxOrderNotional        float64       // Maximum order size (e.g., $500)
-	MaxTotalExposurePct     float64       // Max total exposure as % of equity (e.g., 0.3 = 30%)
-	ATRMultiplier           float64       // ATR impact on sizing (e.g., 0.5)
-	VolatilityThreshold     float64       // ATR % to consider high volatility (e.g., 0.01 = 1%)
-	UseDirectionalBias      bool          // Whether to check trend before entering
-	TrendFollowingOnly    bool          // Only trade with trend (no counter-trend)
-	MaxConsecutiveLosses    int           // Pause after N consecutive losses
-	CooldownAfterLosses     time.Duration // Cooldown duration after max losses
+	BaseOrderNotional    float64       // Base order size in USD (e.g., $100)
+	MinOrderNotional     float64       // Minimum order size (e.g., $20)
+	MaxOrderNotional     float64       // Maximum order size (e.g., $500)
+	MaxTotalExposurePct  float64       // Max total exposure as % of equity (e.g., 0.3 = 30%)
+	ATRMultiplier        float64       // ATR impact on sizing (e.g., 0.5)
+	VolatilityThreshold  float64       // ATR % to consider high volatility (e.g., 0.01 = 1%)
+	UseDirectionalBias   bool          // Whether to check trend before entering
+	TrendFollowingOnly   bool          // Only trade with trend (no counter-trend)
+	MaxConsecutiveLosses int           // Pause after N consecutive losses
+	CooldownAfterLosses  time.Duration // Cooldown duration after max losses
 }
 
 // DefaultEnhancedRiskConfig returns default enhanced config
@@ -348,14 +275,14 @@ func DefaultEnhancedRiskConfig() *EnhancedRiskConfig {
 		TrendingThreshold:       0.7,
 
 		// New defaults
-		BaseOrderNotional:    100.0,  // $100 per order
-		MinOrderNotional:     20.0,   // Minimum $20
-		MaxOrderNotional:     500.0,  // Maximum $500 per order
-		MaxTotalExposurePct:  0.3,    // Max 30% of equity
-		ATRMultiplier:        0.5,    // Reduce size when volatile
-		VolatilityThreshold:  0.01,   // 1% ATR = high volatility
+		BaseOrderNotional:    100.0, // $100 per order
+		MinOrderNotional:     20.0,  // Minimum $20
+		MaxOrderNotional:     500.0, // Maximum $500 per order
+		MaxTotalExposurePct:  0.3,   // Max 30% of equity
+		ATRMultiplier:        0.5,   // Reduce size when volatile
+		VolatilityThreshold:  0.01,  // 1% ATR = high volatility
 		UseDirectionalBias:   true,
-		TrendFollowingOnly:   false,  // Allow counter-trend but with reduced size
+		TrendFollowingOnly:   false, // Allow counter-trend but with reduced size
 		MaxConsecutiveLosses: 3,
 		CooldownAfterLosses:  5 * time.Minute,
 	}
@@ -363,15 +290,15 @@ func DefaultEnhancedRiskConfig() *EnhancedRiskConfig {
 
 // ExposureManager manages total exposure across all symbols
 type ExposureManager struct {
-	equity           float64
-	totalExposure    float64 // Sum of all notional positions
-	maxExposurePct   float64
-	symbolExposures  map[string]float64
+	equity            float64
+	totalExposure     float64 // Sum of all notional positions
+	maxExposurePct    float64
+	symbolExposures   map[string]float64
 	consecutiveLosses int
-	lastLossTime     time.Time
-	cooldownActive   bool
-	mu               sync.RWMutex
-	logger           *zap.Logger
+	lastLossTime      time.Time
+	cooldownActive    bool
+	mu                sync.RWMutex
+	logger            *zap.Logger
 }
 
 // NewExposureManager creates new exposure manager
@@ -469,14 +396,14 @@ type AccountInfoProvider interface {
 
 // RiskMonitor monitors and manages risk in real-time
 type RiskMonitor struct {
-	exposureMgr    *ExposureManager
-	sizeCalc       *DynamicSizeCalculator
-	biasChecker    *DirectionalBiasChecker
+	exposureMgr     *ExposureManager
+	sizeCalc        *DynamicSizeCalculator
+	biasChecker     *DirectionalBiasChecker
 	accountProvider AccountInfoProvider
-	logger         *zap.Logger
-	config         *EnhancedRiskConfig
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
+	logger          *zap.Logger
+	config          *EnhancedRiskConfig
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
 }
 
 // NewRiskMonitor creates new risk monitor

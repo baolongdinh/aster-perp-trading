@@ -1,0 +1,47 @@
+# Cluster Stop-Loss Configuration
+# Stop-loss theo cụm lệnh dựa trên thời gian và breakeven
+
+cluster_stop_loss:
+  enabled: true
+  
+  # Time-based stop-loss thresholds
+  time_thresholds:
+    monitor_hours: 2          # Sau 2 giờ bắt đầu monitor
+    emergency_hours: 4        # Sau 4 giờ emergency close nếu drawdown > 1%
+    stale_hours: 8            # Sau 8 giờ đóng bất kể PnL
+    
+  # Drawdown thresholds (%)
+  drawdown_thresholds:
+    monitor: -0.5            # Monitor nếu drawdown > 0.5% sau 2h
+    emergency: -1.0          # Emergency close nếu drawdown > 1% sau 4h
+    
+  # Breakeven exit settings
+  breakeven_exit:
+    enabled: true
+    
+    # 50% exit: Đóng 50% position khi hồi về -0.2%
+    # (Sau khi drawdown > 2%)
+    close_50_pct_at: -0.002
+    min_drawdown_for_50_pct: -0.02
+    
+    # 100% exit: Đóng toàn bộ khi về breakeven
+    # (Sau khi drawdown > 3%)
+    close_100_pct_at: 0.0
+    min_drawdown_for_100_pct: -0.03
+    
+  # Cluster definition
+  cluster_definition:
+    max_levels_per_cluster: 3   # Mỗi cluster tối đa 3 levels
+    max_distance_between_levels: 0.5  # % khoảng cách tối đa giữa các levels
+    
+  # Heat map generation
+  heat_map:
+    enabled: true
+    log_interval: 15m           # Log heat map mỗi 15 phút
+    include_recommendations: true
+    
+  # Alert settings
+  alerts:
+    on_emergency_close: true
+    on_stale_close: true
+    on_breakeven_exit: true

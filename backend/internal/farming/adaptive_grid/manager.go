@@ -99,6 +99,30 @@ type AdaptiveGridManager struct {
 	// NEW: TimeFilter for time-based trading rules
 	timeFilter *TimeFilter
 
+	// NEW: SpreadProtection for monitoring orderbook spread
+	spreadProtection *SpreadProtection
+
+	// NEW: DynamicSpreadCalculator for ATR-based spreads
+	dynamicSpreadCalc *DynamicSpreadCalculator
+
+	// NEW: InventoryManager for tracking inventory skew
+	inventoryMgr *InventoryManager
+
+	// NEW: ClusterManager for cluster stop-loss
+	clusterMgr *ClusterManager
+
+	// NEW: TrendDetector for RSI-based trend detection
+	trendDetector *TrendDetector
+
+	// NEW: FundingRateMonitor for funding rate tracking
+	fundingMonitor *FundingRateMonitor
+
+	// NEW: ATRCalculator for volatility calculation
+	atrCalc *ATRCalculator
+
+	// NEW: RSICalculator for RSI calculation
+	rsiCalc *RSICalculator
+
 	// Control channels
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -248,6 +272,50 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 			zap.String("mode", string(timeFilterConfig.Mode)),
 			zap.String("timezone", timeFilterConfig.Timezone))
 	}
+
+	// NEW: Initialize SpreadProtection for orderbook spread monitoring
+	a.spreadProtection = NewSpreadProtection(a.logger)
+	a.logger.Info("SpreadProtection initialized")
+
+	// NEW: Initialize DynamicSpreadCalculator for ATR-based spreads
+	dynamicSpreadConfig := DefaultDynamicSpreadConfig()
+	a.dynamicSpreadCalc = NewDynamicSpreadCalculator(dynamicSpreadConfig, a.logger)
+	a.logger.Info("DynamicSpreadCalculator initialized",
+		zap.Float64("base_spread_pct", dynamicSpreadConfig.BaseSpreadPct),
+		zap.Float64("low_threshold", dynamicSpreadConfig.LowThreshold))
+
+	// NEW: Initialize InventoryManager for inventory skew tracking
+	inventoryConfig := DefaultInventoryConfig()
+	a.inventoryMgr = NewInventoryManager(inventoryConfig, a.logger)
+	a.logger.Info("InventoryManager initialized",
+		zap.Float64("max_inventory_pct", inventoryConfig.MaxInventoryPct))
+
+	// NEW: Initialize ClusterManager for cluster stop-loss
+	clusterConfig := DefaultClusterStopLossConfig()
+	a.clusterMgr = NewClusterManager(clusterConfig, a.logger)
+	a.logger.Info("ClusterManager initialized",
+		zap.Float64("monitor_hours", clusterConfig.MonitorHours),
+		zap.Float64("emergency_hours", clusterConfig.EmergencyHours))
+
+	// NEW: Initialize TrendDetector for trend detection
+	trendConfig := DefaultTrendDetectionConfig()
+	a.trendDetector = NewTrendDetector(trendConfig, a.logger)
+	a.logger.Info("TrendDetector initialized",
+		zap.Int("rsi_period", trendConfig.RSIPeriod))
+
+	// NEW: Initialize FundingRateMonitor (pass nil client for now)
+	fundingConfig := DefaultFundingProtectionConfig()
+	a.fundingMonitor = NewFundingRateMonitor(fundingConfig, nil, a.logger)
+	a.logger.Info("FundingRateMonitor initialized",
+		zap.Float64("high_threshold", fundingConfig.HighThreshold))
+
+	// NEW: Initialize ATRCalculator with default period
+	a.atrCalc = NewATRCalculator(14)
+	a.logger.Info("ATRCalculator initialized", zap.Int("period", 14))
+
+	// NEW: Initialize RSICalculator with default period
+	a.rsiCalc = NewRSICalculator(14)
+	a.logger.Info("RSICalculator initialized", zap.Int("period", 14))
 
 	// Start position monitoring goroutine
 	a.wg.Add(1)
@@ -822,6 +890,42 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		}
 	}
 
+	// NEW: Check SpreadProtection - pause if spread too wide
+	if a.spreadProtection != nil {
+		if a.spreadProtection.ShouldPauseTrading() {
+			a.logger.Warn("CanPlaceOrder blocked: spread too wide",
+				zap.String("symbol", symbol),
+				zap.Float64("spread_pct", a.spreadProtection.GetSpreadPct()*100))
+			return false
+		}
+	}
+
+	// NEW: Check InventoryManager - pause skewed side
+	if a.inventoryMgr != nil {
+		// Check both buy and sell sides
+		if a.inventoryMgr.ShouldPauseSide(symbol, "LONG") {
+			a.logger.Warn("CanPlaceOrder blocked: inventory skew - LONG side paused",
+				zap.String("symbol", symbol),
+				zap.Float64("skew_ratio", a.inventoryMgr.CalculateSkewRatio(symbol)))
+			return false
+		}
+	}
+
+	// NEW: Check TrendDetector - pause counter-trend orders
+	if a.trendDetector != nil {
+		state := a.trendDetector.GetTrendState()
+		score := a.trendDetector.GetTrendScore()
+
+		// Strong trend - pause trading
+		if score >= 4 {
+			a.logger.Warn("CanPlaceOrder blocked: strong trend detected",
+				zap.String("symbol", symbol),
+				zap.String("trend_state", state.String()),
+				zap.Int("trend_score", score))
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -922,6 +1026,47 @@ func (a *AdaptiveGridManager) AddPriceData(high, low, close float64) {
 	if a.riskMonitor != nil {
 		a.riskMonitor.AddPriceData(high, low, close)
 	}
+
+	// NEW: Feed price data to ATR calculator
+	if a.atrCalc != nil {
+		a.atrCalc.AddPrice(high, low, close)
+	}
+}
+
+// UpdatePriceData feeds price data to all calculators (called from WebSocket)
+func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, bid, ask float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Feed ATR calculator
+	if a.atrCalc != nil {
+		a.atrCalc.AddPrice(high, low, close)
+	}
+
+	// Feed RSI calculator
+	if a.rsiCalc != nil {
+		a.rsiCalc.AddPrice(close)
+	}
+
+	// Feed TrendDetector
+	if a.trendDetector != nil {
+		a.trendDetector.UpdatePrice(close, 0)
+
+		// NEW: Check for strong trend and close all immediately
+		if a.trendDetector.GetTrendScore() >= 6 {
+			a.handleStrongTrend(symbol, close, a.trendDetector.GetTrendState())
+		}
+	}
+
+	// Feed SpreadProtection
+	if a.spreadProtection != nil && bid > 0 && ask > 0 {
+		a.spreadProtection.UpdateOrderbook(bid, ask)
+	}
+
+	// Feed DynamicSpreadCalculator
+	if a.dynamicSpreadCalc != nil {
+		a.dynamicSpreadCalc.UpdateATR(high, low, close)
+	}
 }
 
 // RecordTradeResult records trade result for loss tracking
@@ -972,6 +1117,36 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 	if detector.IsBreakout() {
 		a.handleBreakout(symbol, close)
 	}
+}
+
+// handleStrongTrend handles strong trend detection - close all immediately
+func (a *AdaptiveGridManager) handleStrongTrend(symbol string, currentPrice float64, state TrendState) {
+	a.logger.Warn("Strong trend detected - Closing all grid orders immediately!",
+		zap.String("symbol", symbol),
+		zap.Float64("price", currentPrice),
+		zap.String("trend_state", state.String()),
+		zap.Int("trend_score", a.trendDetector.GetTrendScore()))
+
+	// 1. Cancel all grid orders immediately
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+		a.logger.Error("Failed to cancel orders on strong trend", zap.Error(err))
+	}
+
+	// 2. Clear position tracking
+	a.mu.Lock()
+	delete(a.positions, symbol)
+	delete(a.positionStopLoss, symbol)
+	delete(a.trailingStopPrice, symbol)
+	a.mu.Unlock()
+
+	// 3. Pause trading for this symbol temporarily
+	a.pauseTrading(symbol)
+
+	a.logger.Info("Strong trend handling complete - All orders cancelled, trading paused",
+		zap.String("symbol", symbol))
 }
 
 // handleBreakout handles breakout detection
@@ -1132,4 +1307,131 @@ func (a *AdaptiveGridManager) GetVolumeScalerInfo(symbol string, price float64) 
 	info := scaler.GetZoneInfo(price)
 	info["tapered_size"] = scaler.CalculateOrderSize(price, true)
 	return info
+}
+
+// GetDynamicSpread returns the calculated dynamic spread percentage
+func (a *AdaptiveGridManager) GetDynamicSpread() float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.dynamicSpreadCalc == nil {
+		return 0.5 // Default spread
+	}
+	return a.dynamicSpreadCalc.GetDynamicSpread()
+}
+
+// GetDynamicSpreadMultiplier returns current spread multiplier based on volatility
+func (a *AdaptiveGridManager) GetDynamicSpreadMultiplier() float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.dynamicSpreadCalc == nil {
+		return 1.0 // Default multiplier
+	}
+	return a.dynamicSpreadCalc.GetMultiplier()
+}
+
+// GetInventoryAdjustedSize returns order size adjusted for inventory skew
+func (a *AdaptiveGridManager) GetInventoryAdjustedSize(symbol string, side string, baseSize float64) float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.inventoryMgr == nil {
+		return baseSize
+	}
+	return a.inventoryMgr.GetAdjustedOrderSize(symbol, side, baseSize)
+}
+
+// ShouldPauseInventorySide returns true if side should be paused due to inventory skew
+func (a *AdaptiveGridManager) ShouldPauseInventorySide(symbol string, side string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.inventoryMgr == nil {
+		return false
+	}
+	return a.inventoryMgr.ShouldPauseSide(symbol, side)
+}
+
+// GetInventoryStatus returns current inventory status for a symbol
+func (a *AdaptiveGridManager) GetInventoryStatus(symbol string) map[string]interface{} {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.inventoryMgr == nil {
+		return map[string]interface{}{"error": "inventory manager not initialized"}
+	}
+	return a.inventoryMgr.GetStatus(symbol)
+}
+
+// TrackInventoryPosition tracks a new position for inventory management
+func (a *AdaptiveGridManager) TrackInventoryPosition(symbol, side string, size, entryPrice float64, gridLevel int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.inventoryMgr != nil {
+		a.inventoryMgr.TrackPosition(symbol, side, size, entryPrice, gridLevel)
+	}
+}
+
+// CloseInventoryPosition removes a position from inventory tracking
+func (a *AdaptiveGridManager) CloseInventoryPosition(symbol string, gridLevel int) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.inventoryMgr == nil {
+		return fmt.Errorf("inventory manager not initialized")
+	}
+	return a.inventoryMgr.ClosePosition(symbol, gridLevel)
+}
+
+// UpdateInventoryPositionPrice updates position prices for PnL calculation
+func (a *AdaptiveGridManager) UpdateInventoryPositionPrice(symbol string, currentPrice float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.inventoryMgr != nil {
+		a.inventoryMgr.UpdatePositionPrice(symbol, currentPrice)
+	}
+}
+
+// CheckClusterStopLoss checks and handles cluster stop-loss conditions
+func (a *AdaptiveGridManager) CheckClusterStopLoss(symbol string, currentPrice float64) ([]Cluster, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.clusterMgr == nil {
+		return nil, fmt.Errorf("cluster manager not initialized")
+	}
+
+	// Check time-based stop-loss
+	updatedClusters := a.clusterMgr.CheckTimeBasedStopLoss(symbol, currentPrice)
+
+	// Check breakeven exits
+	exitClusters := a.clusterMgr.CheckBreakevenExit(symbol, currentPrice)
+
+	// Combine results
+	allClusters := append(updatedClusters, exitClusters...)
+	return allClusters, nil
+}
+
+// GetClusterHeatMap returns cluster heat map for a symbol
+func (a *AdaptiveGridManager) GetClusterHeatMap(symbol string) map[string]interface{} {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.clusterMgr == nil {
+		return map[string]interface{}{"error": "cluster manager not initialized"}
+	}
+	return a.clusterMgr.GenerateClusterHeatMap(symbol)
+}
+
+// TrackClusterEntry tracks a new cluster entry for stop-loss tracking
+func (a *AdaptiveGridManager) TrackClusterEntry(symbol string, level int, side string, positions []PositionInfo) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.clusterMgr != nil {
+		a.clusterMgr.TrackClusterEntry(symbol, level, side, positions)
+	}
 }

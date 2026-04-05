@@ -1,0 +1,41 @@
+# Dynamic Grid Configuration
+# Tự động điều chỉnh spread dựa trên ATR (Average True Range)
+
+dynamic_grid:
+  enabled: true
+  
+  # ATR Configuration - điều chỉnh cho volume farming (nhanh hơn)
+  atr_period: 7              # Giảm xuống 7 period (nhanh hơn 14)
+  atr_timeframe: "5m"        # Giảm xuống 5m (nhanh hơn 15m)
+  
+  # Base spread configuration - giảm xuống cho tight grid
+  base_spread_pct: 0.01        # Spread mặc định 0.01% (giảm từ 0.02%)
+  
+  # Spread multipliers theo volatility level - giảm multipliers
+  spread_multipliers:
+    low_volatility: 0.8       # ATR < 0.3% - Grid hẹp (tăng từ 0.6)
+    normal: 1.0               # ATR 0.3-0.8% - Spread bình thường
+    high_volatility: 1.3      # ATR 0.8-1.5% - Grid rộng (giảm từ 1.8)
+    extreme: 1.8              # ATR > 1.5% - Grid rất rộng (giảm từ 2.5)
+  
+  # Grid level adjustments
+  level_adjustments:
+    increase_threshold: 0.7   # Tăng levels khi spread multiplier < 0.7
+    decrease_threshold: 2.0   # Giảm levels khi spread multiplier > 2.0
+    min_levels: 3             # Tối thiểu số levels mỗi bên
+    max_levels: 10            # Tối đa số levels mỗi bên
+  
+  # ATR thresholds (%)
+  atr_thresholds:
+    low: 0.3                  # ATR < 0.3% = low volatility
+    normal: 0.8               # ATR 0.3-0.8% = normal
+    high: 1.5                 # ATR 0.8-1.5% = high
+    # ATR > 1.5% = extreme
+  
+  # Update settings
+  update_interval: 5m         # Cập nhật ATR mỗi 5 phút
+  price_change_threshold: 0.5 # Cập nhật ngay lập tức nếu giá thay đổi > 0.5%
+  
+  # Logging
+  log_volatility_changes: true  # Log khi volatility level thay đổi
+  log_interval: 15m             # Log status mỗi 15 phút

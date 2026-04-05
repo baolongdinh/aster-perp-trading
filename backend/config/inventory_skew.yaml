@@ -1,0 +1,53 @@
+# Inventory Skew Configuration
+# Quản lý lệch vị thế để tránh tích lũy position một chiều
+
+inventory_skew:
+  enabled: true
+  
+  # Giới hạn inventory - tăng lên cho volume farming
+  max_inventory_pct: 0.50    # Tối đa 50% equity cho một vị thế (tăng từ 30%)
+  
+  # Skew thresholds và actions - điều chỉnh cho volume farming
+  thresholds:
+    low:
+      threshold: 0.4          # Skew ratio < 40% (tăng từ 30%)
+      size_reduction: 0.0     # Không giảm size
+      pause_side: false       # Không pause
+      action: "NORMAL"
+      
+    moderate:
+      threshold: 0.7          # Skew ratio 40-70% (tăng từ 30-60%)
+      size_reduction: 0.2   # Giảm 20% size cho side bị skew (giảm từ 30%)
+      pause_side: false
+      action: "REDUCE_SKEW_SIDE"
+      
+    high:
+      threshold: 0.9          # Skew ratio 70-90% (tăng từ 60-80%)
+      size_reduction: 0.3     # Giảm 30% size (giảm từ 50%)
+      pause_side: false        # Không pause, chỉ giảm size (đổi từ true)
+      action: "PAUSE_SKEW_SIDE"
+      take_profit_reduction: 0.2  # Giảm 20% take-profit distance (giảm từ 30%)
+      
+    critical:
+      threshold: 1.2          # Skew ratio > 90% (tăng từ 80%)
+      size_reduction: 0.5     # Giảm 50% (giảm từ 100%)
+      pause_side: true
+      emergency_close: false     # Không emergency close ngay (đổi từ true)
+      action: "EMERGENCY_SKEW"
+      take_profit_reduction: 0.3  # Giảm 30% take-profit distance (giảm từ 50%)
+  
+  # Take-profit adjustment theo skew ratio
+  take_profit_adjustments:
+    skew_0.5_0.7: 0.15       # Giảm 15% khi skew 50-70%
+    skew_0.7_0.9: 0.30       # Giảm 30% khi skew 70-90%
+    skew_above_0.9: 0.50     # Giảm 50% khi skew > 90%
+  
+  # Rebalancing priority
+  rebalancing:
+    close_furthest_first: true    # Đóng vị thế xa nhất trước
+    breakeven_exit_enabled: true  # Cho phép exit ở breakeven
+    max_positions_to_close: 3     # Tối đa đóng 3 vị thế mỗi lần
+  
+  # Monitoring
+  log_interval: 5m            # Log inventory status mỗi 5 phút
+  alert_on_skew_change: true  # Alert khi skew level thay đổi

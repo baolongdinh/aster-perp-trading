@@ -100,18 +100,18 @@ func Load(cfgPath string) (*Config, error) {
 
 	v.SetDefault("risk.position_mode", "one_way")
 
-	// Volume farming defaults
+	// Volume farming defaults - optimized for high volume
 	v.SetDefault("volume_farming.enabled", true)
-	v.SetDefault("volume_farming.max_daily_loss_usdt", 50)
-	v.SetDefault("volume_farming.order_size_usdt", 100)
-	v.SetDefault("volume_farming.grid_spread_pct", 0.05)
-	v.SetDefault("volume_farming.max_orders_per_side", 2)
+	v.SetDefault("volume_farming.max_daily_loss_usdt", 200)
+	v.SetDefault("volume_farming.order_size_usdt", 5)      // Small orders
+	v.SetDefault("volume_farming.grid_spread_pct", 0.01)   // Tight spread
+	v.SetDefault("volume_farming.max_orders_per_side", 30) // Many orders
 	v.SetDefault("volume_farming.replace_immediately", true)
-	v.SetDefault("volume_farming.position_timeout_minutes", 30)
+	v.SetDefault("volume_farming.position_timeout_minutes", 10) // Fast turnover
 	v.SetDefault("volume_farming.ticker_stream", "!ticker@arr")
-	v.SetDefault("volume_farming.symbol_refresh_interval_seconds", 120)
-	v.SetDefault("volume_farming.grid_placement_cooldown_seconds", 90)
-	v.SetDefault("volume_farming.rate_limit_cooldown_seconds", 300)
+	v.SetDefault("volume_farming.symbol_refresh_interval_seconds", 30) // 30s refresh
+	v.SetDefault("volume_farming.grid_placement_cooldown_seconds", 1)  // 1s cooldown
+	v.SetDefault("volume_farming.rate_limit_cooldown_seconds", 3)      // 3s recovery
 	v.SetDefault("volume_farming.supported_quote_currencies", []string{"USD1"})
 	v.SetDefault("volume_farming.min_volume_24h", 1000000)
 	v.SetDefault("volume_farming.symbols.auto_discover", true)
@@ -275,39 +275,39 @@ func LoadVolumeFarming(configPath string) (*VolumeFarmConfig, error) {
 	return &cfg, nil
 }
 
-// setVolumeFarmDefaults sets default values for volume farming
+// setVolumeFarmDefaults sets default values for volume farming - OPTIMIZED FOR HIGH VOLUME
 func setVolumeFarmDefaults() {
 	viper.SetDefault("enabled", true)
-	viper.SetDefault("max_daily_loss_usdt", 50)
-	viper.SetDefault("max_total_drawdown_pct", 5.0)
-	viper.SetDefault("order_size_usdt", 100)
-	viper.SetDefault("grid_spread_pct", 0.05)
-	viper.SetDefault("max_orders_per_side", 2)
+	viper.SetDefault("max_daily_loss_usdt", 200)
+	viper.SetDefault("max_total_drawdown_pct", 15.0)
+	viper.SetDefault("order_size_usdt", 5)      // Small orders for volume
+	viper.SetDefault("grid_spread_pct", 0.01)   // Tight spread
+	viper.SetDefault("max_orders_per_side", 30) // Many orders per side
 	viper.SetDefault("replace_immediately", true)
-	viper.SetDefault("position_timeout_minutes", 30)
+	viper.SetDefault("position_timeout_minutes", 10) // Fast turnover
 	viper.SetDefault("ticker_stream", "!ticker@arr")
-	viper.SetDefault("symbol_refresh_interval_seconds", 120)
-	viper.SetDefault("grid_placement_cooldown_seconds", 90)
-	viper.SetDefault("rate_limit_cooldown_seconds", 300)
+	viper.SetDefault("symbol_refresh_interval_seconds", 30) // Fast refresh
+	viper.SetDefault("grid_placement_cooldown_seconds", 1)  // 1s cooldown
+	viper.SetDefault("rate_limit_cooldown_seconds", 3)      // Quick recovery
 	viper.SetDefault("supported_quote_currencies", []string{"USD1"})
-	viper.SetDefault("min_volume_24h", 1000000)
+	viper.SetDefault("min_volume_24h", 500) // Lower threshold
 
 	// Bot defaults
 	viper.SetDefault("bot.dry_run", true)
 
-	// Symbol defaults
+	// Symbol defaults - optimized for volume
 	viper.SetDefault("symbols.auto_discover", true)
-	viper.SetDefault("symbols.quote_currency_mode", "flexible")
-	viper.SetDefault("symbols.min_volume_24h", 10000000)
-	viper.SetDefault("symbols.max_spread_pct", 0.1)
+	viper.SetDefault("symbols.quote_currency_mode", "USD1")
+	viper.SetDefault("symbols.min_volume_24h", 500)  // Lower volume threshold
+	viper.SetDefault("symbols.max_spread_pct", 15.0) // Allow higher spread
 	viper.SetDefault("symbols.boosted_only", false)
-	viper.SetDefault("symbols.max_symbols_per_quote", 10)
-	viper.SetDefault("symbols.spread_ranking", true)
-	viper.SetDefault("symbols.volume_weighting", 0.7)
-	viper.SetDefault("symbols.min_liquidity_score", 0.5)
-	viper.SetDefault("symbols.optimal_spread_range", []float64{0.01, 0.05})
-	viper.SetDefault("symbols.spread_volatility_threshold", 0.02)
-	viper.SetDefault("symbols.exclude_high_fee_symbols", true)
+	viper.SetDefault("symbols.max_symbols_per_quote", 20) // More symbols
+	viper.SetDefault("symbols.spread_ranking", false)
+	viper.SetDefault("symbols.volume_weighting", 0.2)    // Less weight on volume
+	viper.SetDefault("symbols.min_liquidity_score", 0.0) // Allow all
+	viper.SetDefault("symbols.optimal_spread_range", []float64{0.0, 2.0})
+	viper.SetDefault("symbols.spread_volatility_threshold", 0.2)
+	viper.SetDefault("symbols.exclude_high_fee_symbols", false)
 	viper.SetDefault("symbols.quote_currencies", []string{"USD1"})
 	viper.SetDefault("symbols.allow_mixed_quotes", true)
 
@@ -330,8 +330,8 @@ func validateVolumeFarmConfig(cfg *VolumeFarmConfig) error {
 	if cfg.GridSpreadPct <= 0 {
 		return fmt.Errorf("grid_spread_pct must be positive")
 	}
-	if cfg.MaxOrdersPerSide <= 0 || cfg.MaxOrdersPerSide > 10 {
-		return fmt.Errorf("max_orders_per_side must be between 1 and 10")
+	if cfg.MaxOrdersPerSide <= 0 || cfg.MaxOrdersPerSide > 50 {
+		return fmt.Errorf("max_orders_per_side must be between 1 and 50")
 	}
 
 	validQuoteModes := []string{"USDT", "USD1", "flexible", "all"}

@@ -1,0 +1,87 @@
+# Backend Safeguards Configuration
+# Các biện pháp bảo vệ kỹ thuật cho bot
+
+safeguards:
+  enabled: true
+  
+  # Anti-Replay Protection
+  anti_replay:
+    enabled: true
+    deduplication_window: 30s     # Window để detect duplicate fills
+    max_stored_events: 100        # Lưu tối đa 100 events
+    lock_timeout: 5s              # Timeout cho order processing lock
+    cleanup_interval: 10m         # Cleanup stale locks mỗi 10 phút
+    
+  # State Validation
+  state_validation:
+    enabled: true
+    valid_transitions:
+      - from: "PENDING"
+        to: ["FILLED", "CANCELLED", "REJECTED"]
+      - from: "FILLED"
+        to: []  # Terminal state
+      - from: "CANCELLED"
+        to: []  # Terminal state
+      - from: "REJECTED"
+        to: []  # Terminal state
+    log_invalid_transitions: true
+    alert_on_invalid: true
+    
+  # Spread Protection
+  spread_protection:
+    enabled: true
+    
+    # Thresholds - điều chỉnh cho volume farming (chấp nhận spread rộng hơn)
+    pause_threshold: 0.005        # Pause khi spread > 0.5% (tăng từ 0.1%)
+    emergency_threshold: 0.01     # Emergency pause khi spread > 1% (tăng từ 0.3%)
+    resume_after: 15s             # Resume sau 15 giây (giảm từ 30s)
+    
+    # Monitoring
+    orderbook_check_interval: 3s  # Check orderbook mỗi 3 giây
+    samples_before_resume: 3      # Cần 3 samples < threshold mới resume
+    
+  # Slippage Monitoring
+  slippage:
+    enabled: true
+    alert_threshold: 0.0005       # Alert nếu slippage > 0.05%
+    max_stored_fills: 10          # Lưu 10 fills gần nhất để tính avg
+    
+  # Funding Rate Protection
+  funding_protection:
+    enabled: true
+    
+    high_threshold: 0.0003        # High funding > 0.03%
+    check_interval: 4h            # Check mỗi 4 giờ
+    level_adjustment: 2           # Giảm 2 levels khi funding cao
+    
+    cost_tracking:
+      enabled: true
+      compare_to_profit: true     # So sánh funding cost với grid profit
+      alert_ratio: 0.5            # Alert nếu funding > 50% profit
+      
+  # Circuit Breaker
+  circuit_breaker:
+    enabled: true
+    
+    # Auto-disable các tính năng nếu calculation lỗi
+    fallback_to_safe_defaults: true
+    safe_spread_pct: 0.02         # Spread mặc định nếu ATR lỗi (giảm từ 0.5%)
+    safe_size_multiplier: 1.0    # Size multiplier mặc định
+    
+    # Auto-recovery
+    retry_interval: 30s             # Thử lại mỗi 30 giây (giảm từ 1m)
+    max_retries: 10               # Thử tối đa 10 lần (tăng từ 5)
+    
+  # Performance Monitoring
+  performance:
+    enabled: true
+    log_slow_operations: true
+    slow_threshold: 100ms         # Log nếu operation > 100ms
+    
+  # Alert Settings
+  alerts:
+    on_spread_pause: true
+    on_funding_high: true
+    on_duplicate_fill: true
+    on_invalid_transition: true
+    on_circuit_breaker: true

@@ -1,41 +1,41 @@
 # Volume Farming Bot Configuration
-# This config is specifically for volume farming operations
+# Tối ưu cho farm volume với rủi ro kiểm soát
 
 # Volume Farming Settings
 enabled: true
-max_daily_loss_usdt: 50
-max_total_drawdown_pct: 5.0
-order_size_usdt: 5  # Giảm xuống 5 USD1 để tạo nhiều lệnh hơn
-grid_spread_pct: 0.02  # Giảm spread xuống 0.02% để lệnh gần giá hơn
-max_orders_per_side: 3  # Tăng lên 3 lệnh mỗi bên
+max_daily_loss_usdt: 100          # Tăng lên 100 cho nhiều lệnh hơn
+max_total_drawdown_pct: 10.0      # Tăng lên 10% cho volume farming
+order_size_usdt: 6                # 6 USD1 mỗi lệnh
+grid_spread_pct: 0.002             # Giảm xuống 0.005% cho spread cực chặt
+max_orders_per_side: 30            # Giảm xuống 3 lệnh mỗi bên = 6 lệnh/symbol, gần nhau hơn
 replace_immediately: true
-position_timeout_minutes: 45
+position_timeout_minutes: 30      # Giảm xuống 30 phút
 ticker_stream: "!ticker@arr"
-symbol_refresh_interval_seconds: 120
-grid_placement_cooldown_seconds: 2  # Giảm cooldown xuống 2 giây cho trading liên tục
-rate_limit_cooldown_seconds: 5  # Giảm rate limit cooldown
-rate_limiter_capacity: 50  # Tăng capacity lên 50
-rate_limiter_refill_rate: 10.0  # Tăng refill rate lên 10
+symbol_refresh_interval_seconds: 60   # Giảm xuống 60s
+grid_placement_cooldown_seconds: 1    # Giảm xuống 1 giây
+rate_limit_cooldown_seconds: 3
+rate_limiter_capacity: 100        # Tăng capacity
+rate_limiter_refill_rate: 20.0    # Tăng refill rate
 supported_quote_currencies: ["USD1"]
-min_volume_24h: 1000  # Giảm xuống 1000 để dễ farming hơn
+min_volume_24h: 500               # Giảm xuống 500 để nhiều symbol hơn
 
 # Symbol Selection & Management
 symbols:
-  auto_discover: true  # Bật auto discover để tìm nhiều symbol hơn
+  auto_discover: true
   quote_currency_mode: "USD1"
-  min_volume_24h: 1000  # Giảm xuống 1000 để dễ qualify
-  max_spread_pct: 10.0  # Tăng max spread để chấp nhận nhiều symbol hơn
+  min_volume_24h: 500
+  max_spread_pct: 15.0             # Tăng lên 15%
   boosted_only: false
-  max_symbols_per_quote: 10  # Tăng lên 10 symbols mỗi quote currency
-  spread_ranking: false  # Tắt spread ranking để tập trung volume
-  volume_weighting: 0.3  # Giảm volume weighting để dễ qualify
+  max_symbols_per_quote: 15       # Tăng lên 15
+  spread_ranking: false
+  volume_weighting: 0.2           # Giảm weighting
   min_liquidity_score: 0.0
-  optimal_spread_range: [0.0, 1.0]  # Mở rộng range spread
-  spread_volatility_threshold: 0.1  # Tăng threshold
-  exclude_high_fee_symbols: false  # Không exclude symbol có phí cao
-  quote_currencies: ["USD1"]  # Thêm USD1
-  allow_mixed_quotes: true  # Cho phép mixed quotes
-  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1"]  # Thêm nhiều symbol hơn
+  optimal_spread_range: [0.0, 2.0]  # Mở rộng range
+  spread_volatility_threshold: 0.2
+  exclude_high_fee_symbols: false
+  quote_currencies: ["USD1"]
+  allow_mixed_quotes: true
+  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1", "XRPUSD1", "DOGEUSD1", "BNBUSD1"]  # Thêm nhiều symbol hơn
 
 # Exchange Configuration (reuse from main config)
 exchange:
@@ -45,24 +45,24 @@ exchange:
   recv_window: 5000
   requests_per_second: 20  # Tăng lên 20 requests/second
 
-# Risk Management (reuse from main config but with farming-specific limits)
+# Risk Management (Volume Farming Optimized)
 risk:
-  max_position_usdt_per_symbol: 250
-  max_total_positions_usdt: 500
-  fee_loss_threshold_pct: 0.1
-  position_timeout_minutes: 45
-  max_daily_loss_usdt: 50
-  daily_drawdown_pct: 5.0
-  max_open_positions: 2
-  max_trades_per_symbol: 100
-  max_global_pending_limit_orders: 4
-  max_pending_per_side: 1
-  per_trade_stop_loss_pct: 2.0
-  per_trade_take_profit_pct: 1.0
-  risk_per_trade_usdt: 3.0
-  atr_multiplier: 2.0
+  max_position_usdt_per_symbol: 500     # Tăng lên 500
+  max_total_positions_usdt: 2000      # Tăng lên 2000
+  fee_loss_threshold_pct: 0.2
+  position_timeout_minutes: 30
+  max_daily_loss_usdt: 100
+  daily_drawdown_pct: 10.0
+  max_open_positions: 5                 # Tăng lên 5
+  max_trades_per_symbol: 200          # Tăng lên 200
+  max_global_pending_limit_orders: 10   # Tăng lên 10
+  max_pending_per_side: 5               # Tăng lên 5
+  per_trade_stop_loss_pct: 3.0          # Giãn stop loss
+  per_trade_take_profit_pct: 1.5
+  risk_per_trade_usdt: 5.0
+  atr_multiplier: 1.5                   # Giảm ATR multiplier
   position_mode: "one_way"
-  correlation_threshold: 0.8
+  correlation_threshold: 0.9
   maker_priority: true
 
 # API Server Configuration (different port from main bot)

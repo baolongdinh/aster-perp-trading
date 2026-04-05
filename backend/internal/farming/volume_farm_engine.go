@@ -159,6 +159,9 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	// Connect adaptive manager as risk checker for grid manager
 	engine.gridManager.SetRiskChecker(adaptiveGridManager)
 
+	// NEW: Connect adaptive manager reference for optimization features
+	engine.gridManager.SetAdaptiveManager(adaptiveGridManager)
+
 	return engine, nil
 }
 
@@ -493,27 +496,26 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 	if cfg.VolumeFarming == nil {
 		return &config.VolumeFarmConfig{
 			Enabled:                  true,
-			MaxDailyLossUSDT:         50,
-			MaxTotalDrawdownPct:      5.0,
-			OrderSizeUSDT:            25,
-			GridSpreadPct:            0.12,
-			MaxOrdersPerSide:         1,
-			ReplaceImmediately:       false,
-			PositionTimeoutMinutes:   30,
-			TickerStream:             "!ticker@arr",
-			SymbolRefreshIntervalSec: 120,
-			GridPlacementCooldownSec: 90,
-			RateLimitCooldownSec:     300,
+			MaxDailyLossUSDT:         200,  // Higher limit for volume farming
+			MaxTotalDrawdownPct:      15.0, // More tolerance for volume
+			OrderSizeUSDT:            5,    // Small orders for high volume
+			GridSpreadPct:            0.01, // Tight spread
+			MaxOrdersPerSide:         30,   // 30 orders per side
+			ReplaceImmediately:       true, // Immediate replacement
+			PositionTimeoutMinutes:   10,   // Fast turnover
+			SymbolRefreshIntervalSec: 30,   // Fast symbol refresh
+			GridPlacementCooldownSec: 1,    // 1 second cooldown
+			RateLimitCooldownSec:     3,    // Quick recovery
 			SupportedQuoteCurrencies: []string{"USD1"},
-			MinVolume24h:             1_000_000,
+			MinVolume24h:             500, // Lower threshold
 			Bot:                      cfg.Bot,
 			Exchange:                 cfg.Exchange,
 			Risk:                     cfg.Risk,
 			API:                      cfg.API,
 			Symbols: config.SymbolsConfig{
 				QuoteCurrencies:    []string{"USD1"},
-				MaxSymbolsPerQuote: 3,
-				MinVolume24h:       1_000_000,
+				MaxSymbolsPerQuote: 20,  // More symbols
+				MinVolume24h:       500, // Lower volume threshold
 			},
 		}
 	}
@@ -564,16 +566,16 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 		volumeConfig.TickerStream = "!ticker@arr"
 	}
 	if volumeConfig.SymbolRefreshIntervalSec <= 0 {
-		volumeConfig.SymbolRefreshIntervalSec = 120
+		volumeConfig.SymbolRefreshIntervalSec = 30 // 30s default
 	}
 	if volumeConfig.GridPlacementCooldownSec <= 0 {
-		volumeConfig.GridPlacementCooldownSec = 90
+		volumeConfig.GridPlacementCooldownSec = 1 // 1s default
 	}
 	if volumeConfig.RateLimitCooldownSec <= 0 {
-		volumeConfig.RateLimitCooldownSec = 300
+		volumeConfig.RateLimitCooldownSec = 3 // 3s default
 	}
 	if volumeConfig.Symbols.MaxSymbolsPerQuote <= 0 {
-		volumeConfig.Symbols.MaxSymbolsPerQuote = 3
+		volumeConfig.Symbols.MaxSymbolsPerQuote = 20 // 20 symbols default
 	}
 
 	return volumeConfig

@@ -1,0 +1,55 @@
+# Trend Detection Configuration
+# Phát hiện xu hướng dựa trên RSI và các chỉ báo khác
+
+trend_detection:
+  enabled: true
+  
+  # RSI Configuration
+  rsi:
+    period: 14              # RSI period
+    timeframe: "15m"        # Timeframe cho RSI
+    update_interval: 5m     # Cập nhật mỗi 5 phút
+    
+  # RSI thresholds - điều chỉnh cho volume farming (ít pause hơn)
+  thresholds:
+    strong_overbought: 80       # RSI > 80 = Strong Up (tăng từ 70)
+    mild_overbought: 70         # RSI > 70 = Up (tăng từ 60)
+    neutral_high: 60            # High end of neutral
+    neutral_low: 40             # Low end of neutral
+    mild_oversold: 30           # RSI < 30 = Down (giảm từ 40)
+    strong_oversold: 20         # RSI < 20 = Strong Down (giảm từ 30)
+    
+  # Trend persistence
+  persistence:
+    required_duration: 15m  # Cần 15 phút RSI trong vùng mới coi là trend
+    min_confirmations: 3    # Cần 3 lần update liên tiếp
+    
+  # Trend score calculation
+  trend_score:
+    rsi_contribution: 4     # 0-4 điểm từ RSI
+    ema_contribution: 2     # 0-2 điểm từ EMA
+    volume_contribution: 2  # 0-2 điểm từ volume
+    price_action_contribution: 2  # 0-2 điểm từ higher highs/lower lows
+    
+  # Pause settings - giảm thời gian pause để farm nhiều hơn
+  pause:
+    strong_trend_pause_duration: 5m   # Pause 5 phút (giảm từ 30m)
+    mild_trend_pause_duration: 2m     # Pause 2 phút (giảm từ 15m)
+    score_threshold_strong: 6         # Score >= 6 = strong trend (tăng từ 4)
+    score_threshold_mild: 4           # Score 4-5 = mild trend (tăng từ 2)
+    
+  # Counter-trend size reduction - giảm mức giảm để farm nhiều hơn
+  counter_trend_reduction:
+    mild: 0.10              # Giảm 10% cho counter-trend (giảm từ 30%)
+    strong: 0.20            # Giảm 20% cho counter-trend (giảm từ 50%)
+    extreme: 0.30           # Giảm 30% cho counter-trend (giảm từ 70%)
+    
+  # Trend exhaustion detection
+  exhaustion:
+    enabled: true
+    detect_divergence: true   # Phát hiện RSI divergence
+    min_trend_duration: 2h    # Tối thiểu 2 giờ trend mới check exhaustion
+    
+  # Logging
+  log_trend_changes: true
+  log_interval: 15m

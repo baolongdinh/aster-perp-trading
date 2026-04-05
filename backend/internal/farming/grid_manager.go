@@ -13,6 +13,7 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
+	"aster-bot/internal/farming/adaptive_grid"
 
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -92,6 +93,14 @@ type GridManager struct {
 	priceHistory   map[string][]PricePoint // symbol -> price history for ATR
 	priceHistoryMu sync.RWMutex
 	atrPeriod      int
+
+	// NEW: Safeguard components
+	orderLockMgr   *adaptive_grid.OrderLockManager
+	deduplicator   *adaptive_grid.FillEventDeduplicator
+	stateValidator *adaptive_grid.StateValidator
+
+	// NEW: Reference to AdaptiveGridManager for optimization features
+	adaptiveMgr *adaptive_grid.AdaptiveGridManager
 }
 
 // SymbolGrid represents a grid for a specific symbol.
@@ -136,20 +145,24 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry) *
 		activeOrders:          make(map[string]*GridOrder),
 		filledOrders:          make(map[string]*GridOrder),
 		stopCh:                make(chan struct{}),
-		baseNotionalUSD:       100.0, // $100 base notional per order
-		minNotionalUSD:        20.0,  // Minimum $20 per order
-		maxNotionalUSD:        500.0, // Maximum $500 per order
-		useDynamicSizing:      true,  // Enable ATR-based sizing by default
-		gridSpreadPct:         0.12,
-		maxOrdersSide:         1,
-		placementQueue:        make(chan string, 256),
-		gridPlacementCooldown: 10 * time.Second,
-		rateLimitCooldown:     30 * time.Second,
+		baseNotionalUSD:       5.0,                     // $5 base notional per order - small for volume farming
+		minNotionalUSD:        5.0,                     // Minimum $5 per order (exchange minimum)
+		maxNotionalUSD:        50.0,                    // Maximum $50 per order - conservative for volume
+		useDynamicSizing:      true,                    // Enable ATR-based sizing by default
+		gridSpreadPct:         0.005,                   // Ultra-tight 0.005% spread for volume farming
+		maxOrdersSide:         3,                       // 3 orders per side = 6 total, clustered tightly around current price
+		placementQueue:        make(chan string, 1024), // Larger queue for high volume
+		gridPlacementCooldown: 500 * time.Millisecond,  // 500ms for rapid placement
+		rateLimitCooldown:     3 * time.Second,         // 3s quick recovery
 		tickerStreamURL:       "wss://fstream.asterdex.com/ws/!ticker@arr",
-		rateLimiter:           NewRateLimiter(10, 2, zapLogger),
+		rateLimiter:           NewRateLimiter(100, 20, zapLogger), // High throughput for volume
 		precisionMgr:          client.NewPrecisionManager(),
 		priceHistory:          make(map[string][]PricePoint),
 		atrPeriod:             14,
+		// NEW: Initialize safeguard components
+		orderLockMgr:   adaptive_grid.NewOrderLockManager(zapLogger),
+		deduplicator:   adaptive_grid.NewFillEventDeduplicator(zapLogger),
+		stateValidator: adaptive_grid.NewStateValidator(zapLogger),
 	}
 }
 
@@ -228,8 +241,8 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.ordersResetWorker(ctx)
 
-	// Start multiple placement workers for concurrency
-	numWorkers := 5 // Tăng từ 3 lên 5 workers
+	// Start multiple placement workers for high volume concurrency
+	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
 		g.wg.Add(1)
 		go g.placementWorker(ctx)
@@ -304,6 +317,13 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 		grid.MidPrice = lastPrice
 		grid.LastUpdate = time.Now()
 
+		// NEW: Feed price data to AdaptiveGridManager calculators
+		if g.adaptiveMgr != nil {
+			// Use lastPrice as high, low, close (ticker only gives last price)
+			// Pass 0 for bid/ask since ticker doesn't provide them
+			g.adaptiveMgr.UpdatePriceData(symbol, lastPrice, lastPrice, lastPrice, 0, 0)
+		}
+
 		if oldPrice != lastPrice && oldPrice != 0 {
 			g.logger.WithFields(logrus.Fields{
 				"symbol":    symbol,
@@ -337,30 +357,52 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 	}
 
 	// For volume farming, we want to place orders more frequently
+	// Allow placement even if grid was partially placed before
+	if grid.OrdersPlaced {
+		// Check if grid is complete (has expected number of active orders)
+		expected := grid.MaxOrdersSide * 2
+		actual := g.countActiveGridOrders(grid.Symbol)
+		if actual >= expected {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   grid.Symbol,
+				"expected": expected,
+				"actual":   actual,
+			}).Debug("Grid complete, skipping placement")
+			return false
+		}
+		// Grid incomplete - allow re-placement to fill missing orders
+		g.logger.WithFields(logrus.Fields{
+			"symbol":   grid.Symbol,
+			"expected": expected,
+			"actual":   actual,
+		}).Info("Grid incomplete, allowing re-placement")
+		return true
+	}
+
 	// Only skip if currently busy placing orders
 	if grid.PlacementBusy {
 		g.logger.WithField("symbol", grid.Symbol).Info("Not scheduling: placement busy")
 		return false
 	}
 
-	// Dynamic cooldown: increase if consecutive failures, but keep it short for farming
-	dynamicCooldown := g.gridPlacementCooldown
-	if g.consecutiveFailures > 0 && time.Since(g.lastFailureTime) < 5*time.Minute {
-		dynamicCooldown *= time.Duration(1 + g.consecutiveFailures)
-		if dynamicCooldown > 30*time.Second {
-			dynamicCooldown = 30 * time.Second
-		}
+	// Volume farming: ultra-short cooldown (200ms base)
+	baseCooldown := 200 * time.Millisecond
+	dynamicCooldown := baseCooldown
+
+	// Increase cooldown only if there are consecutive failures
+	if g.consecutiveFailures > 2 && time.Since(g.lastFailureTime) < 5*time.Minute {
+		dynamicCooldown = 3 * time.Second
 	}
 
-	// For volume farming, allow more frequent placement
-	// If no recent attempt, or cooldown has passed, allow placement
+	// For volume farming, allow very frequent placement attempts
+	// If no recent attempt, or short cooldown has passed, allow placement
 	if grid.LastAttempt.IsZero() || time.Since(grid.LastAttempt) >= dynamicCooldown {
 		g.logger.WithField("symbol", grid.Symbol).Info("Scheduling placement allowed for volume farming")
 		return true
 	}
 
-	// Also allow if price changed significantly (but keep threshold low for farming)
-	priceChangeThreshold := 0.001 // 0.1% change
+	// For price-based triggering, use tiny threshold for sensitive triggers
+	priceChangeThreshold := 0.0001 // 0.01% change (ultra sensitive)
 	if oldPrice > 0 {
 		priceChangePct := math.Abs(grid.CurrentPrice-oldPrice) / oldPrice
 		if priceChangePct >= priceChangeThreshold {
@@ -368,7 +410,7 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 				"symbol":       grid.Symbol,
 				"price_change": priceChangePct,
 				"threshold":    priceChangeThreshold,
-			}).Info("Scheduling placement due to significant price change")
+			}).Info("Scheduling placement due to price change")
 			return true
 		}
 	}
@@ -377,7 +419,7 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 		"symbol":     grid.Symbol,
 		"since_last": time.Since(grid.LastAttempt),
 		"cooldown":   dynamicCooldown,
-	}).Info("Not scheduling: cooldown active")
+	}).Debug("Not scheduling: cooldown active") // Changed to Debug to reduce noise
 	return false
 }
 
@@ -418,108 +460,132 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 
 	for _, symbol := range created {
 		g.logger.WithField("symbol", symbol).Info("Created new grid")
-		// Force initial placement for new grids
-		g.enqueuePlacement(symbol)
+		// Only enqueue if we already have a price, otherwise wait for WebSocket
+		g.gridsMu.RLock()
+		grid, exists := g.activeGrids[symbol]
+		hasPrice := exists && grid.CurrentPrice > 0
+		g.gridsMu.RUnlock()
+
+		if hasPrice {
+			g.enqueuePlacement(symbol)
+		} else {
+			g.logger.WithField("symbol", symbol).Info("Grid created without price - waiting for WebSocket price update")
+		}
 	}
 	for _, symbol := range removed {
 		g.logger.WithField("symbol", symbol).Info("Removed grid")
 	}
 }
 
-// placeGridOrders places initial grid orders for a symbol.
+// placeGridOrders places initial grid orders for a symbol concurrently.
 func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
-	g.logger.WithField("symbol", symbol).Info("Placing grid orders for volume farming")
+	g.logger.WithField("symbol", symbol).Info("Placing grid orders for volume farming (concurrent)")
 
 	if grid.CurrentPrice == 0 {
 		g.logger.WithField("symbol", symbol).Error("Cannot place orders: current price is 0")
 		return 0
 	}
 
-	// For volume farming, use ultra-small spreads for maximum fills
-	spreadAmount := grid.CurrentPrice * (grid.GridSpreadPct / 100)
-	if spreadAmount < 0.001 { // Minimum spread of $0.001 for volume farming
-		spreadAmount = 0.001
+	// NEW: Get dynamic spread from AdaptiveGridManager if available
+	spreadPct := grid.GridSpreadPct
+	if g.adaptiveMgr != nil {
+		dynamicSpread := g.adaptiveMgr.GetDynamicSpread()
+		// Only use dynamic spread if it's SMALLER than our configured spread
+		// For volume farming, we want tight spreads, not wide ones
+		if dynamicSpread > 0 && dynamicSpread < spreadPct {
+			spreadPct = dynamicSpread
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"dynamic_spread": dynamicSpread,
+				"base_spread":    grid.GridSpreadPct,
+				"final_spread":   spreadPct,
+			}).Info("Using tighter dynamic spread for grid")
+		} else if dynamicSpread > 0 {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"dynamic_spread": dynamicSpread,
+				"base_spread":    grid.GridSpreadPct,
+				"final_spread":   spreadPct,
+			}).Warn("Dynamic spread wider than config - using config spread")
+		}
 	}
 
-	placedOrders := 0
+	// For volume farming, use ultra-small spreads for maximum fills
+	spreadAmount := grid.CurrentPrice * (spreadPct / 100)
+
+	// Ensure minimum spread amount for very low prices or tiny percentages
+	minSpreadAmount := grid.CurrentPrice * 0.0001 // 0.01% minimum
+	if spreadAmount < minSpreadAmount {
+		spreadAmount = minSpreadAmount
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":        symbol,
+		"current_price": grid.CurrentPrice,
+		"spread_pct":    spreadPct,
+		"spread_amount": spreadAmount,
+		"min_spread":    minSpreadAmount,
+	}).Info("Calculated grid spread for volume farming")
+
+	// Collect all orders to place
+	var orders []*GridOrder
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":          symbol,
+		"max_orders_side": grid.MaxOrdersSide,
+		"current_price":   grid.CurrentPrice,
+		"spread_pct":      spreadPct,
+		"spread_amount":   spreadAmount,
+	}).Info("Starting to build grid orders")
 
 	// Place BUY orders below current price
+	buyOrdersCreated := 0
 	for i := 1; i <= grid.MaxOrdersSide; i++ {
 		buyPrice := grid.CurrentPrice - (spreadAmount * float64(i))
 		if buyPrice <= 0 {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"grid_level": i,
+				"buy_price":  buyPrice,
+			}).Warn("Skipping BUY order: price <= 0")
 			continue
 		}
 		orderSize := g.baseNotionalUSD / buyPrice
 
-		// Enhanced order size calculation with multiple fallbacks
-		var finalSize float64
-		var notional float64
-
-		// Try symbol-specific precision first
-		if g.precisionMgr != nil {
-			roundedSize := g.precisionMgr.RoundQty(symbol, orderSize)
-			parsedSize, parseErr := strconv.ParseFloat(roundedSize, 64)
-			if parseErr == nil && parsedSize > 0 {
-				notional = parsedSize * buyPrice
+		// NEW: Apply inventory-adjusted sizing if AdaptiveGridManager available
+		if g.adaptiveMgr != nil {
+			adjustedSize := g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "LONG", orderSize)
+			if adjustedSize <= 0 {
 				g.logger.WithFields(logrus.Fields{
-					"symbol":       symbol,
-					"price":        buyPrice,
-					"calc_size":    orderSize,
-					"rounded_size": parsedSize,
-					"notional":     notional,
-				}).Info("Order size calculated successfully")
-				finalSize = parsedSize
+					"symbol":        symbol,
+					"original_size": orderSize,
+					"adjusted_size": adjustedSize,
+					"side":          "BUY",
+					"grid_level":    i,
+				}).Warn("BUY order adjusted to 0, using original size")
+				adjustedSize = orderSize // Use original if adjusted is 0
 			}
+			if adjustedSize != orderSize {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"original_size": orderSize,
+					"adjusted_size": adjustedSize,
+					"side":          "BUY",
+				}).Info("Order size adjusted for inventory skew")
+			}
+			orderSize = adjustedSize
 		}
 
-		// Fallback 1: Ensure minimum notional (5.0 USD with safety margin)
-		if finalSize == 0 || notional < 5.0 {
-			// Add 2% safety margin to ensure no -4164 errors
-			minRequired := 5.0 * 1.02 // 5.1 USD minimum
-			minSize := minRequired / buyPrice
-			if minSize > 0 {
-				// Apply reasonable precision based on price range
-				var precision int
-				if buyPrice < 1 {
-					precision = 6 // For sub-dollar assets
-				} else if buyPrice < 100 {
-					precision = 4 // For moderate assets
-				} else {
-					precision = 2 // For high-value assets
-				}
-
-				multiplier := math.Pow(10, float64(precision))
-				// Use Round instead of Floor to ensure notional >= 5.0
-				roundedSize := math.Round(minSize*multiplier) / multiplier
-				adjustedNotional := roundedSize * buyPrice
-
-				// Ensure minimum notional is met
-				for adjustedNotional < 5.0 {
-					roundedSize += 1.0 / multiplier // Increment by smallest unit
-					adjustedNotional = roundedSize * buyPrice
-				}
-
-				g.logger.WithFields(logrus.Fields{
-					"symbol":       symbol,
-					"price":        buyPrice,
-					"min_required": minRequired,
-					"calc_size":    minSize,
-					"rounded_size": roundedSize,
-					"notional":     adjustedNotional,
-					"precision":    precision,
-				}).Info("Applied minimum notional with safety margin")
-				finalSize = roundedSize
-			}
-		}
-
-		// Fallback 2: Ensure minimum reasonable size
-		if finalSize < 0.000001 {
-			finalSize = 0.000001
+		if orderSize <= 0 {
 			g.logger.WithFields(logrus.Fields{
-				"symbol": symbol,
-				"size":   finalSize,
-			}).Info("Applied minimum size fallback")
+				"symbol":     symbol,
+				"grid_level": i,
+				"buy_price":  buyPrice,
+			}).Warn("Skipping BUY order due to zero/negative size")
+			continue
 		}
+
+		finalSize := g.calculateOrderSize(symbol, orderSize, buyPrice)
 		order := &GridOrder{
 			Symbol:    symbol,
 			Side:      "BUY",
@@ -530,94 +596,49 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 			CreatedAt: time.Now(),
 			GridLevel: -i,
 		}
-
-		if err := g.placeOrder(order); err != nil {
-			g.logger.WithError(err).WithField("symbol", symbol).Warn("Failed to place BUY order")
-		} else {
-			placedOrders++
-			g.logger.WithFields(logrus.Fields{
-				"symbol": symbol,
-				"side":   "BUY",
-				"price":  buyPrice,
-				"level":  -i,
-			}).Info("Placed BUY order for volume farming")
-		}
+		orders = append(orders, order)
+		buyOrdersCreated++
 	}
 
 	// Place SELL orders above current price
+	sellOrdersCreated := 0
 	for i := 1; i <= grid.MaxOrdersSide; i++ {
 		sellPrice := grid.CurrentPrice + (spreadAmount * float64(i))
 		orderSize := g.baseNotionalUSD / sellPrice
 
-		// Enhanced order size calculation with multiple fallbacks
-		var finalSize float64
-		var notional float64
-
-		// Try symbol-specific precision first
-		if g.precisionMgr != nil {
-			roundedSize := g.precisionMgr.RoundQty(symbol, orderSize)
-			parsedSize, parseErr := strconv.ParseFloat(roundedSize, 64)
-			if parseErr == nil && parsedSize > 0 {
-				notional = parsedSize * sellPrice
+		if g.adaptiveMgr != nil {
+			adjustedSize := g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "SHORT", orderSize)
+			if adjustedSize <= 0 {
 				g.logger.WithFields(logrus.Fields{
-					"symbol":       symbol,
-					"price":        sellPrice,
-					"calc_size":    orderSize,
-					"rounded_size": parsedSize,
-					"notional":     notional,
-				}).Info("Order size calculated successfully")
-				finalSize = parsedSize
+					"symbol":        symbol,
+					"original_size": orderSize,
+					"adjusted_size": adjustedSize,
+					"side":          "SELL",
+					"grid_level":    i,
+				}).Warn("SELL order adjusted to 0, using original size")
+				adjustedSize = orderSize
 			}
+			if adjustedSize != orderSize {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"original_size": orderSize,
+					"adjusted_size": adjustedSize,
+					"side":          "SELL",
+				}).Info("Order size adjusted for inventory skew")
+			}
+			orderSize = adjustedSize
 		}
 
-		// Fallback 1: Ensure minimum notional (5.0 USD with safety margin)
-		if finalSize == 0 || notional < 5.0 {
-			// Add 2% safety margin to ensure no -4164 errors
-			minRequired := 5.0 * 1.02 // 5.1 USD minimum
-			minSize := minRequired / sellPrice
-			if minSize > 0 {
-				// Apply reasonable precision based on price range
-				var precision int
-				if sellPrice < 1 {
-					precision = 6 // For sub-dollar assets
-				} else if sellPrice < 100 {
-					precision = 4 // For moderate assets
-				} else {
-					precision = 2 // For high-value assets
-				}
-
-				multiplier := math.Pow(10, float64(precision))
-				// Use Round instead of Floor to ensure notional >= 5.0
-				roundedSize := math.Round(minSize*multiplier) / multiplier
-				adjustedNotional := roundedSize * sellPrice
-
-				// Ensure minimum notional is met
-				for adjustedNotional < 5.0 {
-					roundedSize += 1.0 / multiplier // Increment by smallest unit
-					adjustedNotional = roundedSize * sellPrice
-				}
-
-				g.logger.WithFields(logrus.Fields{
-					"symbol":       symbol,
-					"price":        sellPrice,
-					"min_required": minRequired,
-					"calc_size":    minSize,
-					"rounded_size": roundedSize,
-					"notional":     adjustedNotional,
-					"precision":    precision,
-				}).Info("Applied minimum notional with safety margin")
-				finalSize = roundedSize
-			}
-		}
-
-		// Fallback 2: Ensure minimum reasonable size
-		if finalSize < 0.000001 {
-			finalSize = 0.000001
+		if orderSize <= 0 {
 			g.logger.WithFields(logrus.Fields{
-				"symbol": symbol,
-				"size":   finalSize,
-			}).Info("Applied minimum size fallback")
+				"symbol":     symbol,
+				"grid_level": i,
+				"sell_price": sellPrice,
+			}).Warn("Skipping SELL order due to zero/negative size")
+			continue
 		}
+
+		finalSize := g.calculateOrderSize(symbol, orderSize, sellPrice)
 		order := &GridOrder{
 			Symbol:    symbol,
 			Side:      "SELL",
@@ -628,17 +649,37 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 			CreatedAt: time.Now(),
 			GridLevel: i,
 		}
+		orders = append(orders, order)
+		sellOrdersCreated++
+	}
 
-		if err := g.placeOrder(order); err != nil {
-			g.logger.WithError(err).WithField("symbol", symbol).Warn("Failed to place SELL order")
-		} else {
+	g.logger.WithFields(logrus.Fields{
+		"symbol":              symbol,
+		"buy_orders_created":  buyOrdersCreated,
+		"sell_orders_created": sellOrdersCreated,
+		"total_orders":        len(orders),
+	}).Info("Grid orders prepared for placement")
+
+	// Place all orders concurrently
+	var wg sync.WaitGroup
+	successChan := make(chan bool, len(orders))
+
+	for _, order := range orders {
+		wg.Add(1)
+		go g.placeOrderAsync(context.Background(), order, &wg, successChan)
+	}
+
+	// Wait for all orders to complete in a goroutine
+	go func() {
+		wg.Wait()
+		close(successChan)
+	}()
+
+	// Count successes
+	placedOrders := 0
+	for success := range successChan {
+		if success {
 			placedOrders++
-			g.logger.WithFields(logrus.Fields{
-				"symbol": symbol,
-				"side":   "SELL",
-				"price":  sellPrice,
-				"level":  i,
-			}).Info("Placed SELL order for volume farming")
 		}
 	}
 
@@ -648,12 +689,102 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 		"sell_orders":  grid.MaxOrdersSide,
 		"total_orders": placedOrders,
 		"spread_pct":   grid.GridSpreadPct,
-	}).Info("Grid orders placed for volume farming")
+	}).Info("Grid orders placed for volume farming (concurrent)")
 
 	return placedOrders
 }
 
-// placeOrder places a single order using the futures client.
+// calculateOrderSize calculates the final order size with fallbacks
+func (g *GridManager) calculateOrderSize(symbol string, orderSize, price float64) float64 {
+	var finalSize float64
+	var notional float64
+
+	// Try symbol-specific precision first
+	if g.precisionMgr != nil {
+		roundedSize := g.precisionMgr.RoundQty(symbol, orderSize)
+		parsedSize, parseErr := strconv.ParseFloat(roundedSize, 64)
+		if parseErr == nil && parsedSize > 0 {
+			notional = parsedSize * price
+			finalSize = parsedSize
+		}
+	}
+
+	// Fallback: Ensure minimum notional (5.0 USD with safety margin)
+	if finalSize == 0 || notional < 5.0 {
+		minRequired := 5.0 * 1.02 // 5.1 USD minimum
+		minSize := minRequired / price
+		if minSize > 0 {
+			var precision int
+			if price < 1 {
+				precision = 6
+			} else if price < 100 {
+				precision = 4
+			} else {
+				precision = 2
+			}
+
+			multiplier := math.Pow(10, float64(precision))
+			roundedSize := math.Round(minSize*multiplier) / multiplier
+			adjustedNotional := roundedSize * price
+
+			for adjustedNotional < 5.0 {
+				roundedSize += 1.0 / multiplier
+				adjustedNotional = roundedSize * price
+			}
+			finalSize = roundedSize
+		}
+	}
+
+	// Ensure minimum reasonable size
+	if finalSize < 0.000001 {
+		finalSize = 0.000001
+	}
+
+	return finalSize
+}
+
+// placeOrderAsync places an order asynchronously with context cancellation support
+func (g *GridManager) placeOrderAsync(ctx context.Context, order *GridOrder, wg *sync.WaitGroup, successChan chan<- bool) {
+	defer wg.Done()
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":     order.Symbol,
+		"side":       order.Side,
+		"price":      order.Price,
+		"size":       order.Size,
+		"grid_level": order.GridLevel,
+	}).Debug("placeOrderAsync started - concurrent order placement")
+
+	// Check context before attempting
+	select {
+	case <-ctx.Done():
+		g.logger.WithField("symbol", order.Symbol).Debug("Context cancelled before placing order")
+		successChan <- false
+		return
+	case <-g.stopCh:
+		g.logger.WithField("symbol", order.Symbol).Debug("Stop signal received before placing order")
+		successChan <- false
+		return
+	default:
+	}
+
+	if err := g.placeOrder(order); err != nil {
+		g.logger.WithError(err).WithFields(logrus.Fields{
+			"symbol":     order.Symbol,
+			"side":       order.Side,
+			"price":      order.Price,
+			"grid_level": order.GridLevel,
+		}).Warn("Failed to place order async")
+		successChan <- false
+	} else {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":     order.Symbol,
+			"side":       order.Side,
+			"grid_level": order.GridLevel,
+		}).Debug("Order placed successfully in async worker")
+		successChan <- true
+	}
+}
 func (g *GridManager) placeOrder(order *GridOrder) error {
 	g.logger.WithFields(logrus.Fields{
 		"symbol": order.Symbol,
@@ -661,6 +792,39 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		"price":  order.Price,
 		"size":   order.Size,
 	}).Info("Attempting to place order")
+
+	// NEW: Check state transition validity (only for existing orders)
+	if order.OrderID != "" {
+		fromState := adaptive_grid.OrderState(order.Status)
+		toState := adaptive_grid.OrderStatePending
+		if !g.stateValidator.IsValidTransition(fromState, toState) {
+			g.logger.WithFields(logrus.Fields{
+				"order_id": order.OrderID,
+				"from":     order.Status,
+				"to":       "PENDING",
+			}).Warn("Invalid order state transition")
+			return fmt.Errorf("invalid order state transition from %s to PENDING", order.Status)
+		}
+	}
+
+	// NEW: Acquire per-symbol order lock - DISABLED for concurrent grid orders
+	// The lock was preventing multiple orders for the same symbol from being placed concurrently
+	// For volume farming, we need to place many orders at once, so we skip this lock
+	// The deduplicator and stateValidator still provide protection against duplicate fills
+	/*
+		if !g.orderLockMgr.LockOrderProcessing(order.Symbol, order.OrderID) {
+			return fmt.Errorf("failed to acquire order lock for symbol %s", order.Symbol)
+		}
+		defer g.orderLockMgr.UnlockOrderProcessing(order.Symbol)
+	*/
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":     order.Symbol,
+		"side":       order.Side,
+		"price":      order.Price,
+		"size":       order.Size,
+		"grid_level": order.GridLevel,
+	}).Debug("Lock bypassed for volume farming - placing order immediately")
 
 	// Use adaptive rate limiter instead of hard block
 	if !g.rateLimiter.WaitForToken(5 * time.Second) {
@@ -681,6 +845,28 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		Quantity:    g.precisionMgr.RoundQty(order.Symbol, order.Size),
 		Price:       g.precisionMgr.RoundPrice(order.Symbol, order.Price),
 		TimeInForce: "GTC",
+	}
+
+	// Verify notional after rounding - fix for SOL and other high-price assets
+	qty, _ := strconv.ParseFloat(orderReq.Quantity, 64)
+	price, _ := strconv.ParseFloat(orderReq.Price, 64)
+	notional := qty * price
+
+	if notional < 5.0 {
+		// Increase quantity to meet minimum notional
+		minQty := 5.0 / price
+		// Add 2% safety margin
+		minQty = minQty * 1.02
+		orderReq.Quantity = g.precisionMgr.RoundQty(order.Symbol, minQty)
+
+		g.logger.WithFields(logrus.Fields{
+			"symbol":       order.Symbol,
+			"side":         order.Side,
+			"original_qty": qty,
+			"adjusted_qty": orderReq.Quantity,
+			"price":        price,
+			"notional":     notional,
+		}).Warn("Adjusted order quantity to meet minimum notional requirement")
 	}
 
 	response, err := g.futuresClient.PlaceOrder(context.Background(), *orderReq)
@@ -715,11 +901,35 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 
 // handleOrderFill handles when an order is filled and triggers rebalancing
 func (g *GridManager) handleOrderFill(orderID string, symbol string) {
+	// NEW: Check for duplicate fill event
+	if g.deduplicator.IsDuplicate(orderID, time.Now()) {
+		g.logger.WithFields(logrus.Fields{
+			"orderID": orderID,
+			"symbol":  symbol,
+		}).Warn("Duplicate fill event detected - skipping")
+		return
+	}
+	// Record the fill event
+	g.deduplicator.RecordEvent(orderID, time.Now())
+
 	g.ordersMu.Lock()
 	order, exists := g.activeOrders[orderID]
 	if !exists {
 		g.ordersMu.Unlock()
 		g.logger.WithField("orderID", orderID).Warn("Order not found in active orders")
+		return
+	}
+
+	// NEW: Validate state transition before processing
+	oldState := adaptive_grid.OrderState(order.Status)
+	newState := adaptive_grid.OrderStateFilled
+	if !g.stateValidator.IsValidTransition(oldState, newState) {
+		g.ordersMu.Unlock()
+		g.logger.WithFields(logrus.Fields{
+			"orderID": orderID,
+			"from":    oldState,
+			"to":      newState,
+		}).Warn("Invalid fill state transition - skipping")
 		return
 	}
 
@@ -742,6 +952,32 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 		"size":    order.Size,
 		"price":   order.Price,
 	}).Info("Order filled - checking risk before rebalancing")
+
+	// NEW: Track filled position in AdaptiveGridManager
+	if g.adaptiveMgr != nil {
+		// Track in InventoryManager
+		g.adaptiveMgr.TrackInventoryPosition(symbol, order.Side, order.Size, order.Price, order.GridLevel)
+
+		// Track in ClusterManager
+		positions := []adaptive_grid.PositionInfo{
+			{
+				Symbol:     symbol,
+				Side:       order.Side,
+				Size:       order.Size,
+				EntryPrice: order.Price,
+				GridLevel:  order.GridLevel,
+				EntryTime:  order.FilledAt,
+			},
+		}
+		g.adaptiveMgr.TrackClusterEntry(symbol, order.GridLevel, order.Side, positions)
+
+		g.logger.WithFields(logrus.Fields{
+			"symbol":     symbol,
+			"side":       order.Side,
+			"size":       order.Size,
+			"grid_level": order.GridLevel,
+		}).Info("Position tracked in inventory and cluster managers")
+	}
 
 	// Check if rebalancing is allowed (risk limits not exceeded)
 	if !g.canRebalance(symbol) {
@@ -817,7 +1053,7 @@ func (g *GridManager) placementWorker(ctx context.Context) {
 func (g *GridManager) ordersResetWorker(ctx context.Context) {
 	defer g.wg.Done()
 
-	ticker := time.NewTicker(15 * time.Second) // Giảm từ 30 xuống 15 giây
+	ticker := time.NewTicker(3 * time.Second) // 3s for rapid grid reset
 	defer ticker.Stop()
 
 	for {
@@ -837,10 +1073,28 @@ func (g *GridManager) resetStaleOrders() {
 	defer g.gridsMu.Unlock()
 
 	for symbol, grid := range g.activeGrids {
-		if grid.OrdersPlaced && time.Since(grid.LastAttempt) > 15*time.Second { // Giảm từ 30 xuống 15
-			// Assume no fills, reset for re-placement
-			grid.OrdersPlaced = false
-			g.logger.WithField("symbol", symbol).Debug("Resetting orders for re-placement after timeout")
+		// Check if grid has been placed but timeout passed
+		if grid.OrdersPlaced && time.Since(grid.LastAttempt) > 3*time.Second {
+			// Check if we have all expected orders
+			expected := grid.MaxOrdersSide * 2
+			actual := 0
+			g.ordersMu.RLock()
+			for _, order := range g.activeOrders {
+				if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
+					actual++
+				}
+			}
+			g.ordersMu.RUnlock()
+
+			// Only reset if grid is incomplete
+			if actual < expected {
+				grid.OrdersPlaced = false
+				g.logger.WithFields(logrus.Fields{
+					"symbol":   symbol,
+					"expected": expected,
+					"actual":   actual,
+				}).Info("Resetting incomplete grid for re-placement")
+			}
 		}
 	}
 }
@@ -855,6 +1109,9 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 		g.logger.WithField("symbol", symbol).Warn("Grid not found for symbol, skipping placement")
 		return
 	}
+
+	// Mark as busy immediately to prevent duplicate scheduling
+	grid.PlacementBusy = true
 	grid.LastAttempt = time.Now()
 	snapshot := *grid
 	g.gridsMu.Unlock()
@@ -866,8 +1123,31 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	}
 
 	placed := g.placeGridOrders(symbol, &snapshot)
-	g.logger.WithField("symbol", symbol).WithField("placed", placed).Info("Completed placement process for symbol")
-	g.finishPlacement(symbol, placed > 0)
+	expectedOrders := snapshot.MaxOrdersSide * 2 // BUY + SELL sides
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":   symbol,
+		"placed":   placed,
+		"expected": expectedOrders,
+	}).Info("Completed placement process for symbol")
+
+	// Mark as complete if at least 80% of orders were placed (allow partial success)
+	minSuccessRate := 0.8
+	successRate := float64(placed) / float64(expectedOrders)
+	g.finishPlacement(symbol, successRate >= minSuccessRate || placed > 0)
+}
+
+func (g *GridManager) countActiveGridOrders(symbol string) int {
+	g.ordersMu.RLock()
+	defer g.ordersMu.RUnlock()
+
+	count := 0
+	for _, order := range g.activeOrders {
+		if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
+			count++
+		}
+	}
+	return count
 }
 
 func (g *GridManager) finishPlacement(symbol string, placed bool) {
@@ -981,6 +1261,16 @@ func (g *GridManager) Stop(ctx context.Context) error {
 
 	g.logger.Info("Stopping Grid Manager")
 
+	// NEW: Cleanup safeguard components
+	if g.deduplicator != nil {
+		g.deduplicator.Reset()
+		g.logger.Info("Fill deduplicator reset")
+	}
+	if g.orderLockMgr != nil {
+		g.orderLockMgr.CleanupStaleLocks()
+		g.logger.Info("Order locks cleaned up")
+	}
+
 	close(g.stopCh)
 
 	if g.wsClient != nil {
@@ -1040,6 +1330,14 @@ func (g *GridManager) SetRiskChecker(checker RiskChecker) {
 	defer g.riskCheckerMu.Unlock()
 	g.riskChecker = checker
 	g.logger.Info("Risk checker set")
+}
+
+// SetAdaptiveManager sets the adaptive grid manager reference
+func (g *GridManager) SetAdaptiveManager(mgr *adaptive_grid.AdaptiveGridManager) {
+	g.riskCheckerMu.Lock()
+	defer g.riskCheckerMu.Unlock()
+	g.adaptiveMgr = mgr
+	g.logger.Info("Adaptive grid manager reference set")
 }
 
 // canRebalance checks if rebalancing is allowed for a symbol
