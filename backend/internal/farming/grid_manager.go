@@ -18,6 +18,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// PricePoint represents a price data point for ATR calculation
+type PricePoint struct {
+	High  float64
+	Low   float64
+	Close float64
+	Time  time.Time
+}
+
+// RiskChecker interface for checking if trading is allowed
+type RiskChecker interface {
+	CanPlaceOrder(symbol string) bool
+}
+
 // GridManager manages trading grids for multiple symbols.
 type GridManager struct {
 	futuresClient *client.FuturesClient
@@ -40,10 +53,13 @@ type GridManager struct {
 	activeOrders map[string]*GridOrder // OrderID -> GridOrder
 	filledOrders map[string]*GridOrder // OrderID -> GridOrder
 
-	// Configuration.
-	orderSizeUSDT float64
-	gridSpreadPct float64
-	maxOrdersSide int
+	// Configuration - Now using Notional Value based sizing
+	baseNotionalUSD  float64 // Base order size in USD (e.g., $100)
+	minNotionalUSD   float64 // Minimum order in USD (e.g., $20)
+	maxNotionalUSD   float64 // Maximum order in USD (e.g., $500)
+	gridSpreadPct    float64
+	maxOrdersSide    int
+	useDynamicSizing bool // Use ATR-based dynamic sizing
 
 	placementQueue        chan string
 	gridPlacementCooldown time.Duration
@@ -67,6 +83,15 @@ type GridManager struct {
 	totalOrdersPlaced int
 	totalOrdersFilled int
 	volumeMetricsMu   sync.RWMutex
+
+	// Risk checker callback
+	riskChecker   RiskChecker
+	riskCheckerMu sync.RWMutex
+
+	// ATR tracking for dynamic sizing
+	priceHistory   map[string][]PricePoint // symbol -> price history for ATR
+	priceHistoryMu sync.RWMutex
+	atrPeriod      int
 }
 
 // SymbolGrid represents a grid for a specific symbol.
@@ -111,15 +136,20 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry) *
 		activeOrders:          make(map[string]*GridOrder),
 		filledOrders:          make(map[string]*GridOrder),
 		stopCh:                make(chan struct{}),
-		orderSizeUSDT:         25.0,
+		baseNotionalUSD:       100.0, // $100 base notional per order
+		minNotionalUSD:        20.0,  // Minimum $20 per order
+		maxNotionalUSD:        500.0, // Maximum $500 per order
+		useDynamicSizing:      true,  // Enable ATR-based sizing by default
 		gridSpreadPct:         0.12,
 		maxOrdersSide:         1,
-		placementQueue:        make(chan string, 256), // Increased queue size
-		gridPlacementCooldown: 10 * time.Second,       // Reduced default cooldown
-		rateLimitCooldown:     30 * time.Second,       // Reduced rate limit cooldown
+		placementQueue:        make(chan string, 256),
+		gridPlacementCooldown: 10 * time.Second,
+		rateLimitCooldown:     30 * time.Second,
 		tickerStreamURL:       "wss://fstream.asterdex.com/ws/!ticker@arr",
-		rateLimiter:           NewRateLimiter(10, 2, zapLogger), // 10 capacity, 2 tokens/sec
+		rateLimiter:           NewRateLimiter(10, 2, zapLogger),
 		precisionMgr:          client.NewPrecisionManager(),
+		priceHistory:          make(map[string][]PricePoint),
+		atrPeriod:             14,
 	}
 }
 
@@ -129,7 +159,7 @@ func (g *GridManager) ApplyConfig(cfg *config.VolumeFarmConfig) {
 		return
 	}
 	if cfg.OrderSizeUSDT > 0 {
-		g.orderSizeUSDT = cfg.OrderSizeUSDT
+		g.baseNotionalUSD = cfg.OrderSizeUSDT // Treat as notional USD
 	}
 	if cfg.GridSpreadPct > 0 {
 		g.gridSpreadPct = cfg.GridSpreadPct
@@ -419,7 +449,7 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 		if buyPrice <= 0 {
 			continue
 		}
-		orderSize := g.orderSizeUSDT / buyPrice
+		orderSize := g.baseNotionalUSD / buyPrice
 
 		// Enhanced order size calculation with multiple fallbacks
 		var finalSize float64
@@ -517,7 +547,7 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 	// Place SELL orders above current price
 	for i := 1; i <= grid.MaxOrdersSide; i++ {
 		sellPrice := grid.CurrentPrice + (spreadAmount * float64(i))
-		orderSize := g.orderSizeUSDT / sellPrice
+		orderSize := g.baseNotionalUSD / sellPrice
 
 		// Enhanced order size calculation with multiple fallbacks
 		var finalSize float64
@@ -711,7 +741,13 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 		"side":    order.Side,
 		"size":    order.Size,
 		"price":   order.Price,
-	}).Info("Order filled - triggering rebalancing")
+	}).Info("Order filled - checking risk before rebalancing")
+
+	// Check if rebalancing is allowed (risk limits not exceeded)
+	if !g.canRebalance(symbol) {
+		g.logger.WithField("symbol", symbol).Warn("Rebalancing blocked due to risk limits")
+		return
+	}
 
 	// Trigger immediate rebalancing for this symbol
 	go g.enqueuePlacement(symbol)
@@ -969,12 +1005,12 @@ func (g *GridManager) Stop(ctx context.Context) error {
 	}
 }
 
-// SetOrderSize sets the order size in USDT
+// SetOrderSize sets the order size (kept for backward compatibility, use SetNotionalSize)
 func (g *GridManager) SetOrderSize(size float64) {
 	g.gridsMu.Lock()
 	defer g.gridsMu.Unlock()
-	g.orderSizeUSDT = size
-	g.logger.WithField("order_size", size).Info("Order size updated")
+	g.baseNotionalUSD = size // Treat as notional size
+	g.logger.WithField("notional_size", size).Info("Order size (notional) updated")
 }
 
 // SetGridSpread sets the grid spread percentage
@@ -996,6 +1032,24 @@ func (g *GridManager) SetMaxOrdersPerSide(max int) {
 // SetPositionTimeout sets the position timeout in minutes (for future use)
 func (g *GridManager) SetPositionTimeout(minutes int) {
 	g.logger.WithField("timeout_minutes", minutes).Info("Position timeout updated")
+}
+
+// SetRiskChecker sets the risk checker callback
+func (g *GridManager) SetRiskChecker(checker RiskChecker) {
+	g.riskCheckerMu.Lock()
+	defer g.riskCheckerMu.Unlock()
+	g.riskChecker = checker
+	g.logger.Info("Risk checker set")
+}
+
+// canRebalance checks if rebalancing is allowed for a symbol
+func (g *GridManager) canRebalance(symbol string) bool {
+	g.riskCheckerMu.RLock()
+	defer g.riskCheckerMu.RUnlock()
+	if g.riskChecker == nil {
+		return true
+	}
+	return g.riskChecker.CanPlaceOrder(symbol)
 }
 
 // GetActivePositions returns active positions for a symbol

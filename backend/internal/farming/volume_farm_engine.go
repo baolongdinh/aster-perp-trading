@@ -151,9 +151,13 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		engine.gridManager,
 		configManager,
 		regimeDetector,
+		engine.futuresClient,
 		logger,
 	)
 	engine.adaptiveGridManager = adaptiveGridManager
+
+	// Connect adaptive manager as risk checker for grid manager
+	engine.gridManager.SetRiskChecker(adaptiveGridManager)
 
 	return engine, nil
 }
