@@ -83,6 +83,16 @@ func (m *Manager) CanEnter(symbol string, notional float64, leverage float64) er
 		}
 	}
 
+	// 1.5. Total Position Notional Limit
+	totalNotional := 0.0
+	for _, positionNotional := range m.symNotional {
+		totalNotional += positionNotional
+	}
+	if m.cfg.MaxTotalPositionsUSDT > 0 && (totalNotional+notional) > m.cfg.MaxTotalPositionsUSDT {
+		return fmt.Errorf("risk: total position notional limit would be exceeded (current: %.2f, new: %.2f, limit: %.2f)",
+			totalNotional, notional, m.cfg.MaxTotalPositionsUSDT)
+	}
+
 	// 2. No Stacking Check: Prevent increasing existing positions or duplicate entries
 	if m.symPositions[symbol] > 0 {
 		return fmt.Errorf("risk: stacking blocked — %s already has an open position", symbol)
@@ -261,14 +271,18 @@ func (m *Manager) CalculatePositionSize(symbol string, entryPrice float64, slPri
 		)
 	}
 
-	// Check against max position size limit
-	if notional > m.cfg.MaxPositionUSDT {
+	// Check against max position size limit (per-symbol if available, otherwise general)
+	maxPositionLimit := m.cfg.MaxPositionUSDTPerSymbol
+	if maxPositionLimit <= 0 {
+		maxPositionLimit = m.cfg.MaxPositionUSDT
+	}
+	if notional > maxPositionLimit {
 		m.log.Info("IQ-RISK: Capping notional size to max limit",
 			zap.String("symbol", symbol),
 			zap.Float64("requested_notional", notional),
-			zap.Float64("max_limit", m.cfg.MaxPositionUSDT),
+			zap.Float64("max_limit", maxPositionLimit),
 		)
-		notional = m.cfg.MaxPositionUSDT
+		notional = maxPositionLimit
 	}
 
 	return notional, nil

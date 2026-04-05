@@ -120,7 +120,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	volumeConfig := engine.extractVolumeFarmConfig(cfg)
 	engine.volumeConfig = volumeConfig
 	engine.futuresClient = client.NewFuturesClient(httpClient, volumeConfig.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
-	engine.riskManager = risk.NewManager(cfg.Risk, logger)
+	engine.riskManager = risk.NewManager(volumeConfig.Risk, logger)
 
 	logrusEntry := logrus.NewEntry(logrus.StandardLogger()).WithField("component", "volume_farm")
 	engine.symbolSelector = NewSymbolSelector(engine.futuresClient, logrusEntry.WithField("component", "symbol_selector"), volumeConfig)
@@ -388,10 +388,10 @@ func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
 			dailyPnL := e.riskManager.DailyPnL()
 			isPaused := e.riskManager.IsPaused()
 
-			if dailyPnL < -e.config.Risk.DailyLossLimitUSDT {
+			if dailyPnL < -e.volumeConfig.Risk.DailyLossLimitUSDT {
 				e.logger.Warn("Daily loss limit reached, stopping farming",
 					zap.Float64("daily_loss", dailyPnL),
-					zap.Float64("limit", e.config.Risk.DailyLossLimitUSDT))
+					zap.Float64("limit", e.volumeConfig.Risk.DailyLossLimitUSDT))
 			}
 
 			if isPaused {

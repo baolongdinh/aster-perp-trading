@@ -1,0 +1,85 @@
+# Volume Farming Configuration with Stop Loss and Volume Control
+enabled: true
+
+# Risk Management
+max_daily_loss_usdt: 100
+max_total_drawdown_pct: 5.0
+
+# Grid Configuration
+order_size_usdt: 50
+grid_spread_pct: 0.1
+max_orders_per_side: 2
+replace_immediately: true
+position_timeout_minutes: 30
+
+# Stop Loss Configuration
+enable_stop_loss: true
+stop_loss_pct: 2.0
+stop_loss_type: "percentage"  # "percentage" or "absolute"
+max_stop_loss_distance: 25.0  # Maximum $25 SL distance
+
+# Volume Control Configuration
+max_volume_per_symbol: 500.0  # Max $500 volume per symbol
+max_active_orders_per_symbol: 8  # Max 8 active orders per symbol
+volume_check_interval_seconds: 60  # Check every minute
+dynamic_volume_adjustment: true
+
+# Timing Configuration - REDUCED FOR TESTING
+grid_placement_cooldown_seconds: 10  # Reduced from 60 to 10 seconds
+rate_limit_cooldown_seconds: 60   # Reduced from 180 to 60 seconds
+symbol_refresh_interval_seconds: 30  # Reduced from 120 to 30 seconds
+
+# Rate Limiting
+rate_limiter_capacity: 10
+rate_limiter_refill_rate: 2.0
+
+# Market Data
+ticker_stream: "!ticker@arr"
+supported_quote_currencies: ["USD1"]
+min_volume_24h: 1000000
+
+# Exchange Configuration
+exchange:
+  futures_rest_base: "https://fapi.asterdex.com"
+  futures_ws_base: "wss://fstream.asterdex.com"
+  recv_window: 5000
+  requests_per_second: 10
+
+# Symbol Selection
+symbols:
+  auto_discover: true
+  quote_currency_mode: "flexible"
+  min_volume_24h: 10000000
+  max_spread_pct: 0.1
+  boosted_only: false
+  max_symbols_per_quote: 10
+  spread_ranking: true
+  volume_weighting: 0.7
+  min_liquidity_score: 0.5
+  optimal_spread_range: [0.01, 0.05]
+  spread_volatility_threshold: 0.02
+  exclude_high_fee_symbols: true
+  quote_currencies: ["USD1"]
+  allow_mixed_quotes: true
+  whitelist: []
+
+# Bot Configuration
+bot:
+  dry_run: true
+
+# API Configuration
+api:
+  host: "0.0.0.0"
+  port: 8081
+
+# Risk Configuration (inherited from main config)
+risk:
+  max_position_usdt: 500
+  max_open_positions: 5
+  daily_loss_limit_usdt: 100
+  daily_drawdown_pct: 5.0
+  per_trade_stop_loss_pct: 2.0
+  risk_per_trade_usdt: 10.0
+  atr_multiplier: 2.0
+  position_mode: "one_way"
+  correlation_threshold: 0.8

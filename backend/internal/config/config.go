@@ -42,6 +42,10 @@ type ExchangeConfig struct {
 }
 
 type RiskConfig struct {
+	MaxPositionUSDTPerSymbol    float64 `mapstructure:"max_position_usdt_per_symbol"`
+	MaxTotalPositionsUSDT       float64 `mapstructure:"max_total_positions_usdt"`
+	FeeLossThresholdPct         float64 `mapstructure:"fee_loss_threshold_pct"`
+	PositionTimeoutMinutes      int     `mapstructure:"position_timeout_minutes"`
 	MaxPositionUSDT             float64 `mapstructure:"max_position_usdt"`
 	MaxOpenPositions            int     `mapstructure:"max_open_positions"`
 	MaxTradesPerSymbol          int     `mapstructure:"max_trades_per_symbol"`
