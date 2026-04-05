@@ -10,6 +10,9 @@ import (
 	"aster-bot/internal/auth"
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
+	"aster-bot/internal/farming/adaptive_config"
+	"aster-bot/internal/farming/adaptive_grid"
+	"aster-bot/internal/farming/market_regime"
 	"aster-bot/internal/risk"
 
 	"github.com/sirupsen/logrus"
@@ -40,18 +43,21 @@ type OrderUpdate struct {
 
 // VolumeFarmEngine orchestrates volume farming operations.
 type VolumeFarmEngine struct {
-	config         *config.Config
-	volumeConfig   *config.VolumeFarmConfig
-	logger         *zap.Logger
-	isRunning      bool
-	isRunningMu    sync.RWMutex
-	futuresClient  *client.FuturesClient
-	riskManager    *risk.Manager
-	symbolSelector *SymbolSelector
-	gridManager    *GridManager
-	pointsTracker  *PointsTracker
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
+	config              *config.Config
+	volumeConfig        *config.VolumeFarmConfig
+	logger              *zap.Logger
+	isRunning           bool
+	isRunningMu         sync.RWMutex
+	futuresClient       *client.FuturesClient
+	riskManager         *risk.Manager
+	symbolSelector      *SymbolSelector
+	gridManager         *GridManager
+	adaptiveGridManager *adaptive_grid.AdaptiveGridManager
+	regimeDetector      *market_regime.RegimeDetector
+	configManager       *adaptive_config.AdaptiveConfigManager
+	pointsTracker       *PointsTracker
+	stopCh              chan struct{}
+	wg                  sync.WaitGroup
 }
 
 // NewVolumeFarmEngine creates a new volume farming engine.
@@ -132,6 +138,23 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	pointsLogger := logrusEntry.WithField("component", "points_tracker")
 	engine.pointsTracker = NewPointsTracker(volumeConfig, pointsLogger)
 
+	// Initialize adaptive configuration
+	configManager := adaptive_config.NewAdaptiveConfigManager("", logger)
+	engine.configManager = configManager
+
+	// Initialize regime detector
+	regimeDetector := market_regime.NewRegimeDetector(logger)
+	engine.regimeDetector = regimeDetector
+
+	// Initialize adaptive grid manager
+	adaptiveGridManager := adaptive_grid.NewAdaptiveGridManager(
+		engine.gridManager,
+		configManager,
+		regimeDetector,
+		logger,
+	)
+	engine.adaptiveGridManager = adaptiveGridManager
+
 	return engine, nil
 }
 
@@ -181,6 +204,31 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		defer e.wg.Done()
 		if err := e.gridManager.Start(ctx); err != nil {
 			e.logger.Error("Grid manager error", zap.Error(err))
+		}
+	}()
+
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		// Initialize adaptive grid manager
+		if err := e.adaptiveGridManager.Initialize(ctx); err != nil {
+			e.logger.Error("Adaptive grid manager initialization error", zap.Error(err))
+			return
+		}
+
+		// Start regime monitoring
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-e.stopCh:
+				return
+			case <-ticker.C:
+				e.monitorRegimeChanges(ctx)
+			}
 		}
 	}()
 
@@ -370,6 +418,41 @@ func (e *VolumeFarmEngine) GetStatus() *VolumeFarmStatus {
 			return "ACTIVE"
 		}(),
 		LastUpdate: time.Now(),
+	}
+}
+
+// monitorRegimeChanges monitors and handles regime changes for all symbols
+func (e *VolumeFarmEngine) monitorRegimeChanges(ctx context.Context) {
+	e.logger.Info("Monitoring regime changes")
+
+	// Get active symbols
+	activeSymbols := e.symbolSelector.GetActiveSymbols()
+
+	for _, symbolData := range activeSymbols {
+		symbol := symbolData.Symbol
+
+		// Get current price (simplified - in real implementation would get from price feed)
+		currentPrice := 0.0 // Placeholder
+
+		// Detect regime
+		newRegime := e.regimeDetector.DetectRegime(symbol, currentPrice)
+
+		// Get current regime
+		currentRegime := e.adaptiveGridManager.GetCurrentRegime(symbol)
+
+		// Check if regime changed
+		if newRegime != currentRegime {
+			e.logger.Info("Regime change detected",
+				zap.String("symbol", symbol),
+				zap.String("from", string(currentRegime)),
+				zap.String("to", string(newRegime)))
+
+			// Handle regime change
+			e.adaptiveGridManager.OnRegimeChange(symbol, currentRegime, newRegime)
+
+			// TODO: Trigger parameter application and grid rebuild
+			// This would be handled by the transition handler
+		}
 	}
 }
 

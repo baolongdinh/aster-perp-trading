@@ -4,17 +4,18 @@ import (
 	"sync"
 	"time"
 
+	"aster-bot/internal/config"
+
 	"go.uber.org/zap"
-	"github.com/aster-bot-perp-trading-2/backend/internal/config"
 )
 
 // AdaptiveConfigManager manages adaptive configuration with hot-reload capability
 type AdaptiveConfigManager struct {
-	config      *config.AdaptiveConfig
-	configPath  string
-	logger      *zap.Logger
-	mu          sync.RWMutex
-	lastReload  time.Time
+	config     *config.AdaptiveConfig
+	configPath string
+	logger     *zap.Logger
+	mu         sync.RWMutex
+	lastReload time.Time
 }
 
 // NewAdaptiveConfigManager creates a new adaptive config manager
@@ -30,21 +31,21 @@ func NewAdaptiveConfigManager(configPath string, logger *zap.Logger) *AdaptiveCo
 func (m *AdaptiveConfigManager) LoadConfig() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	config, err := config.LoadAdaptiveConfig(m.configPath)
 	if err != nil {
 		m.logger.Error("Failed to load adaptive config", zap.Error(err))
 		return err
 	}
-	
+
 	m.config = config
 	m.lastReload = time.Now()
-	
+
 	m.logger.Info("Adaptive config loaded successfully",
 		zap.String("config_path", m.configPath),
 		zap.Bool("enabled", m.config.Enabled),
 		zap.String("detection_method", m.config.Detection.Method))
-	
+
 	return nil
 }
 
@@ -65,17 +66,17 @@ func (m *AdaptiveConfigManager) ReloadConfig() error {
 func (m *AdaptiveConfigManager) GetRegimeConfig(regime string) (*config.RegimeConfig, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	if !m.config.Enabled {
 		return nil, false
 	}
-	
+
 	regimeConfig, exists := m.config.Regimes[regime]
 	if !exists {
 		m.logger.Warn("Regime config not found", zap.String("regime", regime))
 		return nil, false
 	}
-	
+
 	return &regimeConfig, true
 }
 

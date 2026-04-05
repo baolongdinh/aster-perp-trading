@@ -968,3 +968,111 @@ func (g *GridManager) Stop(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+// SetOrderSize sets the order size in USDT
+func (g *GridManager) SetOrderSize(size float64) {
+	g.gridsMu.Lock()
+	defer g.gridsMu.Unlock()
+	g.orderSizeUSDT = size
+	g.logger.WithField("order_size", size).Info("Order size updated")
+}
+
+// SetGridSpread sets the grid spread percentage
+func (g *GridManager) SetGridSpread(spread float64) {
+	g.gridsMu.Lock()
+	defer g.gridsMu.Unlock()
+	g.gridSpreadPct = spread
+	g.logger.WithField("grid_spread", spread).Info("Grid spread updated")
+}
+
+// SetMaxOrdersPerSide sets the maximum orders per side
+func (g *GridManager) SetMaxOrdersPerSide(max int) {
+	g.gridsMu.Lock()
+	defer g.gridsMu.Unlock()
+	g.maxOrdersSide = max
+	g.logger.WithField("max_orders", max).Info("Max orders per side updated")
+}
+
+// SetPositionTimeout sets the position timeout in minutes (for future use)
+func (g *GridManager) SetPositionTimeout(minutes int) {
+	g.logger.WithField("timeout_minutes", minutes).Info("Position timeout updated")
+}
+
+// GetActivePositions returns active positions for a symbol
+func (g *GridManager) GetActivePositions(symbol string) ([]interface{}, error) {
+	g.ordersMu.RLock()
+	defer g.ordersMu.RUnlock()
+
+	var positions []interface{}
+	for orderID, order := range g.activeOrders {
+		if order.Symbol == symbol {
+			positions = append(positions, map[string]interface{}{
+				"order_id": orderID,
+				"symbol":   order.Symbol,
+				"side":     order.Side,
+				"size":     order.Size,
+				"price":    order.Price,
+				"status":   order.Status,
+			})
+		}
+	}
+	return positions, nil
+}
+
+// CancelAllOrders cancels all orders for a symbol
+func (g *GridManager) CancelAllOrders(ctx context.Context, symbol string) error {
+	g.ordersMu.Lock()
+	defer g.ordersMu.Unlock()
+
+	g.logger.WithField("symbol", symbol).Info("Cancelling all orders for symbol")
+
+	// Cancel active orders for this symbol
+	for orderID, order := range g.activeOrders {
+		if order.Symbol == symbol {
+			// Remove from active orders
+			delete(g.activeOrders, orderID)
+			g.logger.WithFields(logrus.Fields{
+				"order_id": orderID,
+				"symbol":   symbol,
+			}).Info("Order cancelled")
+		}
+	}
+
+	return nil
+}
+
+// ClearGrid clears the grid for a symbol
+func (g *GridManager) ClearGrid(ctx context.Context, symbol string) error {
+	g.gridsMu.Lock()
+	defer g.gridsMu.Unlock()
+
+	g.logger.WithField("symbol", symbol).Info("Clearing grid for symbol")
+
+	if grid, exists := g.activeGrids[symbol]; exists {
+		grid.IsActive = false
+		grid.OrdersPlaced = false
+		g.logger.WithField("symbol", symbol).Info("Grid cleared")
+	}
+
+	return nil
+}
+
+// RebuildGrid rebuilds the grid for a symbol
+func (g *GridManager) RebuildGrid(ctx context.Context, symbol string) error {
+	g.gridsMu.Lock()
+	defer g.gridsMu.Unlock()
+
+	g.logger.WithField("symbol", symbol).Info("Rebuilding grid for symbol")
+
+	if grid, exists := g.activeGrids[symbol]; exists {
+		grid.IsActive = true
+		grid.OrdersPlaced = false
+		grid.PlacementBusy = false
+
+		// Enqueue placement for this symbol
+		g.enqueuePlacement(symbol)
+		g.logger.WithField("symbol", symbol).Info("Grid rebuild scheduled")
+	}
+
+	return nil
+}
