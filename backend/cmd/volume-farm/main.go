@@ -50,6 +50,43 @@ func main() {
 	// Set volume farming config in main config
 	cfg.VolumeFarming = volumeCfg
 
+	// Merge volume farming risk config into main risk config if available
+	if volumeCfg != nil {
+		logger.Info("Merging volume farming risk config",
+			zap.Float64("max_position_usdt", volumeCfg.Risk.MaxPositionUSDTPerSymbol),
+			zap.Float64("daily_loss_limit", volumeCfg.Risk.DailyLossLimitUSDT),
+			zap.Int("max_open_positions", volumeCfg.Risk.MaxOpenPositions),
+		)
+		// Only override if volume farming config has valid values
+		if volumeCfg.Risk.MaxPositionUSDTPerSymbol > 0 {
+			cfg.Risk.MaxPositionUSDTPerSymbol = volumeCfg.Risk.MaxPositionUSDTPerSymbol
+		}
+		if volumeCfg.Risk.MaxTotalPositionsUSDT > 0 {
+			cfg.Risk.MaxTotalPositionsUSDT = volumeCfg.Risk.MaxTotalPositionsUSDT
+		}
+		if volumeCfg.Risk.DailyLossLimitUSDT > 0 {
+			cfg.Risk.DailyLossLimitUSDT = volumeCfg.Risk.DailyLossLimitUSDT
+		}
+		if volumeCfg.Risk.DailyDrawdownPct > 0 {
+			cfg.Risk.DailyDrawdownPct = volumeCfg.Risk.DailyDrawdownPct
+		}
+		if volumeCfg.Risk.MaxOpenPositions > 0 {
+			cfg.Risk.MaxOpenPositions = volumeCfg.Risk.MaxOpenPositions
+		}
+		if volumeCfg.Risk.MaxGlobalPendingLimitOrders > 0 {
+			cfg.Risk.MaxGlobalPendingLimitOrders = volumeCfg.Risk.MaxGlobalPendingLimitOrders
+		}
+		if volumeCfg.Risk.MaxPendingPerSide > 0 {
+			cfg.Risk.MaxPendingPerSide = volumeCfg.Risk.MaxPendingPerSide
+		}
+		if volumeCfg.Risk.PerTradeStopLossPct > 0 {
+			cfg.Risk.PerTradeStopLossPct = volumeCfg.Risk.PerTradeStopLossPct
+		}
+		if volumeCfg.Risk.PerTradeTakeProfitPct > 0 {
+			cfg.Risk.PerTradeTakeProfitPct = volumeCfg.Risk.PerTradeTakeProfitPct
+		}
+	}
+
 	// Load optimization configs (dynamic_grid, inventory_skew, cluster_stoploss, etc.)
 	optimizationConfigPath := "config"
 	optCfg, err := config.LoadOptimizationConfig(optimizationConfigPath)

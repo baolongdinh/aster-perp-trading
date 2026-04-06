@@ -134,9 +134,35 @@ type GridOrder struct {
 	GridLevel    int       `json:"grid_level"`
 }
 
-// NewGridManager creates a new grid manager.
-func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry) *GridManager {
+// NewGridManager creates a new grid manager with volume farm config.
+func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, cfg *config.VolumeFarmConfig) *GridManager {
 	zapLogger, _ := zap.NewDevelopment()
+
+	// Use config values or defaults
+	baseNotional := 5.0
+	gridSpread := 0.005
+	maxOrdersSide := 3
+	placementCooldown := 500 * time.Millisecond
+	rateLimitCooldown := 3 * time.Second
+
+	if cfg != nil {
+		if cfg.OrderSizeUSDT > 0 {
+			baseNotional = cfg.OrderSizeUSDT
+		}
+		if cfg.GridSpreadPct > 0 {
+			gridSpread = cfg.GridSpreadPct
+		}
+		if cfg.MaxOrdersPerSide > 0 {
+			maxOrdersSide = cfg.MaxOrdersPerSide
+		}
+		if cfg.GridPlacementCooldownSec > 0 {
+			placementCooldown = time.Duration(cfg.GridPlacementCooldownSec) * time.Second
+		}
+		if cfg.RateLimitCooldownSec > 0 {
+			rateLimitCooldown = time.Duration(cfg.RateLimitCooldownSec) * time.Second
+		}
+	}
+
 	return &GridManager{
 		futuresClient:         futuresClient,
 		logger:                logger,
@@ -145,24 +171,23 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry) *
 		activeOrders:          make(map[string]*GridOrder),
 		filledOrders:          make(map[string]*GridOrder),
 		stopCh:                make(chan struct{}),
-		baseNotionalUSD:       5.0,                     // $5 base notional per order - small for volume farming
-		minNotionalUSD:        5.0,                     // Minimum $5 per order (exchange minimum)
-		maxNotionalUSD:        50.0,                    // Maximum $50 per order - conservative for volume
-		useDynamicSizing:      true,                    // Enable ATR-based sizing by default
-		gridSpreadPct:         0.005,                   // Ultra-tight 0.005% spread for volume farming
-		maxOrdersSide:         3,                       // 3 orders per side = 6 total, clustered tightly around current price
-		placementQueue:        make(chan string, 1024), // Larger queue for high volume
-		gridPlacementCooldown: 500 * time.Millisecond,  // 500ms for rapid placement
-		rateLimitCooldown:     3 * time.Second,         // 3s quick recovery
+		baseNotionalUSD:       baseNotional,
+		minNotionalUSD:        5.0,
+		maxNotionalUSD:        50.0,
+		useDynamicSizing:      true,
+		gridSpreadPct:         gridSpread,
+		maxOrdersSide:         maxOrdersSide,
+		placementQueue:        make(chan string, 1024),
+		gridPlacementCooldown: placementCooldown,
+		rateLimitCooldown:     rateLimitCooldown,
 		tickerStreamURL:       "wss://fstream.asterdex.com/ws/!ticker@arr",
-		rateLimiter:           NewRateLimiter(100, 20, zapLogger), // High throughput for volume
+		rateLimiter:           NewRateLimiter(100, 20, zapLogger),
 		precisionMgr:          client.NewPrecisionManager(),
 		priceHistory:          make(map[string][]PricePoint),
 		atrPeriod:             14,
-		// NEW: Initialize safeguard components
-		orderLockMgr:   adaptive_grid.NewOrderLockManager(zapLogger),
-		deduplicator:   adaptive_grid.NewFillEventDeduplicator(zapLogger),
-		stateValidator: adaptive_grid.NewStateValidator(zapLogger),
+		orderLockMgr:          adaptive_grid.NewOrderLockManager(zapLogger),
+		deduplicator:          adaptive_grid.NewFillEventDeduplicator(zapLogger),
+		stateValidator:        adaptive_grid.NewStateValidator(zapLogger),
 	}
 }
 

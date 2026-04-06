@@ -1,4 +1,4 @@
-.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps
+.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon
 
 # The name of our output binary
 APP_NAME := aster-bot
@@ -287,3 +287,66 @@ test-help:
 clean:
 	rm -rf bin/
 	go clean
+
+# ============================================================================
+# Termux (Android) Targets - Run with wake lock (non-sleep mode)
+# ============================================================================
+
+# Start volume farming bot on Termux with wake lock (keeps running when screen off)
+termux-start:
+	@echo "============================================"
+	@echo "Starting Volume Farming Bot on Termux"
+	@echo "============================================"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Wake lock enabled (runs when screen off)"
+	@echo "  • Auto-discover trading pairs"
+	@echo "  • Grid trading with volume farming"
+	@echo "  • Logs to volume-farm.log"
+	@echo ""
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh start ./config/volume-farm-config.yaml
+
+# Stop the volume farming bot
+termux-stop:
+	@echo "Stopping Volume Farming Bot..."
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh stop
+
+# Check bot status
+termux-status:
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh status
+
+# View live logs
+termux-logs:
+	@echo "Viewing logs (Ctrl+C to exit)..."
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh logs
+
+# Restart the bot
+termux-restart:
+	@echo "Restarting Volume Farming Bot..."
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh restart ./config/volume-farm-config.yaml
+
+# Run in daemon mode with auto-restart
+termux-daemon:
+	@echo "Starting in daemon mode (auto-restart on crash)..."
+	@echo "Press Ctrl+C to stop daemon watcher (bot will keep running)"
+	@echo "Use 'make termux-stop' to stop the bot completely"
+	@echo ""
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh daemon ./config/volume-farm-config.yaml
+
+# Quick setup for Termux (install termux-api if needed)
+termux-setup:
+	@echo "Setting up Termux environment..."
+	@echo ""
+	@echo "1. Installing termux-api (for wake lock)..."
+	@pkg install termux-api -y 2>/dev/null || echo "termux-api already installed or manual install needed"
+	@echo ""
+	@echo "2. Building binary..."
+	@go build -o bin/volume-farm ./cmd/volume-farm
+	@echo ""
+	@echo "Setup complete! Use 'make termux-start' to run"

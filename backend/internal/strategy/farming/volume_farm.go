@@ -28,9 +28,10 @@ type VolumeFarmStrategy struct {
 	logger           *logrus.Entry
 
 	// Volume farming specific components
-	symbolSelector *SymbolSelector
-	gridManager    *GridManager
-	pointsTracker  *PointsTracker
+	symbolSelector *farming.SymbolSelector
+	gridManager    *farming.GridManager
+	pointsTracker  *farming.PointsTracker
+	volumeFarmCfg  *config.VolumeFarmConfig
 
 	// State management
 	isRunning   bool
@@ -62,9 +63,10 @@ func NewVolumeFarmStrategy(
 	}
 
 	// Initialize volume farming components
-	strategy.symbolSelector = farming.NewSymbolSelector(futuresClient, strategy.logger)
-	strategy.gridManager = farming.NewGridManager(futuresClient, strategy.logger)
-	strategy.pointsTracker = farming.NewPointsTracker(extractVolumeFarmConfig(cfg), strategy.logger)
+	strategy.volumeFarmCfg = buildVolumeFarmConfig(cfg)
+	strategy.symbolSelector = farming.NewSymbolSelector(futuresClient, strategy.logger, strategy.volumeFarmCfg)
+	strategy.gridManager = farming.NewGridManager(futuresClient, strategy.logger, strategy.volumeFarmCfg)
+	strategy.pointsTracker = farming.NewPointsTracker(strategy.volumeFarmCfg, strategy.logger)
 
 	return strategy
 }
@@ -242,68 +244,78 @@ func (s *VolumeFarmStrategy) farmingLoop(ctx context.Context) {
 	}
 }
 
-// extractVolumeFarmConfig extracts volume farming config from strategy config
-func extractVolumeFarmConfig(cfg *config.StrategyConfig) *VolumeFarmConfig {
-	// Extract volume farming specific config from strategy parameters
-	volumeConfig := &VolumeFarmConfig{
-		Enabled:                cfg.Params["enabled"].(bool),
-		MaxDailyLossUSDT:       cfg.Params["max_daily_loss_usdt"].(float64),
-		OrderSizeUSDT:          cfg.Params["order_size_usdt"].(float64),
-		GridSpreadPct:          cfg.Params["grid_spread_pct"].(float64),
-		MaxOrdersPerSide:       int(cfg.Params["max_orders_per_side"].(float64)),
-		ReplaceImmediately:     cfg.Params["replace_immediately"].(bool),
-		PositionTimeoutMinutes: int(cfg.Params["position_timeout_minutes"].(float64)),
+// buildVolumeFarmConfig extracts volume farming config from strategy config
+func buildVolumeFarmConfig(cfg *config.StrategyConfig) *config.VolumeFarmConfig {
+	// Build volume farming config from strategy parameters
+	vc := &config.VolumeFarmConfig{}
+
+	if v, ok := cfg.Params["enabled"].(bool); ok {
+		vc.Enabled = v
+	}
+	if v, ok := cfg.Params["max_daily_loss_usdt"].(float64); ok {
+		vc.MaxDailyLossUSDT = v
+	}
+	if v, ok := cfg.Params["order_size_usdt"].(float64); ok {
+		vc.OrderSizeUSDT = v
+	}
+	if v, ok := cfg.Params["grid_spread_pct"].(float64); ok {
+		vc.GridSpreadPct = v
+	}
+	if v, ok := cfg.Params["max_orders_per_side"].(float64); ok {
+		vc.MaxOrdersPerSide = int(v)
+	}
+	if v, ok := cfg.Params["replace_immediately"].(bool); ok {
+		vc.ReplaceImmediately = v
+	}
+	if v, ok := cfg.Params["position_timeout_minutes"].(float64); ok {
+		vc.PositionTimeoutMinutes = int(v)
 	}
 
-	// Extract symbols config
-	symbolsConfig := SymbolsConfig{
-		AutoDiscover:              cfg.Params["symbols.auto_discover"].(bool),
-		QuoteCurrencyMode:         cfg.Params["symbols.quote_currency_mode"].(string),
-		MinVolume24h:              cfg.Params["symbols.min_volume_24h"].(float64),
-		MaxSpreadPct:              cfg.Params["symbols.max_spread_pct"].(float64),
-		BoostedOnly:               cfg.Params["symbols.boosted_only"].(bool),
-		MaxSymbolsPerQuote:        int(cfg.Params["symbols.max_symbols_per_quote"].(float64)),
-		SpreadRanking:             cfg.Params["symbols.spread_ranking"].(bool),
-		VolumeWeighting:           cfg.Params["symbols.volume_weighting"].(float64),
-		MinLiquidityScore:         cfg.Params["symbols.min_liquidity_score"].(float64),
-		SpreadVolatilityThreshold: cfg.Params["symbols.spread_volatility_threshold"].(float64),
-		ExcludeHighFeeSymbols:     cfg.Params["symbols.exclude_high_fee_symbols"].(bool),
-		QuoteCurrencies:           cfg.Params["symbols.quote_currencies"].([]string),
-		AllowMixedQuotes:          cfg.Params["symbols.allow_mixed_quotes"].(bool),
+	// Build symbols config
+	sc := config.SymbolsConfig{}
+	if v, ok := cfg.Params["symbols.auto_discover"].(bool); ok {
+		sc.AutoDiscover = v
+	}
+	if v, ok := cfg.Params["symbols.quote_currency_mode"].(string); ok {
+		sc.QuoteCurrencyMode = v
+	}
+	if v, ok := cfg.Params["symbols.min_volume_24h"].(float64); ok {
+		sc.MinVolume24h = v
+	}
+	if v, ok := cfg.Params["symbols.max_spread_pct"].(float64); ok {
+		sc.MaxSpreadPct = v
+	}
+	if v, ok := cfg.Params["symbols.boosted_only"].(bool); ok {
+		sc.BoostedOnly = v
+	}
+	if v, ok := cfg.Params["symbols.max_symbols_per_quote"].(float64); ok {
+		sc.MaxSymbolsPerQuote = int(v)
+	}
+	if v, ok := cfg.Params["symbols.spread_ranking"].(bool); ok {
+		sc.SpreadRanking = v
+	}
+	if v, ok := cfg.Params["symbols.volume_weighting"].(float64); ok {
+		sc.VolumeWeighting = v
+	}
+	if v, ok := cfg.Params["symbols.min_liquidity_score"].(float64); ok {
+		sc.MinLiquidityScore = v
+	}
+	if v, ok := cfg.Params["symbols.spread_volatility_threshold"].(float64); ok {
+		sc.SpreadVolatilityThreshold = v
+	}
+	if v, ok := cfg.Params["symbols.exclude_high_fee_symbols"].(bool); ok {
+		sc.ExcludeHighFeeSymbols = v
+	}
+	if v, ok := cfg.Params["symbols.quote_currencies"].([]string); ok {
+		sc.QuoteCurrencies = v
+	}
+	if v, ok := cfg.Params["symbols.allow_mixed_quotes"].(bool); ok {
+		sc.AllowMixedQuotes = v
 	}
 
-	volumeConfig.Symbols = symbolsConfig
+	vc.Symbols = sc
 
-	return volumeConfig
-}
-
-// VolumeFarmConfig represents volume farming configuration
-type VolumeFarmConfig struct {
-	Enabled                bool          `json:"enabled"`
-	MaxDailyLossUSDT       float64       `json:"max_daily_loss_usdt"`
-	OrderSizeUSDT          float64       `json:"order_size_usdt"`
-	GridSpreadPct          float64       `json:"grid_spread_pct"`
-	MaxOrdersPerSide       int           `json:"max_orders_per_side"`
-	ReplaceImmediately     bool          `json:"replace_immediately"`
-	PositionTimeoutMinutes int           `json:"position_timeout_minutes"`
-	Symbols                SymbolsConfig `json:"symbols"`
-}
-
-// SymbolsConfig represents symbol selection configuration
-type SymbolsConfig struct {
-	AutoDiscover              bool     `json:"auto_discover"`
-	QuoteCurrencyMode         string   `json:"quote_currency_mode"`
-	MinVolume24h              float64  `json:"min_volume_24h"`
-	MaxSpreadPct              float64  `json:"max_spread_pct"`
-	BoostedOnly               bool     `json:"boosted_only"`
-	MaxSymbolsPerQuote        int      `json:"max_symbols_per_quote"`
-	SpreadRanking             bool     `json:"spread_ranking"`
-	VolumeWeighting           float64  `json:"volume_weighting"`
-	MinLiquidityScore         float64  `json:"min_liquidity_score"`
-	SpreadVolatilityThreshold float64  `json:"spread_volatility_threshold"`
-	ExcludeHighFeeSymbols     bool     `json:"exclude_high_fee_symbols"`
-	QuoteCurrencies           []string `json:"quote_currencies"`
-	AllowMixedQuotes          bool     `json:"allow_mixed_quotes"`
+	return vc
 }
 
 // VolumeFarmStatus represents the current status

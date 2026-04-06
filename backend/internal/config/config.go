@@ -250,6 +250,7 @@ type SymbolsConfig struct {
 	QuoteCurrencies           []string  `mapstructure:"quote_currencies"`
 	AllowMixedQuotes          bool      `mapstructure:"allow_mixed_quotes"`
 	Whitelist                 []string  `mapstructure:"whitelist"`
+	Blacklist                 []string  `mapstructure:"blacklist"`
 }
 
 // LoadVolumeFarming loads volume farming configuration from file

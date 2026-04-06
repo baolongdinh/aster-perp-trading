@@ -146,6 +146,14 @@ func (s *SymbolSelector) processWebSocketTicker(msg map[string]interface{}) {
 			continue
 		}
 
+		// Check blacklist first
+		if s.isSymbolBlacklisted(symbol) {
+			s.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+			}).Debug("Filtered out symbol - blacklisted")
+			continue
+		}
+
 		quoteCurrency := s.extractQuoteCurrency(symbol)
 		if !s.isQuoteCurrencySupported(quoteCurrency) {
 			s.logger.WithFields(logrus.Fields{
@@ -312,6 +320,16 @@ func (s *SymbolSelector) isQuoteCurrencySupported(quoteCurrency string) bool {
 	return false
 }
 
+// isSymbolBlacklisted checks if the symbol is in the blacklist.
+func (s *SymbolSelector) isSymbolBlacklisted(symbol string) bool {
+	for _, blacklisted := range s.config.Symbols.Blacklist {
+		if symbol == blacklisted {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *SymbolSelector) meetsBasicCriteria(symbol string, volume24h int, count int) bool {
 	if volume24h <= 0 || count <= 0 {
 		return false
@@ -444,18 +462,28 @@ func (s *SymbolSelector) IsRunning() bool {
 
 func normalizeVolumeConfig(cfg *config.VolumeFarmConfig) *config.VolumeFarmConfig {
 	if cfg == nil {
-		cfg = &config.VolumeFarmConfig{}
+		cfg = &config.VolumeFarmConfig{
+			Symbols: config.SymbolsConfig{
+				MinVolume24h:       1000,
+				MaxSymbolsPerQuote: 1,
+				QuoteCurrencies:    []string{"USD1"},
+			},
+			SymbolRefreshIntervalSec: 60,
+			TickerStream:             "!ticker@arr",
+		}
 	}
 
 	normalized := *cfg
+
+	// Only apply defaults if values are not set (zero/empty)
 	if normalized.Symbols.MinVolume24h <= 0 {
 		normalized.Symbols.MinVolume24h = normalized.MinVolume24h
 	}
 	if normalized.Symbols.MinVolume24h <= 0 {
-		normalized.Symbols.MinVolume24h = 1_000_000
+		normalized.Symbols.MinVolume24h = 1000 // Default only if not configured
 	}
 	if normalized.SymbolRefreshIntervalSec <= 0 {
-		normalized.SymbolRefreshIntervalSec = 120
+		normalized.SymbolRefreshIntervalSec = 60 // Use config default (60s not 120s)
 	}
 	if normalized.TickerStream == "" {
 		normalized.TickerStream = "!ticker@arr"
@@ -463,7 +491,6 @@ func normalizeVolumeConfig(cfg *config.VolumeFarmConfig) *config.VolumeFarmConfi
 	if normalized.Exchange.FuturesWSBase == "" {
 		normalized.Exchange.FuturesWSBase = "wss://fstream.asterdex.com"
 	}
-
 	if len(normalized.Symbols.QuoteCurrencies) == 0 {
 		normalized.Symbols.QuoteCurrencies = append([]string{}, normalized.SupportedQuoteCurrencies...)
 	}
@@ -471,7 +498,7 @@ func normalizeVolumeConfig(cfg *config.VolumeFarmConfig) *config.VolumeFarmConfi
 		normalized.Symbols.QuoteCurrencies = []string{"USD1"}
 	}
 	if normalized.Symbols.MaxSymbolsPerQuote <= 0 {
-		normalized.Symbols.MaxSymbolsPerQuote = 3
+		normalized.Symbols.MaxSymbolsPerQuote = 1 // Use config file default (1 not 3)
 	}
 
 	return &normalized

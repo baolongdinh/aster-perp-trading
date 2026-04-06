@@ -1,176 +1,121 @@
 # =============================================================================
-# VOLUME FARMING BOT CONFIGURATION
-# Tối ưu cho farm volume với rủi ro kiểm soát
+# VOLUME FARMING BOT CONFIGURATION - OPTIMIZED FOR $10 CAPITAL + HIGH LEVERAGE
+# =============================================================================
+#
+# ⚠️  CONFIG CHO VỐN NHỎ ($10) + LEVERAGE CAO (20x-50x)
 # =============================================================================
 #
 # MỤC ĐÍCH:
-#   - Tạo nhiều giao dịch nhỏ để đạt volume target
-#   - Kiểm soát rủi ro tối đa cho phép
-#   - Tự động quản lý symbols và positions
+#   - Farm volume với vốn siêu nhỏ ($10)
+#   - Tận dụng leverage cao để tăng position size
+#   - Vào-ra nhanh, không giữ position lâu (tránh liq)
+#   - 100% limit order (tối ưu phí)
 #
-# TRADE-OFFS:
-#   ┌─────────────────────────────────────────────────────────────────────┐
-#   │ THAM SỐ           │ GIÁ TRỊ CAO              │ GIÁ TRỊ THẤP          │
-#   ├─────────────────────────────────────────────────────────────────────┤
-#   │ order_size_usdt   │ Lệnh lớn                 │ Lệnh nhỏ              │
-#   │                   │ → Nhanh đạt volume       → An toàn hơn         │
-#   │                   │ → Rủi ro cao hơn         → Nhiều lệnh hơn      │
-#   ├─────────────────────────────────────────────────────────────────────┤
-#   │ grid_spread_pct   │ Spread rộng              │ Spread hẹp            │
-#   │                   │ → Ít giao dịch           → Nhiều giao dịch      │
-#   │                   │ → Dễ fill                → Khó fill            │
-#   ├─────────────────────────────────────────────────────────────────────┤
-#   │ max_orders/side   │ Nhiều orders             │ Ít orders             │
-#   │                   │ → Coverage tốt           → Ít phức tạp         │
-#   │                   │ → Nhiều vốn cần          → Ít vốn cần          │
-#   ├─────────────────────────────────────────────────────────────────────┤
-#   │ position_timeout  │ Thời gian dài            │ Thời gian ngắn        │
-#   │                   │ → Cho phép hồi          → Đóng sớm hơn        │
-#   │                   │ → Có thể treo lâu        → Ít treo lệnh        │
-#   ├─────────────────────────────────────────────────────────────────────┤
-#   │ max_daily_loss    │ Chịu lỗ nhiều            │ Chịu lỗ ít            │
-#   │                   │ → Nhiều cơ hội           → Bảo vệ vốn tốt      │
-#   └─────────────────────────────────────────────────────────────────────┘
+# RỦI RO:
+#   - Leverage cao = liquidation risk cao
+#   - Chỉ dùng vốn bạn sẵn sàng mất 100%
+#   - Không dùng vốn vay hoặc chi tiêu cần thiết
 #
-# CÁC CHẾ ĐỘ GỢI Ý:
-#   - CONSERVATIVE: order_size=3, max_daily_loss=50, grid_spread=0.005%
-#   - BALANCED:     order_size=6, max_daily_loss=100, grid_spread=0.002% (default)
-#   - AGGRESSIVE:   order_size=10, max_daily_loss=200, grid_spread=0.001%
+# CÁCH TÍNH MARGIN VỚI LEVERAGE:
+#   Vốn: $10 | Leverage: 20x | Order: $3
+#   → Margin cần: $3 / 20 = $0.15
+#   → Buffer an toàn: 10 lệnh = $1.5 margin
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# VOLUME FARMING SETTINGS - Cấu hình chính
+# VOLUME FARMING SETTINGS - Cấu hình cho $10 vốn
 # ---------------------------------------------------------------------------
-enabled: true  # true/false: Bật/tắt volume farming
+enabled: true
 
-# max_daily_loss_usdt: Giới hạn lỗ tối đa mỗi ngày (USDT)
-#   - 50: An toàn, dừng sớm nếu thị trường xấu
-#   - 100: Cân bằng (default) - cho phép farm nhiều hơn
-#   - 200+: Chấp nhận rủi ro cao để farm nhiều volume
-max_daily_loss_usdt: 100
+# max_daily_loss_usdt: Giới hạn lỗ tối đa mỗi ngày
+# Với $10 vốn, 30% = $3 (cho phép nhiều lần thua liên tiếp)
+max_daily_loss_usdt: 3
 
-# max_total_drawdown_pct: Drawdown tối đa cho phép (%)
-#   - 5%: Bảo thủ, dừng khi drawdown nhỏ
-#   - 10%: Cân bằng (default)
-#   - 20%: Chấp nhận drawdown lớn để farm nhiều
-max_total_drawdown_pct: 10.0
+# max_total_drawdown_pct: Drawdown tối đa
+# Dừng bot nếu drawdown 50% vốn ($5) - bảo vệ vốn còn lại
+max_total_drawdown_pct: 50.0
 
-# order_size_usdt: Kích thước mỗi lệnh (USDT)
-#   - 3-5: Lệnh nhỏ, an toàn, nhiều lệnh để đạt volume
-#   - 6-10: Cân bằng (default = 6)
-#   - 15+: Lệnh lớn, nhanh đạt volume nhưng rủi ro cao
-order_size_usdt: 30
+# order_size_usdt: Kích thước mỗi lệnh
+# $10 = 100% vốn, với 100x leverage chỉ cần $0.10 margin
+# Cho ETHUSD1 hoặc altcoin hỗ trợ 100x
+order_size_usdt: 10
 
-# grid_spread_pct: Spread giữa các lệnh trong grid (%)
-#   - 0.001% (1 bps): Grid cực chặt, nhiều lệnh, khó fill
-#   - 0.002% (2 bps): Grid chặt (default) - phù hợp farm volume
-#   - 0.005% (5 bps): Grid rộng hơn, dễ fill hơn
-#   - 0.01% (10 bps): Grid rộng, ít lệnh, dễ fill
-grid_spread_pct: 0.005
+# grid_spread_pct: Spread giữa các lệnh
+# 0.3% = lãi ~0.2% sau phí (0.05% maker × 2)
+# Spread chặt để fill nhanh, không chờ đợi lâu → tránh liq
+grid_spread_pct: 0.003
 
-# max_orders_per_side: Số lệnh tối đa mỗi bên (buy/sell)
-#   - 10-20: Ít lệnh, dễ quản lý, cần ít vốn
-#   - 30-50: Nhiều lệnh (default = 30), coverage tốt, cần nhiều vốn
-#   - 50+: Rất nhiều lệnh, phức tạp, cần vốn lớn
-max_orders_per_side: 35
+# max_orders_per_side: Số lệnh tối đa mỗi bên
+# GIẢM XUỐNG: Chỉ 1 lệnh mỗi bên = 2 lệnh total
+# Tránh over-commit margin, chỉ có 1 BUY + 1 SELL cùng lúc
+max_orders_per_side: 1
 
-# replace_immediately: Có đặt lại lệnh ngay sau khi fill không
-#   - true: Luôn có lệnh trên orderbook (tăng tần suất)
-#   - false: Chờ điều kiện tốt hơn mới đặt lại
+# max_global_pending_limit_orders: Tổng số lệnh pending
+# 2 lệnh = $6 notional, với 20x leverage = $0.3 margin
+max_global_pending_limit_orders: 2
+
+# max_pending_per_side: Số lệnh pending mỗi bên
+max_pending_per_side: 1
+
+# replace_immediately: Đặt lại lệnh ngay sau khi fill
+# true = luôn có lệnh trên sách, tăng tần suất giao dịch
 replace_immediately: true
 
-# position_timeout_minutes: Thời gian tối đa giữ một vị thế (phút)
-#   - 15-30: Scalping ngắn hạn, đóng sớm (default = 30)
-#   - 60-120: Swing trading, cho phép hồi
-#   - 240+: Position dài hạn
-position_timeout_minutes: 15
+# position_timeout_minutes: Thời gian tối đa giữ position
+# GIẢM: 5 phút = đóng position nếu không đạt TP/SL
+# Không để position treo quá lâu (tránh funding rate, tránh liq)
+position_timeout_minutes: 5
 
 # Ticker và symbol refresh
 # ticker_stream: WebSocket stream để nhận giá real-time
 ticker_stream: "!ticker@arr"
 
-# symbol_refresh_interval_seconds: Tần suất refresh danh sách symbols
-#   - 30s: Refresh thường xuyên, bắt kịp thay đổi nhanh
-#   - 60s: Cân bằng (default)
-#   - 300s: Ít refresh hơn, tiết kiệm tài nguyên
-symbol_refresh_interval_seconds: 5
+# symbol_refresh_interval_seconds: Tần suất refresh symbols
+# Chỉ chạy 1 symbol duy nhất để tập trung margin
+symbol_refresh_interval_seconds: 60
 
 # grid_placement_cooldown_seconds: Thời gian chờ giữa các lần đặt lệnh
-#   - 0-1s: Không chờ, đặt liên tục (default = 1)
-#   - 3-5s: Chờ một chút, tránh spam
-#   - 10s+: Chờ lâu, ít lệnh hơn
-grid_placement_cooldown_seconds: 1
+# 0.2s = đặt lại ngay khi có thể, không bỏ lỡ cơ hội
+grid_placement_cooldown_seconds: 0
 
-# Rate limiter settings
-rate_limit_cooldown_seconds: 3  # Thời gian chờ khi gặp rate limit
-rate_limiter_capacity: 100       # Số request tối đa trong bucket
-rate_limiter_refill_rate: 20.0   # Tốc độ refill (requests/giây)
+# Rate limiter - TĂNG capacity, giảm tốc độ để tránh timeout
+rate_limit_cooldown_seconds: 3
+rate_limiter_capacity: 200
+rate_limiter_refill_rate: 5.0  # Chậm hơn = ít timeout hơn
 
-# Supported quote currencies - chỉ trade các pair với quote này
+# Supported quote currencies
 supported_quote_currencies: ["USD1"]
 
-# min_volume_24h: Volume 24h tối thiểu để chọn symbol (nghìn USD)
-#   - 100-300: Bao gồm nhiều symbol, kể cả ít thanh khoản
-#   - 500: Cân bằng (default)
-#   - 1000+: Chỉ chọn symbol thanh khoản cao
+# min_volume_24h: Chỉ chọn symbol thanh khoản cao (dễ fill)
 min_volume_24h: 1000
 
 # ---------------------------------------------------------------------------
-# SYMBOL SELECTION & MANAGEMENT
+# SYMBOL SELECTION - CHỈ CHẠY USD1 (KHÔNG PHẢI USDT)
 # ---------------------------------------------------------------------------
 symbols:
-  # auto_discover: Tự động tìm symbols hay dùng whitelist
-  #   - true: Tự động tìm symbols theo điều kiện
-  #   - false: Chỉ dùng whitelist
-  auto_discover: true
-
-  quote_currency_mode: "USD1"  # Mode chọn quote currency
-
-  min_volume_24h: 500  # Volume 24h tối thiểu (nghìn USD)
-
-  # max_spread_pct: Spread tối đa chấp nhận được (%)
-  #   - 5%: Chỉ chọn symbol spread rất thấp
-  #   - 10-15%: Cân bằng (default = 15%)
-  #   - 30%: Chấp nhận spread cao
-  max_spread_pct: 15.0
-
-  # boosted_only: Chỉ chọn symbol có boost reward
-  #   - true: Chỉ farm symbol có boost (lợi nhuận cao hơn)
-  #   - false: Farm tất cả symbol phù hợp
-  boosted_only: false
-
-  # max_symbols_per_quote: Số symbol tối đa mỗi quote currency
-  #   - 5-10: Ít symbol, tập trung
-  #   - 15: Cân bằng (default)
-  #   - 20+: Nhiều symbol, đa dạng hóa
-  max_symbols_per_quote: 15
-
-  # spread_ranking: Ưu tiên symbol theo spread ranking
-  spread_ranking: false
-
-  # volume_weighting: Trọng số volume trong ranking (0-1)
-  #   - 0: Không quan tâm volume
-  #   - 0.2: Tham khảo volume nhẹ (default)
-  #   - 0.5+: Ưu tiên volume cao
-  volume_weighting: 0.2
-
-  min_liquidity_score: 0.0  # Điểm thanh khoản tối thiểu
-
-  # optimal_spread_range: Khoảng spread lý tưởng để farm (%)
-  #   - [0, 1]: Chỉ chọn spread rất thấp
-  #   - [0, 2]: Cân bằng (default)
-  #   - [0, 5]: Chấp nhận spread cao hơn
-  optimal_spread_range: [0.0, 1.0]
-
-  spread_volatility_threshold: 0.2
-  exclude_high_fee_symbols: false  # Loại bỏ symbol phí cao
+  auto_discover: false  # TẮT HOÀN TOÀN auto discover
+  
+  # Quote currency CHỈ USD1 - không USDT
+  quote_currency_mode: "USD1"
+  supported_quote_currencies: ["USD1"]
   quote_currencies: ["USD1"]
-  allow_mixed_quotes: true  # Cho phép mixed quote currencies
-
-  # whitelist: Danh sách symbol luôn được phép trade
-  #   - Để trống: Dùng auto-discover hoàn toàn
-  #   - Danh sách cụ thể: Ưu tiên các symbol này
-  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1"]
+  allow_mixed_quotes: false
+  
+  min_volume_24h: 1000
+  max_spread_pct: 5.0
+  boosted_only: false
+  max_symbols_per_quote: 1
+  spread_ranking: true
+  volume_weighting: 0.5
+  min_liquidity_score: 0.7
+  optimal_spread_range: [0.0, 0.5]
+  spread_volatility_threshold: 0.1
+  exclude_high_fee_symbols: true
+  
+  # WHITELIST CHỈ USD1: ETHUSD1 hoặc BTCUSD1 (nếu đủ leverage)
+  # LƯU Ý: Symbol PHẢI kết thúc bằng USD1
+  whitelist: ["ETHUSD1"]
+  blacklist: []  # Không cần blacklist vì whitelist đã giới hạn
 
 # ---------------------------------------------------------------------------
 # EXCHANGE CONFIGURATION
@@ -180,61 +125,53 @@ exchange:
   futures_rest_base: "https://fapi.asterdex.com"
   futures_ws_base: "wss://fstream.asterdex.com"
   recv_window: 5000  # Receive window (ms) - không nên quá nhỏ
-  requests_per_second: 20  # Tốc độ request tối đa
+  requests_per_second: 5  # Giảm xuống 5 để tránh rate limit timeout
 
 # ---------------------------------------------------------------------------
-# RISK MANAGEMENT (Volume Farming Optimized)
+# RISK MANAGEMENT - SIÊU CHẶT CHO VỐN NHỎ
 # ---------------------------------------------------------------------------
 risk:
-  # max_position_usdt_per_symbol: Vị thế tối đa mỗi symbol (USDT)
-  #   - 100-200: An toàn, phân tán rủi ro
-  #   - 300-500: Cân bằng (default = 500)
-  #   - 1000+: Tập trung vào ít symbol
-  max_position_usdt_per_symbol: 500
+  # max_position_usdt_per_symbol: Giới hạn position/symbol
+  # $20 = 200% vốn, với 100x leverage = $0.20 margin
+  # An toàn vì SL 0.3% = đóng lệnh trước khi liq
+  max_position_usdt_per_symbol: 20
 
-  # max_total_positions_usdt: Tổng vị thế tối đa (USDT)
-  #   - 1000: An toàn
-  #   - 2000: Cân bằng (default)
-  #   - 5000+: Chấp nhận rủi ro cao
-  max_total_positions_usdt: 2000
+  # max_total_positions_usdt: Tổng position tối đa
+  # $20 = tối đa 2 lệnh $10 chồng nhau
+  max_total_positions_usdt: 20
 
   # fee_loss_threshold_pct: Ngưỡng lỗ do phí (%)
-  fee_loss_threshold_pct: 0.2
+  fee_loss_threshold_pct: 0.1
 
-  position_timeout_minutes: 30  # Thời gian chờ position
-  max_daily_loss_usdt: 100      # Lỗ tối đa mỗi ngày
-  daily_drawdown_pct: 10.0      # Drawdown tối đa
+  position_timeout_minutes: 3  # GIẢM: 3 phút (vào-ra siêu nhanh)
+  max_daily_loss_usdt: 2       # GIẢM: 20% vốn
+  daily_drawdown_pct: 50.0     # Dừng nếu drawdown 50%
 
   # max_open_positions: Số vị thế mở tối đa
-  #   - 3-5: Ít vị thế, dễ quản lý (default = 5)
-  #   - 10+: Nhiều vị thế, đa dạng hóa
-  max_open_positions: 5
+  max_open_positions: 1  # CHỈ 1 POSITION
 
-  # max_trades_per_symbol: Số giao dịch tối đa mỗi symbol/ngày
-  max_trades_per_symbol: 1000
+  # max_trades_per_symbol: Tối đa 500 giao dịch/ngày
+  max_trades_per_symbol: 500
 
   # max_global_pending_limit_orders: Tổng số lệnh pending tối đa
-  max_global_pending_limit_orders: 20
+  max_global_pending_limit_orders: 2
 
   # max_pending_per_side: Số lệnh pending tối đa mỗi bên
-  max_pending_per_side: 10
+  max_pending_per_side: 1
 
-  # per_trade_stop_loss_pct: Stop loss cho mỗi giao dịch (%)
-  #   - 1-2%: Chặt chẽ, cắt lỗ nhanh
-  #   - 3%: Cân bằng (default)
-  #   - 5%+: Cho phép biến động nhiều
-  per_trade_stop_loss_pct: 1.0
+  # per_trade_stop_loss_pct: 0.3% (cho 100x leverage)
+  # $10 order × 0.3% = $0.03 loss max
+  # 100x liquidation tại ~1%, 0.3% SL = an toàn với buffer 0.7%
+  per_trade_stop_loss_pct: 0.3
 
-  # per_trade_take_profit_pct: Take profit cho mỗi giao dịch (%)
-  #   - 0.5-1%: Scalping nhanh
-  #   - 1.5%: Cân bằng (default)
-  #   - 3%+: Cho phép profit nhiều hơn
-  per_trade_take_profit_pct: 1.5
+  # per_trade_take_profit_pct: 0.2% (chặt cho 100x)
+  # $10 order × 0.2% = $0.02 profit, sau phí ~$0.015
+  per_trade_take_profit_pct: 0.2
 
-  risk_per_trade_usdt: 2        # Rủi ro mỗi giao dịch (USDT)
-  atr_multiplier: 1.5             # ATR multiplier cho stop loss
+  risk_per_trade_usdt: 0.5     # Rủi ro mỗi giao dịch (USDT)
+  atr_multiplier: 0.5             # Không dùng ATR cho vốn nhỏ
   position_mode: "one_way"        # Chế độ vị thế
-  correlation_threshold: 0.9      # Ngưỡng tương quan
+  correlation_threshold: 1.0      # Không cần vì chỉ 1 symbol
   maker_priority: true            # Ưu tiên maker orders
 
 # ---------------------------------------------------------------------------

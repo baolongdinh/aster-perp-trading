@@ -3,7 +3,6 @@ package farming
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -132,7 +131,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	engine.symbolSelector = NewSymbolSelector(engine.futuresClient, logrusEntry.WithField("component", "symbol_selector"), volumeConfig)
 
 	gridLogger := logrusEntry.WithField("component", "grid_manager")
-	engine.gridManager = NewGridManager(engine.futuresClient, gridLogger)
+	engine.gridManager = NewGridManager(engine.futuresClient, gridLogger, volumeConfig)
 	engine.gridManager.ApplyConfig(volumeConfig)
 
 	pointsLogger := logrusEntry.WithField("component", "points_tracker")
@@ -318,19 +317,10 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 	}
 
 	if len(activeSymbols) == 0 {
-		e.logger.Info("No symbols from selector, adding basic whitelist for volume farming")
-		// Force add some basic symbols for volume farming
-		basicSymbols := []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
-		for _, sym := range basicSymbols {
-			activeSymbols = append(activeSymbols, &SymbolData{
-				Symbol:     sym,
-				BaseAsset:  strings.TrimSuffix(sym, "USDT"),
-				QuoteAsset: "USDT",
-				Status:     "TRADING",
-				Volume24h:  1000000, // Minimum volume for farming
-				Count24h:   1000,
-			})
-		}
+		e.logger.Info("No symbols from selector, adding whitelist symbols only")
+		// Only add whitelist symbols with USD1 quote - NO USDT
+		whitelistOnly := e.createWhitelistSymbols()
+		activeSymbols = append(activeSymbols, whitelistOnly...)
 	}
 
 	e.logger.Info("Updating grid manager with symbols", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
@@ -576,6 +566,10 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 	if volumeConfig.MinVolume24h <= 0 {
 		volumeConfig.MinVolume24h = volumeConfig.Symbols.MinVolume24h
 	}
+	// Only apply defaults if still zero after using Symbols.MinVolume24h
+	if volumeConfig.MinVolume24h <= 0 {
+		volumeConfig.MinVolume24h = 1000 // Use config file default
+	}
 	if len(volumeConfig.SupportedQuoteCurrencies) == 0 {
 		volumeConfig.SupportedQuoteCurrencies = append([]string{}, volumeConfig.Symbols.QuoteCurrencies...)
 	}
@@ -589,17 +583,49 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 		volumeConfig.TickerStream = "!ticker@arr"
 	}
 	if volumeConfig.SymbolRefreshIntervalSec <= 0 {
-		volumeConfig.SymbolRefreshIntervalSec = 30 // 30s default
+		volumeConfig.SymbolRefreshIntervalSec = 60 // Use config file default (60s not 30s)
 	}
-	if volumeConfig.GridPlacementCooldownSec <= 0 {
-		volumeConfig.GridPlacementCooldownSec = 1 // 1s default
+	if volumeConfig.GridPlacementCooldownSec < 0 { // Allow 0 for no cooldown
+		volumeConfig.GridPlacementCooldownSec = 0
 	}
 	if volumeConfig.RateLimitCooldownSec <= 0 {
-		volumeConfig.RateLimitCooldownSec = 3 // 3s default
+		volumeConfig.RateLimitCooldownSec = 3
 	}
 	if volumeConfig.Symbols.MaxSymbolsPerQuote <= 0 {
-		volumeConfig.Symbols.MaxSymbolsPerQuote = 20 // 20 symbols default
+		volumeConfig.Symbols.MaxSymbolsPerQuote = 1 // Use config file default (1 not 20)
 	}
+	// Ensure risk values from volume-farm-config are properly set
+	if volumeConfig.Risk.MaxPositionUSDTPerSymbol <= 0 && cfg.VolumeFarming.Risk.MaxPositionUSDTPerSymbol > 0 {
+		volumeConfig.Risk.MaxPositionUSDTPerSymbol = cfg.VolumeFarming.Risk.MaxPositionUSDTPerSymbol
+	}
+	if volumeConfig.Risk.MaxTotalPositionsUSDT <= 0 && cfg.VolumeFarming.Risk.MaxTotalPositionsUSDT > 0 {
+		volumeConfig.Risk.MaxTotalPositionsUSDT = cfg.VolumeFarming.Risk.MaxTotalPositionsUSDT
+	}
+	if volumeConfig.Risk.DailyLossLimitUSDT <= 0 && cfg.VolumeFarming.Risk.DailyLossLimitUSDT > 0 {
+		volumeConfig.Risk.DailyLossLimitUSDT = cfg.VolumeFarming.Risk.DailyLossLimitUSDT
+	}
+	if volumeConfig.Risk.MaxOpenPositions <= 0 && cfg.VolumeFarming.Risk.MaxOpenPositions > 0 {
+		volumeConfig.Risk.MaxOpenPositions = cfg.VolumeFarming.Risk.MaxOpenPositions
+	}
+	if volumeConfig.Risk.PerTradeStopLossPct <= 0 && cfg.VolumeFarming.Risk.PerTradeStopLossPct > 0 {
+		volumeConfig.Risk.PerTradeStopLossPct = cfg.VolumeFarming.Risk.PerTradeStopLossPct
+	}
+	if volumeConfig.Risk.PerTradeTakeProfitPct <= 0 && cfg.VolumeFarming.Risk.PerTradeTakeProfitPct > 0 {
+		volumeConfig.Risk.PerTradeTakeProfitPct = cfg.VolumeFarming.Risk.PerTradeTakeProfitPct
+	}
+	// Log final applied config values
+	e.logger.Info("Final volume farming config applied",
+		zap.Float64("order_size_usdt", volumeConfig.OrderSizeUSDT),
+		zap.Float64("grid_spread_pct", volumeConfig.GridSpreadPct),
+		zap.Int("max_orders_per_side", volumeConfig.MaxOrdersPerSide),
+		zap.Int("position_timeout_minutes", volumeConfig.PositionTimeoutMinutes),
+		zap.Int("symbol_refresh_interval_sec", volumeConfig.SymbolRefreshIntervalSec),
+		zap.Int("grid_placement_cooldown_sec", volumeConfig.GridPlacementCooldownSec),
+		zap.Float64("risk_max_position_usdt", volumeConfig.Risk.MaxPositionUSDTPerSymbol),
+		zap.Float64("risk_daily_loss_limit", volumeConfig.Risk.DailyLossLimitUSDT),
+		zap.Int("risk_max_open_positions", volumeConfig.Risk.MaxOpenPositions),
+		zap.Float64("risk_per_trade_sl_pct", volumeConfig.Risk.PerTradeStopLossPct),
+	)
 
 	return volumeConfig
 }
