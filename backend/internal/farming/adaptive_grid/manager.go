@@ -812,7 +812,14 @@ func (a *AdaptiveGridManager) applyNewRegimeParameters(
 // Stop stops the adaptive grid manager
 func (a *AdaptiveGridManager) Stop(ctx context.Context) error {
 	a.logger.Info("Stopping adaptive grid manager")
-	close(a.stopCh)
+
+	// Safely close stopCh
+	select {
+	case <-a.stopCh:
+		// already closed
+	default:
+		close(a.stopCh)
+	}
 
 	// NEW: Stop RiskMonitor
 	if a.riskMonitor != nil {

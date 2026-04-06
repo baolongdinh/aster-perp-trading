@@ -177,6 +177,22 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.logger.Info("Starting Volume Farming Engine")
 
+	// Bridge context cancellation to stopCh
+	// This ensures that when context is cancelled (e.g., from signal), stopCh is also closed
+	go func() {
+		select {
+		case <-ctx.Done():
+			select {
+			case <-e.stopCh:
+				// already closed
+			default:
+				close(e.stopCh)
+			}
+		case <-e.stopCh:
+			// already closed, nothing to do
+		}
+	}()
+
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -368,7 +384,14 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 	e.isRunningMu.Unlock()
 
 	e.logger.Info("Stopping Volume Farming Engine")
-	close(e.stopCh)
+
+	// Safely close stopCh (may already be closed by bridge goroutine)
+	select {
+	case <-e.stopCh:
+		// already closed
+	default:
+		close(e.stopCh)
+	}
 
 	if e.symbolSelector != nil {
 		if err := e.symbolSelector.Stop(ctx); err != nil {

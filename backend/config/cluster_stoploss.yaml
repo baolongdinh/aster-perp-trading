@@ -1,47 +1,135 @@
-# Cluster Stop-Loss Configuration
-# Stop-loss theo cụm lệnh dựa trên thời gian và breakeven
+# =============================================================================
+# CLUSTER STOP-LOSS CONFIGURATION
+# Cấu hình stop-loss theo cụm lệnh dựa trên thời gian và breakeven
+# =============================================================================
+#
+# MỤC ĐÍCH:
+#   - Tự động đóng các vị thế theo cụm (cluster) khi đạt điều kiện nhất định
+#   - Bảo vệ account khỏi các vị thế treo kéo dài
+#   - Breakeven exit: đóng position khi giá hồi về gần giá vào lệnh
+#
+# TRADE-OFFS:
+#   ┌─────────────────────────────────────────────────────────────────────┐
+#   │ THAM SỐ           │ GIÁ TRỊ CAO              │ GIÁ TRỊ THẤP          │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ monitor_hours     │ Chờ lâu hơn              │ Đóng sớm hơn          │
+#   │                   │ → Có thể hồi phục        │ → Ít bị treo lệnh     │
+#   │                   │ → Rủi ro đóng non-profit │ → Có thể đóng sớm     │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ emergency_hours   │ Chờ lâu hơn              │ Đóng sớm hơn          │
+#   │                   │ → Có thể hồi              │ → Giảm drawdown sâu   │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ drawdown monitor  │ Nhạy cảm thấp            │ Nhạy cảm cao          │
+#   │                   │ → Ít false alarm         │ → Đóng sớm hơn        │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ breakeven_exit    │ Thoát sớm hơn            │ Chờ lâu hơn           │
+#   │                   │ → An toàn hơn            │ → Có thể profit nhiều │
+#   └─────────────────────────────────────────────────────────────────────┘
+#
+# CÁC CHẾ ĐỘ GỢI Ý:
+#   - CONSERVATIVE: monitor_hours=1, emergency_hours=2, stale_hours=4
+#   - BALANCED:     monitor_hours=2, emergency_hours=4, stale_hours=8 (default)
+#   - AGGRESSIVE:   monitor_hours=4, emergency_hours=8, stale_hours=12
+# =============================================================================
 
 cluster_stop_loss:
-  enabled: true
-  
-  # Time-based stop-loss thresholds
+  enabled: true  # true/false: Bật/tắt toàn bộ cluster stop-loss
+
+  # ---------------------------------------------------------------------------
+  # TIME-BASED STOP-LOSS THRESHOLDS
+  # Đóng vị thế dựa trên thời gian nắm giữ
+  # ---------------------------------------------------------------------------
   time_thresholds:
-    monitor_hours: 2          # Sau 2 giờ bắt đầu monitor
-    emergency_hours: 4        # Sau 4 giờ emergency close nếu drawdown > 1%
-    stale_hours: 8            # Sau 8 giờ đóng bất kể PnL
-    
-  # Drawdown thresholds (%)
+    # monitor_hours: Sau bao nhiêu giờ thì bắt đầu monitor drawdown
+    #   - 1-2 giờ: Phù hợp scalping, không để lệnh treo
+    #   - 4-6 giờ: Cho swing trading, cho phép hồi phục
+    #   - 12-24 giờ: Cho position dài hạn
+    monitor_hours: 2
+
+    # emergency_hours: Sau bao nhiêu giờ thì emergency close nếu drawdown > 1%
+    #   - Giá trị càng cao → cho phép chờ hồi lâu hơn
+    #   - Giá trị càng thấp → cắt lỗ nhanh hơn, tránh drawdown sâu
+    emergency_hours: 4
+
+    # stale_hours: Sau bao nhiêu giờ thì đóng BẤT KỂ PnL (kể cả đang lãi)
+    #   - Đảm bảo không có vị thế nào treo quá lâu
+    #   - Set cao nếu muốn giữ position dài hạn
+    #   - Set thấp nếu chỉ muốn scalping ngắn hạn
+    stale_hours: 8
+
+  # ---------------------------------------------------------------------------
+  # DRAWDOWN THRESHOLDS (%)
+  # Ngưỡng lỗ để trigger các hành động
+  # ---------------------------------------------------------------------------
   drawdown_thresholds:
-    monitor: -0.5            # Monitor nếu drawdown > 0.5% sau 2h
-    emergency: -1.0          # Emergency close nếu drawdown > 1% sau 4h
-    
-  # Breakeven exit settings
+    # monitor: % drawdown để bắt đầu theo dõi sát
+    #   - -0.3%: Rất nhạy, đóng sớm
+    #   - -0.5%: Cân bằng (default)
+    #   - -1.0%: Chịu lỗ nhiều hơn trước khi hành động
+    monitor: -0.5
+
+    # emergency: % drawdown để emergency close ngay lập tức
+    #   - NÊN LỚN HƠN monitor threshold
+    #   - -1.0%: Cắt lỗ nhanh, bảo vệ vốn
+    #   - -2.0%: Chịu lỗ nhiều hơn, chờ hồi
+    emergency: -1.0
+
+  # ---------------------------------------------------------------------------
+  # BREAKEVEN EXIT SETTINGS
+  # Tự động đóng position khi giá hồi về gần giá vào lệnh
+  # ---------------------------------------------------------------------------
   breakeven_exit:
-    enabled: true
-    
-    # 50% exit: Đóng 50% position khi hồi về -0.2%
-    # (Sau khi drawdown > 2%)
+    enabled: true  # true/false: Bật/tắt breakeven exit
+
+    # close_50_pct_at: Đóng 50% position khi PnL đạt ngưỡng này
+    #   - -0.001 = -0.1%: Đóng gần breakeven (hòa vốn ~ -0.1%)
+    #   - -0.002 = -0.2%: Chấp nhận lỗ nhỏ 0.2% cho 50% position
+    #   - 0.0: Chỉ đóng khi đúng breakeven
     close_50_pct_at: -0.002
+
+    # min_drawdown_for_50_pct: Chỉ áp dụng nếu đã drawdown ít nhất bao nhiêu
+    #   - Đảm bảo không đóng sớm khi mới vào lệnh
+    #   - -0.02 = -2%: Phải chịu lỗ 2% trước mới được phép breakeven exit
     min_drawdown_for_50_pct: -0.02
-    
-    # 100% exit: Đóng toàn bộ khi về breakeven
-    # (Sau khi drawdown > 3%)
+
+    # close_100_pct_at: Đóng 100% position khi PnL đạt ngưỡng này
+    #   - 0.0 = Breakeven: Đóng toàn bộ khi hòa vốn
+    #   - -0.001: Chấp nhận lỗ nhỏ để thoát toàn bộ
     close_100_pct_at: 0.0
+
+    # min_drawdown_for_100_pct: Chỉ áp dụng nếu đã drawdown ít nhất bao nhiêu
     min_drawdown_for_100_pct: -0.03
-    
-  # Cluster definition
+
+  # ---------------------------------------------------------------------------
+  # CLUSTER DEFINITION
+  # Định nghĩa một "cụm" (cluster) gồm những vị thế nào
+  # ---------------------------------------------------------------------------
   cluster_definition:
-    max_levels_per_cluster: 3   # Mỗi cluster tối đa 3 levels
-    max_distance_between_levels: 0.5  # % khoảng cách tối đa giữa các levels
-    
-  # Heat map generation
+    # max_levels_per_cluster: Một cluster tối đa bao nhiêu levels
+    #   - 2-3: Cluster nhỏ, dễ quản lý, ít rủi ro
+    #   - 5-7: Cluster lớn, có thể tối ưu hơn nhưng phức tạp
+    max_levels_per_cluster: 3
+
+    # max_distance_between_levels: % khoảng cách tối đa giữa các levels trong cluster
+    #   - 0.3%: Các lệnh phải rất gần nhau mới tính là 1 cluster
+    #   - 0.5%: Cho phép khoảng cách vừa phải (default)
+    #   - 1.0%: Các lệnh xa nhau vẫn tính là 1 cluster
+    max_distance_between_levels: 0.5
+
+  # ---------------------------------------------------------------------------
+  # HEAT MAP GENERATION
+  # Tạo báo cáo "heat map" về các cluster đang hoạt động
+  # ---------------------------------------------------------------------------
   heat_map:
-    enabled: true
-    log_interval: 15m           # Log heat map mỗi 15 phút
-    include_recommendations: true
-    
-  # Alert settings
+    enabled: true      # true/false: Bật/tắt heat map logging
+    log_interval: 15m  # 5m/15m/30m/1h: Tần suất log heat map
+    include_recommendations: true  # true/false: Bao gồm khuyến nghị hành động
+
+  # ---------------------------------------------------------------------------
+  # ALERT SETTINGS
+  # Thông báo khi các sự kiện xảy ra
+  # ---------------------------------------------------------------------------
   alerts:
-    on_emergency_close: true
-    on_stale_close: true
-    on_breakeven_exit: true
+    on_emergency_close: true   # true/false: Alert khi emergency close
+    on_stale_close: true       # true/false: Alert khi đóng do stale
+    on_breakeven_exit: true    # true/false: Alert khi breakeven exit

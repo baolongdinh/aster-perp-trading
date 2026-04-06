@@ -1,55 +1,210 @@
-# Trend Detection Configuration
+# =============================================================================
+# TREND DETECTION CONFIGURATION
 # Phát hiện xu hướng dựa trên RSI và các chỉ báo khác
+# =============================================================================
+#
+# MỤC ĐÍCH:
+#   - Phát hiện xu hướng mạnh để điều chỉnh chiến lược grid
+#   - Khi trending mạnh → giảm size/pause vì grid hoạt động kém trong trend
+#   - Khi sideway → tăng size vì grid hoạt động tốt
+#
+# TRADE-OFFS:
+#   ┌─────────────────────────────────────────────────────────────────────┐
+#   │ THAM SỐ           │ GIÁ TRỊ CAO              │ GIÁ TRỊ THẤP          │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ rsi_thresholds    │ Ngưỡng cao (80/20)       │ Ngưỡng thấp (70/30)   │
+#   │                   │ → Ít phát hiện trend     → Nhiều false signal   │
+#   │                   │ → Có thể miss trend      → Có thể pause quá mức│
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ pause_duration    │ Pause lâu                │ Pause ngắn            │
+#   │                   │ → An toàn hơn            → Farm nhiều hơn      │
+#   │                   │ → Miss cơ hội            → Có thể bị hit      │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ score_threshold   │ Ngưỡng cao (7-8)         │ Ngưỡng thấp (4-5)    │
+#   │                   │ → Chỉ pause khi trend    → Dễ pause hơn        │
+#   │                   │   rất mạnh               → Nhiều false pause   │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ counter_reduction │ Giảm nhiều (50%+)        │ Giảm ít (10-20%)      │
+#   │                   │ → An toàn hơn            → Vẫn farm được        │
+#   │                   │ → Farm ít hơn            → Rủi ro cao hơn     │
+#   └─────────────────────────────────────────────────────────────────────┘
+#
+# CÁC CHẾ ĐỘ GỢI Ý:
+#   - CONSERVATIVE: rsi_strong=85/15, pause_duration=15m, score_threshold=7
+#   - BALANCED:     rsi_strong=80/20, pause_duration=5m, score_threshold=6 (default)
+#   - AGGRESSIVE:   rsi_strong=75/25, pause_duration=2m, score_threshold=5
+# =============================================================================
 
 trend_detection:
-  enabled: true
-  
-  # RSI Configuration
+  enabled: true  # true/false: Bật/tắt trend detection
+
+  # ---------------------------------------------------------------------------
+  # RSI CONFIGURATION
+  # Cấu hình chỉ báo RSI
+  # ---------------------------------------------------------------------------
   rsi:
-    period: 14              # RSI period
-    timeframe: "15m"        # Timeframe cho RSI
-    update_interval: 5m     # Cập nhật mỗi 5 phút
-    
-  # RSI thresholds - điều chỉnh cho volume farming (ít pause hơn)
+    # period: Số period cho RSI
+    #   - 7: Nhạy cảm cao (phản ứng nhanh)
+    #   - 14: Cân bằng (default, khuyến nghị bởi Wilder)
+    #   - 21: Ổn định hơn, ít whipsaw
+    period: 14
+
+    # timeframe: Timeframe tính RSI
+    #   - "5m": Phản ứng rất nhanh (scalping)
+    #   - "15m": Cân bằng (default)
+    #   - "1h": Phản ứng chậm, trend dài hạn
+    timeframe: "15m"
+
+    # update_interval: Tần suất cập nhật RSI
+    #   - 1m/3m: Cập nhật thường xuyên
+    #   - 5m: Cân bằng (default)
+    #   - 15m: Cập nhật ít, ít thay đổi
+    update_interval: 5m
+
+  # ---------------------------------------------------------------------------
+  # RSI THRESHOLDS
+  # Các ngưỡng RSI để phân loại xu hướng
+  # ---------------------------------------------------------------------------
   thresholds:
-    strong_overbought: 80       # RSI > 80 = Strong Up (tăng từ 70)
-    mild_overbought: 70         # RSI > 70 = Up (tăng từ 60)
-    neutral_high: 60            # High end of neutral
-    neutral_low: 40             # Low end of neutral
-    mild_oversold: 30           # RSI < 30 = Down (giảm từ 40)
-    strong_oversold: 20         # RSI < 20 = Strong Down (giảm từ 30)
-    
-  # Trend persistence
+    # strong_overbought: RSI > ngưỡng này = Up trend rất mạnh
+    #   - 75: Bắt trend sớm nhưng nhiều false signal
+    #   - 80: Cân bằng (default)
+    #   - 85: Chỉ khi trend cực mạnh
+    strong_overbought: 80
+
+    # mild_overbought: RSI > ngưỡng này = Up trend
+    #   - 65: Nhạy cảm cao
+    #   - 70: Cân bằng (default)
+    #   - 75: Ít nhạy cảm hơn
+    mild_overbought: 70
+
+    # neutral_high: Ngưỡng trên của vùng neutral
+    #   - NÊN < mild_overbought
+    #   - 55-60: Hẹp (default = 60)
+    #   - 65: Rộng hơn
+    neutral_high: 60
+
+    # neutral_low: Ngưỡng dưới của vùng neutral
+    #   - NÊN > mild_oversold
+    #   - 35-40: Hẹp (default = 40)
+    #   - 30: Rộng hơn
+    neutral_low: 40
+
+    # mild_oversold: RSI < ngưỡng này = Down trend
+    #   - 25: Nhạy cảm cao
+    #   - 30: Cân bằng (default)
+    #   - 35: Ít nhạy cảm hơn
+    mild_oversold: 30
+
+    # strong_oversold: RSI < ngưỡng này = Down trend rất mạnh
+    #   - 15: Bắt trend sớm
+    #   - 20: Cân bằng (default)
+    #   - 25: Chỉ khi trend cực mạnh
+    strong_oversold: 20
+
+  # ---------------------------------------------------------------------------
+  # TREND PERSISTENCE
+  # Yêu cầu trend tồn tại đủ lâu mới coi là valid
+  # ---------------------------------------------------------------------------
   persistence:
-    required_duration: 15m  # Cần 15 phút RSI trong vùng mới coi là trend
-    min_confirmations: 3    # Cần 3 lần update liên tiếp
-    
-  # Trend score calculation
+    # required_duration: Thời gian tối thiểu RSI trong vùng trend (phút)
+    #   - 5m: Nhanh, dễ false signal
+    #   - 15m: Cân bằng (default)
+    #   - 30m+: Chắc chắn trend hơn
+    required_duration: 15m
+
+    # min_confirmations: Số lần update liên tiếp xác nhận trend
+    #   - 2: Nhanh nhưng dễ false
+    #   - 3: Cân bằng (default)
+    #   - 5+: Chắc chắn hơn
+    min_confirmations: 3
+
+  # ---------------------------------------------------------------------------
+  # TREND SCORE CALCULATION
+  # Cách tính điểm trend (0-10)
+  # ---------------------------------------------------------------------------
   trend_score:
-    rsi_contribution: 4     # 0-4 điểm từ RSI
-    ema_contribution: 2     # 0-2 điểm từ EMA
-    volume_contribution: 2  # 0-2 điểm từ volume
-    price_action_contribution: 2  # 0-2 điểm từ higher highs/lower lows
-    
-  # Pause settings - giảm thời gian pause để farm nhiều hơn
+    # rsi_contribution: Điểm từ RSI (0-4)
+    #   Tính dựa trên mức độ overbought/oversold
+    rsi_contribution: 4
+
+    # ema_contribution: Điểm từ EMA (0-2)
+    #   Tính dựa trên vị trí giá so với EMA
+    ema_contribution: 2
+
+    # volume_contribution: Điểm từ volume (0-2)
+    #   Tính dựa trên volume so với average
+    volume_contribution: 2
+
+    # price_action_contribution: Điểm từ price action (0-2)
+    #   Tính dựa trên higher highs / lower lows
+    price_action_contribution: 2
+
+  # ---------------------------------------------------------------------------
+  # PAUSE SETTINGS
+  # Cấu hình tạm dừng khi phát hiện trend
+  # ---------------------------------------------------------------------------
   pause:
-    strong_trend_pause_duration: 5m   # Pause 5 phút (giảm từ 30m)
-    mild_trend_pause_duration: 2m     # Pause 2 phút (giảm từ 15m)
-    score_threshold_strong: 6         # Score >= 6 = strong trend (tăng từ 4)
-    score_threshold_mild: 4           # Score 4-5 = mild trend (tăng từ 2)
-    
-  # Counter-trend size reduction - giảm mức giảm để farm nhiều hơn
+    # strong_trend_pause_duration: Thời gian pause khi trend mạnh (phút)
+    #   - 2-5m: Pause ngắn, nhanh quay lại (default = 5m)
+    #   - 15-30m: Pause dài, an toàn hơn
+    strong_trend_pause_duration: 5m
+
+    # mild_trend_pause_duration: Thời gian pause khi trend nhẹ (phút)
+    #   - 1-2m: Pause rất ngắn (default = 2m)
+    #   - 5-10m: Pause lâu hơn
+    mild_trend_pause_duration: 2m
+
+    # score_threshold_strong: Điểm để coi là trend mạnh (6-8)
+    #   - 6: Cân bằng (default)
+    #   - 7-8: Chỉ khi rất mạnh
+    score_threshold_strong: 6
+
+    # score_threshold_mild: Điểm để coi là trend nhẹ (4-5)
+    #   - 4: Cân bằng (default)
+    #   - 5: Ít nhạy cảm hơn
+    score_threshold_mild: 4
+
+  # ---------------------------------------------------------------------------
+  # COUNTER-TREND SIZE REDUCTION
+  # Giảm size khi đi ngược trend
+  # ---------------------------------------------------------------------------
   counter_trend_reduction:
-    mild: 0.10              # Giảm 10% cho counter-trend (giảm từ 30%)
-    strong: 0.20            # Giảm 20% cho counter-trend (giảm từ 50%)
-    extreme: 0.30           # Giảm 30% cho counter-trend (giảm từ 70%)
-    
-  # Trend exhaustion detection
+    # mild: Giảm bao nhiêu % khi counter mild trend (0.0-1.0)
+    #   - 0.10: Giảm 10% (default)
+    #   - 0.20-0.30: Giảm nhiều hơn (conservative)
+    mild: 0.10
+
+    # strong: Giảm bao nhiêu % khi counter strong trend
+    #   - 0.20: Giảm 20% (default)
+    #   - 0.40-0.50: Giảm nhiều hơn
+    strong: 0.20
+
+    # extreme: Giảm bao nhiêu % khi counter extreme trend
+    #   - 0.30: Giảm 30% (default)
+    #   - 0.70-1.00: Giảm rất nhiều hoặc pause hẳn
+    extreme: 0.30
+
+  # ---------------------------------------------------------------------------
+  # TREND EXHAUSTION DETECTION
+  # Phát hiện khi trend sắp kết thúc
+  # ---------------------------------------------------------------------------
   exhaustion:
-    enabled: true
-    detect_divergence: true   # Phát hiện RSI divergence
-    min_trend_duration: 2h    # Tối thiểu 2 giờ trend mới check exhaustion
-    
-  # Logging
-  log_trend_changes: true
-  log_interval: 15m
+    enabled: true  # true/false: Bật/tắt exhaustion detection
+
+    # detect_divergence: Phát hiện RSI divergence
+    #   - Bullish divergence: Giá lower low, RSI higher low → Up trend sắp hết
+    #   - Bearish divergence: Giá higher high, RSI lower high → Down trend sắp hết
+    detect_divergence: true
+
+    # min_trend_duration: Tối thiểu trend tồn tại bao lâu mới check exhaustion
+    #   - 1h: Nhanh nhưng dễ false
+    #   - 2h: Cân bằng (default)
+    #   - 4h+: Chắc chắn hơn
+    min_trend_duration: 2h
+
+  # ---------------------------------------------------------------------------
+  # LOGGING
+  # ---------------------------------------------------------------------------
+  log_trend_changes: true  # true/false: Log mỗi khi trend thay đổi
+  log_interval: 15m         # 5m/15m/30m/1h: Tần suất log status

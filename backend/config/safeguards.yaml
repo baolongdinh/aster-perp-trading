@@ -1,20 +1,73 @@
-# Backend Safeguards Configuration
+# =============================================================================
+# BACKEND SAFEGUARDS CONFIGURATION
 # Các biện pháp bảo vệ kỹ thuật cho bot
+# =============================================================================
+#
+# MỤC ĐÍCH:
+#   - Bảo vệ bot khỏi các lỗi kỹ thuật và sự cố
+#   - Ngăn chặn duplicate fills, invalid state transitions
+#   - Tự động dừng khi phát hiện điều kiện nguy hiểm
+#
+# TRADE-OFFS:
+#   ┌─────────────────────────────────────────────────────────────────────┐
+#   │ THAM SỐ           │ GIÁ TRỊ CAO              │ GIÁ TRỊ THẤP          │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ spread_threshold  │ Dễ trigger pause         │ Khó trigger pause     │
+#   │                   │ → An toàn hơn            → Ít false pause      │
+#   │                   │ → Có thể pause quá mức   → Có thể miss nguy hiểm│
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ dedup_window      │ Window dài               │ Window ngắn           │
+#   │                   │ → Bắt duplicate tốt        → Ít memory dùng       │
+#   │                   │ → Nhiều memory dùng      → Có thể miss dup      │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ retry_interval    │ Thử lại nhanh            │ Thử lại chậm          │
+#   │                   │ → Nhanh recover          → Ít spam API         │
+#   └─────────────────────────────────────────────────────────────────────┘
+#
+# LƯU Ý: Safeguards là biện pháp PHÒNG NGỪA, không phải chiến lược trading.
+# =============================================================================
 
 safeguards:
-  enabled: true
-  
-  # Anti-Replay Protection
+  enabled: true  # true/false: Bật/tắt toàn bộ safeguards (KHÔNG NÊN TẮT)
+
+  # ---------------------------------------------------------------------------
+  # ANTI-REPLAY PROTECTION
+  # Ngăn chặn xử lý duplicate fills từ exchange
+  # ---------------------------------------------------------------------------
   anti_replay:
-    enabled: true
-    deduplication_window: 30s     # Window để detect duplicate fills
-    max_stored_events: 100        # Lưu tối đa 100 events
-    lock_timeout: 5s              # Timeout cho order processing lock
-    cleanup_interval: 10m         # Cleanup stale locks mỗi 10 phút
-    
-  # State Validation
+    enabled: true  # true/false: Bật/tắt anti-replay
+
+    # deduplication_window: Window kiểm tra duplicate (giây)
+    #   - 10-20s: Window ngắn, ít memory
+    #   - 30s: Cân bằng (default)
+    #   - 60s+: Window dài, bắt duplicate tốt hơn
+    deduplication_window: 30s
+
+    # max_stored_events: Số events tối đa lưu trong memory
+    #   - 50-100: Cân bằng (default = 100)
+    #   - 200+: Nhiều hơn nhưng tốn memory
+    max_stored_events: 100
+
+    # lock_timeout: Timeout cho order processing lock (giây)
+    #   - 3s: Nhanh
+    #   - 5s: Cân bằng (default)
+    #   - 10s: Cho phép xử lý chậm hơn
+    lock_timeout: 5s
+
+    # cleanup_interval: Tần suất dọn dẹp stale locks
+    cleanup_interval: 10m
+
+  # ---------------------------------------------------------------------------
+  # STATE VALIDATION
+  # Kiểm tra tính hợp lệ của state transitions
+  # ---------------------------------------------------------------------------
   state_validation:
-    enabled: true
+    enabled: true  # true/false: Bật/tắt state validation
+
+    # valid_transitions: Các transition được phép
+    # ĐỊNH NGHĨA STATE MACHINE:
+    #   - PENDING → FILLED/CANCELLED/REJECTED (hợp lệ)
+    #   - FILLED/CANCELLED/REJECTED → terminal (không chuyển tiếp)
     valid_transitions:
       - from: "PENDING"
         to: ["FILLED", "CANCELLED", "REJECTED"]
@@ -24,64 +77,148 @@ safeguards:
         to: []  # Terminal state
       - from: "REJECTED"
         to: []  # Terminal state
+
+    # log_invalid_transitions: Có log các transition không hợp lệ
     log_invalid_transitions: true
+
+    # alert_on_invalid: Có alert khi phát hiện invalid transition
     alert_on_invalid: true
-    
-  # Spread Protection
+
+  # ---------------------------------------------------------------------------
+  # SPREAD PROTECTION
+  # Tạm dừng khi spread quá rộng (thanh khoản thấp)
+  # ---------------------------------------------------------------------------
   spread_protection:
-    enabled: true
-    
-    # Thresholds - điều chỉnh cho volume farming (chấp nhận spread rộng hơn)
-    pause_threshold: 0.005        # Pause khi spread > 0.5% (tăng từ 0.1%)
-    emergency_threshold: 0.01     # Emergency pause khi spread > 1% (tăng từ 0.3%)
-    resume_after: 15s             # Resume sau 15 giây (giảm từ 30s)
-    
-    # Monitoring
-    orderbook_check_interval: 3s  # Check orderbook mỗi 3 giây
-    samples_before_resume: 3      # Cần 3 samples < threshold mới resume
-    
-  # Slippage Monitoring
+    enabled: true  # true/false: Bật/tắt spread protection
+
+    # pause_threshold: Ngưỡng spread để tạm dừng (%)
+    #   - 0.1% (10 bps): Rất nhạy, dễ pause
+    #   - 0.5% (50 bps): Cân bằng (default)
+    #   - 1.0%+: Chỉ pause khi spread rất rộng
+    pause_threshold: 0.005
+
+    # emergency_threshold: Ngưỡng spread để emergency pause (%)
+    #   - NÊN lớn hơn pause_threshold
+    #   - 1.0%: Cân bằng (default)
+    #   - 2.0%+: Chỉ emergency khi spread cực rộng
+    emergency_threshold: 0.01
+
+    # resume_after: Thời gian chờ trước khi resume (giây)
+    #   - 5-10s: Resume nhanh
+    #   - 15s: Cân bằng (default)
+    #   - 30s+: Chờ lâu hơn để spread ổn định
+    resume_after: 15s
+
+    # orderbook_check_interval: Tần suất check orderbook (giây)
+    orderbook_check_interval: 3s
+
+    # samples_before_resume: Số samples < threshold cần thiết để resume
+    #   - 1-2: Resume nhanh
+    #   - 3: Cân bằng (default)
+    #   - 5+: Chắc chắn spread ổn định mới resume
+    samples_before_resume: 3
+
+  # ---------------------------------------------------------------------------
+  # SLIPPAGE MONITORING
+  # Theo dõi slippage khi fill orders
+  # ---------------------------------------------------------------------------
   slippage:
-    enabled: true
-    alert_threshold: 0.0005       # Alert nếu slippage > 0.05%
-    max_stored_fills: 10          # Lưu 10 fills gần nhất để tính avg
-    
-  # Funding Rate Protection
+    enabled: true  # true/false: Bật/tắt slippage monitoring
+
+    # alert_threshold: Ngưỡng slippage để alert (%)
+    #   - 0.01% (1 bps): Rất nhạy
+    #   - 0.05% (5 bps): Cân bằng (default)
+    #   - 0.1% (10 bps): Chỉ alert khi slippage lớn
+    alert_threshold: 0.0005
+
+    # max_stored_fills: Số fills lưu để tính average slippage
+    max_stored_fills: 10
+
+  # ---------------------------------------------------------------------------
+  # FUNDING RATE PROTECTION
+  # Điều chỉnh khi funding rate cao
+  # ---------------------------------------------------------------------------
   funding_protection:
-    enabled: true
-    
-    high_threshold: 0.0003        # High funding > 0.03%
-    check_interval: 4h            # Check mỗi 4 giờ
-    level_adjustment: 2           # Giảm 2 levels khi funding cao
-    
+    enabled: true  # true/false: Bật/tắt funding protection
+
+    # high_threshold: Ngưỡng funding cao (%)
+    #   - 0.01% (1 bps): Rất nhạy
+    #   - 0.03% (3 bps): Cân bằng (default)
+    #   - 0.05% (5 bps): Chỉ khi funding rất cao
+    high_threshold: 0.0003
+
+    # check_interval: Tần suất check funding rate
+    check_interval: 4h
+
+    # level_adjustment: Số levels giảm khi funding cao
+    #   - 1: Giảm nhẹ
+    #   - 2: Cân bằng (default)
+    #   - 3+: Giảm mạnh
+    level_adjustment: 2
+
+    # cost_tracking: Theo dõi chi phí funding
     cost_tracking:
       enabled: true
-      compare_to_profit: true     # So sánh funding cost với grid profit
-      alert_ratio: 0.5            # Alert nếu funding > 50% profit
-      
-  # Circuit Breaker
+      compare_to_profit: true  # So sánh funding cost vs grid profit
+
+      # alert_ratio: Ngưỡng alert nếu funding/profit > ratio
+      #   - 0.3: Alert sớm
+      #   - 0.5: Cân bằng (default)
+      #   - 0.7: Chỉ alert khi funding rất cao so với profit
+      alert_ratio: 0.5
+
+  # ---------------------------------------------------------------------------
+  # CIRCUIT BREAKER
+  # Tự động disable tính năng khi có lỗi calculation
+  # ---------------------------------------------------------------------------
   circuit_breaker:
-    enabled: true
-    
-    # Auto-disable các tính năng nếu calculation lỗi
+    enabled: true  # true/false: Bật/tắt circuit breaker
+
+    # fallback_to_safe_defaults: Quay về defaults an toàn khi lỗi
     fallback_to_safe_defaults: true
-    safe_spread_pct: 0.02         # Spread mặc định nếu ATR lỗi (giảm từ 0.5%)
-    safe_size_multiplier: 1.0    # Size multiplier mặc định
-    
-    # Auto-recovery
-    retry_interval: 30s             # Thử lại mỗi 30 giây (giảm từ 1m)
-    max_retries: 10               # Thử tối đa 10 lần (tăng từ 5)
-    
-  # Performance Monitoring
+
+    # safe_spread_pct: Spread mặc định khi ATR calculation lỗi (%)
+    #   - 0.5%: An toàn
+    #   - 2.0%: Rất an toàn (default)
+    safe_spread_pct: 0.02
+
+    # safe_size_multiplier: Size multiplier mặc định khi lỗi
+    safe_size_multiplier: 1.0
+
+    # retry_interval: Thời gian thử lại sau lỗi (giây)
+    #   - 10-30s: Thử lại nhanh
+    #   - 30s: Cân bằng (default)
+    #   - 60s+: Thử lại chậm hơn
+    retry_interval: 30s
+
+    # max_retries: Số lần thử lại tối đa
+    #   - 5: Ít lần thử
+    #   - 10: Cân bằng (default)
+    #   - 20+: Thử nhiều lần
+    max_retries: 10
+
+  # ---------------------------------------------------------------------------
+  # PERFORMANCE MONITORING
+  # Theo dõi hiệu năng các operations
+  # ---------------------------------------------------------------------------
   performance:
-    enabled: true
+    enabled: true  # true/false: Bật/tắt performance monitoring
+
+    # log_slow_operations: Log các operation chậm
     log_slow_operations: true
-    slow_threshold: 100ms         # Log nếu operation > 100ms
-    
-  # Alert Settings
+
+    # slow_threshold: Ngưỡng để coi là operation chậm (ms)
+    #   - 50ms: Rất nhạy
+    #   - 100ms: Cân bằng (default)
+    #   - 200ms: Chỉ log khi rất chậm
+    slow_threshold: 100ms
+
+  # ---------------------------------------------------------------------------
+  # ALERT SETTINGS
+  # ---------------------------------------------------------------------------
   alerts:
-    on_spread_pause: true
-    on_funding_high: true
-    on_duplicate_fill: true
-    on_invalid_transition: true
-    on_circuit_breaker: true
+    on_spread_pause: true      # Alert khi spread pause trigger
+    on_funding_high: true      # Alert khi funding rate cao
+    on_duplicate_fill: true    # Alert khi phát hiện duplicate fill
+    on_invalid_transition: true  # Alert khi state transition invalid
+    on_circuit_breaker: true   # Alert khi circuit breaker trigger

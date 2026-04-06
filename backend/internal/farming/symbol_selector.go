@@ -405,7 +405,13 @@ func (s *SymbolSelector) Stop(ctx context.Context) error {
 
 	s.logger.Info("Stopping Symbol Selector")
 
-	close(s.stopCh)
+	// Safely close stopCh
+	select {
+	case <-s.stopCh:
+		// already closed
+	default:
+		close(s.stopCh)
+	}
 
 	if s.wsClient != nil {
 		if err := s.wsClient.Close(); err != nil {

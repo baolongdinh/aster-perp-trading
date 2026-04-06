@@ -211,7 +211,7 @@ func (g *GridManager) Start(ctx context.Context) error {
 
 	// Fetch exchange info to populate precision manager
 	marketClient := client.NewMarketClient(g.futuresClient.GetHTTPClient())
-	exchangeInfo, err := marketClient.ExchangeInfo(context.Background())
+	exchangeInfo, err := marketClient.ExchangeInfo(ctx)
 	if err != nil {
 		g.logger.WithError(err).Warn("Failed to fetch exchange info, using default precision")
 	} else {
@@ -478,7 +478,7 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 }
 
 // placeGridOrders places initial grid orders for a symbol concurrently.
-func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
+func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *SymbolGrid) int {
 	g.logger.WithField("symbol", symbol).Info("Placing grid orders for volume farming (concurrent)")
 
 	if grid.CurrentPrice == 0 {
@@ -666,7 +666,7 @@ func (g *GridManager) placeGridOrders(symbol string, grid *SymbolGrid) int {
 
 	for _, order := range orders {
 		wg.Add(1)
-		go g.placeOrderAsync(context.Background(), order, &wg, successChan)
+		go g.placeOrderAsync(ctx, order, &wg, successChan)
 	}
 
 	// Wait for all orders to complete in a goroutine
@@ -1122,7 +1122,7 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 		return
 	}
 
-	placed := g.placeGridOrders(symbol, &snapshot)
+	placed := g.placeGridOrders(ctx, symbol, &snapshot)
 	expectedOrders := snapshot.MaxOrdersSide * 2 // BUY + SELL sides
 
 	g.logger.WithFields(logrus.Fields{
@@ -1261,7 +1261,15 @@ func (g *GridManager) Stop(ctx context.Context) error {
 
 	g.logger.Info("Stopping Grid Manager")
 
-	// NEW: Cleanup safeguard components
+	// Safely close stopCh (may already be closed)
+	select {
+	case <-g.stopCh:
+		// already closed
+	default:
+		close(g.stopCh)
+	}
+
+	// Cleanup safeguard components
 	if g.deduplicator != nil {
 		g.deduplicator.Reset()
 		g.logger.Info("Fill deduplicator reset")
@@ -1270,8 +1278,6 @@ func (g *GridManager) Stop(ctx context.Context) error {
 		g.orderLockMgr.CleanupStaleLocks()
 		g.logger.Info("Order locks cleaned up")
 	}
-
-	close(g.stopCh)
 
 	if g.wsClient != nil {
 		if err := g.wsClient.Close(); err != nil {

@@ -1,53 +1,161 @@
-# Inventory Skew Configuration
+# =============================================================================
+# INVENTORY SKEW CONFIGURATION
 # Quản lý lệch vị thế để tránh tích lũy position một chiều
+# =============================================================================
+#
+# MỤC ĐÍCH:
+#   - Phát hiện và xử lý khi portfolio bị lệch về một hướng (long/short)
+#   - Tránh rủi ro khi thị trường đi ngược với vị thế đang nắm giữ
+#   - Tự động giảm size/pause khi skew quá cao
+#
+# TRADE-OFFS:
+#   ┌─────────────────────────────────────────────────────────────────────┐
+#   │ THAM SỐ           │ GIÁ TRỊ CAO              │ GIÁ TRỊ THẤP          │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ max_inventory_pct │ Chấp nhận lệch nhiều     │ Chặt chẽ hơn         │
+#   │                   │ → Nhiều cơ hội profit    → An toàn hơn         │
+#   │                   │ → Rủi ro drawdown cao    → Có thể miss cơ hội  │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ thresholds        │ Ngưỡng cao               │ Ngưỡng thấp           │
+#   │                   │ → Ít action hơn          → Nhiều action hơn    │
+#   │                   │ → Cho phép skew lâu     → Cắt giảm sớm       │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ size_reduction    │ Giảm ít                  │ Giảm nhiều            │
+#   │                   │ → Vẫn farm được          → Farm ít hơn         │
+#   │                   │ → Rủi ro cao hơn         → Bảo vệ tốt hơn      │
+#   └─────────────────────────────────────────────────────────────────────┘
+#
+# CÁC CHẾ ĐỘ GỢI Ý:
+#   - CONSERVATIVE: max_inventory_pct=0.30, threshold_moderate=0.50
+#   - BALANCED:     max_inventory_pct=0.50, threshold_moderate=0.70 (default)
+#   - AGGRESSIVE:   max_inventory_pct=0.70, threshold_moderate=0.80
+# =============================================================================
 
 inventory_skew:
-  enabled: true
-  
-  # Giới hạn inventory - tăng lên cho volume farming
-  max_inventory_pct: 0.50    # Tối đa 50% equity cho một vị thế (tăng từ 30%)
-  
-  # Skew thresholds và actions - điều chỉnh cho volume farming
+  enabled: true  # true/false: Bật/tắt inventory skew control
+
+  # ---------------------------------------------------------------------------
+  # MAX INVENTORY PCT
+  # Giới hạn % tổng equity cho phép nắm giữ một vị thế (long hoặc short)
+  # ---------------------------------------------------------------------------
+  # max_inventory_pct: Tối đa % equity cho một hướng
+  #   - 0.30 (30%): Conservative, chỉ cho phép lệch nhẹ
+  #   - 0.50 (50%): Cân bằng (default), cho phép lệch vừa phải
+  #   - 0.70 (70%): Aggressive, chấp nhận lệch nhiều để farm nhiều hơn
+  max_inventory_pct: 0.50
+
+  # ---------------------------------------------------------------------------
+  # THRESHOLDS VÀ ACTIONS
+  # Các ngưỡng skew ratio và hành động tương ứng
+  # ---------------------------------------------------------------------------
   thresholds:
+    # LOW: Skew ratio < threshold - Hoạt động bình thường
+    #   - threshold: Ngưỡng bắt đầu coi là low skew
+    #     + 0.30-0.40: Nhạy cảm cao (conservative)
+    #     + 0.40-0.50: Cân bằng (default = 0.40)
     low:
-      threshold: 0.4          # Skew ratio < 40% (tăng từ 30%)
-      size_reduction: 0.0     # Không giảm size
-      pause_side: false       # Không pause
+      threshold: 0.4
+      size_reduction: 0.0   # Không giảm size
+      pause_side: false     # Không pause
       action: "NORMAL"
-      
+
+    # MODERATE: Skew ratio trong khoảng - Giảm size side bị skew
+    #   - threshold: Ngưỡng bắt đầu moderate (NÊN > low threshold)
+    #     + 0.50-0.60: Conservative
+    #     + 0.60-0.70: Cân bằng (default = 0.70)
+    #   - size_reduction: % giảm size cho side bị skew
+    #     + 0.20: Giảm 20% (conservative)
+    #     + 0.30-0.40: Cân bằng
     moderate:
-      threshold: 0.7          # Skew ratio 40-70% (tăng từ 30-60%)
-      size_reduction: 0.2   # Giảm 20% size cho side bị skew (giảm từ 30%)
+      threshold: 0.7
+      size_reduction: 0.2   # Giảm 20% size
       pause_side: false
       action: "REDUCE_SKEW_SIDE"
-      
+
+    # HIGH: Skew ratio cao - Giảm nhiều hơn, có thể pause
+    #   - threshold: Ngưỡng bắt đầu high skew
+    #     + 0.70-0.80: Conservative
+    #     + 0.80-0.90: Cân bằng (default = 0.90)
+    #   - size_reduction: % giảm size (0.3 = giảm 30%)
+    #   - pause_side: Có pause hoàn toàn không
+    #     + true: Dừng hẳn side bị skew (an toàn)
+    #     + false: Chỉ giảm size (cho phép farm tiếp)
+    #   - take_profit_reduction: Giảm khoảng cách take-profit
+    #     + Giúp thoát lệnh nhanh hơn khi đang skew
     high:
-      threshold: 0.9          # Skew ratio 70-90% (tăng từ 60-80%)
-      size_reduction: 0.3     # Giảm 30% size (giảm từ 50%)
-      pause_side: false        # Không pause, chỉ giảm size (đổi từ true)
+      threshold: 0.9
+      size_reduction: 0.3
+      pause_side: false
       action: "PAUSE_SKEW_SIDE"
-      take_profit_reduction: 0.2  # Giảm 20% take-profit distance (giảm từ 30%)
-      
+      take_profit_reduction: 0.2  # Giảm 20% take-profit distance
+
+    # CRITICAL: Skew ratio rất cao - Emergency measures
+    #   - threshold: Ngưỡng critical
+    #     + 0.90-1.00: Conservative (hành động sớm)
+    #     + 1.00-1.20: Cân bằng (default = 1.20)
+    #   - emergency_close: Có đóng emergency không
+    #     + true: Đóng ngay một phần position
+    #     + false: Chỉ pause, không đóng (default)
     critical:
-      threshold: 1.2          # Skew ratio > 90% (tăng từ 80%)
-      size_reduction: 0.5     # Giảm 50% (giảm từ 100%)
-      pause_side: true
-      emergency_close: false     # Không emergency close ngay (đổi từ true)
+      threshold: 1.2
+      size_reduction: 0.5     # Giảm 50%
+      pause_side: true        # Pause hẳn
+      emergency_close: false  # Không emergency close ngay
       action: "EMERGENCY_SKEW"
-      take_profit_reduction: 0.3  # Giảm 30% take-profit distance (giảm từ 50%)
-  
-  # Take-profit adjustment theo skew ratio
+      take_profit_reduction: 0.3  # Giảm 30% take-profit
+
+  # ---------------------------------------------------------------------------
+  # TAKE-PROFIT ADJUSTMENTS
+  # Điều chỉnh take-profit theo mức độ skew
+  # ---------------------------------------------------------------------------
+  # Khi skew cao, giảm take-profit distance để thoát lệnh nhanh hơn
+  # và giảm rủi ro tích lũy thêm vị thế
   take_profit_adjustments:
-    skew_0.5_0.7: 0.15       # Giảm 15% khi skew 50-70%
-    skew_0.7_0.9: 0.30       # Giảm 30% khi skew 70-90%
-    skew_above_0.9: 0.50     # Giảm 50% khi skew > 90%
-  
-  # Rebalancing priority
+    # skew_0.5_0.7: Khi skew 50-70%, giảm bao nhiêu % take-profit
+    #   - 0.10: Giảm 10% (conservative)
+    #   - 0.15: Giảm 15% (default)
+    skew_0.5_0.7: 0.15
+
+    # skew_0.7_0.9: Khi skew 70-90%
+    #   - 0.20: Giảm 20% (conservative)
+    #   - 0.30: Giảm 30% (default)
+    skew_0.7_0.9: 0.30
+
+    # skew_above_0.9: Khi skew > 90%
+    #   - 0.30: Giảm 30% (conservative)
+    #   - 0.50: Giảm 50% (default)
+    skew_above_0.9: 0.50
+
+  # ---------------------------------------------------------------------------
+  # REBALANCING
+  # Cấu hình tái cân bằng portfolio
+  # ---------------------------------------------------------------------------
   rebalancing:
-    close_furthest_first: true    # Đóng vị thế xa nhất trước
-    breakeven_exit_enabled: true  # Cho phép exit ở breakeven
-    max_positions_to_close: 3     # Tối đa đóng 3 vị thế mỗi lần
-  
-  # Monitoring
-  log_interval: 5m            # Log inventory status mỗi 5 phút
-  alert_on_skew_change: true  # Alert khi skew level thay đổi
+    # close_furthest_first: Ưu tiên đóng vị thế xa nhất
+    #   - true: Đóng vị thế có entry price xa nhất (giảm skew nhanh nhất)
+    #   - false: Đóng FIFO hoặc theo PnL
+    close_furthest_first: true
+
+    # breakeven_exit_enabled: Cho phép exit ở breakeven khi skew cao
+    #   - true: Chấp nhận hòa vốn để giảm skew
+    #   - false: Chỉ đóng khi có lời
+    breakeven_exit_enabled: true
+
+    # max_positions_to_close: Số vị thế tối đa đóng mỗi lần
+    #   - 1-3: Đóng từ từ (default = 3)
+    #   - 5+: Đóng nhiều cùng lúc
+    max_positions_to_close: 3
+
+  # ---------------------------------------------------------------------------
+  # MONITORING
+  # ---------------------------------------------------------------------------
+  # log_interval: Tần suất log inventory status
+  #   - 1m/5m: Log thường xuyên
+  #   - 5m: Cân bằng (default)
+  #   - 15m/30m: Log ít hơn
+  log_interval: 5m
+
+  # alert_on_skew_change: Alert khi skew level thay đổi
+  #   - true: Thông báo mỗi khi chuyển level (low→moderate, v.v.)
+  #   - false: Chỉ log, không alert
+  alert_on_skew_change: true

@@ -122,7 +122,13 @@ func (p *PointsTracker) Stop(ctx context.Context) error {
 
 	p.logger.Info("🛑 Stopping Points Tracker")
 
-	close(p.stopCh)
+	// Safely close stopCh
+	select {
+	case <-p.stopCh:
+		// already closed
+	default:
+		close(p.stopCh)
+	}
 
 	// Wait for goroutines to finish
 	done := make(chan struct{})
