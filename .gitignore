@@ -7,3 +7,11 @@ node_modules
 .gitnexus
 *.pid
 bin/
+
+# Activity log data
+data/activity/
+*.db
+*.db-shm
+*.db-wal
+
+docs/

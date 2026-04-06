@@ -1,202 +1,133 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import StatsCard from '../components/StatsCard.vue'
-import PositionsTable from '../components/PositionsTable.vue'
+import { computed } from 'vue'
+import { useStatus } from '../api/status'
+import { usePositions } from '../api/positions'
 import { 
-  BarChart3, 
-  AlertCircle,
-  Clock,
-  RefreshCw
+  Activity,
+  TrendingUp,
+  TrendingDown,
+  Wallet,
+  List
 } from 'lucide-vue-next'
 
-const totalPnl = ref({ value: '+$1,250.20', change: '+2.4%', isPositive: true })
-const openPositionsCount = ref({ value: '4', change: '$12,400 Notional', isPositive: true })
-const dailyDrawdown = ref({ value: '0.45%', change: 'Safe', isPositive: true })
+const { status } = useStatus()
+const { positions, loading: positionsLoading } = usePositions()
 
-interface Position {
-  symbol: string
-  side: 'LONG' | 'SHORT'
-  leverage: number
-  entryPrice: number
-  markPrice: number
-  unrealizedPnl: number
-  unrealizedPnlPct: number
+const isRunning = computed(() => status.value?.running ?? false)
+const isPaused = computed(() => status.value?.paused ?? false)
+const dailyPnl = computed(() => status.value?.daily_pnl ?? 0)
+
+const totalUnrealizedPnl = computed(() => {
+  return positions.value.reduce((sum, pos) => sum + (pos.unrealized_pnl || 0), 0)
+})
+
+const formatPnl = (pnl: number) => {
+  const sign = pnl >= 0 ? '+' : ''
+  return `${sign}$${pnl.toFixed(2)}`
 }
 
-const mockPositions = ref<Position[]>([
-  {
-    symbol: 'BTC/USDT',
-    side: 'LONG',
-
-    leverage: 10,
-    entryPrice: 64210.50,
-    markPrice: 65120.40,
-    unrealizedPnl: 450.20,
-    unrealizedPnlPct: 1.42
-  },
-  {
-    symbol: 'ETH/USDT',
-    side: 'SHORT',
-    leverage: 5,
-    entryPrice: 3450.20,
-    markPrice: 3420.10,
-    unrealizedPnl: 120.40,
-    unrealizedPnlPct: 0.85
-  },
-  {
-    symbol: 'SOL/USDT',
-    side: 'LONG',
-    leverage: 3,
-    entryPrice: 145.20,
-    markPrice: 142.10,
-    unrealizedPnl: -25.40,
-    unrealizedPnlPct: -2.10
-  }
-])
-
-const lastUpdate = ref(new Date().toLocaleTimeString())
-const isRefreshing = ref(false)
-
-const refreshData = () => {
-  isRefreshing.value = true
-  setTimeout(() => {
-    isRefreshing.value = false
-    lastUpdate.value = new Date().toLocaleTimeString()
-  }, 800)
+const formatPrice = (price: number) => {
+  return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })
 }
 </script>
 
-
 <template>
-  <div class="p-8 space-y-8 max-w-[1600px] mx-auto">
-    <!-- Page Header -->
-    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-      <div>
-        <h1 class="text-3xl font-bold text-white flex items-center tracking-tight">
-          Performance Dashboard
-          <span class="ml-4 text-[10px] bg-gray-800 text-gray-400 px-2 py-1 rounded font-mono uppercase tracking-tighter">Live</span>
-        </h1>
-        <div class="flex items-center mt-2 text-sm text-gray-500 space-x-4">
-          <div class="flex items-center">
-            <Clock class="w-4 h-4 mr-1.5" />
-            Last Updated: {{ lastUpdate }}
-          </div>
-          <button @click="refreshData" class="flex items-center hover:text-[#40baf7] transition-colors group">
-            <RefreshCw :class="['w-4 h-4 mr-1.5', isRefreshing ? 'animate-spin' : 'group-hover:rotate-180 transition-transform duration-500']" />
-            Refresh
-          </button>
+  <div class="dashboard">
+    <header class="dashboard-header">
+      <h1>Bot Dashboard</h1>
+      <div class="status-badge" :class="{ running: isRunning, paused: isPaused }">
+        <Activity class="status-icon" />
+        <span>{{ isRunning ? (isPaused ? 'Paused' : 'Running') : 'Stopped' }}</span>
+      </div>
+    </header>
+
+    <div class="stats-grid">
+      <div class="stat-card" :class="{ positive: dailyPnl >= 0, negative: dailyPnl < 0 }">
+        <div class="stat-icon">
+          <TrendingUp v-if="dailyPnl >= 0" />
+          <TrendingDown v-else />
+        </div>
+        <div class="stat-content">
+          <span class="stat-label">Daily P&L</span>
+          <span class="stat-value">{{ formatPnl(dailyPnl) }}</span>
         </div>
       </div>
-      
-      <div class="flex items-center space-x-3">
-        <button class="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm font-semibold rounded-lg transition-colors border border-gray-700">
-          History
-        </button>
-        <button class="px-4 py-2 bg-[#40baf7] hover:bg-[#40baf7]/80 text-gray-900 font-bold rounded-lg transition-all shadow-lg shadow-[#40baf7]/20">
-          New Strategy
-        </button>
+
+      <div class="stat-card">
+        <div class="stat-icon"><Wallet /></div>
+        <div class="stat-content">
+          <span class="stat-label">Unrealized P&L</span>
+          <span class="stat-value" :class="{ positive: totalUnrealizedPnl >= 0, negative: totalUnrealizedPnl < 0 }">
+            {{ formatPnl(totalUnrealizedPnl) }}
+          </span>
+        </div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-icon"><List /></div>
+        <div class="stat-content">
+          <span class="stat-label">Open Positions</span>
+          <span class="stat-value">{{ positions.length }}</span>
+        </div>
       </div>
     </div>
 
-    <!-- Stats Grid -->
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-      <StatsCard 
-        title="Total Net P&L" 
-        :value="totalPnl.value" 
-        :change="totalPnl.change" 
-        :is-positive="totalPnl.isPositive"
-      >
-        <template #icon>
-          <TrendingUp v-if="totalPnl.isPositive" class="w-4 h-4 text-[#0ecb81]" />
-          <TrendingUp v-else class="w-4 h-4 text-[#f84960] rotate-180" />
-        </template>
-      </StatsCard>
-
-      <StatsCard 
-        title="Open Positions" 
-        :value="openPositionsCount.value" 
-        :change="openPositionsCount.change" 
-        :is-positive="openPositionsCount.isPositive"
-      >
-        <template #icon>
-          <BarChart3 class="w-4 h-4 text-[#40baf7]" />
-        </template>
-      </StatsCard>
-
-      <StatsCard 
-        title="Daily Drawdown" 
-        :value="dailyDrawdown.value" 
-        :change="dailyDrawdown.change" 
-        :is-positive="dailyDrawdown.isPositive"
-      >
-        <template #icon>
-          <AlertCircle class="w-4 h-4 text-[#40baf7]" />
-        </template>
-      </StatsCard>
-    </div>
-
-    <!-- Charts & Main Table Grid -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-      <!-- PnL Chart (Placeholder for now) -->
-      <div class="lg:col-span-2 space-y-8">
-        <div class="bg-[#151a1e] border border-[#2b3139] rounded-xl p-6 backdrop-blur-sm">
-          <div class="flex justify-between items-center mb-6">
-            <h3 class="text-sm font-bold text-white tracking-wider flex items-center uppercase">
-              <span class="w-1.5 h-4 bg-[#40baf7] rounded-full mr-3"></span>
-              Equity Curve (30D)
-            </h3>
-            <div class="flex items-center space-x-2">
-              <span class="w-3 h-3 rounded-full bg-[#40baf7]/20 border border-[#40baf7]"></span>
-              <span class="text-xs text-gray-400">Net Value</span>
-            </div>
-          </div>
-          
-          <div class="h-64 flex items-center justify-center border-2 border-dashed border-gray-800 rounded-lg group hover:border-[#40baf7]/20 transition-colors">
-            <div class="text-center">
-              <BarChart3 class="w-12 h-12 text-gray-700 mx-auto mb-3 group-hover:text-[#40baf7]/30 transition-colors" />
-              <p class="text-gray-600 text-sm italic font-mono uppercase tracking-tighter">Charting engine initializing...</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Positions Table -->
-        <PositionsTable :positions="mockPositions" />
-      </div>
-
-      <!-- Right Side Panel: Recent Fills -->
-      <div class="space-y-8">
-        <div class="bg-[#151a1e] border border-[#2b3139] rounded-xl flex flex-col h-full backdrop-blur-sm">
-          <div class="px-6 py-4 border-b border-[#2b3139] flex justify-between items-center">
-            <h3 class="text-sm font-bold text-white tracking-wider flex items-center uppercase">
-              <span class="w-1.5 h-4 bg-purple-500 rounded-full mr-3"></span>
-              Recent Activity
-            </h3>
-            <button class="text-[10px] text-[#40baf7] uppercase tracking-widest hover:underline">View All</button>
-          </div>
-          
-          <div class="flex-1 p-6 space-y-6">
-            <div v-for="i in 5" :key="i" class="flex items-start space-x-4 group cursor-default">
-              <div class="mt-1 w-2 h-2 rounded-full bg-[#0ecb81] shadow-[0_0_8px_rgba(14,203,129,0.5)]"></div>
-              <div class="flex-1">
-                <div class="flex justify-between">
-                  <span class="text-xs font-bold text-white tracking-widest group-hover:text-[#40baf7] transition-colors uppercase">BTCUSDT Buy Fill</span>
-                  <span class="text-[10px] text-gray-600 font-mono">14:22:45</span>
-                </div>
-                <p class="text-[10px] text-gray-500 mt-1 leading-relaxed">
-                  EMA Crossover signal triggered long entry at <span class="text-white">$64,210.50</span>. Size 0.45 BTC.
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div class="p-4 bg-gray-900/30 border-t border-[#2b3139]">
-            <div class="flex items-center justify-between text-[10px] text-gray-500 font-mono uppercase">
-              <span>Engine Status</span>
-              <span class="text-[#0ecb81]">All systems nominal</span>
-            </div>
-          </div>
-        </div>
-      </div>
+    <div class="positions-section">
+      <h2>Open Positions</h2>
+      <div v-if="positionsLoading" class="loading">Loading...</div>
+      <div v-else-if="positions.length === 0" class="empty">No positions</div>
+      <table v-else class="positions-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Size</th>
+            <th>Entry</th>
+            <th>P&L</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="pos in positions" :key="pos.symbol + pos.side">
+            <td class="symbol">{{ pos.symbol }}</td>
+            <td class="side" :class="pos.side.toLowerCase()">{{ pos.side }}</td>
+            <td>{{ pos.size.toFixed(4) }}</td>
+            <td>${{ formatPrice(pos.entry_price) }}</td>
+            <td class="pnl" :class="{ positive: (pos.unrealized_pnl || 0) >= 0, negative: (pos.unrealized_pnl || 0) < 0 }">
+              {{ formatPnl(pos.unrealized_pnl || 0) }}
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </template>
+
+<style scoped>
+.dashboard { padding: 24px; max-width: 1200px; margin: 0 auto; }
+.dashboard-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+.dashboard-header h1 { font-size: 24px; font-weight: 600; color: #1a1a1a; margin: 0; }
+.status-badge { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 8px; background: #f3f4f6; color: #6b7280; font-size: 14px; font-weight: 500; }
+.status-badge.running { background: #dcfce7; color: #16a34a; }
+.status-badge.paused { background: #fef3c7; color: #d97706; }
+.stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 32px; }
+.stat-card { display: flex; align-items: center; gap: 16px; padding: 20px; background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid #6b7280; }
+.stat-card.positive { border-left-color: #22c55e; }
+.stat-card.negative { border-left-color: #ef4444; }
+.stat-icon { width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; background: #f3f4f6; border-radius: 10px; color: #6b7280; }
+.stat-label { font-size: 13px; color: #6b7280; margin-bottom: 4px; }
+.stat-value { font-size: 24px; font-weight: 700; color: #1a1a1a; }
+.stat-value.positive { color: #22c55e; }
+.stat-value.negative { color: #ef4444; }
+.positions-section { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.positions-section h2 { font-size: 18px; font-weight: 600; margin: 0 0 20px 0; }
+.loading, .empty { text-align: center; padding: 40px; color: #6b7280; }
+.positions-table { width: 100%; border-collapse: collapse; }
+.positions-table th { text-align: left; padding: 12px; font-size: 12px; font-weight: 600; color: #6b7280; text-transform: uppercase; border-bottom: 2px solid #e5e7eb; }
+.positions-table td { padding: 16px 12px; border-bottom: 1px solid #f3f4f6; font-size: 14px; color: #4b5563; }
+.symbol { font-weight: 600; color: #1a1a1a; }
+.side.long { color: #22c55e; }
+.side.short { color: #ef4444; }
+.pnl.positive { color: #22c55e; font-weight: 500; }
+.pnl.negative { color: #ef4444; font-weight: 500; }
+@media (max-width: 768px) { .stats-grid { grid-template-columns: 1fr; } }
+</style>

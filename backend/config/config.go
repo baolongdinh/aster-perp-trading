@@ -285,14 +285,19 @@ type TradingHoursConfig struct {
 	Slots    []TimeSlot `yaml:"slots"`
 }
 
+type TimeWindow struct {
+	Start    string `yaml:"start"`
+	End      string `yaml:"end"`
+	Timezone string `yaml:"timezone"`
+}
+
 type TimeSlot struct {
-	Start            string  `yaml:"start"`
-	End              string  `yaml:"end"`
-	Enabled          bool    `yaml:"enabled"`
-	SizeMultiplier   float64 `yaml:"size_multiplier"`
-	MaxExposurePct   float64 `yaml:"max_exposure_pct"`
-	SpreadMultiplier float64 `yaml:"spread_multiplier"`
-	Description      string  `yaml:"description"`
+	Window           TimeWindow `yaml:"window"`
+	Enabled          bool       `yaml:"enabled"`
+	SizeMultiplier   float64    `yaml:"size_multiplier"`
+	MaxExposurePct   float64    `yaml:"max_exposure_pct"`
+	SpreadMultiplier float64    `yaml:"spread_multiplier"`
+	Description      string     `yaml:"description"`
 }
 
 // LoadOptimizationConfig loads all optimization configs from directory

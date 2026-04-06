@@ -22,6 +22,9 @@
 #   → Buffer an toàn: 10 lệnh = $1.5 margin
 # =============================================================================
 
+bot:
+  dry_run: false
+
 # ---------------------------------------------------------------------------
 # VOLUME FARMING SETTINGS - Cấu hình cho $10 vốn
 # ---------------------------------------------------------------------------
@@ -36,26 +39,26 @@ max_daily_loss_usdt: 3
 max_total_drawdown_pct: 50.0
 
 # order_size_usdt: Kích thước mỗi lệnh
-# $10 = 100% vốn, với 100x leverage chỉ cần $0.10 margin
-# Cho ETHUSD1 hoặc altcoin hỗ trợ 100x
-order_size_usdt: 10
+# $30 notional với 100x leverage chỉ cần $0.30 margin
+# Tăng size để farm nhiều volume hơn
+order_size_usdt: 30
 
 # grid_spread_pct: Spread giữa các lệnh
-# 0.3% = lãi ~0.2% sau phí (0.05% maker × 2)
-# Spread chặt để fill nhanh, không chờ đợi lâu → tránh liq
-grid_spread_pct: 0.003
+# 0.2% = chặt hơn, fill nhanh hơn, nhiều volume hơn
+# Lãi ~0.1% sau phí (0.05% maker × 2)
+grid_spread_pct: 0.002
 
 # max_orders_per_side: Số lệnh tối đa mỗi bên
-# GIẢM XUỐNG: Chỉ 1 lệnh mỗi bên = 2 lệnh total
-# Tránh over-commit margin, chỉ có 1 BUY + 1 SELL cùng lúc
-max_orders_per_side: 1
+# TĂNG LÊN: 10 lệnh mỗi bên = 20 lệnh total
+# Nhiều lệnh = nhiều cơ hội fill = nhiều volume hơn
+max_orders_per_side: 10
 
 # max_global_pending_limit_orders: Tổng số lệnh pending
-# 2 lệnh = $6 notional, với 20x leverage = $0.3 margin
-max_global_pending_limit_orders: 2
+# 20 lệnh = $600 notional, với 100x leverage = $6 margin (60% vốn)
+max_global_pending_limit_orders: 20
 
 # max_pending_per_side: Số lệnh pending mỗi bên
-max_pending_per_side: 1
+max_pending_per_side: 10
 
 # replace_immediately: Đặt lại lệnh ngay sau khi fill
 # true = luôn có lệnh trên sách, tăng tần suất giao dịch
@@ -132,13 +135,13 @@ exchange:
 # ---------------------------------------------------------------------------
 risk:
   # max_position_usdt_per_symbol: Giới hạn position/symbol
-  # $20 = 200% vốn, với 100x leverage = $0.20 margin
-  # An toàn vì SL 0.3% = đóng lệnh trước khi liq
-  max_position_usdt_per_symbol: 20
+  # $300 = 30x vốn, với 100x leverage = $3 margin
+  # Cho phép nhiều lệnh chồng lên nhau để farm volume
+  max_position_usdt_per_symbol: 300
 
   # max_total_positions_usdt: Tổng position tối đa
-  # $20 = tối đa 2 lệnh $10 chồng nhau
-  max_total_positions_usdt: 20
+  # $300 notional với 100x leverage = $3 margin
+  max_total_positions_usdt: 300
 
   # fee_loss_threshold_pct: Ngưỡng lỗ do phí (%)
   fee_loss_threshold_pct: 0.1
@@ -148,27 +151,26 @@ risk:
   daily_drawdown_pct: 50.0     # Dừng nếu drawdown 50%
 
   # max_open_positions: Số vị thế mở tối đa
-  max_open_positions: 1  # CHỈ 1 POSITION
+  max_open_positions: 5  # Cho phép nhiều position để farm volume
 
   # max_trades_per_symbol: Tối đa 500 giao dịch/ngày
   max_trades_per_symbol: 500
 
   # max_global_pending_limit_orders: Tổng số lệnh pending tối đa
-  max_global_pending_limit_orders: 2
+  max_global_pending_limit_orders: 20
 
   # max_pending_per_side: Số lệnh pending tối đa mỗi bên
-  max_pending_per_side: 1
+  max_pending_per_side: 10
 
-  # per_trade_stop_loss_pct: 0.3% (cho 100x leverage)
-  # $10 order × 0.3% = $0.03 loss max
-  # 100x liquidation tại ~1%, 0.3% SL = an toàn với buffer 0.7%
-  per_trade_stop_loss_pct: 0.3
+  # per_trade_stop_loss_pct: 0.5% (cho 50x-100x leverage)
+  # Với leverage cao, SL rộng hơn một chút để tránh bị quét
+  per_trade_stop_loss_pct: 0.5
 
-  # per_trade_take_profit_pct: 0.2% (chặt cho 100x)
-  # $10 order × 0.2% = $0.02 profit, sau phí ~$0.015
-  per_trade_take_profit_pct: 0.2
+  # per_trade_take_profit_pct: 0.3% (chặt cho high volume)
+  # Chốt lời nhanh = nhiều giao dịch hơn = nhiều volume hơn
+  per_trade_take_profit_pct: 0.3
 
-  risk_per_trade_usdt: 0.5     # Rủi ro mỗi giao dịch (USDT)
+  risk_per_trade_usdt: 1.5     # Rủi ro mỗi giao dịch tăng theo size
   atr_multiplier: 0.5             # Không dùng ATR cho vốn nhỏ
   position_mode: "one_way"        # Chế độ vị thế
   correlation_threshold: 1.0      # Không cần vì chỉ 1 symbol

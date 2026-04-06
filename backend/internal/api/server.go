@@ -7,28 +7,32 @@ import (
 	"net/http"
 	"time"
 
+	"aster-bot/internal/activitylog"
 	"aster-bot/internal/engine"
 	"aster-bot/internal/risk"
+
 	"go.uber.org/zap"
 )
 
 // Server is the HTTP API server.
 type Server struct {
-	engine *engine.Engine
-	risk   *risk.Manager
-	hub    *WsHub
-	log    *zap.Logger
-	mux    *http.ServeMux
+	engine      *engine.Engine
+	risk        *risk.Manager
+	activityLog *activitylog.ActivityLogger
+	hub         *WsHub
+	log         *zap.Logger
+	mux         *http.ServeMux
 }
 
 // NewServer creates a new API server.
-func NewServer(e *engine.Engine, r *risk.Manager, log *zap.Logger) *Server {
+func NewServer(e *engine.Engine, r *risk.Manager, al *activitylog.ActivityLogger, log *zap.Logger) *Server {
 	s := &Server{
-		engine: e,
-		risk:   r,
-		hub:    NewWsHub(log),
-		log:    log,
-		mux:    http.NewServeMux(),
+		engine:      e,
+		risk:        r,
+		activityLog: al,
+		hub:         NewWsHub(log),
+		log:         log,
+		mux:         http.NewServeMux(),
 	}
 	s.registerRoutes()
 	return s
@@ -50,16 +54,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/strategies/{name}/enable", s.handleEnableStrategy)
 	s.mux.HandleFunc("POST /api/v1/strategies/{name}/disable", s.handleDisableStrategy)
 	s.mux.HandleFunc("GET /api/v1/metrics", s.handleMetrics)
+	s.registerActivityRoutes()
 	s.mux.HandleFunc("GET /ws", s.hub.ServeWS)
 }
 
 // handleStatus returns bot/engine status.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{
-		"running":    s.engine.IsRunning(),
-		"paused":     s.risk.IsPaused(),
-		"daily_pnl":  s.risk.DailyPnL(),
-		"open_pos":   s.risk.OpenPositions(),
+		"running":     s.engine.IsRunning(),
+		"paused":      s.risk.IsPaused(),
+		"daily_pnl":   s.risk.DailyPnL(),
+		"open_pos":    s.risk.OpenPositions(),
 		"server_time": time.Now().UnixMilli(),
 	})
 }
@@ -124,9 +129,9 @@ func (s *Server) handleDisableStrategy(w http.ResponseWriter, r *http.Request) {
 // handleMetrics returns P&L metrics.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{
-		"daily_pnl":     s.risk.DailyPnL(),
+		"daily_pnl":      s.risk.DailyPnL(),
 		"open_positions": s.risk.OpenPositions(),
-		"is_paused":     s.risk.IsPaused(),
+		"is_paused":      s.risk.IsPaused(),
 	})
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"aster-bot/internal/activitylog"
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/farming/adaptive_grid"
@@ -36,6 +37,7 @@ type RiskChecker interface {
 type GridManager struct {
 	futuresClient *client.FuturesClient
 	logger        *logrus.Entry
+	activityLog   *activitylog.ActivityLogger // Activity logging
 	activeGrids   map[string]*SymbolGrid
 	gridsMu       sync.RWMutex
 	isRunning     bool
@@ -101,6 +103,11 @@ type GridManager struct {
 
 	// NEW: Reference to AdaptiveGridManager for optimization features
 	adaptiveMgr *adaptive_grid.AdaptiveGridManager
+}
+
+// SetActivityLogger sets the activity logger for the grid manager.
+func (g *GridManager) SetActivityLogger(al *activitylog.ActivityLogger) {
+	g.activityLog = al
 }
 
 // SymbolGrid represents a grid for a specific symbol.
@@ -381,6 +388,45 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 		return false
 	}
 
+	// For price-based triggering, use tiny threshold for sensitive triggers
+	// This check comes FIRST to allow rebalancing when price moves significantly
+	priceChangeThreshold := 0.0001 // 0.01% change (ultra sensitive)
+	if oldPrice > 0 {
+		priceChangePct := math.Abs(grid.CurrentPrice-oldPrice) / oldPrice
+		if priceChangePct >= priceChangeThreshold {
+			// Check if we have stale orders that need updating
+			expected := grid.MaxOrdersSide * 2
+			actual := g.countActiveGridOrders(grid.Symbol)
+
+			if grid.OrdersPlaced && actual >= expected {
+				// Grid is "complete" but price moved - check if we should rebalance
+				if time.Since(grid.LastAttempt) > 5*time.Second {
+					// Enough time passed, allow rebalancing to update order prices
+					g.logger.WithFields(logrus.Fields{
+						"symbol":       grid.Symbol,
+						"price_change": priceChangePct,
+						"old_price":    oldPrice,
+						"new_price":    grid.CurrentPrice,
+					}).Info("Scheduling rebalancing due to price change (grid complete but stale)")
+					return true
+				}
+				g.logger.WithFields(logrus.Fields{
+					"symbol":       grid.Symbol,
+					"price_change": priceChangePct,
+					"since_last":   time.Since(grid.LastAttempt),
+				}).Debug("Grid complete, skipping rebalancing (cooldown)")
+				return false
+			}
+
+			g.logger.WithFields(logrus.Fields{
+				"symbol":       grid.Symbol,
+				"price_change": priceChangePct,
+				"threshold":    priceChangeThreshold,
+			}).Info("Scheduling placement due to price change")
+			return true
+		}
+	}
+
 	// For volume farming, we want to place orders more frequently
 	// Allow placement even if grid was partially placed before
 	if grid.OrdersPlaced {
@@ -426,25 +472,11 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 		return true
 	}
 
-	// For price-based triggering, use tiny threshold for sensitive triggers
-	priceChangeThreshold := 0.0001 // 0.01% change (ultra sensitive)
-	if oldPrice > 0 {
-		priceChangePct := math.Abs(grid.CurrentPrice-oldPrice) / oldPrice
-		if priceChangePct >= priceChangeThreshold {
-			g.logger.WithFields(logrus.Fields{
-				"symbol":       grid.Symbol,
-				"price_change": priceChangePct,
-				"threshold":    priceChangeThreshold,
-			}).Info("Scheduling placement due to price change")
-			return true
-		}
-	}
-
 	g.logger.WithFields(logrus.Fields{
 		"symbol":     grid.Symbol,
 		"since_last": time.Since(grid.LastAttempt),
 		"cooldown":   dynamicCooldown,
-	}).Debug("Not scheduling: cooldown active") // Changed to Debug to reduce noise
+	}).Debug("Not scheduling: cooldown active")
 	return false
 }
 
@@ -485,6 +517,17 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 
 	for _, symbol := range created {
 		g.logger.WithField("symbol", symbol).Info("Created new grid")
+		// Log grid creation
+		if g.activityLog != nil {
+			g.activityLog.Log(context.Background(), activitylog.EventGridCreated, activitylog.SeverityInfo,
+				activitylog.EntryContext{Symbol: symbol, StrategyName: "grid"},
+				activitylog.GridCreatedPayload{
+					GridID: fmt.Sprintf("grid_%s_%d", symbol, time.Now().Unix()),
+					Symbol: symbol,
+					Levels: g.maxOrdersSide * 2,
+				},
+			)
+		}
 		// Only enqueue if we already have a price, otherwise wait for WebSocket
 		g.gridsMu.RLock()
 		grid, exists := g.activeGrids[symbol]
@@ -908,6 +951,23 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	g.activeOrders[order.OrderID] = order
 	g.ordersMu.Unlock()
 
+	// Log order placement
+	if g.activityLog != nil {
+		g.activityLog.Log(context.Background(), activitylog.EventOrderPlaced, activitylog.SeverityInfo,
+			activitylog.EntryContext{Symbol: order.Symbol, StrategyName: "grid"},
+			activitylog.OrderPlacedPayload{
+				OrderID:       order.OrderID,
+				ClientOrderID: "",
+				Side:          order.Side,
+				Type:          order.OrderType,
+				Price:         order.Price,
+				Quantity:      order.Size,
+				TimeInForce:   "GTC",
+				Reason:        fmt.Sprintf("grid_level_%d", order.GridLevel),
+			},
+		)
+	}
+
 	// Update volume metrics
 	g.volumeMetricsMu.Lock()
 	g.totalOrdersPlaced++
@@ -969,6 +1029,25 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 	g.volumeMetricsMu.Lock()
 	g.totalOrdersFilled++
 	g.volumeMetricsMu.Unlock()
+
+	// Log order fill
+	if g.activityLog != nil {
+		g.activityLog.Log(context.Background(), activitylog.EventOrderFilled, activitylog.SeverityInfo,
+			activitylog.EntryContext{Symbol: symbol, StrategyName: "grid"},
+			activitylog.OrderFilledPayload{
+				OrderID:         orderID,
+				ClientOrderID:   "",
+				Side:            order.Side,
+				FilledPrice:     order.Price,
+				FilledQuantity:  order.Size,
+				FilledValue:     order.Size * order.Price,
+				Fee:             0,
+				FeeAsset:        "USDT",
+				ExecutionTimeMs: 0,
+				GridLevel:       &order.GridLevel,
+			},
+		)
+	}
 
 	g.logger.WithFields(logrus.Fields{
 		"symbol":  symbol,
@@ -1103,15 +1182,20 @@ func (g *GridManager) resetStaleOrders() {
 			// Check if we have all expected orders
 			expected := grid.MaxOrdersSide * 2
 			actual := 0
+			staleOrders := 0
 			g.ordersMu.RLock()
 			for _, order := range g.activeOrders {
 				if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
 					actual++
+					// Count orders that have been pending for too long (>60s)
+					if time.Since(order.CreatedAt) > 60*time.Second {
+						staleOrders++
+					}
 				}
 			}
 			g.ordersMu.RUnlock()
 
-			// Only reset if grid is incomplete
+			// Reset if grid is incomplete
 			if actual < expected {
 				grid.OrdersPlaced = false
 				g.logger.WithFields(logrus.Fields{
@@ -1119,6 +1203,19 @@ func (g *GridManager) resetStaleOrders() {
 					"expected": expected,
 					"actual":   actual,
 				}).Info("Resetting incomplete grid for re-placement")
+				continue
+			}
+
+			// Also reset if all orders are stale (not getting filled after 60s)
+			// This handles the case where price moved away from order prices
+			if actual > 0 && staleOrders == actual {
+				grid.OrdersPlaced = false
+				g.logger.WithFields(logrus.Fields{
+					"symbol":       symbol,
+					"expected":     expected,
+					"actual":       actual,
+					"stale_orders": staleOrders,
+				}).Info("Resetting stale grid - all orders pending too long without fills")
 			}
 		}
 	}

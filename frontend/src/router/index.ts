@@ -14,14 +14,9 @@ const router = createRouter({
       component: () => import('../views/Strategies.vue')
     },
     {
-      path: '/trades',
-      name: 'trades',
-      component: () => import('../views/Trades.vue')
-    },
-    {
-      path: '/config',
-      name: 'config',
-      component: () => import('../views/Config.vue')
+      path: '/activity',
+      name: 'activity',
+      component: () => import('../views/Activity.vue')
     }
   ]
 })

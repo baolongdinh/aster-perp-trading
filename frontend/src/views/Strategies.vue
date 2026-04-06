@@ -1,107 +1,182 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import StrategyCard from '../components/StrategyCard.vue'
-import { Plus, PauseCircle, Settings2, Zap, AlertCircle } from 'lucide-vue-next'
+import { useStrategies } from '../api/strategies'
+import { Zap, Power } from 'lucide-vue-next'
 
-const strategies = ref([
+const { strategies, loading, enableStrategy, disableStrategy } = useStrategies()
 
-  {
-    name: 'EMA Crossover',
-    enabled: true,
-    winRate: '68.4%',
-    profitFactor: '1.42',
-    lastSignal: 'LONG BTC @ $64,210',
-    symbols: ['BTCUSDT', 'ETHUSDT']
-  },
-  {
-    name: 'Funding Rate Arb',
-    enabled: false,
-    winRate: '82.1%',
-    profitFactor: '1.25',
-    lastSignal: 'N/A',
-    symbols: ['BTCUSDT', 'SOLUSDT', 'BNBUSDT']
-  },
-  {
-    name: 'Grid Trading',
-    enabled: true,
-    winRate: '54.2%',
-    profitFactor: '1.18',
-    lastSignal: 'BUY @ $62,100',
-    symbols: ['BTCUSDT']
+const toggleStrategy = async (strategy: { name: string; enabled: boolean }) => {
+  if (strategy.enabled) {
+    await disableStrategy(strategy.name)
+  } else {
+    await enableStrategy(strategy.name)
   }
-])
-
-const pauseAll = () => {
-  strategies.value.forEach(s => s.enabled = false)
-}
-
-const saveStrategy = (name: string, data: any) => {
-  console.log('Saving strategy:', name, data)
-  // Logic to call API
 }
 </script>
 
 <template>
-  <div class="p-8 space-y-8 max-w-[1600px] mx-auto">
-    <!-- Header -->
-    <div class="flex justify-between items-center">
-      <div>
-        <h1 class="text-3xl font-bold text-white tracking-tight flex items-center">
-          Strategy Management
-        </h1>
-        <p class="text-sm text-gray-500 mt-2 italic font-mono uppercase tracking-tighter">Active Algorithms: 2 / 3</p>
-      </div>
+  <div class="strategies">
+    <header class="strategies-header">
+      <h1>Strategies</h1>
+      <span v-if="loading" class="loading-text">Loading...</span>
+    </header>
 
-      <div class="flex space-x-3">
+    <div v-if="strategies.length === 0 && !loading" class="empty">
+      No strategies configured
+    </div>
+
+    <div class="strategy-list">
+      <div 
+        v-for="strategy in strategies" 
+        :key="strategy.name"
+        class="strategy-card"
+        :class="{ enabled: strategy.enabled }"
+      >
+        <div class="strategy-info">
+          <div class="strategy-icon">
+            <Zap />
+          </div>
+          <div class="strategy-details">
+            <h3>{{ strategy.name }}</h3>
+            <p class="symbols">{{ strategy.symbols?.join(', ') || 'No symbols' }}</p>
+          </div>
+        </div>
+
         <button 
-          @click="pauseAll"
-          class="px-4 py-2 bg-[#f84960]/10 hover:bg-[#f84960]/20 text-[#f84960] font-bold rounded-lg transition-all border border-[#f84960]/20 flex items-center"
+          @click="toggleStrategy(strategy)"
+          class="toggle-btn"
+          :class="{ active: strategy.enabled }"
+          :disabled="loading"
         >
-          <PauseCircle class="w-4 h-4 mr-2" />
-          Pause All
-        </button>
-        <button class="px-4 py-2 bg-[#40baf7] hover:bg-[#40baf7]/80 text-gray-900 font-bold rounded-lg transition-all shadow-lg shadow-[#40baf7]/20 flex items-center">
-          <Plus class="w-4 h-4 mr-2" />
-          New Strategy
+          <Power class="btn-icon" />
+          <span>{{ strategy.enabled ? 'ON' : 'OFF' }}</span>
         </button>
       </div>
-    </div>
-
-    <!-- Stats Bar -->
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
-      <div v-for="i in 4" :key="i" class="bg-[#151a1e] border border-[#2b3139] rounded-xl p-4 flex items-center space-x-4">
-        <div class="w-10 h-10 rounded-lg bg-gray-900 flex items-center justify-center text-gray-500">
-          <AlertCircle v-if="i === 1" class="w-5 h-5" />
-          <Zap v-if="i === 2" class="w-5 h-5 text-[#40baf7]" />
-          <ShieldAlert v-if="i === 3" class="w-5 h-5 text-[#f84960]" />
-          <Settings2 v-if="i === 4" class="w-5 h-5" />
-        </div>
-
-        <div>
-          <div class="text-[10px] text-gray-500 uppercase tracking-widest font-bold">{{ ['Total signals', 'Active Leverge', 'Risk Alerts', 'Engine Load'][i-1] }}</div>
-          <div class="text-sm font-mono font-bold">{{ ['1,242', '8.5x', '0', '4%'][i-1] }}</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Strategy Grid -->
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-      <StrategyCard 
-        v-for="st in strategies" 
-        :key="st.name"
-        v-bind="st"
-        @update:enabled="st.enabled = $event"
-        @save="saveStrategy(st.name, $event)"
-      />
-    </div>
-
-    <!-- System Logs / Help -->
-    <div class="bg-[#151a1e]/50 border border-dashed border-gray-800 rounded-xl p-8 text-center">
-      <ShieldAlert class="w-10 h-10 text-gray-700 mx-auto mb-4" />
-      <h4 class="text-gray-400 font-bold text-sm uppercase tracking-widest mb-2">Security Note</h4>
-      <p class="text-gray-600 text-[10px] leading-relaxed max-w-lg mx-auto italic font-mono uppercase tracking-tighter">
-        Strategy parameters are hot-reloaded into the Go engine. All changes are validated against the global risk management layer before execution. Signature verification (EIP-712) ensures integrity.
-      </p>
     </div>
   </div>
 </template>
+
+<style scoped>
+.strategies {
+  padding: 24px;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.strategies-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.strategies-header h1 {
+  font-size: 24px;
+  font-weight: 600;
+  color: #1a1a1a;
+  margin: 0;
+}
+
+.loading-text {
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.empty {
+  text-align: center;
+  padding: 40px;
+  color: #6b7280;
+  background: #f9fafb;
+  border-radius: 12px;
+}
+
+.strategy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.strategy-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  border-left: 4px solid #6b7280;
+  transition: all 0.2s;
+}
+
+.strategy-card.enabled {
+  border-left-color: #22c55e;
+}
+
+.strategy-info {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.strategy-icon {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f3f4f6;
+  border-radius: 10px;
+  color: #6b7280;
+}
+
+.strategy-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.strategy-details h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1a1a1a;
+  margin: 0 0 4px 0;
+}
+
+.symbols {
+  font-size: 13px;
+  color: #6b7280;
+  margin: 0;
+}
+
+.toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: none;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.toggle-btn:hover:not(:disabled) {
+  background: #e5e7eb;
+}
+
+.toggle-btn.active {
+  background: #dcfce7;
+  color: #16a34a;
+}
+
+.toggle-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-icon {
+  width: 16px;
+  height: 16px;
+}
+</style>

@@ -83,7 +83,7 @@ regimes:
     #   - 0.01-0.02%: Chặt, nhiều volume (KHUYẾN NGHỊ)
     grid_spread_pct: 0.02
 
-    max_orders_per_side: 4
+    max_orders_per_side: 10
     max_daily_loss_usdt: 2.0
     position_timeout_minutes: 3
 
@@ -100,7 +100,7 @@ regimes:
     #   - 0.1%: Rộng, ít orders (KHUYẾN NGHỊ volatile)
     grid_spread_pct: 0.1
 
-    max_orders_per_side: 2
+    max_orders_per_side: 4
     max_daily_loss_usdt: 1.0
     position_timeout_minutes: 2
 

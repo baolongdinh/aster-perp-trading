@@ -4,10 +4,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { 
   LayoutDashboard, 
   Zap, 
-  History, 
-  Settings, 
-  Activity,
-  ChevronRight
+  FileText
 } from 'lucide-vue-next'
 
 
@@ -19,8 +16,7 @@ const isSidebarOpen = ref(true)
 const navItems = [
   { name: 'Dashboard', icon: LayoutDashboard, path: '/' },
   { name: 'Strategies', icon: Zap, path: '/strategies' },
-  { name: 'Trades', icon: History, path: '/trades' },
-  { name: 'Config', icon: Settings, path: '/config' },
+  { name: 'Activity', icon: FileText, path: '/activity' },
 ]
 
 const navigate = (path: string) => {

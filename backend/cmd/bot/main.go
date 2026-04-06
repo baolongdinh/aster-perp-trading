@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"aster-bot/internal/activitylog"
 	"aster-bot/internal/api"
 	"aster-bot/internal/auth"
 	"aster-bot/internal/client"
@@ -114,11 +115,25 @@ func main() {
 		log.Warn("no strategies enabled — bot will run but not trade")
 	}
 
+	// --- Activity Logger ---
+	activityLog, err := activitylog.New(activitylog.Config{
+		BufferSize:    10000,
+		RetentionDays: 90,
+		DBPath:        "activity.db",
+		FilePath:      "logs/activity",
+		MaxFileSize:   10 * 1024 * 1024,
+		Workers:       2,
+	}, nil, log)
+	if err != nil {
+		log.Fatal("failed to create activity logger", zap.Error(err))
+	}
+	defer activityLog.Shutdown(context.Background())
+
 	// --- Engine ---
-	eng := engine.New(cfg, futuresClient, marketClient, riskMgr, orderMgr, prec, strategies, log)
+	eng := engine.New(cfg, futuresClient, marketClient, riskMgr, orderMgr, prec, strategies, log, activityLog)
 
 	// --- API server ---
-	apiServer := api.NewServer(eng, riskMgr, log)
+	apiServer := api.NewServer(eng, riskMgr, activityLog, log)
 
 	// --- Start engine ---
 	runCtx, cancel := context.WithCancel(ctx)

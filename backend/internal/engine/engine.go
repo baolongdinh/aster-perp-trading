@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"aster-bot/internal/activitylog"
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/ordermanager"
@@ -21,14 +22,15 @@ import (
 
 // Engine orchestrates bot operations.
 type Engine struct {
-	cfg        *config.Config
-	futures    *client.FuturesClient
-	market     *client.MarketClient
-	risk       *risk.Manager
-	orders     *ordermanager.Manager
-	strategies []strategy.Strategy
-	prec       *client.PrecisionManager
-	log        *zap.Logger
+	cfg         *config.Config
+	futures     *client.FuturesClient
+	market      *client.MarketClient
+	risk        *risk.Manager
+	orders      *ordermanager.Manager
+	strategies  []strategy.Strategy
+	prec        *client.PrecisionManager
+	log         *zap.Logger
+	activityLog *activitylog.ActivityLogger // Activity logging
 
 	marketStream *stream.MarketStream
 	userStream   *stream.UserStream
@@ -53,9 +55,10 @@ func New(
 	market *client.MarketClient,
 	riskMgr *risk.Manager,
 	orderMgr *ordermanager.Manager,
-	prec *client.PrecisionManager, // NEW
+	prec *client.PrecisionManager,
 	strategies []strategy.Strategy,
 	log *zap.Logger,
+	activityLog *activitylog.ActivityLogger, // Activity logger
 ) *Engine {
 	return &Engine{
 		cfg:            cfg,
@@ -63,9 +66,10 @@ func New(
 		market:         market,
 		risk:           riskMgr,
 		orders:         orderMgr,
-		prec:           prec, // Assigned prec
+		prec:           prec,
 		strategies:     strategies,
 		log:            log,
+		activityLog:    activityLog,
 		positions:      make(map[string]*client.Position),
 		prices:         make(map[string]float64),
 		tickers:        make(map[string]stream.WsBookTicker),
@@ -80,6 +84,17 @@ func (e *Engine) Start(ctx context.Context) error {
 		zap.Bool("dry_run", e.cfg.Bot.DryRun),
 		zap.Int("strategies", len(e.strategies)),
 	)
+
+	// Log bot started event
+	if e.activityLog != nil {
+		e.activityLog.Log(ctx, activitylog.EventBotStarted, activitylog.SeverityInfo,
+			activitylog.EntryContext{},
+			map[string]interface{}{
+				"dry_run":    e.cfg.Bot.DryRun,
+				"strategies": len(e.strategies),
+			},
+		)
+	}
 
 	// 1. Reconcile open orders from exchange
 	if err := e.orders.Reconcile(ctx); err != nil {
@@ -240,6 +255,17 @@ func (e *Engine) Stop() {
 	e.mu.Lock()
 	e.running = false
 	e.mu.Unlock()
+
+	// Log bot stopped event
+	if e.activityLog != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		e.activityLog.Log(ctx, activitylog.EventBotStopped, activitylog.SeverityInfo,
+			activitylog.EntryContext{},
+			nil,
+		)
+	}
+
 	e.log.Info("engine stopped")
 }
 

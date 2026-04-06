@@ -299,7 +299,16 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	)
 
 	// NEW: Initialize TimeFilter for time-based trading rules
-	timeFilterConfig := DefaultTradingHoursConfig()
+	var timeFilterConfig *TradingHoursConfig
+	if a.optConfig != nil && a.optConfig.TimeFilter != nil {
+		timeFilterConfig = ConvertTimeFilterConfig(a.optConfig.TimeFilter)
+		a.logger.Info("TimeFilter using loaded config",
+			zap.String("mode", a.optConfig.TimeFilter.Mode),
+			zap.Int("slots", len(a.optConfig.TimeFilter.Slots)))
+	} else {
+		timeFilterConfig = DefaultTradingHoursConfig()
+		a.logger.Info("TimeFilter using default config")
+	}
 	timeFilter, err := NewTimeFilter(timeFilterConfig, a.logger)
 	if err != nil {
 		a.logger.Warn("Failed to initialize TimeFilter, using default", zap.Error(err))
@@ -315,27 +324,61 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	a.logger.Info("SpreadProtection initialized")
 
 	// NEW: Initialize DynamicSpreadCalculator for ATR-based spreads
-	dynamicSpreadConfig := DefaultDynamicSpreadConfig()
+	var dynamicSpreadConfig *DynamicSpreadConfig
+	if a.optConfig != nil && a.optConfig.DynamicGrid != nil {
+		dynamicSpreadConfig = ConvertDynamicGridConfig(a.optConfig.DynamicGrid)
+		a.logger.Info("DynamicSpreadCalculator using loaded config",
+			zap.Float64("base_spread_pct", a.optConfig.DynamicGrid.BaseSpreadPct),
+			zap.Float64("low_mult", a.optConfig.DynamicGrid.SpreadMultipliers.Low))
+	} else {
+		dynamicSpreadConfig = DefaultDynamicSpreadConfig()
+		a.logger.Info("DynamicSpreadCalculator using default config")
+	}
 	a.dynamicSpreadCalc = NewDynamicSpreadCalculator(dynamicSpreadConfig, a.logger)
 	a.logger.Info("DynamicSpreadCalculator initialized",
 		zap.Float64("base_spread_pct", dynamicSpreadConfig.BaseSpreadPct),
 		zap.Float64("low_threshold", dynamicSpreadConfig.LowThreshold))
 
 	// NEW: Initialize InventoryManager for inventory skew tracking
-	inventoryConfig := DefaultInventoryConfig()
+	var inventoryConfig *InventoryConfig
+	if a.optConfig != nil && a.optConfig.InventorySkew != nil {
+		inventoryConfig = ConvertInventoryConfig(a.optConfig.InventorySkew)
+		a.logger.Info("InventoryManager using loaded config",
+			zap.Float64("max_inventory_pct", a.optConfig.InventorySkew.MaxInventoryPct))
+	} else {
+		inventoryConfig = DefaultInventoryConfig()
+		a.logger.Info("InventoryManager using default config")
+	}
 	a.inventoryMgr = NewInventoryManager(inventoryConfig, a.logger)
 	a.logger.Info("InventoryManager initialized",
 		zap.Float64("max_inventory_pct", inventoryConfig.MaxInventoryPct))
 
 	// NEW: Initialize ClusterManager for cluster stop-loss
-	clusterConfig := DefaultClusterStopLossConfig()
+	var clusterConfig *ClusterStopLossConfig
+	if a.optConfig != nil && a.optConfig.ClusterStopLoss != nil {
+		clusterConfig = ConvertClusterStopLossConfig(a.optConfig.ClusterStopLoss)
+		a.logger.Info("ClusterManager using loaded config",
+			zap.Float64("monitor_hours", a.optConfig.ClusterStopLoss.TimeThresholds.Monitor))
+	} else {
+		clusterConfig = DefaultClusterStopLossConfig()
+		a.logger.Info("ClusterManager using default config")
+	}
 	a.clusterMgr = NewClusterManager(clusterConfig, a.logger)
 	a.logger.Info("ClusterManager initialized",
 		zap.Float64("monitor_hours", clusterConfig.MonitorHours),
 		zap.Float64("emergency_hours", clusterConfig.EmergencyHours))
 
 	// NEW: Initialize TrendDetector for trend detection
-	trendConfig := DefaultTrendDetectionConfig()
+	var trendConfig *TrendDetectionConfig
+	if a.optConfig != nil && a.optConfig.TrendDetection != nil {
+		trendConfig = ConvertTrendDetectionConfig(a.optConfig.TrendDetection)
+		a.logger.Info("TrendDetector using loaded config",
+			zap.Int("rsi_period", a.optConfig.TrendDetection.RSI.Period),
+			zap.String("timeframe", a.optConfig.TrendDetection.RSI.Timeframe))
+	} else {
+		trendConfig = DefaultTrendDetectionConfig()
+		a.logger.Info("TrendDetector using default config")
+	}
 	a.trendDetector = NewTrendDetector(trendConfig, a.logger)
 	a.logger.Info("TrendDetector initialized",
 		zap.Int("rsi_period", trendConfig.RSIPeriod))

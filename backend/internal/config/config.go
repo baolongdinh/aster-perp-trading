@@ -296,7 +296,7 @@ func setVolumeFarmDefaults() {
 	viper.SetDefault("min_volume_24h", 500) // Lower threshold
 
 	// Bot defaults
-	viper.SetDefault("bot.dry_run", true)
+	viper.SetDefault("bot.dry_run", false)
 
 	// Symbol defaults - optimized for volume
 	viper.SetDefault("symbols.auto_discover", true)
@@ -622,6 +622,31 @@ type SafeguardsAlerts struct {
 	OnCircuitBreaker    bool `yaml:"on_circuit_breaker"`
 }
 
+// TrendDetectionYAML is a wrapper for trend_detection.yaml root key
+type TrendDetectionYAML struct {
+	TrendDetection TrendDetectionConfig `yaml:"trend_detection"`
+}
+
+// DynamicGridYAML is a wrapper for dynamic_grid.yaml root key
+type DynamicGridYAML struct {
+	DynamicGrid DynamicGridConfig `yaml:"dynamic_grid"`
+}
+
+// InventorySkewYAML is a wrapper for inventory_skew.yaml root key
+type InventorySkewYAML struct {
+	InventorySkew InventorySkewConfig `yaml:"inventory_skew"`
+}
+
+// ClusterStopLossYAML is a wrapper for cluster_stoploss.yaml root key
+type ClusterStopLossYAML struct {
+	ClusterStopLoss ClusterStopLossConfig `yaml:"cluster_stop_loss"`
+}
+
+// SafeguardsYAML is a wrapper for safeguards.yaml root key
+type SafeguardsYAML struct {
+	Safeguards SafeguardsConfig `yaml:"safeguards"`
+}
+
 // TradingHoursConfig for time filter
 type TradingHoursConfig struct {
 	Enabled  bool       `yaml:"enabled"`
@@ -630,44 +655,59 @@ type TradingHoursConfig struct {
 	Slots    []TimeSlot `yaml:"slots"`
 }
 
+type TimeWindow struct {
+	Start    string `yaml:"start"`
+	End      string `yaml:"end"`
+	Timezone string `yaml:"timezone"`
+}
+
 type TimeSlot struct {
-	Start            string  `yaml:"start"`
-	End              string  `yaml:"end"`
-	Enabled          bool    `yaml:"enabled"`
-	SizeMultiplier   float64 `yaml:"size_multiplier"`
-	MaxExposurePct   float64 `yaml:"max_exposure_pct"`
-	SpreadMultiplier float64 `yaml:"spread_multiplier"`
-	Description      string  `yaml:"description"`
+	Window           TimeWindow `yaml:"window"`
+	Enabled          bool       `yaml:"enabled"`
+	SizeMultiplier   float64    `yaml:"size_multiplier"`
+	MaxExposurePct   float64    `yaml:"max_exposure_pct"`
+	SpreadMultiplier float64    `yaml:"spread_multiplier"`
+	Description      string     `yaml:"description"`
 }
 
 // LoadOptimizationConfig loads all optimization configs from directory
 func LoadOptimizationConfig(configPath string) (*OptimizationConfig, error) {
 	config := &OptimizationConfig{}
 
-	// Load dynamic grid config
-	if err := loadYAML(configPath+"/dynamic_grid.yaml", &config.DynamicGrid); err != nil {
+	// Load dynamic grid config with wrapper for root key
+	var gridWrapper DynamicGridYAML
+	if err := loadYAML(configPath+"/dynamic_grid.yaml", &gridWrapper); err != nil {
 		return nil, fmt.Errorf("failed to load dynamic_grid config: %w", err)
 	}
+	config.DynamicGrid = &gridWrapper.DynamicGrid
 
-	// Load inventory skew config
-	if err := loadYAML(configPath+"/inventory_skew.yaml", &config.InventorySkew); err != nil {
+	// Load inventory skew config with wrapper for root key
+	var invWrapper InventorySkewYAML
+	if err := loadYAML(configPath+"/inventory_skew.yaml", &invWrapper); err != nil {
 		return nil, fmt.Errorf("failed to load inventory_skew config: %w", err)
 	}
+	config.InventorySkew = &invWrapper.InventorySkew
 
-	// Load cluster stop-loss config
-	if err := loadYAML(configPath+"/cluster_stoploss.yaml", &config.ClusterStopLoss); err != nil {
+	// Load cluster stop-loss config with wrapper for root key
+	var clusterWrapper ClusterStopLossYAML
+	if err := loadYAML(configPath+"/cluster_stoploss.yaml", &clusterWrapper); err != nil {
 		return nil, fmt.Errorf("failed to load cluster_stoploss config: %w", err)
 	}
+	config.ClusterStopLoss = &clusterWrapper.ClusterStopLoss
 
-	// Load trend detection config
-	if err := loadYAML(configPath+"/trend_detection.yaml", &config.TrendDetection); err != nil {
+	// Load trend detection config with wrapper for root key
+	var trendWrapper TrendDetectionYAML
+	if err := loadYAML(configPath+"/trend_detection.yaml", &trendWrapper); err != nil {
 		return nil, fmt.Errorf("failed to load trend_detection config: %w", err)
 	}
+	config.TrendDetection = &trendWrapper.TrendDetection
 
-	// Load safeguards config
-	if err := loadYAML(configPath+"/safeguards.yaml", &config.Safeguards); err != nil {
+	// Load safeguards config with wrapper for root key
+	var safeWrapper SafeguardsYAML
+	if err := loadYAML(configPath+"/safeguards.yaml", &safeWrapper); err != nil {
 		return nil, fmt.Errorf("failed to load safeguards config: %w", err)
 	}
+	config.Safeguards = &safeWrapper.Safeguards
 
 	// Load time filter config
 	if err := loadYAML(configPath+"/trading_hours.yaml", &config.TimeFilter); err != nil {
