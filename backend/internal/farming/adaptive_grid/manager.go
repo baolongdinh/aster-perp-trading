@@ -123,6 +123,9 @@ type AdaptiveGridManager struct {
 	// NEW: RSICalculator for RSI calculation
 	rsiCalc *RSICalculator
 
+	// NEW: OptimizationConfig from YAML files
+	optConfig *config.OptimizationConfig
+
 	// Control channels
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -237,6 +240,23 @@ func (a *AdaptiveGridManager) SetRiskConfig(config *RiskConfig) {
 	)
 }
 
+// SetOptimizationConfig sets the optimization config from YAML files
+func (a *AdaptiveGridManager) SetOptimizationConfig(optConfig *config.OptimizationConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.optConfig = optConfig
+	if optConfig != nil {
+		a.logger.Info("Optimization config set",
+			zap.Bool("dynamic_grid", optConfig.DynamicGrid != nil),
+			zap.Bool("inventory_skew", optConfig.InventorySkew != nil),
+			zap.Bool("cluster_stoploss", optConfig.ClusterStopLoss != nil),
+			zap.Bool("trend_detection", optConfig.TrendDetection != nil),
+			zap.Bool("safeguards", optConfig.Safeguards != nil),
+			zap.Bool("time_filter", optConfig.TimeFilter != nil),
+		)
+	}
+}
+
 // Initialize sets up the adaptive grid manager
 func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	a.logger.Info("Initializing adaptive grid manager")
@@ -250,6 +270,19 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	if !a.configManager.IsEnabled() {
 		a.logger.Warn("Adaptive configuration is disabled, using base grid manager")
 		return nil
+	}
+
+	// Log if optimization config from YAML is available
+	if a.optConfig != nil {
+		a.logger.Info("Using optimization config from YAML files",
+			zap.Bool("dynamic_grid", a.optConfig.DynamicGrid != nil),
+			zap.Bool("inventory_skew", a.optConfig.InventorySkew != nil),
+			zap.Bool("cluster_stoploss", a.optConfig.ClusterStopLoss != nil),
+			zap.Bool("trend_detection", a.optConfig.TrendDetection != nil),
+			zap.Bool("safeguards", a.optConfig.Safeguards != nil),
+			zap.Bool("time_filter", a.optConfig.TimeFilter != nil))
+	} else {
+		a.logger.Warn("No optimization config from YAML, using hardcoded defaults")
 	}
 
 	// NEW: Initialize RiskMonitor for dynamic sizing
@@ -309,13 +342,23 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	a.logger.Info("FundingRateMonitor initialized",
 		zap.Float64("high_threshold", fundingConfig.HighThreshold))
 
-	// NEW: Initialize ATRCalculator with default period
-	a.atrCalc = NewATRCalculator(14)
-	a.logger.Info("ATRCalculator initialized", zap.Int("period", 14))
+	// NEW: Initialize ATRCalculator with default period (or from YAML config if available)
+	atrPeriod := 14
+	if a.optConfig != nil && a.optConfig.DynamicGrid != nil && a.optConfig.DynamicGrid.ATRPeriod > 0 {
+		atrPeriod = a.optConfig.DynamicGrid.ATRPeriod
+		a.logger.Info("Using ATR period from YAML config", zap.Int("period", atrPeriod))
+	}
+	a.atrCalc = NewATRCalculator(atrPeriod)
+	a.logger.Info("ATRCalculator initialized", zap.Int("period", atrPeriod))
 
-	// NEW: Initialize RSICalculator with default period
-	a.rsiCalc = NewRSICalculator(14)
-	a.logger.Info("RSICalculator initialized", zap.Int("period", 14))
+	// NEW: Initialize RSICalculator with default period (or from YAML config if available)
+	rsiPeriod := 14
+	if a.optConfig != nil && a.optConfig.TrendDetection != nil && a.optConfig.TrendDetection.RSI.Period > 0 {
+		rsiPeriod = a.optConfig.TrendDetection.RSI.Period
+		a.logger.Info("Using RSI period from YAML config", zap.Int("period", rsiPeriod))
+	}
+	a.rsiCalc = NewRSICalculator(rsiPeriod)
+	a.logger.Info("RSICalculator initialized", zap.Int("period", rsiPeriod))
 
 	// Start position monitoring goroutine
 	a.wg.Add(1)

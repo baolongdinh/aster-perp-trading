@@ -50,6 +50,16 @@ func main() {
 	// Set volume farming config in main config
 	cfg.VolumeFarming = volumeCfg
 
+	// Load optimization configs (dynamic_grid, inventory_skew, cluster_stoploss, etc.)
+	optimizationConfigPath := "config"
+	optCfg, err := config.LoadOptimizationConfig(optimizationConfigPath)
+	if err != nil {
+		logger.Warn("Failed to load optimization configs, using defaults", zap.Error(err))
+	} else {
+		logger.Info("Loaded optimization configs", zap.String("path", optimizationConfigPath))
+		cfg.Optimization = optCfg
+	}
+
 	// Override dry-run if flag is set
 	if *dryRun {
 		cfg.Bot.DryRun = true

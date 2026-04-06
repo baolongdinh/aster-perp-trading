@@ -1,9 +1,10 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
+
+	"github.com/stretchr/testify/assert/yaml"
 )
 
 // OptimizationConfig holds all grid optimization configurations
@@ -331,15 +332,15 @@ func LoadOptimizationConfig(configPath string) (*OptimizationConfig, error) {
 	return config, nil
 }
 
-// loadYAML loads a single YAML/JSON file
+// loadYAML loads a single YAML file
 func loadYAML(path string, target interface{}) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 
-	if err := json.Unmarshal(data, target); err != nil {
-		return fmt.Errorf("failed to parse JSON %s: %w", path, err)
+	if err := yaml.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("failed to parse YAML %s: %w", path, err)
 	}
 
 	return nil

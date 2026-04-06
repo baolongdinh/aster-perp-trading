@@ -47,19 +47,19 @@ trend_detection:
     #   - 7: Nhạy cảm cao (phản ứng nhanh)
     #   - 14: Cân bằng (default, khuyến nghị bởi Wilder)
     #   - 21: Ổn định hơn, ít whipsaw
-    period: 14
+    period: 7
 
     # timeframe: Timeframe tính RSI
     #   - "5m": Phản ứng rất nhanh (scalping)
     #   - "15m": Cân bằng (default)
     #   - "1h": Phản ứng chậm, trend dài hạn
-    timeframe: "15m"
+    timeframe: "5m"
 
     # update_interval: Tần suất cập nhật RSI
     #   - 1m/3m: Cập nhật thường xuyên
     #   - 5m: Cân bằng (default)
     #   - 15m: Cập nhật ít, ít thay đổi
-    update_interval: 5m
+    update_interval: 1m
 
   # ---------------------------------------------------------------------------
   # RSI THRESHOLDS
@@ -70,13 +70,13 @@ trend_detection:
     #   - 75: Bắt trend sớm nhưng nhiều false signal
     #   - 80: Cân bằng (default)
     #   - 85: Chỉ khi trend cực mạnh
-    strong_overbought: 80
+    strong_overbought: 85
 
     # mild_overbought: RSI > ngưỡng này = Up trend
     #   - 65: Nhạy cảm cao
     #   - 70: Cân bằng (default)
     #   - 75: Ít nhạy cảm hơn
-    mild_overbought: 70
+    mild_overbought: 75
 
     # neutral_high: Ngưỡng trên của vùng neutral
     #   - NÊN < mild_overbought
@@ -94,13 +94,13 @@ trend_detection:
     #   - 25: Nhạy cảm cao
     #   - 30: Cân bằng (default)
     #   - 35: Ít nhạy cảm hơn
-    mild_oversold: 30
+    mild_oversold: 25
 
     # strong_oversold: RSI < ngưỡng này = Down trend rất mạnh
     #   - 15: Bắt trend sớm
     #   - 20: Cân bằng (default)
     #   - 25: Chỉ khi trend cực mạnh
-    strong_oversold: 20
+    strong_oversold: 15
 
   # ---------------------------------------------------------------------------
   # TREND PERSISTENCE
@@ -111,7 +111,7 @@ trend_detection:
     #   - 5m: Nhanh, dễ false signal
     #   - 15m: Cân bằng (default)
     #   - 30m+: Chắc chắn trend hơn
-    required_duration: 15m
+    required_duration: 5m
 
     # min_confirmations: Số lần update liên tiếp xác nhận trend
     #   - 2: Nhanh nhưng dễ false
@@ -148,12 +148,12 @@ trend_detection:
     # strong_trend_pause_duration: Thời gian pause khi trend mạnh (phút)
     #   - 2-5m: Pause ngắn, nhanh quay lại (default = 5m)
     #   - 15-30m: Pause dài, an toàn hơn
-    strong_trend_pause_duration: 5m
+    strong_trend_pause_duration: 2m
 
     # mild_trend_pause_duration: Thời gian pause khi trend nhẹ (phút)
     #   - 1-2m: Pause rất ngắn (default = 2m)
     #   - 5-10m: Pause lâu hơn
-    mild_trend_pause_duration: 2m
+    mild_trend_pause_duration: 30s
 
     # score_threshold_strong: Điểm để coi là trend mạnh (6-8)
     #   - 6: Cân bằng (default)
@@ -201,7 +201,7 @@ trend_detection:
     #   - 1h: Nhanh nhưng dễ false
     #   - 2h: Cân bằng (default)
     #   - 4h+: Chắc chắn hơn
-    min_trend_duration: 2h
+    min_trend_duration: 1h
 
   # ---------------------------------------------------------------------------
   # LOGGING

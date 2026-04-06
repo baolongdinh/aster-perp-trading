@@ -46,7 +46,7 @@ safeguards:
     # max_stored_events: Số events tối đa lưu trong memory
     #   - 50-100: Cân bằng (default = 100)
     #   - 200+: Nhiều hơn nhưng tốn memory
-    max_stored_events: 100
+    max_stored_events: 200
 
     # lock_timeout: Timeout cho order processing lock (giây)
     #   - 3s: Nhanh
@@ -95,19 +95,19 @@ safeguards:
     #   - 0.1% (10 bps): Rất nhạy, dễ pause
     #   - 0.5% (50 bps): Cân bằng (default)
     #   - 1.0%+: Chỉ pause khi spread rất rộng
-    pause_threshold: 0.005
+    pause_threshold: 0.002
 
     # emergency_threshold: Ngưỡng spread để emergency pause (%)
     #   - NÊN lớn hơn pause_threshold
     #   - 1.0%: Cân bằng (default)
     #   - 2.0%+: Chỉ emergency khi spread cực rộng
-    emergency_threshold: 0.01
+    emergency_threshold: 0.005
 
     # resume_after: Thời gian chờ trước khi resume (giây)
     #   - 5-10s: Resume nhanh
     #   - 15s: Cân bằng (default)
     #   - 30s+: Chờ lâu hơn để spread ổn định
-    resume_after: 15s
+    resume_after: 10s
 
     # orderbook_check_interval: Tần suất check orderbook (giây)
     orderbook_check_interval: 3s

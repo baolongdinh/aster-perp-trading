@@ -59,20 +59,20 @@ max_total_drawdown_pct: 10.0
 #   - 3-5: Lệnh nhỏ, an toàn, nhiều lệnh để đạt volume
 #   - 6-10: Cân bằng (default = 6)
 #   - 15+: Lệnh lớn, nhanh đạt volume nhưng rủi ro cao
-order_size_usdt: 6
+order_size_usdt: 30
 
 # grid_spread_pct: Spread giữa các lệnh trong grid (%)
 #   - 0.001% (1 bps): Grid cực chặt, nhiều lệnh, khó fill
 #   - 0.002% (2 bps): Grid chặt (default) - phù hợp farm volume
 #   - 0.005% (5 bps): Grid rộng hơn, dễ fill hơn
 #   - 0.01% (10 bps): Grid rộng, ít lệnh, dễ fill
-grid_spread_pct: 0.002
+grid_spread_pct: 0.005
 
 # max_orders_per_side: Số lệnh tối đa mỗi bên (buy/sell)
 #   - 10-20: Ít lệnh, dễ quản lý, cần ít vốn
 #   - 30-50: Nhiều lệnh (default = 30), coverage tốt, cần nhiều vốn
 #   - 50+: Rất nhiều lệnh, phức tạp, cần vốn lớn
-max_orders_per_side: 30
+max_orders_per_side: 35
 
 # replace_immediately: Có đặt lại lệnh ngay sau khi fill không
 #   - true: Luôn có lệnh trên orderbook (tăng tần suất)
@@ -83,7 +83,7 @@ replace_immediately: true
 #   - 15-30: Scalping ngắn hạn, đóng sớm (default = 30)
 #   - 60-120: Swing trading, cho phép hồi
 #   - 240+: Position dài hạn
-position_timeout_minutes: 30
+position_timeout_minutes: 15
 
 # Ticker và symbol refresh
 # ticker_stream: WebSocket stream để nhận giá real-time
@@ -93,7 +93,7 @@ ticker_stream: "!ticker@arr"
 #   - 30s: Refresh thường xuyên, bắt kịp thay đổi nhanh
 #   - 60s: Cân bằng (default)
 #   - 300s: Ít refresh hơn, tiết kiệm tài nguyên
-symbol_refresh_interval_seconds: 60
+symbol_refresh_interval_seconds: 5
 
 # grid_placement_cooldown_seconds: Thời gian chờ giữa các lần đặt lệnh
 #   - 0-1s: Không chờ, đặt liên tục (default = 1)
@@ -113,7 +113,7 @@ supported_quote_currencies: ["USD1"]
 #   - 100-300: Bao gồm nhiều symbol, kể cả ít thanh khoản
 #   - 500: Cân bằng (default)
 #   - 1000+: Chỉ chọn symbol thanh khoản cao
-min_volume_24h: 500
+min_volume_24h: 1000
 
 # ---------------------------------------------------------------------------
 # SYMBOL SELECTION & MANAGEMENT
@@ -170,7 +170,7 @@ symbols:
   # whitelist: Danh sách symbol luôn được phép trade
   #   - Để trống: Dùng auto-discover hoàn toàn
   #   - Danh sách cụ thể: Ưu tiên các symbol này
-  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1", "XRPUSD1", "DOGEUSD1", "BNBUSD1"]
+  whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1"]
 
 # ---------------------------------------------------------------------------
 # EXCHANGE CONFIGURATION
@@ -211,19 +211,19 @@ risk:
   max_open_positions: 5
 
   # max_trades_per_symbol: Số giao dịch tối đa mỗi symbol/ngày
-  max_trades_per_symbol: 200
+  max_trades_per_symbol: 1000
 
   # max_global_pending_limit_orders: Tổng số lệnh pending tối đa
-  max_global_pending_limit_orders: 10
+  max_global_pending_limit_orders: 30
 
   # max_pending_per_side: Số lệnh pending tối đa mỗi bên
-  max_pending_per_side: 5
+  max_pending_per_side: 15
 
   # per_trade_stop_loss_pct: Stop loss cho mỗi giao dịch (%)
   #   - 1-2%: Chặt chẽ, cắt lỗ nhanh
   #   - 3%: Cân bằng (default)
   #   - 5%+: Cho phép biến động nhiều
-  per_trade_stop_loss_pct: 3.0
+  per_trade_stop_loss_pct: 1.0
 
   # per_trade_take_profit_pct: Take profit cho mỗi giao dịch (%)
   #   - 0.5-1%: Scalping nhanh
