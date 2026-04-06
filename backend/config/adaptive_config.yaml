@@ -1,0 +1,110 @@
+# =============================================================================
+# ADAPTIVE CONFIGURATION - AGGRESSIVE BUT SMART FOR $10 FARMING
+# =============================================================================
+#
+# MỤC ĐÍCH:
+#   - Phát hiện nhanh regime để điều chỉnh grid (farm nhanh)
+#   - Tự động tăng size khi thị trường ổn định (ranging)
+#   - Giảm size ngay khi biến động mạnh (volatile) → tránh liq
+#
+# TRADE-OFFS CHO FAST FARMING:
+#   ┌─────────────────────────────────────────────────────────────────────┐
+#   │ THAM SỐ           │ GIÁ TRỊ CAO              │ GIÁ TRỊ THẤP          │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ update_interval   │ 60s (nhanh)              │ 300s (chậm)            │
+#   │                   │ → Nhanh phát hiện trend   → Ít whipsaw           │
+#   │                   │ → Có thể false signal    → Chậm phản ứng        │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ ranging_size      │ $5-10                    │ $1-2                  │
+#   │                   │ → Farm nhiều khi ranging   → An toàn hơn         │
+#   │                   │ → Risk nếu fakeout       → Farm chậm           │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │ trending_size     │ $3-5                     │ $0.5-1               │
+#   │                   │ → Theo trend mạnh        → Ít risk trend       │
+#   │                   │ → Dễ bị hồi cắt         → Miss trend lớn      │
+#   └─────────────────────────────────────────────────────────────────────┘
+#
+# ⚠️ CHIẾN LƯỢC AGGRESSIVE BUT SAFE:
+#   - Ranging (70% thời gian): Size lớn ($3), farm nhanh
+#   - Trending (20% thời gian): Size nhỏ ($1), chỉ follow trend mạnh
+#   - Volatile (10% thời gian): Size cực nhỏ ($0.5) hoặc pause
+# =============================================================================
+
+# Bật adaptive để tự động điều chỉnh theo thị trường
+enabled: true
+
+detection:
+  # method: Phương pháp phát hiện
+  #   - "hybrid": Kết hợp ATR + momentum (KHUYẾN NGHỊ)
+  method: hybrid
+
+  # update_interval_sec: Tần suất cập nhật (GIẢM để nhanh hơn)
+  #   - 60s: Nhanh (KHUYẾN NGHỊ cho farm nhanh)
+  #   - 300s: Chậm, ít thay đổi
+  update_interval_sec: 60
+
+  # atr_period: Số period ATR
+  #   - 7: Nhạy cảm cao (KHUYẾN NGHỊ cho farm nhanh)
+  #   - 14: Cân bằng
+  atr_period: 7
+
+  momentum_short: 10
+  momentum_long: 20
+
+regimes:
+  # ---------------------------------------------------------------------------
+  # TRENDING: Size nhỏ, chỉ follow trend mạnh, tránh hồi cắt
+  # ---------------------------------------------------------------------------
+  trending:
+    # order_size_usdt: GIẢM để an toàn khi trending
+    #   - $0.5-1: An toàn (KHUYẾN NGHỊ)
+    #   - $2-3: Risk hơn nhưng nhiều profit
+    order_size_usdt: 1.0
+
+    # grid_spread_pct: Tăng để tránh bị hit liên tục
+    #   - 0.1-0.2%: Rộng, ít bị hit (KHUYẾN NGHỊ trending)
+    grid_spread_pct: 0.15
+
+    max_orders_per_side: 2
+    max_daily_loss_usdt: 1.0
+    position_timeout_minutes: 5
+
+  # ---------------------------------------------------------------------------
+  # RANGING: Size lớn, farm nhanh, chặt grid
+  # Đây là bread & butter cho volume farming
+  # ---------------------------------------------------------------------------
+  ranging:
+    # order_size_usdt: TĂNG để farm nhiều khi ranging
+    #   - $2-3: Nhanh farm (KHUYẾN NGHỊ)
+    #   - $5+: Rất nhanh nhưng risk fakeout
+    order_size_usdt: 2.0
+
+    # grid_spread_pct: Giảm để nhiều lệnh hơn
+    #   - 0.01-0.02%: Chặt, nhiều volume (KHUYẾN NGHỊ)
+    grid_spread_pct: 0.02
+
+    max_orders_per_side: 4
+    max_daily_loss_usdt: 2.0
+    position_timeout_minutes: 3
+
+  # ---------------------------------------------------------------------------
+  # VOLATILE: Size cực nhỏ, rộng grid, hoặc pause
+  # ---------------------------------------------------------------------------
+  volatile:
+    # order_size_usdt: GIẢM MẠNH để tránh liq
+    #   - $0.3-0.5: Cực nhỏ (KHUYẾN NGHỊ)
+    #   - $1+: Risk liquidation
+    order_size_usdt: 0.5
+
+    # grid_spread_pct: Rộng để tránh bị hit liên tục
+    #   - 0.1%: Rộng, ít orders (KHUYẾN NGHỊ volatile)
+    grid_spread_pct: 0.1
+
+    max_orders_per_side: 2
+    max_daily_loss_usdt: 1.0
+    position_timeout_minutes: 2
+
+# Giảm cooldown để chuyển regime nhanh hơn
+transition:
+  cooldown_seconds: 15
+  confirmation_required: 1

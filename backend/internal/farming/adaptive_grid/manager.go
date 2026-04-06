@@ -133,29 +133,33 @@ type AdaptiveGridManager struct {
 
 // RiskConfig holds risk management parameters
 type RiskConfig struct {
-	MaxPositionUSDT         float64       // Max position size per symbol (USDT)
-	MaxUnhedgedExposureUSDT float64       // Max unhedged exposure (USDT)
-	MaxUnrealizedLossUSDT   float64       // Max unrealized loss before emergency close
-	StopLossPct             float64       // Stop loss percentage from entry (e.g., 0.02 = 2%)
-	TrailingStopPct         float64       // Trailing stop activation (e.g., 0.01 = 1% profit)
-	TrailingStopDistancePct float64       // Trailing stop distance (e.g., 0.005 = 0.5%)
-	LiquidationBufferPct    float64       // Close before liquidation (e.g., 0.2 = 20% away)
-	PositionCheckInterval   time.Duration // How often to check positions
-	TrendingThreshold       float64       // Trending strength to pause trading
+	MaxPositionUSDT          float64       // Max position size per symbol (USDT)
+	MaxUnhedgedExposureUSDT  float64       // Max unhedged exposure (USDT)
+	MaxUnrealizedLossUSDT    float64       // Max unrealized loss before emergency close per position
+	PerPositionLossLimitUSDT float64       // Max unrealized loss per position (1 USDT default)
+	TotalNetLossLimitUSDT    float64       // Max total net unrealized loss before close all (5 USDT default)
+	StopLossPct              float64       // Stop loss percentage from entry (e.g., 0.02 = 2%)
+	TrailingStopPct          float64       // Trailing stop activation (e.g., 0.01 = 1% profit)
+	TrailingStopDistancePct  float64       // Trailing stop distance (e.g., 0.005 = 0.5%)
+	LiquidationBufferPct     float64       // Close before liquidation (e.g., 0.2 = 20% away)
+	PositionCheckInterval    time.Duration // How often to check positions
+	TrendingThreshold        float64       // Trending strength to pause trading
 }
 
 // DefaultRiskConfig returns default risk configuration
 func DefaultRiskConfig() *RiskConfig {
 	return &RiskConfig{
-		MaxPositionUSDT:         300.0, // Max 1000 USDT per symbol
-		MaxUnhedgedExposureUSDT: 200.0, // Max 500 USDT unhedged
-		MaxUnrealizedLossUSDT:   3.0,   // Close if unrealized loss > 3 USDT
-		StopLossPct:             0.01,  // 1% stop loss
-		TrailingStopPct:         0.01,  // Activate at 1% profit
-		TrailingStopDistancePct: 0.005, // 0.5% trailing distance
-		LiquidationBufferPct:    0.2,   // Close at 20% away from liquidation
-		PositionCheckInterval:   1 * time.Second,
-		TrendingThreshold:       0.7, // Pause if trending > 70%
+		MaxPositionUSDT:          300.0, // Max 300 USDT per symbol
+		MaxUnhedgedExposureUSDT:  200.0, // Max 200 USDT unhedged
+		MaxUnrealizedLossUSDT:    3.0,   // Close if unrealized loss > 3 USDT per position
+		PerPositionLossLimitUSDT: 1.0,   // Close position if unrealized loss > 1 USDT
+		TotalNetLossLimitUSDT:    5.0,   // Close ALL if total net unrealized loss > 5 USDT
+		StopLossPct:              0.01,  // 1% stop loss
+		TrailingStopPct:          0.01,  // Activate at 1% profit
+		TrailingStopDistancePct:  0.005, // 0.5% trailing distance
+		LiquidationBufferPct:     0.2,   // Close at 20% away from liquidation
+		PositionCheckInterval:    1 * time.Second,
+		TrendingThreshold:        0.7, // Pause if trending > 70%
 	}
 }
 
@@ -378,6 +382,10 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 	ticker := time.NewTicker(a.riskConfig.PositionCheckInterval)
 	defer ticker.Stop()
 
+	// Additional ticker for checking resume conditions (less frequent)
+	resumeCheckTicker := time.NewTicker(10 * time.Second)
+	defer resumeCheckTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -386,6 +394,9 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			a.checkAndManageRisk(ctx)
+		case <-resumeCheckTicker.C:
+			// Check if any paused symbols can resume trading
+			a.CheckAndResumeAll()
 		}
 	}
 }
@@ -403,17 +414,39 @@ func (a *AdaptiveGridManager) checkAndManageRisk(ctx context.Context) {
 		return
 	}
 
+	// Calculate total net unrealized PnL across all positions
+	totalNetUnrealizedPnL := 0.0
+	activePositions := make([]client.Position, 0)
+
 	for _, pos := range positions {
 		if pos.PositionAmt == 0 {
 			continue // Skip empty positions
 		}
+		activePositions = append(activePositions, pos)
+		totalNetUnrealizedPnL += pos.UnrealizedProfit
+	}
 
+	// CRITICAL: Check total net unrealized loss first
+	// If total net loss > 5 USDT, close ALL positions and ALL orders immediately
+	if totalNetUnrealizedPnL < -a.riskConfig.TotalNetLossLimitUSDT {
+		a.logger.Error("CRITICAL: TOTAL NET UNREALIZED LOSS EXCEEDED - EMERGENCY CLOSE ALL",
+			zap.Float64("total_net_unrealized_pnl", totalNetUnrealizedPnL),
+			zap.Float64("limit", -a.riskConfig.TotalNetLossLimitUSDT),
+			zap.Int("active_positions", len(activePositions)))
+
+		// Close all positions and orders for all symbols
+		a.emergencyCloseAll(ctx, activePositions)
+		return
+	}
+
+	// Process each position individually
+	for _, pos := range activePositions {
 		symbol := pos.Symbol
 
 		// Update position tracking
 		a.updatePositionTracking(symbol, &pos)
 
-		// Check risk limits
+		// Check risk limits for this position
 		a.evaluateRiskAndAct(ctx, symbol, &pos)
 	}
 }
@@ -538,12 +571,23 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 		return
 	}
 
-	// 3. Check max unrealized loss
+	// 3. Check max unrealized loss per position (3 USDT default)
 	if unrealizedPnL < -a.riskConfig.MaxUnrealizedLossUSDT {
 		a.logger.Warn("MAX UNREALIZED LOSS EXCEEDED - Closing position",
 			zap.String("symbol", symbol),
 			zap.Float64("unrealized_pnl", unrealizedPnL),
 			zap.Float64("max_loss", a.riskConfig.MaxUnrealizedLossUSDT))
+		a.emergencyClosePosition(ctx, symbol, pos.PositionAmt)
+		return
+	}
+
+	// NEW: 3.5. Check per-position loss limit (1 USDT)
+	// Close position immediately if unrealized loss > 1 USDT
+	if unrealizedPnL < -a.riskConfig.PerPositionLossLimitUSDT {
+		a.logger.Warn("PER-POSITION LOSS LIMIT EXCEEDED (>1 USDT) - Closing position immediately",
+			zap.String("symbol", symbol),
+			zap.Float64("unrealized_pnl", unrealizedPnL),
+			zap.Float64("limit", a.riskConfig.PerPositionLossLimitUSDT))
 		a.emergencyClosePosition(ctx, symbol, pos.PositionAmt)
 		return
 	}
@@ -646,6 +690,99 @@ func (a *AdaptiveGridManager) emergencyClosePosition(ctx context.Context, symbol
 	a.pauseTrading(symbol)
 }
 
+// emergencyCloseAll closes ALL positions and cancels ALL orders across all symbols
+// This is triggered when total net unrealized loss exceeds the limit (5 USDT)
+func (a *AdaptiveGridManager) emergencyCloseAll(ctx context.Context, positions []client.Position) {
+	a.logger.Error("EMERGENCY CLOSE ALL - Closing all positions and cancelling all orders!")
+
+	// 1. Cancel ALL orders for ALL symbols
+	// We need to get unique symbols from all positions
+	symbolsMap := make(map[string]bool)
+	for _, pos := range positions {
+		symbolsMap[pos.Symbol] = true
+	}
+
+	// Also include any symbols that might have orders but no positions
+	a.mu.RLock()
+	for symbol := range a.positions {
+		symbolsMap[symbol] = true
+	}
+	a.mu.RUnlock()
+
+	// Cancel all orders for each symbol
+	for symbol := range symbolsMap {
+		a.logger.Warn("Cancelling all orders for symbol", zap.String("symbol", symbol))
+		if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+			a.logger.Error("Failed to cancel orders for symbol", zap.String("symbol", symbol), zap.Error(err))
+		}
+	}
+
+	// 2. Close ALL positions
+	for _, pos := range positions {
+		if pos.PositionAmt == 0 {
+			continue
+		}
+
+		symbol := pos.Symbol
+		side := "SELL"
+		if pos.PositionAmt < 0 {
+			side = "BUY" // Close short
+		}
+
+		qty := fmt.Sprintf("%.6f", math.Abs(pos.PositionAmt))
+
+		orderReq := client.PlaceOrderRequest{
+			Symbol:        symbol,
+			Side:          side,
+			Type:          "MARKET",
+			Quantity:      qty,
+			ReduceOnly:    true,
+			ClosePosition: true,
+		}
+
+		a.logger.Error("EMERGENCY CLOSE - Closing position",
+			zap.String("symbol", symbol),
+			zap.String("side", side),
+			zap.String("qty", qty),
+			zap.Float64("unrealized_pnl", pos.UnrealizedProfit))
+
+		order, err := a.futuresClient.PlaceOrder(ctx, orderReq)
+		if err != nil {
+			a.logger.Error("Failed to close position", zap.String("symbol", symbol), zap.Error(err))
+			continue
+		}
+
+		a.logger.Info("Position closed successfully",
+			zap.String("symbol", symbol),
+			zap.Int64("order_id", order.OrderID))
+	}
+
+	// 3. Clear ALL position tracking
+	a.mu.Lock()
+	a.positions = make(map[string]*SymbolPosition)
+	a.positionStopLoss = make(map[string]float64)
+	a.trailingStopPrice = make(map[string]float64)
+	a.mu.Unlock()
+
+	// 4. Pause trading for ALL symbols
+	for symbol := range symbolsMap {
+		a.pauseTrading(symbol)
+	}
+
+	// 5. Initialize range detectors for all symbols to wait for stabilization
+	for symbol := range symbolsMap {
+		// Initialize or reset range detector to wait for new stable range
+		config := DefaultRangeConfig()
+		config.StabilizationPeriod = 5 * time.Minute // Wait 5 minutes for stabilization
+		a.InitializeRangeDetector(symbol, config)
+		a.logger.Info("Range detector initialized - waiting for price stabilization",
+			zap.String("symbol", symbol),
+			zap.Duration("stabilization_period", config.StabilizationPeriod))
+	}
+
+	a.logger.Error("EMERGENCY CLOSE ALL COMPLETE - All positions closed, trading paused, waiting for stabilization")
+}
+
 // pauseTrading pauses trading for a symbol
 func (a *AdaptiveGridManager) pauseTrading(symbol string) {
 	a.mu.Lock()
@@ -658,6 +795,61 @@ func (a *AdaptiveGridManager) resumeTrading(symbol string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.tradingPaused, symbol)
+}
+
+// TryResumeTrading attempts to resume trading for a symbol if conditions are met
+// This is called after emergency close to wait for price stabilization
+func (a *AdaptiveGridManager) TryResumeTrading(symbol string) bool {
+	a.mu.RLock()
+	isPaused := a.tradingPaused[symbol]
+	detector, hasDetector := a.rangeDetectors[symbol]
+	a.mu.RUnlock()
+
+	// If not paused, nothing to do
+	if !isPaused {
+		return true
+	}
+
+	// If no range detector, we can't check stabilization
+	if !hasDetector {
+		// Just resume without range check (fallback)
+		a.logger.Info("No range detector found - resuming trading without stabilization check",
+			zap.String("symbol", symbol))
+		a.resumeTrading(symbol)
+		return true
+	}
+
+	// Check if range is active (price is stable)
+	if detector.ShouldTrade() {
+		a.logger.Info("Price stabilized - Range is active, resuming trading",
+			zap.String("symbol", symbol),
+			zap.String("range_state", detector.GetStateString()))
+		a.resumeTrading(symbol)
+		return true
+	}
+
+	// Still waiting for stabilization
+	a.logger.Debug("Waiting for price stabilization before resuming",
+		zap.String("symbol", symbol),
+		zap.String("range_state", detector.GetStateString()))
+	return false
+}
+
+// CheckAndResumeAll attempts to resume trading for all paused symbols
+// Returns map of symbol -> resumed (true/false)
+func (a *AdaptiveGridManager) CheckAndResumeAll() map[string]bool {
+	a.mu.RLock()
+	pausedSymbols := make([]string, 0, len(a.tradingPaused))
+	for symbol := range a.tradingPaused {
+		pausedSymbols = append(pausedSymbols, symbol)
+	}
+	a.mu.RUnlock()
+
+	results := make(map[string]bool)
+	for _, symbol := range pausedSymbols {
+		results[symbol] = a.TryResumeTrading(symbol)
+	}
+	return results
 }
 
 // IsTradingPaused checks if trading is paused for a symbol

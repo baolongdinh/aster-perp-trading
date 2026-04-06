@@ -160,7 +160,7 @@ symbols:
   #   - [0, 1]: Chỉ chọn spread rất thấp
   #   - [0, 2]: Cân bằng (default)
   #   - [0, 5]: Chấp nhận spread cao hơn
-  optimal_spread_range: [0.0, 2.0]
+  optimal_spread_range: [0.0, 1.0]
 
   spread_volatility_threshold: 0.2
   exclude_high_fee_symbols: false  # Loại bỏ symbol phí cao
@@ -214,10 +214,10 @@ risk:
   max_trades_per_symbol: 1000
 
   # max_global_pending_limit_orders: Tổng số lệnh pending tối đa
-  max_global_pending_limit_orders: 30
+  max_global_pending_limit_orders: 20
 
   # max_pending_per_side: Số lệnh pending tối đa mỗi bên
-  max_pending_per_side: 15
+  max_pending_per_side: 10
 
   # per_trade_stop_loss_pct: Stop loss cho mỗi giao dịch (%)
   #   - 1-2%: Chặt chẽ, cắt lỗ nhanh
@@ -231,7 +231,7 @@ risk:
   #   - 3%+: Cho phép profit nhiều hơn
   per_trade_take_profit_pct: 1.5
 
-  risk_per_trade_usdt: 5.0        # Rủi ro mỗi giao dịch (USDT)
+  risk_per_trade_usdt: 2        # Rủi ro mỗi giao dịch (USDT)
   atr_multiplier: 1.5             # ATR multiplier cho stop loss
   position_mode: "one_way"        # Chế độ vị thế
   correlation_threshold: 0.9      # Ngưỡng tương quan
