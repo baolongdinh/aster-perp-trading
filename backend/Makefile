@@ -1,4 +1,4 @@
-.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon
+.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script
 
 # The name of our output binary
 APP_NAME := aster-bot
@@ -350,3 +350,33 @@ termux-setup:
 	@go build -o bin/volume-farm ./cmd/volume-farm
 	@echo ""
 	@echo "Setup complete! Use 'make termux-start' to run"
+
+# ============================================================================
+# Dashboard (Real-time Metrics)
+# ============================================================================
+
+# Launch real-time dashboard (refresh 1s)
+dashboard:
+	@echo "============================================"
+	@echo "Starting Grid Trading Dashboard"
+	@echo "============================================"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Real-time metrics (refresh 1s)"
+	@echo "  • Volume, orders, fill rate"
+	@echo "  • PnL, positions, risk status"
+	@echo "  • Press Ctrl+C to exit"
+	@echo ""
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 ./scripts/dashboard.py; \
+	elif command -v python >/dev/null 2>&1; then \
+		python ./scripts/dashboard.py; \
+	else \
+		echo "ERROR: Python not found. Install with: pkg install python"; \
+		exit 1; \
+	fi
+
+# Dashboard from run script (alternative)
+dashboard-script:
+	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
+	@./run-volume-farm-termux.sh dashboard

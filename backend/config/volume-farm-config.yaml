@@ -141,7 +141,7 @@ risk:
 
   # max_total_positions_usdt: Tổng position tối đa
   # $300 notional với 100x leverage = $3 margin
-  max_total_positions_usdt: 300
+  max_total_positions_usdt: 900
 
   # fee_loss_threshold_pct: Ngưỡng lỗ do phí (%)
   fee_loss_threshold_pct: 0.1

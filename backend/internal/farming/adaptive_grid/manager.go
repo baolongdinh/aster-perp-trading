@@ -158,6 +158,39 @@ type RiskConfig struct {
 
 	// Directional bias field
 	UseDirectionalBias bool // Only trade with trend (no counter-trend)
+
+	// NEW: Consecutive loss tracking
+	MaxConsecutiveLosses int           // Max consecutive losses before cooldown (default 3)
+	CooldownDuration     time.Duration // Cooldown duration after max losses (default 5m)
+}
+
+// ConvertRiskConfig converts config.RiskConfig to adaptive_grid.RiskConfig
+func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
+	return &RiskConfig{
+		MaxPositionUSDT:          cfg.MaxPositionUSDTPerSymbol,
+		MaxUnhedgedExposureUSDT:  cfg.MaxTotalPositionsUSDT,
+		MaxUnrealizedLossUSDT:    3.0, // Default, can be overridden
+		PerPositionLossLimitUSDT: 1.0, // Default, can be overridden
+		TotalNetLossLimitUSDT:    5.0, // Default, can be overridden
+		StopLossPct:              cfg.PerTradeStopLossPct,
+		TrailingStopPct:          0.01,  // Default 1%
+		TrailingStopDistancePct:  0.005, // Default 0.5%
+		LiquidationBufferPct:     0.2,   // Default 20%
+		PositionCheckInterval:    1 * time.Second,
+		TrendingThreshold:        0.7, // Default 70%
+
+		// Take-profit from config
+		TakeProfitRRatio: cfg.TakeProfitRRatio,
+		MinTakeProfitPct: cfg.MinTakeProfitPct,
+		MaxTakeProfitPct: cfg.MaxTakeProfitPct,
+
+		// Directional bias from config
+		UseDirectionalBias: true, // Default
+
+		// Consecutive loss tracking defaults
+		MaxConsecutiveLosses: 3,
+		CooldownDuration:     5 * time.Minute,
+	}
 }
 
 // DefaultRiskConfig returns default risk configuration
@@ -613,15 +646,22 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 // checkAndManageRisk checks positions and applies risk controls
 func (a *AdaptiveGridManager) checkAndManageRisk(ctx context.Context) {
 	if a.futuresClient == nil {
+		a.logger.Error("RISK CHECK: futuresClient is nil - cannot check positions")
 		return
 	}
 
 	// Fetch positions from exchange
 	positions, err := a.futuresClient.GetPositions(ctx)
 	if err != nil {
-		a.logger.Warn("Failed to fetch positions", zap.Error(err))
+		a.logger.Warn("RISK CHECK: Failed to fetch positions", zap.Error(err))
 		return
 	}
+
+	a.logger.Debug("RISK CHECK: Fetched positions",
+		zap.Int("count", len(positions)),
+		zap.Float64("per_position_limit", a.riskConfig.PerPositionLossLimitUSDT),
+		zap.Float64("max_unrealized_loss", a.riskConfig.MaxUnrealizedLossUSDT),
+		zap.Float64("total_net_loss_limit", a.riskConfig.TotalNetLossLimitUSDT))
 
 	// Calculate total net unrealized PnL across all positions
 	totalNetUnrealizedPnL := 0.0
@@ -629,11 +669,20 @@ func (a *AdaptiveGridManager) checkAndManageRisk(ctx context.Context) {
 
 	for _, pos := range positions {
 		if pos.PositionAmt == 0 {
+			a.logger.Debug("RISK CHECK: Skipping empty position", zap.String("symbol", pos.Symbol))
 			continue // Skip empty positions
 		}
 		activePositions = append(activePositions, pos)
 		totalNetUnrealizedPnL += pos.UnrealizedProfit
+		a.logger.Debug("RISK CHECK: Active position",
+			zap.String("symbol", pos.Symbol),
+			zap.Float64("amt", pos.PositionAmt),
+			zap.Float64("unrealized_pnl", pos.UnrealizedProfit))
 	}
+
+	a.logger.Info("RISK CHECK: Summary",
+		zap.Int("active_positions", len(activePositions)),
+		zap.Float64("total_net_unrealized_pnl", totalNetUnrealizedPnL))
 
 	// CRITICAL: Check total net unrealized loss first
 	// If total net loss > 5 USDT, close ALL positions and ALL orders immediately
@@ -758,6 +807,7 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	a.mu.RUnlock()
 
 	if position == nil {
+		a.logger.Warn("RISK CHECK: Position tracking nil", zap.String("symbol", symbol))
 		return
 	}
 
@@ -766,6 +816,12 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	unrealizedPnL := position.UnrealizedPnL
 	liquidationPrice := position.LiquidationPrice
 	entryPrice := position.EntryPrice
+
+	a.logger.Debug("RISK CHECK: Evaluating position",
+		zap.String("symbol", symbol),
+		zap.Float64("unrealized_pnl", unrealizedPnL),
+		zap.Float64("per_position_limit", -a.riskConfig.PerPositionLossLimitUSDT),
+		zap.Float64("max_unrealized_loss", -a.riskConfig.MaxUnrealizedLossUSDT))
 
 	// 1. Check stop loss
 	if a.isStopLossHit(symbol, markPrice, pos.PositionAmt, stopLoss, trailingStop) {
@@ -814,7 +870,7 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	// NEW: 3.5. Check per-position loss limit (1 USDT)
 	// Close position immediately if unrealized loss > 1 USDT
 	if unrealizedPnL < -a.riskConfig.PerPositionLossLimitUSDT {
-		a.logger.Warn("PER-POSITION LOSS LIMIT EXCEEDED (>1 USDT) - Closing position immediately",
+		a.logger.Error("PER-POSITION LOSS LIMIT EXCEEDED - Closing position immediately",
 			zap.String("symbol", symbol),
 			zap.Float64("unrealized_pnl", unrealizedPnL),
 			zap.Float64("limit", a.riskConfig.PerPositionLossLimitUSDT))
@@ -831,6 +887,10 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 		a.pauseTrading(symbol)
 		return
 	}
+
+	a.logger.Debug("RISK CHECK: Position passed all risk checks",
+		zap.String("symbol", symbol),
+		zap.Float64("unrealized_pnl", unrealizedPnL))
 }
 
 // isStopLossHit checks if stop loss is hit
@@ -1473,7 +1533,10 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 	// NEW: Check consecutive loss cooldown
 	if a.cooldownActive[symbol] {
 		lastLoss := a.lastLossTime[symbol]
-		cooldownDuration := 5 * time.Minute
+		cooldownDuration := a.riskConfig.CooldownDuration
+		if cooldownDuration <= 0 {
+			cooldownDuration = 5 * time.Minute // Default
+		}
 		if time.Since(lastLoss) < cooldownDuration {
 			a.logger.Warn("CanPlaceOrder blocked: cooldown after consecutive losses",
 				zap.String("symbol", symbol),
@@ -1772,12 +1835,14 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 		a.riskMonitor.RecordTradeResult(isWin)
 	}
 
-	// Get EnhancedRiskConfig values (fallback to defaults if not set)
-	maxConsecutiveLosses := 3
-	cooldownDuration := 5 * time.Minute
-	if a.riskConfig != nil {
-		// Use RiskConfig values if available - could add these fields to RiskConfig
-		// For now use reasonable defaults
+	// Get RiskConfig values (fallback to defaults if not set)
+	maxConsecutiveLosses := a.riskConfig.MaxConsecutiveLosses
+	if maxConsecutiveLosses <= 0 {
+		maxConsecutiveLosses = 3 // Default
+	}
+	cooldownDuration := a.riskConfig.CooldownDuration
+	if cooldownDuration <= 0 {
+		cooldownDuration = 5 * time.Minute // Default
 	}
 
 	if isWin {
@@ -1821,7 +1886,10 @@ func (a *AdaptiveGridManager) IsInCooldown(symbol string) bool {
 		return false
 	}
 
-	cooldownDuration := 5 * time.Minute
+	cooldownDuration := a.riskConfig.CooldownDuration
+	if cooldownDuration <= 0 {
+		cooldownDuration = 5 * time.Minute // Default
+	}
 	lastLoss := a.lastLossTime[symbol]
 	elapsed := time.Since(lastLoss)
 
@@ -2081,8 +2149,10 @@ func (a *AdaptiveGridManager) GetDynamicSpread() float64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	baseSpread := 0.5 // Default spread
-	if a.dynamicSpreadCalc != nil {
+	baseSpread := 0.01 // Default 1% spread
+	if a.optConfig != nil && a.optConfig.DynamicGrid != nil && a.optConfig.DynamicGrid.BaseSpreadPct > 0 {
+		baseSpread = a.optConfig.DynamicGrid.BaseSpreadPct
+	} else if a.dynamicSpreadCalc != nil {
 		baseSpread = a.dynamicSpreadCalc.GetDynamicSpread()
 	}
 

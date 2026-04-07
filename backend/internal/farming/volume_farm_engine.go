@@ -166,6 +166,14 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	)
 	engine.adaptiveGridManager = adaptiveGridManager
 
+	// CRITICAL: Set risk config from volume config (not hardcode)
+	adaptiveGridManager.SetRiskConfig(adaptive_grid.ConvertRiskConfig(volumeConfig.Risk))
+	logger.Info("AdaptiveGridManager risk config set from volume config",
+		zap.Float64("max_position_usdt", volumeConfig.Risk.MaxPositionUSDTPerSymbol),
+		zap.Float64("daily_loss_limit", volumeConfig.Risk.DailyLossLimitUSDT),
+		zap.Float64("per_trade_sl_pct", volumeConfig.Risk.PerTradeStopLossPct),
+	)
+
 	// Connect adaptive manager as risk checker for grid manager
 	engine.gridManager.SetRiskChecker(adaptiveGridManager)
 
@@ -248,6 +256,7 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 			e.logger.Error("Adaptive grid manager initialization error", zap.Error(err))
 			return
 		}
+		e.logger.Info("Adaptive grid manager initialized - position monitor ACTIVE")
 
 		// Start regime monitoring
 		ticker := time.NewTicker(5 * time.Minute)

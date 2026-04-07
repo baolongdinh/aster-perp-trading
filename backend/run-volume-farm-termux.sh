@@ -183,6 +183,20 @@ view_logs() {
     tail -f "${LOG_FILE}"
 }
 
+dashboard() {
+    if command -v python3 &> /dev/null; then
+        log_info "Starting dashboard (Ctrl+C to exit)..."
+        BOT_LOG_FILE="${LOG_FILE}" python3 ./scripts/dashboard.py
+    elif command -v python &> /dev/null; then
+        log_info "Starting dashboard (Ctrl+C to exit)..."
+        BOT_LOG_FILE="${LOG_FILE}" python ./scripts/dashboard.py
+    else
+        log_error "Python not found. Cannot run dashboard."
+        log_info "Install Python: pkg install python"
+        exit 1
+    fi
+}
+
 daemon_mode() {
     log_info "Starting in daemon mode (auto-restart on crash)..."
     log_info "Press Ctrl+C to stop daemon watcher (bot will keep running)"
@@ -208,6 +222,7 @@ usage() {
     echo "  restart  - Restart the bot"
     echo "  status   - Check bot status"
     echo "  logs     - View live logs"
+    echo "  dashboard - Real-time metrics dashboard (refresh 1s)"
     echo "  daemon   - Run in daemon mode (auto-restart)"
     echo "  build    - Build the binary"
     echo ""
@@ -215,6 +230,7 @@ usage() {
     echo "  $0 start                                    # Start with default config"
     echo "  $0 start config/volume-farm-config.yaml     # Start with custom config"
     echo "  $0 logs                                     # View logs"
+    echo "  $0 dashboard                                # Real-time dashboard"
     echo "  $0 stop                                     # Stop the bot"
     echo ""
     echo "Note: This script uses termux-wake-lock to keep running when screen is off"
@@ -244,6 +260,9 @@ case "${COMMAND}" in
         ;;
     logs)
         view_logs
+        ;;
+    dashboard)
+        dashboard
         ;;
     daemon)
         daemon_mode

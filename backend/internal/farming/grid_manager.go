@@ -151,6 +151,7 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 	maxOrdersSide := 3
 	placementCooldown := 500 * time.Millisecond
 	rateLimitCooldown := 3 * time.Second
+	maxNotional := 50.0 // Default max position size per order
 
 	if cfg != nil {
 		if cfg.OrderSizeUSDT > 0 {
@@ -168,6 +169,10 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		if cfg.RateLimitCooldownSec > 0 {
 			rateLimitCooldown = time.Duration(cfg.RateLimitCooldownSec) * time.Second
 		}
+		// Use Risk config for max position size
+		if cfg.Risk.MaxPositionUSDTPerSymbol > 0 {
+			maxNotional = cfg.Risk.MaxPositionUSDTPerSymbol
+		}
 	}
 
 	return &GridManager{
@@ -180,7 +185,7 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		stopCh:                make(chan struct{}),
 		baseNotionalUSD:       baseNotional,
 		minNotionalUSD:        5.0,
-		maxNotionalUSD:        50.0,
+		maxNotionalUSD:        maxNotional,
 		useDynamicSizing:      true,
 		gridSpreadPct:         gridSpread,
 		maxOrdersSide:         maxOrdersSide,
@@ -217,6 +222,11 @@ func (g *GridManager) ApplyConfig(cfg *config.VolumeFarmConfig) {
 	}
 	if cfg.RateLimitCooldownSec > 0 {
 		g.rateLimitCooldown = time.Duration(cfg.RateLimitCooldownSec) * time.Second
+	}
+	// Update max position size from Risk config
+	if cfg.Risk.MaxPositionUSDTPerSymbol > 0 {
+		g.maxNotionalUSD = cfg.Risk.MaxPositionUSDTPerSymbol
+		g.logger.WithField("max_notional_usd", g.maxNotionalUSD).Info("Max position size updated from config")
 	}
 	if wsURL := buildTickerStreamURL(cfg.Exchange.FuturesWSBase, cfg.TickerStream); wsURL != "" {
 		g.tickerStreamURL = wsURL
@@ -861,6 +871,34 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		"size":   order.Size,
 	}).Info("Attempting to place order")
 
+	// CRITICAL: Check max position size before placing order
+	notional := order.Size * order.Price
+	if notional > g.maxNotionalUSD {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":       order.Symbol,
+			"side":         order.Side,
+			"order_size":   order.Size,
+			"price":        order.Price,
+			"notional":     notional,
+			"max_notional": g.maxNotionalUSD,
+		}).Error("ORDER REJECTED: Exceeds max notional limit")
+		return fmt.Errorf("order rejected: notional %.2f exceeds max %.2f", notional, g.maxNotionalUSD)
+	}
+
+	// CRITICAL: Check total position exposure before adding new order
+	currentExposure := g.calculateCurrentExposure(context.Background(), order.Symbol)
+	newTotalExposure := currentExposure + notional
+	if newTotalExposure > g.maxNotionalUSD*2 { // Allow 2x for both sides
+		g.logger.WithFields(logrus.Fields{
+			"symbol":           order.Symbol,
+			"current_exposure": currentExposure,
+			"new_order":        notional,
+			"total_exposure":   newTotalExposure,
+			"max_exposure":     g.maxNotionalUSD * 2,
+		}).Error("ORDER REJECTED: Total exposure would exceed limit - position too large!")
+		return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, g.maxNotionalUSD*2)
+	}
+
 	// NEW: Check if trading is allowed by time filter
 	if g.adaptiveMgr != nil && !g.adaptiveMgr.CanTrade() {
 		g.logger.WithFields(logrus.Fields{
@@ -927,7 +965,7 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	// Verify notional after rounding - fix for SOL and other high-price assets
 	qty, _ := strconv.ParseFloat(orderReq.Quantity, 64)
 	price, _ := strconv.ParseFloat(orderReq.Price, 64)
-	notional := qty * price
+	notional = qty * price
 
 	if notional < 5.0 {
 		// Increase quantity to meet minimum notional
@@ -1446,6 +1484,32 @@ func (g *GridManager) SetGridSpread(spread float64) {
 	defer g.gridsMu.Unlock()
 	g.gridSpreadPct = spread
 	g.logger.WithField("grid_spread", spread).Info("Grid spread updated")
+}
+
+// calculateCurrentExposure calculates total exposure for a symbol from exchange positions
+func (g *GridManager) calculateCurrentExposure(ctx context.Context, symbol string) float64 {
+	// Get actual positions from exchange
+	positions, err := g.futuresClient.GetPositions(ctx)
+	if err != nil {
+		g.logger.WithError(err).Warn("Failed to get positions for exposure check")
+		return 0
+	}
+
+	totalExposure := 0.0
+	for _, pos := range positions {
+		if pos.Symbol == symbol && pos.PositionAmt != 0 {
+			exposure := math.Abs(pos.PositionAmt) * pos.MarkPrice
+			totalExposure += exposure
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"position":   pos.PositionAmt,
+				"mark_price": pos.MarkPrice,
+				"exposure":   exposure,
+			}).Debug("Position exposure calculated")
+		}
+	}
+
+	return totalExposure
 }
 
 // SetMaxOrdersPerSide sets the maximum orders per side

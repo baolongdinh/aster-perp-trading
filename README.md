@@ -1,161 +1,174 @@
-# Aster Skills Hub
+# Aster Perp Trading Bot 🤖
 
-OpenClaw skills for the **Aster Finance Futures API** and **Spot API (testnet)**.
+Bot giao dịch tự động trên Aster Finance Futures API - Grid Trading + Volume Farming.
 
-## What this is
+## 📚 Tài Liệu Quan Trọng
 
-This repo is a collection of [AgentSkills](https://agentskills.io/)-compatible skills that teach an AI agent how to call the Aster Finance **Futures** and **Spot (testnet)** APIs. Each skill includes a `SKILL.md` (instructions and frontmatter) and a `reference.md` (detailed API reference). They work with **OpenClaw** and any other agent that loads skills from this format.
+| Tài Liệu | Mô Tả | Dành Cho |
+|----------|-------|----------|
+| **[GRID_TRADING_LOGIC.md](GRID_TRADING_LOGIC.md)** | Giải thích chi tiết nghiệp vụ bot - cách vào lệnh, ra lệnh, quản lý rủi ro | Người muốn hiểu bot **trade như thế nào** |
+| **[VOLUME_FARMING_README.md](VOLUME_FARMING_README.md)** | Giải thích logic code - cách code thực hiện các nghiệp vụ | Người muốn hiểu **code chạy như thế nào** |
 
-Coverage includes:
-
-- **Authentication** — EIP-712 signed requests, nonce, signature (Futures and Spot)
-- **Trading** — Place, cancel, and query orders (Futures and Spot)
-- **Market data** — Public REST endpoints (ping, time, depth, klines, tickers, funding, etc.)
-- **WebSocket** — Market streams and user data stream
-- **Account** — Balance, positions, transfers, income
-- **Errors** — Error codes, rate limits, retry/backoff
-- **Deposit** — Deposit funds to Aster from wallet (BAPI, supported assets, env key)
-
-## API base URLs
-
-| API     | Type      | URL                              |
-|---------|-----------|-----------------------------------|
-| Futures | REST      | `https://fapi.asterdex.com`       |
-| Futures | WebSocket | `wss://fstream.asterdex.com`      |
-| Spot (testnet) | REST      | `https://sapi.asterdex-testnet.com` |
-| Spot (testnet) | WebSocket | `wss://sstream.asterdex-testnet.com` |
-
-## Skills
-
-### Futures API
-
-| Skill | Purpose |
-|-------|---------|
-| **aster-api-auth-v3** | EIP-712 signed requests, nonce, signature payload |
-| **aster-api-auth-v1** | Same for v1 API |
-| **aster-api-trading-v3** | Orders: place, cancel, batch, query (open/history) |
-| **aster-api-trading-v1** | Same for v1 API |
-| **aster-api-market-data-v3** | Public REST: ping, time, exchangeInfo, depth, trades, klines, tickers, funding |
-| **aster-api-market-data-v1** | Same for v1 API |
-| **aster-api-websocket-v3** | WebSocket: market streams + user data stream, listenKey |
-| **aster-api-websocket-v1** | Same for v1 API |
-| **aster-api-account-v3** | Account, balance, positions, transfers, income |
-| **aster-api-account-v1** | Same for v1 API |
-| **aster-api-errors-v3** | Error codes, rate limits, 429/418 handling, retry/backoff |
-| **aster-api-errors-v1** | Same for v1 API |
-
-### Spot API (testnet)
-
-| Skill | Purpose |
-|-------|---------|
-| **aster-api-spot-auth-v3** | EIP-712 signed requests for Spot testnet (/api/v3/) |
-| **aster-api-spot-auth-v1** | Same for v1 |
-| **aster-api-spot-trading-v3** | Spot orders: place, cancel, query (open/history) |
-| **aster-api-spot-trading-v1** | Same for v1 |
-| **aster-api-spot-market-data-v3** | Public REST: ping, time, exchangeInfo, depth, trades, klines, tickers |
-| **aster-api-spot-market-data-v1** | Same for v1 |
-| **aster-api-spot-websocket-v3** | WebSocket: market + user data streams, listenKey |
-| **aster-api-spot-websocket-v1** | Same for v1 |
-| **aster-api-spot-account-v3** | Spot account, balance |
-| **aster-api-spot-account-v1** | Same for v1 |
-| **aster-api-spot-errors-v3** | Error codes, rate limits, retry/backoff |
-| **aster-api-spot-errors-v1** | Same for v1 |
-
-### Other
-
-| Skill | Purpose |
-|-------|---------|
-| **aster-deposit-fund** | Deposit funds to Aster from wallet; supported assets and deposit address via BAPI; private key from env; ETH, BSC, Arbitrum |
-
-## Using with OpenClaw
-
-OpenClaw loads skills from workspace folders, `~/.openclaw/skills`, or paths listed in config. To use this hub:
-
-1. Install and set up OpenClaw (see [OpenClaw installation](#openclaw-installation) below).
-2. Either copy/symlink this repo’s `skills/` into your OpenClaw workspace skills folder, or add this repo’s `skills` directory to `skills.load.extraDirs` in `~/.openclaw/openclaw.json`.
-3. Start a new session so OpenClaw picks up the Aster skills.
-
-Details and install steps are in the [OpenClaw installation](#openclaw-installation) section.
+> 💡 **Gợi ý**: Đọc `GRID_TRADING_LOGIC.md` trước để hiểu nghiệp vụ, sau đó đọc `VOLUME_FARMING_README.md` nếu cần tìm hiểu sâu về implementation.
 
 ---
 
-## OpenClaw installation
+## 🎯 Bot Làm Gì?
 
-This section walks through installing OpenClaw and then loading the Aster skills from this hub.
+Bot tự động đặt lệnh mua (BUY) và bán (SELL) xung quanh giá hiện tại để:
+- **Grid Trading**: Kiếm lãi từ biên độ dao động giá (mua thấp - bán cao)
+- **Volume Farming**: Tạo volume giao dịch liên tục để tích lũy điểm thưởng
 
-### Prerequisites
-
-- **Node.js 22+** (check with `node --version`).
-- 4 GB RAM minimum (8 GB recommended), 64-bit macOS, Linux, or WSL2 on Windows.
-
-### Install
-
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://openclaw.ai/install.sh | bash
+### Cơ Chế Đơn Giản
 ```
+Giá hiện tại: $100
+├─ Đặt SELL ở $101, $102, $103... (trên giá)
+└─ Đặt BUY ở $99, $98, $97... (dưới giá)
 
-**Windows (PowerShell):**
-
-```powershell
-iwr -useb https://openclaw.ai/install.ps1 | iex
+Khi giá dao động:
+→ Chạm BUY $99 → Khớp lệnh → Tự động đặt SELL $101
+→ Chạm SELL $101 → Khớp lệnh → Lãi $2
+→ Lặp lại nhiều lần → Tích lũy lãi
 ```
-
-### First-time setup
-
-Run the onboarding wizard (configures auth, gateway, and optional channels):
-
-```bash
-openclaw onboard --install-daemon
-```
-
-Then check that the gateway is running and open the UI:
-
-```bash
-openclaw gateway status
-openclaw dashboard
-```
-
-You can also open the Control UI at **http://127.0.0.1:18789/**.
-
-### Using this hub with OpenClaw
-
-OpenClaw loads skills from, in order of precedence:
-
-1. Workspace skills (e.g. `/skills` in the agent’s workspace)
-2. `~/.openclaw/skills`
-3. Paths in `skills.load.extraDirs` in `~/.openclaw/openclaw.json`
-
-**Option A — Workspace skills**
-
-Clone this repo and copy or symlink its `skills/` contents into your OpenClaw workspace skills folder (often `~/.openclaw/workspace/skills/`). Each skill should appear as its own folder, e.g. `~/.openclaw/workspace/skills/aster-api-auth-v3`, `~/.openclaw/workspace/skills/aster-api-spot-trading-v3`, and so on.
-
-**Option B — Extra skill dirs**
-
-Clone this repo to a fixed path (e.g. `~/aster-skills-hubs`). In `~/.openclaw/openclaw.json`, set `skills.load.extraDirs` to an array that includes the **absolute path** to this repo’s `skills` directory:
-
-```json
-{
-  "skills": {
-    "load": {
-      "extraDirs": ["/path/to/aster-skills-hubs/skills"]
-    }
-  }
-}
-```
-
-Restart the gateway or start a new session so OpenClaw reloads skills.
-
-### Verification
-
-After adding the Aster skills, start a new session and confirm they appear (e.g. in the Skills UI or in the agent’s available skills list).
-
-### More information
-
-- [OpenClaw Skills](https://docs.openclaw.ai/skills) — Skill locations, format, and config
-- [OpenClaw Getting Started](https://docs.openclaw.ai/start/getting-started) — Full setup and next steps
 
 ---
 
-Built with [Claude Code](https://claude.ai/claude-code)
+## 🚀 Cách Chạy Bot
+
+### 1. Cài Đặt
+
+```bash
+# Vào thư mục backend
+cd backend
+
+# Build bot
+go build -v ./cmd/bot
+```
+
+### 2. Cấu Hình
+
+```bash
+# Copy file config mẫu
+cp config/volume-farm-config.example.yaml config/volume-farm-config.yaml
+
+# Sửa config theo nhu cầu
+nano config/volume-farm-config.yaml
+```
+
+**Cấu hình quan trọng:**
+```yaml
+volume_farming:
+  order_size_usdt: 100      # $100 mỗi lệnh
+  grid_spread_pct: 0.001    # 0.1% spread
+  max_orders_per_side: 5    # 5 lệnh mỗi bên
+
+risk_management:
+  max_position_usdt: 300    # Tối đa $300/symbol
+  daily_drawdown_pct: 20    # Dừng nếu lỗ 20%
+```
+
+### 3. Chạy Bot
+
+```bash
+# Cách 1: Chạy trực tiếp
+./bot
+
+# Cách 2: Chạy với Termux (mobile)
+make termux-start
+
+# Cách 3: Dùng script
+./run-volume-farm.sh start
+```
+
+### 4. Theo Dõi
+
+```bash
+# Xem logs
+./run-volume-farm.sh logs
+
+# Kiểm tra status
+./run-volume-farm.sh status
+
+# Dừng bot
+./run-volume-farm.sh stop
+```
+
+---
+
+## 📂 Cấu Trúc Project
+
+```
+aster-perp-trading/
+├── backend/                      # Code Go chính
+│   ├── cmd/bot/                  # Entry point
+│   ├── internal/
+│   │   ├── farming/              # Core trading logic
+│   │   │   ├── adaptive_grid/    # Grid manager
+│   │   │   └── market_regime/    # Trend detection
+│   │   ├── risk/                 # Risk management
+│   │   └── client/               # Binance API client
+│   └── config/                   # YAML configs
+├── skills/                       # OpenClaw skills (nếu dùng)
+├── GRID_TRADING_LOGIC.md         # 📖 Nghiệp vụ chi tiết
+├── VOLUME_FARMING_README.md      # 📖 Logic code chi tiết
+└── README.md                     # 📖 File này
+```
+
+---
+
+## ⚠️ Lưu Ý Quan Trọng
+
+### Rủi Ro
+- **Trending Market**: Nếu giá chạy 1 chiều mạnh, bot có thể tích lũy vị thế lớn
+- **Volatility**: Biến động cao có thể gây slippage
+- **Funding Fee**: Giữ vị thế qua đêm có thể mất phí funding
+
+### Khuyến Nghị
+- **Test trên testnet** trước khi chạy real
+- **Bắt đầu với vốn nhỏ** ($100-500)
+- **Theo dõi liên tục** trong những ngày đầu
+- **Đọc kỹ** [GRID_TRADING_LOGIC.md](GRID_TRADING_LOGIC.md) để hiểu rủi ro
+
+---
+
+## 🔧 Skills (Nếu Dùng OpenClaw)
+
+Thư mục `skills/` chứa các skills để tích hợp với OpenClaw:
+
+| Skill | Mục Đích |
+|-------|----------|
+| `aster-api-auth-v3` | Xác thực EIP-712 |
+| `aster-api-trading-v3` | Đặt/hủy lệnh |
+| `aster-api-market-data-v3` | Lấy dữ liệu thị trường |
+| `aster-api-account-v3` | Quản lý tài khoản |
+
+---
+
+## 🆘 Hỗ Trợ
+
+### Debug
+```bash
+# Xem logs chi tiết
+tail -f backend/logs/volume-farm.log
+
+# Kiểm tra lỗi
+grep "ERROR" backend/logs/volume-farm.log
+```
+
+### Thông Tin Thêm
+- Đọc [GRID_TRADING_LOGIC.md](GRID_TRADING_LOGIC.md) để hiểu **cách bot trade**
+- Đọc [VOLUME_FARMING_README.md](VOLUME_FARMING_README.md) để hiểu **cách code hoạt động**
+
+---
+
+## 📊 API Endpoints
+
+| API | Loại | URL |
+|-----|------|-----|
+| Futures | REST | `https://fapi.asterdex.com` |
+| Futures | WebSocket | `wss://fstream.asterdex.com` |
+
+---
+
+*Bot được xây dựng bằng Go + được tài liệu hóa chi tiết bằng tiếng Việt 🇻🇳*
+
