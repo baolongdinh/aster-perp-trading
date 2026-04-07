@@ -36,15 +36,15 @@ func (s SkewAction) String() string {
 
 // PositionInfo tracks information about a position
 type PositionInfo struct {
-	Symbol         string
-	Side           string  // "LONG" or "SHORT"
-	Size           float64 // Quantity
-	EntryPrice     float64
-	CurrentPrice   float64
-	NotionalValue  float64
-	UnrealizedPnL  float64
-	EntryTime      time.Time
-	GridLevel      int
+	Symbol        string
+	Side          string  // "LONG" or "SHORT"
+	Size          float64 // Quantity
+	EntryPrice    float64
+	CurrentPrice  float64
+	NotionalValue float64
+	UnrealizedPnL float64
+	EntryTime     time.Time
+	GridLevel     int
 }
 
 // InventoryManager manages inventory skew and position tracking
@@ -53,19 +53,54 @@ type InventoryManager struct {
 	netExposure     map[string]float64        // symbol -> net exposure (positive = long, negative = short)
 	maxInventoryPct float64                   // Max inventory as % of equity
 	equity          float64
+	config          *InventoryConfig // Full config reference
 	logger          *zap.Logger
 	mu              sync.RWMutex
 }
 
+// SkewThreshold holds configuration for a skew level
+type SkewThreshold struct {
+	Threshold           float64 `yaml:"threshold"`
+	SizeReduction       float64 `yaml:"size_reduction"`
+	PauseSide           bool    `yaml:"pause_side"`
+	TakeProfitReduction float64 `yaml:"take_profit_reduction,omitempty"`
+}
+
 // InventoryConfig holds configuration for inventory management
 type InventoryConfig struct {
-	MaxInventoryPct float64 `yaml:"max_inventory_pct"` // Default 0.30 (30%)
+	MaxInventoryPct   float64       `yaml:"max_inventory_pct"` // Default 0.30 (30%)
+	LowThreshold      SkewThreshold `yaml:"low_threshold"`
+	ModerateThreshold SkewThreshold `yaml:"moderate_threshold"`
+	HighThreshold     SkewThreshold `yaml:"high_threshold"`
+	CriticalThreshold SkewThreshold `yaml:"critical_threshold"`
 }
 
 // DefaultInventoryConfig returns default configuration
 func DefaultInventoryConfig() *InventoryConfig {
 	return &InventoryConfig{
 		MaxInventoryPct: 0.30,
+		LowThreshold: SkewThreshold{
+			Threshold:     0.40,
+			SizeReduction: 0.0,
+			PauseSide:     false,
+		},
+		ModerateThreshold: SkewThreshold{
+			Threshold:     0.80,
+			SizeReduction: 0.20,
+			PauseSide:     false,
+		},
+		HighThreshold: SkewThreshold{
+			Threshold:           1.0,
+			SizeReduction:       0.30,
+			PauseSide:           false,
+			TakeProfitReduction: 0.20,
+		},
+		CriticalThreshold: SkewThreshold{
+			Threshold:           1.2,
+			SizeReduction:       0.50,
+			PauseSide:           true,
+			TakeProfitReduction: 0.30,
+		},
 	}
 }
 
@@ -79,6 +114,7 @@ func NewInventoryManager(config *InventoryConfig, logger *zap.Logger) *Inventory
 		positions:       make(map[string][]PositionInfo),
 		netExposure:     make(map[string]float64),
 		maxInventoryPct: config.MaxInventoryPct,
+		config:          config,
 		logger:          logger,
 	}
 }
@@ -132,7 +168,7 @@ func (im *InventoryManager) UpdatePositionPrice(symbol string, currentPrice floa
 		positions[i].CurrentPrice = currentPrice
 		notional := positions[i].Size * currentPrice
 		positions[i].NotionalValue = notional
-		
+
 		// Calculate unrealized PnL
 		if positions[i].Side == "LONG" {
 			positions[i].UnrealizedPnL = (currentPrice - positions[i].EntryPrice) * positions[i].Size
@@ -177,12 +213,20 @@ func (im *InventoryManager) CalculateSkewRatio(symbol string) float64 {
 
 // GetSkewAction determines the action to take based on skew ratio
 func (im *InventoryManager) GetSkewAction(skewRatio float64) SkewAction {
+	// Use config thresholds if available, otherwise use defaults
+	var lowThreshold, moderateThreshold, highThreshold float64 = 0.40, 0.80, 1.0
+	if im.config != nil {
+		lowThreshold = im.config.LowThreshold.Threshold
+		moderateThreshold = im.config.ModerateThreshold.Threshold
+		highThreshold = im.config.HighThreshold.Threshold
+	}
+
 	switch {
-	case skewRatio < 0.3:
+	case skewRatio < lowThreshold:
 		return SkewActionNormal
-	case skewRatio < 0.6:
+	case skewRatio < moderateThreshold:
 		return SkewActionReduceSkewSide
-	case skewRatio < 0.8:
+	case skewRatio < highThreshold:
 		return SkewActionPauseSkewSide
 	default:
 		return SkewActionEmergencySkew
@@ -311,7 +355,7 @@ func (im *InventoryManager) ClosePosition(symbol string, gridLevel int) error {
 
 			// Remove from slice
 			im.positions[symbol] = append(positions[:i], positions[i+1:]...)
-			
+
 			im.logger.Debug("Position closed",
 				zap.String("symbol", symbol),
 				zap.Int("grid_level", gridLevel))

@@ -42,7 +42,7 @@ inventory_skew:
   #   - 0.30 (30%): Conservative, chỉ cho phép lệch nhẹ
   #   - 0.50 (50%): Cân bằng (default), cho phép lệch vừa phải
   #   - 0.70 (70%): Aggressive, chấp nhận lệch nhiều để farm nhiều hơn
-  max_inventory_pct: 0.50
+  max_inventory_pct: 0.70
 
   # ---------------------------------------------------------------------------
   # THRESHOLDS VÀ ACTIONS
@@ -67,7 +67,7 @@ inventory_skew:
     #     + 0.20: Giảm 20% (conservative)
     #     + 0.30-0.40: Cân bằng
     moderate:
-      threshold: 0.7
+      threshold: 0.8
       size_reduction: 0.2   # Giảm 20% size
       pause_side: false
       action: "REDUCE_SKEW_SIDE"
@@ -83,7 +83,7 @@ inventory_skew:
     #   - take_profit_reduction: Giảm khoảng cách take-profit
     #     + Giúp thoát lệnh nhanh hơn khi đang skew
     high:
-      threshold: 0.9
+      threshold: 1.0
       size_reduction: 0.3
       pause_side: false
       action: "PAUSE_SKEW_SIDE"

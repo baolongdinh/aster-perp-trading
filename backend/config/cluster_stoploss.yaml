@@ -44,18 +44,18 @@ cluster_stop_loss:
     #   - 1-2 giờ: Phù hợp scalping, không để lệnh treo
     #   - 4-6 giờ: Cho swing trading, cho phép hồi phục
     #   - 12-24 giờ: Cho position dài hạn
-    monitor_hours: 0.5
+    monitor_hours: 0.25
 
     # emergency_hours: Sau bao nhiêu giờ thì emergency close nếu drawdown > 1%
     #   - Giá trị càng cao → cho phép chờ hồi lâu hơn
     #   - Giá trị càng thấp → cắt lỗ nhanh hơn, tránh drawdown sâu
-    emergency_hours: 1
+    emergency_hours: 0.5
 
     # stale_hours: Sau bao nhiêu giờ thì đóng BẤT KỂ PnL (kể cả đang lãi)
     #   - Đảm bảo không có vị thế nào treo quá lâu
     #   - Set cao nếu muốn giữ position dài hạn
     #   - Set thấp nếu chỉ muốn scalping ngắn hạn
-    stale_hours: 2
+    stale_hours: 1
 
   # ---------------------------------------------------------------------------
   # DRAWDOWN THRESHOLDS (%)
@@ -66,13 +66,13 @@ cluster_stop_loss:
     #   - -0.3%: Rất nhạy, đóng sớm
     #   - -0.5%: Cân bằng (default)
     #   - -1.0%: Chịu lỗ nhiều hơn trước khi hành động
-    monitor: -0.3
+    monitor: -0.5
 
     # emergency: % drawdown để emergency close ngay lập tức
     #   - NÊN LỚN HƠN monitor threshold
     #   - -1.0%: Cắt lỗ nhanh, bảo vệ vốn
     #   - -2.0%: Chịu lỗ nhiều hơn, chờ hồi
-    emergency: -1.0
+    emergency: -2.0
 
   # ---------------------------------------------------------------------------
   # BREAKEVEN EXIT SETTINGS

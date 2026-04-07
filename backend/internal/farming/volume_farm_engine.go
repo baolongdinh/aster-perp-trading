@@ -142,7 +142,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	engine.configManager = configManager
 
 	// Initialize regime detector
-	regimeDetector := market_regime.NewRegimeDetector(logger)
+	regimeDetector := market_regime.NewRegimeDetector(logger, nil)
 	engine.regimeDetector = regimeDetector
 
 	// Initialize adaptive grid manager

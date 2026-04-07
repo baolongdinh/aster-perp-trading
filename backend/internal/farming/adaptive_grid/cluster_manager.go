@@ -42,27 +42,29 @@ type ClusterManager struct {
 
 // ClusterStopLossConfig holds configuration
 type ClusterStopLossConfig struct {
-	MonitorHours       float64 `yaml:"monitor_hours"`         // 2 hours
-	EmergencyHours     float64 `yaml:"emergency_hours"`       // 4 hours
-	StaleHours         float64 `yaml:"stale_hours"`           // 8 hours
-	MonitorDrawdown    float64 `yaml:"monitor_drawdown"`      // -0.5%
-	EmergencyDrawdown  float64 `yaml:"emergency_drawdown"`    // -1.0%
-	Breakeven50PctAt   float64 `yaml:"breakeven_50_pct_at"`   // -0.2%
-	Breakeven100PctAt  float64 `yaml:"breakeven_100_pct_at"`  // 0.0%
-	MinDrawdownForExit float64 `yaml:"min_drawdown_for_exit"` // -2.0%
+	MonitorHours         float64 `yaml:"monitor_hours"`            // 2 hours
+	EmergencyHours       float64 `yaml:"emergency_hours"`          // 4 hours
+	StaleHours           float64 `yaml:"stale_hours"`              // 8 hours
+	MonitorDrawdown      float64 `yaml:"monitor_drawdown"`         // -0.5%
+	EmergencyDrawdown    float64 `yaml:"emergency_drawdown"`       // -1.0%
+	Breakeven50PctAt     float64 `yaml:"breakeven_50_pct_at"`      // -0.2%
+	Breakeven100PctAt    float64 `yaml:"breakeven_100_pct_at"`     // 0.0%
+	MinDrawdownFor50Pct  float64 `yaml:"min_drawdown_for_50_pct"`  // -2.0%
+	MinDrawdownFor100Pct float64 `yaml:"min_drawdown_for_100_pct"` // -3.0%
 }
 
 // DefaultClusterStopLossConfig returns default configuration
 func DefaultClusterStopLossConfig() *ClusterStopLossConfig {
 	return &ClusterStopLossConfig{
-		MonitorHours:       2,
-		EmergencyHours:     4,
-		StaleHours:         8,
-		MonitorDrawdown:    -0.005,
-		EmergencyDrawdown:  -0.01,
-		Breakeven50PctAt:   -0.002,
-		Breakeven100PctAt:  0.0,
-		MinDrawdownForExit: -0.02,
+		MonitorHours:         2,
+		EmergencyHours:       4,
+		StaleHours:           8,
+		MonitorDrawdown:      -0.005,
+		EmergencyDrawdown:    -0.01,
+		Breakeven50PctAt:     -0.002,
+		Breakeven100PctAt:    0.0,
+		MinDrawdownFor50Pct:  -0.02,
+		MinDrawdownFor100Pct: -0.03,
 	}
 }
 

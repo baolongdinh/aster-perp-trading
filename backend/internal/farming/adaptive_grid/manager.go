@@ -411,9 +411,150 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	a.wg.Add(1)
 	go a.positionMonitor(ctx)
 
+	// NEW: Start time slot monitoring goroutine
+	a.wg.Add(1)
+	go a.slotMonitor(ctx)
+
 	a.logger.Info("Adaptive grid manager initialized successfully",
 		zap.Bool("enabled", a.configManager.IsEnabled()),
 		zap.Time("last_reload", a.configManager.GetLastReload()))
+
+	return nil
+}
+
+// slotMonitor monitors time slot changes and triggers grid transitions
+func (a *AdaptiveGridManager) slotMonitor(ctx context.Context) {
+	defer a.wg.Done()
+
+	// Check every 30 seconds for slot changes
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Initialize slot tracking on first run
+	if a.timeFilter != nil {
+		a.timeFilter.UpdateSlotTracking()
+		a.logger.Info("Slot monitor initialized",
+			zap.String("current_slot", a.GetCurrentSlot().Description))
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.stopCh:
+			return
+		case <-ticker.C:
+			if a.timeFilter != nil {
+				if changed := a.timeFilter.UpdateSlotTracking(); changed {
+					// Slot changed - handle transition for all active symbols
+					a.handleSlotTransitionForAll(ctx)
+				}
+			}
+		}
+	}
+}
+
+// handleSlotTransitionForAll handles time slot transition for all active symbols
+func (a *AdaptiveGridManager) handleSlotTransitionForAll(ctx context.Context) {
+	a.mu.RLock()
+	symbols := make([]string, 0, len(a.positions))
+	for symbol := range a.positions {
+		symbols = append(symbols, symbol)
+	}
+	a.mu.RUnlock()
+
+	// Get current slot info
+	currentSlot := a.GetCurrentSlot()
+	if currentSlot == nil {
+		a.logger.Info("No active time slot - skipping transition for all symbols")
+		return
+	}
+
+	for _, symbol := range symbols {
+		if err := a.handleSlotTransition(ctx, symbol); err != nil {
+			a.logger.Error("Failed to handle slot transition",
+				zap.String("symbol", symbol),
+				zap.Error(err))
+		}
+	}
+}
+
+// handleSlotTransition handles time slot change for a single symbol
+func (a *AdaptiveGridManager) handleSlotTransition(ctx context.Context, symbol string) error {
+	// Check cooldown (2 minutes between transitions)
+	if a.IsInSlotTransitionCooldown(symbol) {
+		a.logger.Debug("Slot transition cooldown active, skipping",
+			zap.String("symbol", symbol))
+		return nil
+	}
+
+	currentSlot := a.GetCurrentSlot()
+
+	if currentSlot == nil {
+		a.logger.Info("Exited all time slots - cancelling orders",
+			zap.String("symbol", symbol))
+
+		// Cancel all orders and pause trading
+		if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+			a.logger.Error("Failed to cancel orders on slot exit",
+				zap.String("symbol", symbol),
+				zap.Error(err))
+		}
+
+		a.pauseTrading(symbol)
+		return nil
+	}
+
+	if !currentSlot.Enabled {
+		a.logger.Info("Entered disabled time slot - cancelling orders",
+			zap.String("symbol", symbol),
+			zap.String("slot", currentSlot.Description))
+
+		// Cancel all orders and pause trading
+		if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+			a.logger.Error("Failed to cancel orders on disabled slot",
+				zap.String("symbol", symbol),
+				zap.Error(err))
+		}
+
+		a.pauseTrading(symbol)
+		return nil
+	}
+
+	// Enabled slot - rebuild grid with new parameters
+	a.logger.Info("Entered enabled time slot - rebuilding grid",
+		zap.String("symbol", symbol),
+		zap.String("slot", currentSlot.Description),
+		zap.Float64("size_multiplier", currentSlot.SizeMultiplier),
+		zap.Float64("spread_multiplier", currentSlot.SpreadMultiplier))
+
+	// Resume trading if it was paused
+	a.resumeTrading(symbol)
+
+	// Cancel existing orders
+	if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+		a.logger.Error("Failed to cancel orders during slot transition",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+		// Continue anyway
+	}
+
+	// Clear grid
+	if err := a.gridManager.ClearGrid(ctx, symbol); err != nil {
+		a.logger.Error("Failed to clear grid during slot transition",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+		// Continue anyway
+	}
+
+	// Rebuild grid with new slot parameters
+	if err := a.gridManager.RebuildGrid(ctx, symbol); err != nil {
+		return fmt.Errorf("failed to rebuild grid for slot transition: %w", err)
+	}
+
+	a.logger.Info("Slot transition completed successfully",
+		zap.String("symbol", symbol),
+		zap.String("slot", currentSlot.Description))
 
 	return nil
 }
@@ -962,6 +1103,19 @@ func (a *AdaptiveGridManager) IsInTransitionCooldown(symbol string) bool {
 	return time.Since(cooldown) < 30*time.Second
 }
 
+// IsInSlotTransitionCooldown checks if symbol is in slot transition cooldown (2 minutes)
+func (a *AdaptiveGridManager) IsInSlotTransitionCooldown(symbol string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	cooldown, exists := a.transitionCooldown[symbol]
+	if !exists {
+		return false
+	}
+
+	return time.Since(cooldown) < 2*time.Minute
+}
+
 // SetTransitionCooldown sets the transition cooldown for a symbol
 func (a *AdaptiveGridManager) SetTransitionCooldown(symbol string) {
 	a.mu.Lock()
@@ -1214,6 +1368,30 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 	return true
 }
 
+// GetCurrentSlot returns the current time slot configuration
+func (a *AdaptiveGridManager) GetCurrentSlot() *TimeSlotConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.timeFilter == nil {
+		return nil
+	}
+
+	return a.timeFilter.GetCurrentSlot()
+}
+
+// CanTrade returns true if trading is allowed at current time
+func (a *AdaptiveGridManager) CanTrade() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.timeFilter == nil {
+		return true // Default allow if no time filter
+	}
+
+	return a.timeFilter.CanTrade()
+}
+
 // InitializeTimeFilter creates or reinitializes the time filter with config
 func (a *AdaptiveGridManager) InitializeTimeFilter(config *TradingHoursConfig) error {
 	filter, err := NewTimeFilter(config, a.logger)
@@ -1291,7 +1469,7 @@ func (a *AdaptiveGridManager) GetCurrentTimeSlot() map[string]interface{} {
 	return a.timeFilter.GetCurrentStatus()
 }
 
-// GetOrderSize returns dynamically calculated order size
+// GetOrderSize returns dynamically calculated order size with time-based adjustment
 func (a *AdaptiveGridManager) GetOrderSize(symbol string, currentPrice float64, isLong bool) (float64, error) {
 	if a.riskMonitor == nil {
 		return 0, fmt.Errorf("risk monitor not initialized")
@@ -1301,6 +1479,18 @@ func (a *AdaptiveGridManager) GetOrderSize(symbol string, currentPrice float64, 
 	size, err := a.riskMonitor.GetOrderSize(symbol, currentPrice, isLong, regime)
 	if err != nil {
 		return 0, err
+	}
+
+	// Apply time-based size multiplier
+	sizeMultiplier := a.GetTimeBasedSizeMultiplier()
+	if sizeMultiplier > 0 && sizeMultiplier != 1.0 {
+		adjustedSize := size * sizeMultiplier
+		a.logger.Info("Order size adjusted by time filter",
+			zap.String("symbol", symbol),
+			zap.Float64("base_size", size),
+			zap.Float64("multiplier", sizeMultiplier),
+			zap.Float64("adjusted_size", adjustedSize))
+		return adjustedSize, nil
 	}
 
 	return size, nil
@@ -1594,15 +1784,28 @@ func (a *AdaptiveGridManager) GetVolumeScalerInfo(symbol string, price float64) 
 	return info
 }
 
-// GetDynamicSpread returns the calculated dynamic spread percentage
+// GetDynamicSpread returns the calculated dynamic spread percentage with time-based adjustment
 func (a *AdaptiveGridManager) GetDynamicSpread() float64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if a.dynamicSpreadCalc == nil {
-		return 0.5 // Default spread
+	baseSpread := 0.5 // Default spread
+	if a.dynamicSpreadCalc != nil {
+		baseSpread = a.dynamicSpreadCalc.GetDynamicSpread()
 	}
-	return a.dynamicSpreadCalc.GetDynamicSpread()
+
+	// Apply time-based spread multiplier
+	spreadMultiplier := a.GetTimeBasedSpreadMultiplier()
+	if spreadMultiplier > 0 && spreadMultiplier != 1.0 {
+		adjustedSpread := baseSpread * spreadMultiplier
+		a.logger.Debug("Spread adjusted by time filter",
+			zap.Float64("base_spread", baseSpread),
+			zap.Float64("multiplier", spreadMultiplier),
+			zap.Float64("adjusted_spread", adjustedSpread))
+		return adjustedSpread
+	}
+
+	return baseSpread
 }
 
 // GetDynamicSpreadMultiplier returns current spread multiplier based on volatility

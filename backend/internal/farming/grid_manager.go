@@ -861,6 +861,15 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		"size":   order.Size,
 	}).Info("Attempting to place order")
 
+	// NEW: Check if trading is allowed by time filter
+	if g.adaptiveMgr != nil && !g.adaptiveMgr.CanTrade() {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": order.Symbol,
+			"side":   order.Side,
+		}).Warn("Order placement blocked - outside trading hours")
+		return fmt.Errorf("trading not allowed: outside configured trading hours")
+	}
+
 	// NEW: Check state transition validity (only for existing orders)
 	if order.OrderID != "" {
 		fromState := adaptive_grid.OrderState(order.Status)

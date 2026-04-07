@@ -1,9 +1,9 @@
 package adaptive_grid
 
 import (
-"time"
+	"time"
 
-"aster-bot/internal/config"
+	"aster-bot/internal/config"
 )
 
 // ConvertTimeFilterConfig converts internal config to adaptive_grid TimeFilter config
@@ -133,8 +133,22 @@ func ConvertInventoryConfig(cfg *config.InventorySkewConfig) *InventoryConfig {
 		maxInvPct = 0.30
 	}
 
+	// Helper to extract threshold config
+	getThreshold := func(tc config.ThresholdConfig) SkewThreshold {
+		return SkewThreshold{
+			Threshold:           tc.Threshold,
+			SizeReduction:       tc.SizeReduction,
+			PauseSide:           tc.PauseSide,
+			TakeProfitReduction: tc.TakeProfitReduction,
+		}
+	}
+
 	return &InventoryConfig{
-		MaxInventoryPct: maxInvPct,
+		MaxInventoryPct:   maxInvPct,
+		LowThreshold:      getThreshold(cfg.Thresholds.Low),
+		ModerateThreshold: getThreshold(cfg.Thresholds.Moderate),
+		HighThreshold:     getThreshold(cfg.Thresholds.High),
+		CriticalThreshold: getThreshold(cfg.Thresholds.Critical),
 	}
 }
 
@@ -146,26 +160,53 @@ func ConvertClusterStopLossConfig(cfg *config.ClusterStopLossConfig) *ClusterSto
 
 	monitorHours := cfg.TimeThresholds.Monitor
 	emergencyHours := cfg.TimeThresholds.Emergency
+	staleHours := cfg.TimeThresholds.Stale
 	if monitorHours == 0 {
-		monitorHours = 24
+		monitorHours = 2
 	}
 	if emergencyHours == 0 {
-		emergencyHours = 48
+		emergencyHours = 4
+	}
+	if staleHours == 0 {
+		staleHours = 8
 	}
 
 	monitorDD := cfg.DrawdownThresholds.Monitor
 	emergencyDD := cfg.DrawdownThresholds.Emergency
 	if monitorDD == 0 {
-		monitorDD = 0.02
+		monitorDD = -0.005
 	}
 	if emergencyDD == 0 {
-		emergencyDD = 0.05
+		emergencyDD = -0.01
+	}
+
+	// Breakeven exit settings from config
+	breakeven50At := cfg.BreakevenExit.Close50PctAt
+	breakeven100At := cfg.BreakevenExit.Close100PctAt
+	minDD50 := cfg.BreakevenExit.MinDrawdownFor50Pct
+	minDD100 := cfg.BreakevenExit.MinDrawdownFor100Pct
+	if breakeven50At == 0 {
+		breakeven50At = -0.002
+	}
+	if breakeven100At == 0 {
+		breakeven100At = 0.0
+	}
+	if minDD50 == 0 {
+		minDD50 = -0.02
+	}
+	if minDD100 == 0 {
+		minDD100 = -0.03
 	}
 
 	return &ClusterStopLossConfig{
-		MonitorHours:      monitorHours,
-		EmergencyHours:    emergencyHours,
-		MonitorDrawdown:   monitorDD,
-		EmergencyDrawdown: emergencyDD,
+		MonitorHours:         monitorHours,
+		EmergencyHours:       emergencyHours,
+		StaleHours:           staleHours,
+		MonitorDrawdown:      monitorDD,
+		EmergencyDrawdown:    emergencyDD,
+		Breakeven50PctAt:     breakeven50At,
+		Breakeven100PctAt:    breakeven100At,
+		MinDrawdownFor50Pct:  minDD50,
+		MinDrawdownFor100Pct: minDD100,
 	}
 }

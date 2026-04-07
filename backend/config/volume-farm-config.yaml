@@ -44,9 +44,9 @@ max_total_drawdown_pct: 50.0
 order_size_usdt: 30
 
 # grid_spread_pct: Spread giữa các lệnh
-# 0.2% = chặt hơn, fill nhanh hơn, nhiều volume hơn
-# Lãi ~0.1% sau phí (0.05% maker × 2)
-grid_spread_pct: 0.002
+# 0.15% = chặt hơn, fill nhanh hơn, nhiều volume hơn
+# Lãi ~0.05% sau phí (0.05% maker × 2)
+grid_spread_pct: 0.0015
 
 # max_orders_per_side: Số lệnh tối đa mỗi bên
 # TĂNG LÊN: 10 lệnh mỗi bên = 20 lệnh total

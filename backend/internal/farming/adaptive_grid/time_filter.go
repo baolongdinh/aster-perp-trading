@@ -135,10 +135,12 @@ func DefaultTradingHoursConfig() *TradingHoursConfig {
 
 // TimeFilter manages time-based trading rules
 type TimeFilter struct {
-	config   *TradingHoursConfig
-	logger   *zap.Logger
-	mu       sync.RWMutex
-	location *time.Location // Cached timezone
+	config              *TradingHoursConfig
+	logger              *zap.Logger
+	mu                  sync.RWMutex
+	location            *time.Location                   // Cached timezone
+	previousSlot        *TimeSlotConfig                  // Track previous slot for change detection
+	slotChangeCallbacks []func(old, new *TimeSlotConfig) // Callbacks for slot transitions
 }
 
 // NewTimeFilter creates new time filter
@@ -155,9 +157,11 @@ func NewTimeFilter(config *TradingHoursConfig, logger *zap.Logger) (*TimeFilter,
 	}
 
 	tf := &TimeFilter{
-		config:   config,
-		logger:   logger,
-		location: loc,
+		config:              config,
+		logger:              logger,
+		location:            loc,
+		previousSlot:        nil,
+		slotChangeCallbacks: make([]func(old, new *TimeSlotConfig), 0),
 	}
 
 	if err := tf.ValidateConfig(); err != nil {
@@ -427,4 +431,141 @@ func (t *TimeFilter) GetAllSlots() []TimeSlotConfig {
 	slots := make([]TimeSlotConfig, len(t.config.Slots))
 	copy(slots, t.config.Slots)
 	return slots
+}
+
+// HasSlotChanged returns true if the current slot is different from previous check
+func (t *TimeFilter) HasSlotChanged() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	currentSlot := t.getCurrentSlotUnsafe()
+
+	// Check if slot changed
+	if t.previousSlot == nil && currentSlot == nil {
+		return false
+	}
+	if t.previousSlot == nil || currentSlot == nil {
+		return true
+	}
+
+	// Compare slot window start time as unique identifier
+	return t.previousSlot.Window.Start != currentSlot.Window.Start ||
+		t.previousSlot.Window.End != currentSlot.Window.End
+}
+
+// GetSlotTransition returns (oldSlot, newSlot) when a transition is detected
+func (t *TimeFilter) GetSlotTransition() (*TimeSlotConfig, *TimeSlotConfig) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	currentSlot := t.getCurrentSlotUnsafe()
+
+	if t.previousSlot == nil && currentSlot == nil {
+		return nil, nil
+	}
+
+	// Check if changed
+	changed := false
+	if t.previousSlot == nil || currentSlot == nil {
+		changed = true
+	} else if t.previousSlot.Window.Start != currentSlot.Window.Start ||
+		t.previousSlot.Window.End != currentSlot.Window.End {
+		changed = true
+	}
+
+	if !changed {
+		return nil, nil
+	}
+
+	// Make copies to return
+	var oldCopy, newCopy *TimeSlotConfig
+	if t.previousSlot != nil {
+		copy := *t.previousSlot
+		oldCopy = &copy
+	}
+	if currentSlot != nil {
+		copy := *currentSlot
+		newCopy = &copy
+	}
+
+	return oldCopy, newCopy
+}
+
+// RegisterSlotChangeCallback registers a function to be called when slot changes
+func (t *TimeFilter) RegisterSlotChangeCallback(fn func(old, new *TimeSlotConfig)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.slotChangeCallbacks = append(t.slotChangeCallbacks, fn)
+}
+
+// UpdateSlotTracking updates previousSlot to current and invokes callbacks if changed
+func (t *TimeFilter) UpdateSlotTracking() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	currentSlot := t.getCurrentSlotUnsafe()
+
+	// Check if changed
+	changed := false
+	if t.previousSlot == nil && currentSlot == nil {
+		changed = false
+	} else if t.previousSlot == nil || currentSlot == nil {
+		changed = true
+	} else if t.previousSlot.Window.Start != currentSlot.Window.Start ||
+		t.previousSlot.Window.End != currentSlot.Window.End {
+		changed = true
+	}
+
+	if changed {
+		// Make copies for callbacks
+		var oldCopy, newCopy *TimeSlotConfig
+		if t.previousSlot != nil {
+			copy := *t.previousSlot
+			oldCopy = &copy
+		}
+		if currentSlot != nil {
+			copy := *currentSlot
+			newCopy = &copy
+		}
+
+		// Update previous slot
+		t.previousSlot = currentSlot
+
+		// Invoke callbacks
+		for _, cb := range t.slotChangeCallbacks {
+			go cb(oldCopy, newCopy)
+		}
+
+		if oldCopy != nil && newCopy != nil {
+			t.logger.Info("Time slot transition detected",
+				zap.String("from", oldCopy.Description),
+				zap.String("to", newCopy.Description),
+				zap.Float64("old_size_mult", oldCopy.SizeMultiplier),
+				zap.Float64("new_size_mult", newCopy.SizeMultiplier))
+		} else if newCopy != nil {
+			t.logger.Info("Entered time slot",
+				zap.String("slot", newCopy.Description),
+				zap.Float64("size_mult", newCopy.SizeMultiplier))
+		} else if oldCopy != nil {
+			t.logger.Info("Exited time slot",
+				zap.String("slot", oldCopy.Description))
+		}
+	}
+
+	return changed
+}
+
+// getCurrentSlotUnsafe returns current slot without locking (caller must hold lock)
+func (t *TimeFilter) getCurrentSlotUnsafe() *TimeSlotConfig {
+	now := time.Now().In(t.location)
+	currentTime := now.Format("15:04")
+
+	for i := range t.config.Slots {
+		slot := &t.config.Slots[i]
+		if t.isTimeInRange(currentTime, slot.Window.Start, slot.Window.End) {
+			return slot
+		}
+	}
+
+	return nil
 }

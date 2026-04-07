@@ -148,12 +148,12 @@ trend_detection:
     # strong_trend_pause_duration: Thời gian pause khi trend mạnh (phút)
     #   - 2-5m: Pause ngắn, nhanh quay lại (default = 5m)
     #   - 15-30m: Pause dài, an toàn hơn
-    strong_trend_pause_duration: 2m
+    strong_trend_pause_duration: 1m
 
     # mild_trend_pause_duration: Thời gian pause khi trend nhẹ (phút)
     #   - 1-2m: Pause rất ngắn (default = 2m)
     #   - 5-10m: Pause lâu hơn
-    mild_trend_pause_duration: 30s
+    mild_trend_pause_duration: 15s
 
     # score_threshold_strong: Điểm để coi là trend mạnh (6-8)
     #   - 6: Cân bằng (default)
@@ -178,7 +178,7 @@ trend_detection:
     # strong: Giảm bao nhiêu % khi counter strong trend
     #   - 0.20: Giảm 20% (default)
     #   - 0.40-0.50: Giảm nhiều hơn
-    strong: 0.20
+    strong: 0.50
 
     # extreme: Giảm bao nhiêu % khi counter extreme trend
     #   - 0.30: Giảm 30% (default)
