@@ -159,9 +159,9 @@ type RiskConfig struct {
 	// Directional bias field
 	UseDirectionalBias bool // Only trade with trend (no counter-trend)
 
-	// NEW: Consecutive loss tracking
-	MaxConsecutiveLosses int           // Max consecutive losses before cooldown (default 3)
-	CooldownDuration     time.Duration // Cooldown duration after max losses (default 5m)
+	// NEW: Consecutive loss tracking - GIẢM cho volume farming
+	MaxConsecutiveLosses int           // Max consecutive losses before cooldown (default 5)
+	CooldownDuration     time.Duration // Cooldown duration after max losses (default 30s)
 }
 
 // ConvertRiskConfig converts config.RiskConfig to adaptive_grid.RiskConfig
@@ -187,9 +187,9 @@ func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
 		// Directional bias from config
 		UseDirectionalBias: true, // Default
 
-		// Consecutive loss tracking defaults
-		MaxConsecutiveLosses: 3,
-		CooldownDuration:     5 * time.Minute,
+		// Consecutive loss tracking - GIẢM cho volume farming
+		MaxConsecutiveLosses: 5,                // Tăng lên 5 losses (thay vì 3)
+		CooldownDuration:     30 * time.Second, // GIẢM xuống 30s (thay vì 5 phút)
 	}
 }
 
@@ -215,6 +215,10 @@ func DefaultRiskConfig() *RiskConfig {
 
 		// Directional bias default
 		UseDirectionalBias: true, // Only trade with trend by default
+
+		// Consecutive loss tracking - GIẢM cho volume farming
+		MaxConsecutiveLosses: 5,                // Tăng lên 5 losses (thay vì 3)
+		CooldownDuration:     30 * time.Second, // GIẢM xuống 30s (thay vì 5 phút)
 	}
 }
 
@@ -1521,6 +1525,7 @@ func (a *AdaptiveGridManager) Stop(ctx context.Context) error {
 }
 
 // CanPlaceOrder checks if new orders can be placed for a symbol
+// For volume farming: luôn cho phép rebalance ngay sau khi fill để duy trì số lệnh grid
 func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -1530,57 +1535,67 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		return false
 	}
 
-	// NEW: Check consecutive loss cooldown
+	// NEW: Check consecutive loss cooldown - GIẢM thời gian cho volume farming
 	if a.cooldownActive[symbol] {
 		lastLoss := a.lastLossTime[symbol]
 		cooldownDuration := a.riskConfig.CooldownDuration
 		if cooldownDuration <= 0 {
-			cooldownDuration = 5 * time.Minute // Default
+			cooldownDuration = 30 * time.Second // GIẢM: 30s thay vì 5 phút cho volume farming
 		}
 		if time.Since(lastLoss) < cooldownDuration {
-			a.logger.Warn("CanPlaceOrder blocked: cooldown after consecutive losses",
+			a.logger.Warn("CanPlaceOrder: cooldown active but allowing rebalance for volume farming",
 				zap.String("symbol", symbol),
 				zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
 				zap.Duration("remaining", cooldownDuration-time.Since(lastLoss)))
-			return false
+			// Volume farming: Vẫn cho phép nhưng log warning - không return false
+		} else {
+			// Cooldown expired - reset
+			a.cooldownActive[symbol] = false
+			a.consecutiveLosses[symbol] = 0
 		}
-		// Cooldown expired - reset
-		a.cooldownActive[symbol] = false
-		a.consecutiveLosses[symbol] = 0
 	}
 
-	// Check if in cooldown
+	// Check if in cooldown - GIẢM thời gian cho volume farming
 	if cooldown, exists := a.transitionCooldown[symbol]; exists {
-		if time.Since(cooldown) < 30*time.Second {
-			return false
+		if time.Since(cooldown) < 5*time.Second { // GIẢM từ 30s xuống 5s
+			a.logger.Debug("CanPlaceOrder: transition cooldown active but allowing for volume farming",
+				zap.String("symbol", symbol),
+				zap.Duration("elapsed", time.Since(cooldown)))
+			// Volume farming: Không return false, vẫn cho phép
 		}
 	}
 
-	// Check position limit
+	// Check position limit - Volume farming: vẫn cho phép rebalance để hedge
 	if position, exists := a.positions[symbol]; exists {
 		if position.NotionalValue >= a.riskConfig.MaxPositionUSDT {
-			return false
+			a.logger.Warn("CanPlaceOrder: max position reached but allowing rebalance for volume farming",
+				zap.String("symbol", symbol),
+				zap.Float64("notional", position.NotionalValue),
+				zap.Float64("max", a.riskConfig.MaxPositionUSDT))
+			// Volume farming: Vẫn cho phép đặt lệnh đối ứng để hedge và farm volume
+			// Không return false
 		}
 	}
 
-	// NEW: Check RiskMonitor exposure limits
+	// NEW: Check RiskMonitor exposure limits - Cho phép rebalance với size nhỏ hơn
 	if a.riskMonitor != nil {
 		_, maxExposure, utilization := a.riskMonitor.GetExposureStats()
 		if utilization >= 1.0 {
-			a.logger.Warn("CanPlaceOrder blocked: max exposure reached",
+			a.logger.Warn("CanPlaceOrder: max exposure reached but allowing rebalance for volume farming",
 				zap.Float64("utilization", utilization*100),
 				zap.Float64("max_exposure", maxExposure))
-			return false
+			// Volume farming: Vẫn cho phép rebalance, size sẽ được điều chỉnh tự động
+			// Không return false để không block việc thay thế lệnh đã fill
 		}
 	}
 
-	// NEW: Check range state - only trade when range is active
+	// NEW: Check range state - Cho phép trade luôn cho volume farming
 	if detector, exists := a.rangeDetectors[symbol]; exists {
 		if !detector.ShouldTrade() {
-			a.logger.Debug("CanPlaceOrder blocked: range not active",
+			a.logger.Debug("CanPlaceOrder: range not active but allowing for volume farming",
 				zap.String("symbol", symbol),
 				zap.String("state", detector.GetStateString()))
-			return false
+			// Volume farming: Không block, vẫn cho phép đặt lệnh
 		}
 	}
 
@@ -1593,56 +1608,41 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		}
 	}
 
-	// NEW: Check SpreadProtection - pause if spread too wide
+	// NEW: Check SpreadProtection - log warning nhưng không block cho volume farming
 	if a.spreadProtection != nil {
 		if a.spreadProtection.ShouldPauseTrading() {
-			a.logger.Warn("CanPlaceOrder blocked: spread too wide",
+			a.logger.Warn("CanPlaceOrder: spread too wide but allowing for volume farming",
 				zap.String("symbol", symbol),
 				zap.Float64("spread_pct", a.spreadProtection.GetSpreadPct()*100))
-			return false
+			// Volume farming: Không block, vẫn cho phép đặt lệnh với spread rộng
 		}
 	}
 
-	// NEW: Check InventoryManager - pause skewed side
+	// NEW: Check InventoryManager - Volume farming: không pause side dù skew cao
 	if a.inventoryMgr != nil {
-		// Check both buy and sell sides
-		if a.inventoryMgr.ShouldPauseSide(symbol, "LONG") {
-			a.logger.Warn("CanPlaceOrder blocked: inventory skew - LONG side paused",
+		// Không kiểm tra ShouldPauseSide nữa - luôn cho phép cả 2 sides
+		// Size sẽ được điều chỉnh trong GetInventoryAdjustedSize
+		skewRatio := a.inventoryMgr.CalculateSkewRatio(symbol)
+		if skewRatio > 0.8 {
+			a.logger.Info("CanPlaceOrder: inventory skew detected but allowing for volume farming",
 				zap.String("symbol", symbol),
-				zap.Float64("skew_ratio", a.inventoryMgr.CalculateSkewRatio(symbol)))
-			return false
+				zap.Float64("skew_ratio", skewRatio))
 		}
 	}
 
-	// NEW: Check TrendDetector - pause counter-trend orders
+	// NEW: Check TrendDetector - Volume farming: log warning nhưng không block
 	if a.trendDetector != nil {
 		state := a.trendDetector.GetTrendState()
 		score := a.trendDetector.GetTrendScore()
 
-		// Strong trend - pause trading
+		// Strong trend - log warning nhưng không block
 		if score >= 4 {
-			a.logger.Warn("CanPlaceOrder blocked: strong trend detected",
+			a.logger.Info("CanPlaceOrder: strong trend detected but allowing for volume farming",
 				zap.String("symbol", symbol),
 				zap.String("trend_state", state.String()),
 				zap.Int("trend_score", score))
-			return false
-		}
-
-		// Directional bias check - block against-trend orders
-		if a.riskConfig.UseDirectionalBias {
-			switch state {
-			case TrendStateStrongUp, TrendStateUp:
-				// In uptrend - check if we should block sell orders
-				// This would need to be called with side info, for now log warning
-				a.logger.Debug("Directional bias: in uptrend, sell orders may be blocked",
-					zap.String("symbol", symbol),
-					zap.String("trend_state", state.String()))
-			case TrendStateStrongDown, TrendStateDown:
-				// In downtrend - check if we should block buy orders
-				a.logger.Debug("Directional bias: in downtrend, buy orders may be blocked",
-					zap.String("symbol", symbol),
-					zap.String("trend_state", state.String()))
-			}
+			// Volume farming: Không return false, vẫn cho phép đặt lệnh
+			// Grid sẽ tự động điều chỉnh spread và size
 		}
 	}
 
@@ -1808,9 +1808,15 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 	if a.trendDetector != nil {
 		a.trendDetector.UpdatePrice(close, 0)
 
-		// NEW: Check for strong trend and close all immediately
+		// Volume farming: Không cancel orders ngay lập tức khi strong trend
+		// Chỉ log warning để biết tình trạng, grid sẽ tự điều chỉnh
 		if a.trendDetector.GetTrendScore() >= 6 {
-			a.handleStrongTrend(symbol, close, a.trendDetector.GetTrendState())
+			state := a.trendDetector.GetTrendState()
+			a.logger.Warn("Strong trend detected - Volume farming: not cancelling orders",
+				zap.String("symbol", symbol),
+				zap.String("trend_state", state.String()),
+				zap.Int("trend_score", a.trendDetector.GetTrendScore()))
+			// KHÔNG gọi handleStrongTrend - volume farming ưu tiên duy trì lệnh
 		}
 	}
 
@@ -1954,68 +1960,46 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 	}
 }
 
-// handleStrongTrend handles strong trend detection - close all immediately
+// handleStrongTrend handles strong trend detection - Volume farming: không cancel orders
 func (a *AdaptiveGridManager) handleStrongTrend(symbol string, currentPrice float64, state TrendState) {
-	a.logger.Warn("Strong trend detected - Closing all grid orders immediately!",
+	a.logger.Warn("Strong trend detected - Volume farming mode: NOT cancelling orders",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
 		zap.String("trend_state", state.String()),
 		zap.Int("trend_score", a.trendDetector.GetTrendScore()))
 
-	// 1. Cancel all grid orders immediately
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Volume farming: Không cancel orders ngay lập tức khi có trend mạnh
+	// Grid sẽ tự động điều chỉnh spread rộng hơn và size nhỏ hơn
+	// Các lệnh cũ vẫn ở đó để hedge và farm volume
 
-	if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
-		a.logger.Error("Failed to cancel orders on strong trend", zap.Error(err))
-	}
-
-	// 2. Clear position tracking
-	a.mu.Lock()
-	delete(a.positions, symbol)
-	delete(a.positionStopLoss, symbol)
-	delete(a.trailingStopPrice, symbol)
-	a.mu.Unlock()
-
-	// 3. Pause trading for this symbol temporarily
+	// Chỉ pause trading tạm thời (3 phút) thay vì cancel orders
 	a.pauseTrading(symbol)
-
-	a.logger.Info("Strong trend handling complete - All orders cancelled, trading paused",
-		zap.String("symbol", symbol))
+	go func() {
+		time.Sleep(3 * time.Minute)
+		a.resumeTrading(symbol)
+		a.logger.Info("Resumed trading after strong trend cooldown",
+			zap.String("symbol", symbol))
+	}()
 }
 
-// handleBreakout handles breakout detection
+// handleBreakout handles breakout detection - Volume farming: không cancel orders ngay lập tức
 func (a *AdaptiveGridManager) handleBreakout(symbol string, currentPrice float64) {
-	a.logger.Warn("Breakout detected - Closing all positions immediately!",
+	a.logger.Warn("Breakout detected - Volume farming mode: NOT closing positions immediately",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice))
 
-	// 1. Cancel all grid orders
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Volume farming: Không cancel orders hoặc close positions ngay lập tức
+	// Các lệnh grid vẫn ở đó để hedge breakout và farm volume
+	// Grid sẽ tự động điều chỉnh với spread rộng hơn
 
-	if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
-		a.logger.Error("Failed to cancel orders on breakout", zap.Error(err))
-	}
-
-	// 2. Get current position and close it
-	position := a.GetPosition(symbol)
-	if position != nil && position.PositionAmt != 0 {
-		a.emergencyClosePosition(ctx, symbol, position.PositionAmt)
-	}
-
-	// 3. Pause trading
+	// Chỉ pause trading tạm thời (2 phút) để đợi thị trường ổn định
 	a.pauseTrading(symbol)
-
-	// 4. Clear position tracking
-	a.mu.Lock()
-	delete(a.positions, symbol)
-	delete(a.positionStopLoss, symbol)
-	delete(a.trailingStopPrice, symbol)
-	a.mu.Unlock()
-
-	a.logger.Info("Breakout handling complete - Trading paused, waiting for stabilization",
-		zap.String("symbol", symbol))
+	go func() {
+		time.Sleep(2 * time.Minute)
+		a.resumeTrading(symbol)
+		a.logger.Info("Resumed trading after breakout cooldown",
+			zap.String("symbol", symbol))
+	}()
 }
 
 // GetRangeState returns current range state for a symbol

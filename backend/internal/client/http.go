@@ -35,6 +35,9 @@ func (e *APIError) IsRateLimit() bool { return e.Code == -1003 }
 // IsSignatureError returns true if the error is an auth/signature error.
 func (e *APIError) IsSignatureError() bool { return e.Code == -1022 }
 
+// IsLeverageError returns true if the error is a leverage exceeds maximum error (-2027).
+func (e *APIError) IsLeverageError() bool { return e.Code == -2027 }
+
 // HTTPClient wraps http.Client with Aster-specific logic.
 type HTTPClient struct {
 	base       string

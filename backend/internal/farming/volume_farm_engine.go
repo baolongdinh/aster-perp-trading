@@ -251,6 +251,22 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
+
+		// CRITICAL: Load optimization config (includes trading_hours.yaml) BEFORE Initialize
+		configDir := "config" // Default config directory
+		optConfig, err := config.LoadOptimizationConfig(configDir)
+		if err != nil {
+			e.logger.Warn("Failed to load optimization config, using defaults",
+				zap.Error(err),
+				zap.String("config_dir", configDir))
+		} else {
+			e.logger.Info("Optimization config loaded successfully",
+				zap.Bool("time_filter_enabled", optConfig.TimeFilter != nil && optConfig.TimeFilter.Enabled),
+				zap.Int("time_slots", len(optConfig.TimeFilter.Slots)))
+			// Pass config to adaptive grid manager BEFORE Initialize
+			e.adaptiveGridManager.SetOptimizationConfig(optConfig)
+		}
+
 		// Initialize adaptive grid manager
 		if err := e.adaptiveGridManager.Initialize(ctx); err != nil {
 			e.logger.Error("Adaptive grid manager initialization error", zap.Error(err))
@@ -343,6 +359,9 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 		activeSymbols = append(activeSymbols, whitelistOnly...)
 	}
 
+	// NEW: Set correct leverage for each symbol from exchange info
+	e.setLeverageForSymbols(activeSymbols)
+
 	e.logger.Info("Updating grid manager with symbols", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
 		syms := make([]string, len(activeSymbols))
 		for i, s := range activeSymbols {
@@ -351,6 +370,40 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 		return syms
 	}()))
 	e.gridManager.UpdateSymbols(activeSymbols)
+}
+
+// setLeverageForSymbols sets the correct leverage for each symbol based on exchange info
+func (e *VolumeFarmEngine) setLeverageForSymbols(symbols []*SymbolData) {
+	for _, sym := range symbols {
+		maxLeverage := e.gridManager.precisionMgr.GetMaxLeverage(sym.Symbol)
+		if maxLeverage > 0 {
+			e.logger.Info("Setting leverage for symbol",
+				zap.String("symbol", sym.Symbol),
+				zap.Float64("max_leverage", maxLeverage))
+
+			// Set leverage to 80% of max to have some buffer
+			targetLeverage := int(maxLeverage * 0.8)
+			if targetLeverage < 1 {
+				targetLeverage = 1
+			}
+
+			if err := e.futuresClient.SetLeverage(context.Background(), client.SetLeverageRequest{
+				Symbol:   sym.Symbol,
+				Leverage: targetLeverage,
+			}); err != nil {
+				e.logger.Warn("Failed to set leverage",
+					zap.String("symbol", sym.Symbol),
+					zap.Error(err))
+			} else {
+				e.logger.Info("Leverage set successfully",
+					zap.String("symbol", sym.Symbol),
+					zap.Int("leverage", targetLeverage))
+			}
+		} else {
+			e.logger.Warn("Max leverage unknown for symbol, skipping leverage set",
+				zap.String("symbol", sym.Symbol))
+		}
+	}
 }
 
 func (e *VolumeFarmEngine) createWhitelistSymbols() []*SymbolData {

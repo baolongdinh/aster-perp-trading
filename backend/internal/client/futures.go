@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ func (f *FuturesClient) GetHTTPClient() *HTTPClient {
 }
 
 // PlaceOrder places a new futures order. Returns the placed Order or a dry-run stub.
+// If leverage exceeds maximum (error -2027), it automatically adjusts to x99 and retries.
 func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*Order, error) {
 	// Wait for rate limiter
 	if err := f.rateLimiter.Wait(ctx); err != nil {
@@ -67,7 +69,41 @@ func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 	params := f.placeOrderParams(req)
 	data, err := f.http.PostSigned(ctx, f.apiPath("/fapi/v1/order"), params)
 	if err != nil {
-		return nil, fmt.Errorf("place order: %w", err)
+		// Check if this is a leverage error (-2027)
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.IsLeverageError() {
+			f.log.Warn("Leverage exceeds maximum detected, adjusting to x99 and retrying",
+				zap.String("symbol", req.Symbol),
+				zap.Int("error_code", apiErr.Code),
+				zap.String("error_msg", apiErr.Message))
+
+			// Set leverage to maximum (x99)
+			if leverageErr := f.SetLeverage(ctx, SetLeverageRequest{
+				Symbol:   req.Symbol,
+				Leverage: 99,
+			}); leverageErr != nil {
+				f.log.Error("Failed to set leverage to x99",
+					zap.String("symbol", req.Symbol),
+					zap.Error(leverageErr))
+				return nil, fmt.Errorf("place order: %w (failed to adjust leverage: %v)", err, leverageErr)
+			}
+
+			f.log.Info("Leverage adjusted to x99, retrying order placement",
+				zap.String("symbol", req.Symbol))
+
+			// Wait for rate limiter again before retry
+			if rateErr := f.rateLimiter.Wait(ctx); rateErr != nil {
+				return nil, fmt.Errorf("rate limit wait on retry: %w", rateErr)
+			}
+
+			// Retry the order
+			data, err = f.http.PostSigned(ctx, f.apiPath("/fapi/v1/order"), params)
+			if err != nil {
+				return nil, fmt.Errorf("place order (after leverage adjustment): %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("place order: %w", err)
+		}
 	}
 	var order Order
 	if err := json.Unmarshal(data, &order); err != nil {
@@ -215,4 +251,32 @@ func (f *FuturesClient) GetPositions(ctx context.Context) ([]Position, error) {
 		return nil, fmt.Errorf("parse positions: %w", err)
 	}
 	return positions, nil
+}
+
+// SetLeverage sets the leverage for a symbol
+func (f *FuturesClient) SetLeverage(ctx context.Context, req SetLeverageRequest) error {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	if f.dryRun {
+		f.log.Info("[DRY-RUN] SetLeverage",
+			zap.String("symbol", req.Symbol),
+			zap.Int("leverage", req.Leverage),
+		)
+		return nil
+	}
+
+	params := map[string]string{
+		"symbol":   req.Symbol,
+		"leverage": strconv.Itoa(req.Leverage),
+	}
+
+	_, err := f.http.PostSigned(ctx, f.apiPath("/fapi/v1/leverage"), params)
+	if err != nil {
+		return fmt.Errorf("set leverage: %w", err)
+	}
+
+	return nil
 }

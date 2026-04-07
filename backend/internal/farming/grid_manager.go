@@ -555,7 +555,29 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 	}
 }
 
+// getActiveGridLevels returns the grid levels that already have active orders
+func (g *GridManager) getActiveGridLevels(symbol string) (map[int]bool, map[int]bool) {
+	g.ordersMu.RLock()
+	defer g.ordersMu.RUnlock()
+
+	buyLevels := make(map[int]bool)
+	sellLevels := make(map[int]bool)
+
+	for _, order := range g.activeOrders {
+		if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
+			if order.Side == "BUY" {
+				buyLevels[order.GridLevel] = true
+			} else if order.Side == "SELL" {
+				sellLevels[order.GridLevel] = true
+			}
+		}
+	}
+
+	return buyLevels, sellLevels
+}
+
 // placeGridOrders places initial grid orders for a symbol concurrently.
+// For rebuilds, it only places orders at levels that don't have active orders.
 func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *SymbolGrid) int {
 	g.logger.WithField("symbol", symbol).Info("Placing grid orders for volume farming (concurrent)")
 
@@ -563,6 +585,14 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		g.logger.WithField("symbol", symbol).Error("Cannot place orders: current price is 0")
 		return 0
 	}
+
+	// Get levels that already have active orders (for rebuild scenario)
+	existingBuyLevels, existingSellLevels := g.getActiveGridLevels(symbol)
+	g.logger.WithFields(logrus.Fields{
+		"symbol":               symbol,
+		"existing_buy_levels":  len(existingBuyLevels),
+		"existing_sell_levels": len(existingSellLevels),
+	}).Info("Checked existing grid levels")
 
 	// NEW: Get dynamic spread from AdaptiveGridManager if available
 	spreadPct := grid.GridSpreadPct
@@ -605,8 +635,12 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		"min_spread":    minSpreadAmount,
 	}).Info("Calculated grid spread for volume farming")
 
-	// Collect all orders to place
+	// Collect all orders to place (only for levels without existing orders)
 	var orders []*GridOrder
+
+	// Track how many orders we're skipping vs creating
+	skippedBuyLevels := 0
+	skippedSellLevels := 0
 
 	g.logger.WithFields(logrus.Fields{
 		"symbol":          symbol,
@@ -614,11 +648,24 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		"current_price":   grid.CurrentPrice,
 		"spread_pct":      spreadPct,
 		"spread_amount":   spreadAmount,
-	}).Info("Starting to build grid orders")
+	}).Info("Starting to build grid orders (smart rebuild)")
 
-	// Place BUY orders below current price
+	// Place BUY orders below current price (skip levels that already have orders)
 	buyOrdersCreated := 0
 	for i := 1; i <= grid.MaxOrdersSide; i++ {
+		gridLevel := -i
+
+		// Skip if this level already has an active order
+		if existingBuyLevels[gridLevel] {
+			skippedBuyLevels++
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"grid_level": gridLevel,
+				"side":       "BUY",
+			}).Debug("Skipping BUY order - level already has active order")
+			continue
+		}
+
 		buyPrice := grid.CurrentPrice - (spreadAmount * float64(i))
 		if buyPrice <= 0 {
 			g.logger.WithFields(logrus.Fields{
@@ -678,9 +725,22 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		buyOrdersCreated++
 	}
 
-	// Place SELL orders above current price
+	// Place SELL orders above current price (skip levels that already have orders)
 	sellOrdersCreated := 0
 	for i := 1; i <= grid.MaxOrdersSide; i++ {
+		gridLevel := i
+
+		// Skip if this level already has an active order
+		if existingSellLevels[gridLevel] {
+			skippedSellLevels++
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"grid_level": gridLevel,
+				"side":       "SELL",
+			}).Debug("Skipping SELL order - level already has active order")
+			continue
+		}
+
 		sellPrice := grid.CurrentPrice + (spreadAmount * float64(i))
 		orderSize := g.baseNotionalUSD / sellPrice
 
@@ -735,8 +795,10 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		"symbol":              symbol,
 		"buy_orders_created":  buyOrdersCreated,
 		"sell_orders_created": sellOrdersCreated,
+		"buy_orders_skipped":  skippedBuyLevels,
+		"sell_orders_skipped": skippedSellLevels,
 		"total_orders":        len(orders),
-	}).Info("Grid orders prepared for placement")
+	}).Info("Grid orders prepared for placement (smart rebuild)")
 
 	// Place all orders concurrently
 	var wg sync.WaitGroup
@@ -1033,6 +1095,11 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 
 // handleOrderFill handles when an order is filled and triggers rebalancing
 func (g *GridManager) handleOrderFill(orderID string, symbol string) {
+	g.logger.WithFields(logrus.Fields{
+		"order_id": orderID,
+		"symbol":   symbol,
+	}).Info("handleOrderFill called - processing fill event")
+
 	// NEW: Check for duplicate fill event
 	if g.deduplicator.IsDuplicate(orderID, time.Now()) {
 		g.logger.WithFields(logrus.Fields{
@@ -1043,6 +1110,7 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 	}
 	// Record the fill event
 	g.deduplicator.RecordEvent(orderID, time.Now())
+	g.logger.WithField("order_id", orderID).Debug("Fill event recorded in deduplicator")
 
 	g.ordersMu.Lock()
 	order, exists := g.activeOrders[orderID]
@@ -1131,12 +1199,21 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 	}
 
 	// Check if rebalancing is allowed (risk limits not exceeded)
-	if !g.canRebalance(symbol) {
-		g.logger.WithField("symbol", symbol).Warn("Rebalancing blocked due to risk limits")
+	canRebalance := g.canRebalance(symbol)
+	g.logger.WithFields(logrus.Fields{
+		"symbol":        symbol,
+		"can_rebalance": canRebalance,
+		"order_id":      orderID,
+		"side":          order.Side,
+	}).Info("Order filled - checking rebalance status")
+
+	if !canRebalance {
+		g.logger.WithField("symbol", symbol).Warn("Rebalancing blocked due to risk limits - SKIPPING REBALANCE")
 		return
 	}
 
 	// Trigger immediate rebalancing for this symbol
+	g.logger.WithField("symbol", symbol).Info("Triggering rebalance enqueue for filled order")
 	go g.enqueuePlacement(symbol)
 }
 
@@ -1250,6 +1327,8 @@ func (g *GridManager) resetStaleOrders() {
 					"expected": expected,
 					"actual":   actual,
 				}).Info("Resetting incomplete grid for re-placement")
+				// QUAN TRỌNG: Enqueue placement để rebuild grid ngay lập tức
+				go g.enqueuePlacement(symbol)
 				continue
 			}
 
@@ -1263,6 +1342,8 @@ func (g *GridManager) resetStaleOrders() {
 					"actual":       actual,
 					"stale_orders": staleOrders,
 				}).Info("Resetting stale grid - all orders pending too long without fills")
+				// Enqueue placement để rebuild grid với giá mới
+				go g.enqueuePlacement(symbol)
 			}
 		}
 	}

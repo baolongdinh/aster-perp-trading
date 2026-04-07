@@ -9,13 +9,14 @@ import (
 	"sync"
 )
 
-// SymbolPrecision holds the tick and step sizes for a specific symbol.
+// SymbolPrecision tracks exchange rules for a symbol.
 type SymbolPrecision struct {
 	Symbol       string
 	TickSize     float64
-	PricePrec    int
 	StepSize     float64
+	PricePrec    int
 	QuantityPrec int
+	MaxLeverage  float64
 }
 
 // PrecisionManager manages symbol-specific formatting rules.
@@ -41,6 +42,11 @@ func (p *PrecisionManager) UpdateFromExchangeInfo(raw []byte) error {
 				TickSize   string `json:"tickSize"`
 				StepSize   string `json:"stepSize"`
 			} `json:"filters"`
+			LeverageBrackets []struct {
+				Bracket     int     `json:"bracket"`
+				NotionalCap float64 `json:"notionalCap"`
+				Leverage    float64 `json:"initialLeverage"`
+			} `json:"leverageBrackets"`
 		} `json:"symbols"`
 	}
 
@@ -61,6 +67,12 @@ func (p *PrecisionManager) UpdateFromExchangeInfo(raw []byte) error {
 			if f.FilterType == "LOT_SIZE" {
 				sp.StepSize, _ = strconv.ParseFloat(f.StepSize, 64)
 				sp.QuantityPrec = precisionFromStep(f.StepSize)
+			}
+		}
+		// NEW: Parse max leverage from brackets
+		for _, b := range s.LeverageBrackets {
+			if b.Leverage > sp.MaxLeverage {
+				sp.MaxLeverage = b.Leverage
 			}
 		}
 		p.symbols[s.Symbol] = sp
@@ -102,6 +114,17 @@ func (p *PrecisionManager) RoundQty(symbol string, qty float64) string {
 
 	rounded := math.Floor(qty/sp.StepSize) * sp.StepSize
 	return strconv.FormatFloat(rounded, 'f', sp.QuantityPrec, 64)
+}
+
+// GetMaxLeverage returns the maximum leverage for a symbol.
+func (p *PrecisionManager) GetMaxLeverage(symbol string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if sp, ok := p.symbols[symbol]; ok {
+		return sp.MaxLeverage
+	}
+	return 0 // Unknown
 }
 
 // precisionFromStep converts "0.0001" to 4

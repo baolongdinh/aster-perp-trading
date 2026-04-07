@@ -259,7 +259,7 @@ func (im *InventoryManager) GetAdjustedOrderSize(symbol string, side string, bas
 		}
 	case SkewActionEmergencySkew:
 		if isSkewedSide {
-			return 0 // No new orders on skewed side
+			reduction = 0.90 // Giảm 90% thay vì block hoàn toàn - vẫn có lệnh để farm volume
 		}
 	}
 
@@ -274,14 +274,15 @@ func (im *InventoryManager) ShouldPauseSide(symbol string, side string) bool {
 	skewRatio := im.CalculateSkewRatio(symbol)
 	action := im.GetSkewAction(skewRatio)
 
-	if action != SkewActionPauseSkewSide && action != SkewActionEmergencySkew {
+	// Volume farming: Không pause hoàn toàn dù skew cao - vẫn đặt lệnh với size giảm
+	// Chỉ return true cho EMERGENCY_SKEW và cần force stop
+	if action != SkewActionEmergencySkew {
 		return false
 	}
 
-	netExposure := im.netExposure[symbol]
-	isSkewedSide := (netExposure > 0 && side == "LONG") || (netExposure < 0 && side == "SHORT")
-
-	return isSkewedSide
+	// Ngay cả với EmergencySkew, vẫn cho phép đặt lệnh nhỏ để farm volume
+	// Trả về false để không block, size sẽ được giảm 90% trong GetAdjustedOrderSize
+	return false
 }
 
 // GetAdjustedTakeProfitDistance returns adjusted take-profit distance
