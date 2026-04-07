@@ -57,6 +57,9 @@ type RiskConfig struct {
 	DailyDrawdownPct            float64 `mapstructure:"daily_drawdown_pct"`
 	PerTradeStopLossPct         float64 `mapstructure:"per_trade_stop_loss_pct"`
 	PerTradeTakeProfitPct       float64 `mapstructure:"per_trade_take_profit_pct"`
+	TakeProfitRRatio            float64 `mapstructure:"take_profit_rr_ratio"` // Target R:R ratio (e.g., 1.5 = 1.5:1)
+	MinTakeProfitPct            float64 `mapstructure:"min_take_profit_pct"`  // Minimum TP as % (e.g., 0.01 = 1%)
+	MaxTakeProfitPct            float64 `mapstructure:"max_take_profit_pct"`  // Maximum TP as % (e.g., 0.05 = 5%)
 	RiskPerTradeUSDT            float64 `mapstructure:"risk_per_trade_usdt"`
 	ATRMultiplier               float64 `mapstructure:"atr_multiplier"`
 	PositionMode                string  `mapstructure:"position_mode"` // one_way | hedge

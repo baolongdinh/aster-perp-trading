@@ -22,7 +22,9 @@ type Manager struct {
 	log *zap.Logger
 
 	mu                  sync.Mutex
-	dailyPnL            float64            // running daily P&L
+	dailyPnL            float64            // running daily P&L (realized)
+	dailyUnrealizedPnL  float64            // current unrealized P&L across all positions
+	symUnrealizedPnL    map[string]float64 // symbol -> current unrealized PnL
 	dailyPnLReset       time.Time          // reset timestamp
 	dailyStartingEquity float64            // equity at the start of the day
 	openPositions       int                // current open total position count
@@ -45,6 +47,7 @@ func (m *Manager) SetCorrelationTracker(t *regime.CorrelationTracker) {
 // PersistentState defines the risk data saved to disk.
 type PersistentState struct {
 	DailyPnL            float64            `json:"daily_pnl"`
+	DailyUnrealizedPnL  float64            `json:"daily_unrealized_pnl"`
 	DailyStartingEquity float64            `json:"daily_starting_equity"`
 	DailyPnLReset       time.Time          `json:"daily_pnl_reset"`
 	LastCumulativePnL   map[string]float64 `json:"last_cumulative_pnl"`
@@ -59,6 +62,7 @@ func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
 		dailyPnLReset:     todayUTC(),
 		symPositions:      make(map[string]int),
 		symNotional:       make(map[string]float64),
+		symUnrealizedPnL:  make(map[string]float64),
 		pendingOrders:     make(map[string]float64),
 		lastCumulativePnL: make(map[string]float64),
 	}
@@ -222,14 +226,21 @@ func (m *Manager) OnPositionClosed(symbol string, realizedPnL float64) {
 		)
 	}
 
-	// 2. PERCENTAGE LIMIT (Drawdown)
+	// 2. PERCENTAGE LIMIT (Drawdown) - Corrected to include unrealized PnL
 	if m.dailyStartingEquity > 0 {
-		drawdown := (m.dailyPnL / m.dailyStartingEquity) * 100
-		if drawdown <= -m.cfg.DailyDrawdownPct {
+		// Calculate total equity including both realized and unrealized PnL
+		totalEquity := m.dailyStartingEquity + m.dailyPnL + m.dailyUnrealizedPnL
+		drawdownPct := ((m.dailyStartingEquity - totalEquity) / m.dailyStartingEquity) * 100
+
+		if drawdownPct >= m.cfg.DailyDrawdownPct {
 			m.paused = true
 			m.log.Warn("risk: daily drawdown percentage hit, bot paused",
-				zap.Float64("drawdown_pct", drawdown),
+				zap.Float64("drawdown_pct", drawdownPct),
 				zap.Float64("limit_pct", m.cfg.DailyDrawdownPct),
+				zap.Float64("starting_equity", m.dailyStartingEquity),
+				zap.Float64("current_equity", totalEquity),
+				zap.Float64("realized_pnl", m.dailyPnL),
+				zap.Float64("unrealized_pnl", m.dailyUnrealizedPnL),
 			)
 		}
 	}
@@ -376,6 +387,39 @@ func (m *Manager) TakeProfitPrice(entryPrice float64, side string, slPrice float
 	return entryPrice - (dist * rr)
 }
 
+// UpdateUnrealizedPnL updates the unrealized PnL for a symbol and recalculates total
+func (m *Manager) UpdateUnrealizedPnL(symbol string, unrealizedPnL float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Update per-symbol unrealized PnL
+	oldPnL := m.symUnrealizedPnL[symbol]
+	m.symUnrealizedPnL[symbol] = unrealizedPnL
+
+	// Recalculate total unrealized PnL
+	m.dailyUnrealizedPnL = 0
+	for _, pnl := range m.symUnrealizedPnL {
+		m.dailyUnrealizedPnL += pnl
+	}
+
+	// Check drawdown immediately on significant unrealized loss changes
+	if m.dailyStartingEquity > 0 && unrealizedPnL < oldPnL {
+		totalEquity := m.dailyStartingEquity + m.dailyPnL + m.dailyUnrealizedPnL
+		drawdownPct := ((m.dailyStartingEquity - totalEquity) / m.dailyStartingEquity) * 100
+
+		if drawdownPct >= m.cfg.DailyDrawdownPct && !m.paused {
+			m.paused = true
+			m.log.Warn("risk: daily drawdown percentage hit during unrealized update, bot paused",
+				zap.Float64("drawdown_pct", drawdownPct),
+				zap.Float64("limit_pct", m.cfg.DailyDrawdownPct),
+				zap.String("symbol", symbol),
+				zap.Float64("symbol_unrealized", unrealizedPnL),
+			)
+			m.saveState()
+		}
+	}
+}
+
 // DailyPnL returns the current daily P&L.
 func (m *Manager) DailyPnL() float64 {
 	m.mu.Lock()
@@ -423,6 +467,9 @@ func (m *Manager) maybeDailyReset() {
 		m.dailyStartingEquity = 0 // will be re-set by next account update
 		m.paused = false
 		m.dailyPnLReset = now
+		m.dailyPnL = 0
+		m.dailyUnrealizedPnL = 0
+		m.symUnrealizedPnL = make(map[string]float64)
 		m.lastCumulativePnL = make(map[string]float64) // reset cumulative deltas for the new day
 		m.log.Info("risk: daily P&L reset")
 		m.saveState()
@@ -453,6 +500,7 @@ func (m *Manager) LoadState() {
 	// Only load if the reset date is still valid (same day)
 	if !todayUTC().After(s.DailyPnLReset) {
 		m.dailyPnL = s.DailyPnL
+		m.dailyUnrealizedPnL = s.DailyUnrealizedPnL
 		m.dailyStartingEquity = s.DailyStartingEquity
 		m.dailyPnLReset = s.DailyPnLReset
 		m.paused = s.Paused
@@ -461,6 +509,7 @@ func (m *Manager) LoadState() {
 		}
 		m.log.Info("risk: state loaded from disk",
 			zap.Float64("daily_pnl", m.dailyPnL),
+			zap.Float64("daily_unrealized_pnl", m.dailyUnrealizedPnL),
 			zap.Bool("paused", m.paused),
 		)
 	} else {
@@ -476,6 +525,7 @@ func (m *Manager) saveState() {
 
 	s := PersistentState{
 		DailyPnL:            m.dailyPnL,
+		DailyUnrealizedPnL:  m.dailyUnrealizedPnL,
 		DailyStartingEquity: m.dailyStartingEquity,
 		DailyPnLReset:       m.dailyPnLReset,
 		LastCumulativePnL:   m.lastCumulativePnL,

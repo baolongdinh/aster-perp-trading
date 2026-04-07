@@ -1,434 +1,1032 @@
-# 🚀 Volume Farming Pure - Complete Implementation Guide
+# Volume Farming Bot - Giải Thích Logic Code Chi Tiết
 
-## 📋 Table of Contents
-- [🎯 Strategy Overview](#-strategy-overview)
-- [🔄 Trade Flow](#-trade-flow)
-- [📊 Order Logic](#-order-logic)
-- [🎯 Entry Conditions](#-entry-conditions)
-- [📈 Exit Conditions](#-exit-conditions)
-- [📊 Metrics & Performance](#-metrics--performance)
-- [⚙️ Configuration](#️-configuration)
-- [🔧 Troubleshooting](#-troubleshooting)
+> Tài liệu này giải thích chi tiết cách code hoạt động để thực hiện các nghiệp vụ grid trading được mô tả trong GRID_TRADING_LOGIC.md.
 
 ---
 
-## 🎯 Strategy Overview
+## � Mục Lục
 
-### **Core Philosophy**
-- **Objective**: Maximum volume generation with minimum cost
-- **Profit Focus**: Not required - only need to avoid losses
-- **Frequency**: Ultra-high frequency order placement
-- **Risk Management**: Safety margins and error prevention
-
-### **Key Metrics**
-- **Target**: 100% order placement success rate
-- **Volume**: Maximize USDT volume traded
-- **Points**: Earn points through fills, not profit
-- **Efficiency**: Minimize fees and slippage
+1. [Kiến Trúc Tổng Quan](#1-kiến-trúc-tổng-quan)
+2. [Luồng Xử Lý Chính](#2-luồng-xử-lý-chính)
+3. [Entry Logic - Code Implementation](#3-entry-logic---code-implementation)
+4. [Exit Logic - Code Implementation](#4-exit-logic---code-implementation)
+5. [Risk Management - Code Implementation](#5-risk-management---code-implementation)
+6. [Adaptive Grid - Code Implementation](#6-adaptive-grid---code-implementation)
+7. [Các Module Quan Trọng](#7-các-module-quan-trọng)
+8. [Data Flow](#8-data-flow)
 
 ---
 
-## 🔄 Trade Flow
+## 1. Kiến Trúc Tổng Quan
 
-### **Phase 1: Initialization**
-```mermaid
-flowchart TD
-    Start([🚀 Start Bot]) --> LoadInfo[📊 Load Exchange Info]
-    LoadInfo --> InitGrid[⚙️ Initialize Grid Manager]
-    InitGrid --> ConnectWS[🔌 Connect WebSocket]
-    ConnectWS --> GetTicker[📡 Get Ticker Data]
+### 1.1 Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    VOLUME FARM ENGINE                         │
+│  (cmd/bot/main.go → volume_farm_engine.go)                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │   Grid       │  │   Adaptive   │  │    Risk      │        │
+│  │   Manager    │  │   Grid Mgr   │  │   Manager    │        │
+│  │              │  │              │  │              │        │
+│  │ • Places     │  │ • Detects    │  │ • Enforces   │        │
+│  │   orders     │  │   regime     │  │   limits     │        │
+│  │ • Manages    │  │ • Adjusts    │  │ • Tracks PnL │        │
+│  │   levels     │  │   spread     │  │ • Emergency  │        │
+│  └──────────────┘  └──────────────┘  └──────────────┘        │
+│         │                │                │                   │
+│         └────────────────┼────────────────┘                   │
+│                          │                                    │
+│              ┌───────────▼────────────┐                       │
+│              │   Futures Client       │                       │
+│              │   (Binance API)        │                       │
+│              │                        │                       │
+│              │ • REST API             │                       │
+│              │ • WebSocket            │                       │
+│              │ • Order mgmt            │                       │
+│              └────────────────────────┘                       │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 Package Structure
+
+```
+backend/
+├── cmd/bot/
+│   └── main.go                    # Entry point
+│
+├── internal/
+│   ├── farming/
+│   │   ├── volume_farm_engine.go  # Main orchestrator
+│   │   ├── adaptive_grid/
+│   │   │   ├── manager.go         # Core grid logic
+│   │   │   ├── grid_calculator.go # Price calculations
+│   │   │   ├── order_placer.go    # Order execution
+│   │   │   ├── inventory_manager.go # Inventory skew mgmt
+│   │   │   ├── cluster_manager.go   # Cluster stop loss
+│   │   │   └── slot_manager.go      # Time slot management
+│   │   └── market_regime/
+│   │       └── detector.go        # Trend detection
+│   │
+│   ├── risk/
+│   │   └── risk_manager.go        # Risk enforcement
+│   │
+│   └── client/
+│       └── futures_client.go      # Binance API wrapper
+│
+└── config/
+    └── volume-farm-config.yaml    # Configuration
+```
+
+---
+
+## 2. Luồng Xử Lý Chính
+
+### 2.1 Main Loop Flow
+
+```go
+// From: volume_farm_engine.go - Run() method
+
+func (e *VolumeFarmEngine) Run(ctx context.Context) error {
+    // 1. Initialize all components
+    e.initializeComponents()
     
-    GetTicker --> CheckSymbol{Symbol Active?}
-    CheckSymbol -->|✅ Yes| CalcGrid[💰 Calculate Grid Prices]
-    CheckSymbol -->|❌ No| IgnoreTicker[🚫 Ignore Ticker]
+    // 2. Start WebSocket for real-time data
+    e.startWebSocket(ctx)
     
-    CalcGrid --> CalcSize[📏 Calculate Order Size]
-    CalcSize --> CheckNotional{Notional ≥ 5.1 USD?}
-    CheckNotional -->|❌ No| AddSafety[🛡️ Add Safety Margin]
-    CheckNotional -->|✅ Yes| PlaceOrder[📝 Place Order]
-    AddSafety --> PlaceOrder
+    // 3. Main trading loop
+    for {
+        select {
+        case <-ticker.C:  // Every 1 second
+            // A. Check risk limits
+            if !e.riskManager.CanTrade() {
+                continue  // Skip if risk limits hit
+            }
+            
+            // B. Update market regime
+            regime := e.detectMarketRegime()
+            
+            // C. Process each symbol
+            for _, symbol := range e.activeSymbols {
+                // 1. Fetch positions
+                positions := e.fetchPositions(symbol)
+                
+                // 2. Check existing orders
+                orders := e.fetchOpenOrders(symbol)
+                
+                // 3. Calculate grid levels
+                grid := e.calculateGrid(symbol, regime)
+                
+                // 4. Place missing orders
+                e.placeMissingOrders(symbol, grid, orders)
+                
+                // 5. Manage risk for existing positions
+                e.checkRiskAndAct(symbol, positions)
+            }
+            
+        case orderUpdate := <-e.orderUpdateCh:
+            // Handle order fill events
+            e.handleOrderFill(orderUpdate)
+            
+        case <-ctx.Done():
+            return e.shutdown()
+        }
+    }
+}
+```
+
+### 2.2 Order Fill Event Flow
+
+```
+[WebSocket] → [FuturesClient] → [VolumeFarmEngine] → [AdaptiveGridManager]
+     ↓              ↓                    ↓                      ↓
+  Receive      Parse JSON        handleOrderFill()      processFill()
+  Raw Data     → OrderUpdate     → Update position      → Place opposite
+                                                    → Record PnL
+                                                    → Update stats
+```
+
+---
+
+## 3. Entry Logic - Code Implementation
+
+### 3.1 Grid Level Calculation
+
+```go
+// From: adaptive_grid/grid_calculator.go
+
+type GridCalculator struct {
+    spread         float64  // Grid spread percentage
+    maxOrders      int      // Max orders per side
+    orderSizeUSDT  float64  // Order size in USDT
+}
+
+// CalculateGridLevels computes buy and sell grid levels
+func (gc *GridCalculator) CalculateGridLevels(
+    symbol string,
+    currentPrice float64,
+    inventorySkew float64,
+) (*GridLevels, error) {
     
-    PlaceOrder --> TrackOrder[📋 Track Order]
-    TrackOrder --> UpdateMetrics[📊 Update Volume Metrics]
-    TrackOrder --> MonitorFill[👀 Monitor for Fills]
+    levels := &GridLevels{
+        Symbol: symbol,
+        BuyLevels:  make([]GridLevel, 0, gc.maxOrders),
+        SellLevels: make([]GridLevel, 0, gc.maxOrders),
+    }
     
-    MonitorFill -->|✅ Filled| MoveToFilled[✅ Move to Filled Orders]
-    MonitorFill -->|⏳ Waiting| MonitorFill
-    MoveToFilled --> LogFill[📝 Log Fill Event]
-    MoveToFilled --> TriggerRebalance[🔄 Trigger Rebalancing]
+    // Calculate spread amount
+    spreadAmount := currentPrice * gc.spread
     
-    TriggerRebalance --> CreateNew[🆕 Create New Order]
-    CreateNew --> PlaceNewOrder[📝 Place New Order]
-    PlaceNewOrder --> TrackOrder
+    // Generate BUY levels (below current price)
+    for i := 1; i <= gc.maxOrders; i++ {
+        price := currentPrice - (float64(i) * spreadAmount)
+        
+        // Adjust for inventory skew
+        if inventorySkew > 0.5 {  // Too much LONG
+            price *= 1.02  // Move buy orders further down
+        }
+        
+        levels.BuyLevels = append(levels.BuyLevels, GridLevel{
+            Price:  price,
+            Amount: gc.orderSizeUSDT / price,
+            Side:   "BUY",
+        })
+    }
     
-    LogFill --> ReportMetrics[📈 Report Metrics]
-    UpdateMetrics --> ReportMetrics
+    // Generate SELL levels (above current price)
+    for i := 1; i <= gc.maxOrders; i++ {
+        price := currentPrice + (float64(i) * spreadAmount)
+        
+        // Adjust for inventory skew
+        if inventorySkew < -0.5 {  // Too much SHORT
+            price *= 0.98  // Move sell orders further up
+        }
+        
+        levels.SellLevels = append(levels.SellLevels, GridLevel{
+            Price:  price,
+            Amount: gc.orderSizeUSDT / price,
+            Side:   "SELL",
+        })
+    }
     
-    IgnoreTicker --> GetTicker
-    ReportMetrics --> GetTicker
-```
-
-### **🔄 Flow Explanation**
-
-#### **1. Initialization Phase**
-- **Load Exchange Info**: Get symbol precision data
-- **Initialize Grid Manager**: Setup order tracking maps
-- **Connect WebSocket**: Start real-time data stream
-
-#### **2. Order Placement Phase**
-- **Check Symbol**: Only process active symbols
-- **Calculate Grid**: BUY below, SELL above current price
-- **Calculate Size**: 100 USDT orders with safety validation
-- **Safety Check**: Ensure ≥5.1 USD notional (2% margin)
-
-#### **3. Order Tracking Phase**
-- **Track Orders**: Add to active orders map
-- **Update Metrics**: Volume and order count tracking
-- **Monitor Fills**: WebSocket order status monitoring
-
-#### **4. Fill Detection Phase**
-- **Fill Detected**: Move order to filled status
-- **Log Event**: Record fill time and points
-- **Trigger Rebalancing**: Immediately create replacement order
-
-#### **5. Continuous Cycle**
-- **Maintain Grid**: Always keep full order set
-- **Generate Volume**: Maximum fill frequency
-- **Report Performance**: 30-second metrics updates
-
-![Volume Farming Pure Flow](volume_farming_flow.png)
-
-### **Phase 2: Order Placement**
-```
-1. Receive Ticker Data → Price updates
-2. Check Symbol Active → Grid exists?
-3. Calculate Grid Prices → BUY below, SELL above
-4. Calculate Order Size → 100 USDT / price
-5. Apply Safety Margin → 5.1 USD minimum notional
-6. Place Orders → Track in active orders
-7. Update Metrics → Volume, orders placed
-```
-
-### **Phase 3: Fill Detection**
-```
-1. Monitor WebSocket → Order status updates
-2. Detect Fill → Status = FILLED
-3. Update Order Status → Move to filled orders
-4. Log Fill Event → Points earned
-5. Trigger Rebalancing → Immediate order replacement
-```
-
-### **Phase 4: Auto Rebalancing**
-```
-1. Fill Detected → Grid has empty slot
-2. Enqueue Placement → Add to placement queue
-3. Worker processes → Calculate new orders
-4. Place New Orders → Fill empty slot
-5. Grid always full → Maximum volume generation
-```
-
----
-
-## 📊 Order Logic
-
-### **Entry Conditions**
-
-#### **1. Symbol Selection**
-```go
-// Must be in active symbols
-if !activeGrids[symbol] {
-    ignore ticker
-}
-
-// Must meet volume requirements
-if volume24h < minQuoteVolume {
-    ignore symbol
-}
-
-// Must support quote currency
-if !isQuoteCurrencySupported(quote) {
-    ignore symbol
+    return levels, nil
 }
 ```
 
-#### **2. Price Calculation**
+### 3.2 Order Placement Logic
+
 ```go
-// Grid spread: 0.001% for volume farming (ultra-small)
-spreadAmount := currentPrice * (0.001 / 100)
-if spreadAmount < 0.001 {
-    spreadAmount = 0.001  // $0.001 minimum
-}
+// From: adaptive_grid/order_placer.go
 
-// BUY orders: below current price
-buyPrice := currentPrice - (spreadAmount * level)
-
-// SELL orders: above current price  
-sellPrice := currentPrice + (spreadAmount * level)
-```
-
-#### **3. Order Sizing**
-```go
-// Base calculation: 100 USDT order size
-orderSize := 100.0 / price
-
-// Safety margin: 2% above minimum
-minRequired := 5.0 * 1.02  // 5.1 USD
-minSize := minRequired / price
-
-// Precision based on price range
-if price < 1:      precision = 6      // Sub-dollar assets
-elif price < 100:  precision = 4      // Moderate assets  
-else:               precision = 2      // High-value assets
-
-// Apply precision and ensure minimum notional
-roundedSize := math.Round(minSize * 10^precision) / 10^precision
-for roundedSize * price < 5.1 {
-    roundedSize += 1.0 / 10^precision  // Increment by smallest unit
-}
-```
-
-### **Order Validation**
-```go
-// Multiple validation layers
-1. Precision Manager → Symbol-specific formatting
-2. Safety Margin → 5.1 USD minimum notional
-3. Minimum Size → 0.000001 fallback
-4. Price Validation → Must be > 0
-```
-
----
-
-## 📈 Exit Conditions
-
-### **Fill Detection**
-```go
-// WebSocket order updates
-if orderUpdate.Status == "FILLED" {
-    handleOrderFill(orderID, symbol)
-}
-
-// Fill handling
-1. Update order status to FILLED
-2. Move to filled orders map
-3. Record fill time
-4. Calculate points earned
-5. Log fill event
-```
-
-### **Auto Rebalancing**
-```go
-// Immediate replacement when filled
-func handleOrderFill(orderID, symbol) {
-    // Move to filled orders
-    order.Status = "FILLED"
-    order.FilledAt = time.Now()
-    filledOrders[orderID] = order
-    delete(activeOrders, orderID)
+func (op *OrderPlacer) PlaceGridOrders(
+    ctx context.Context,
+    symbol string,
+    levels *GridLevels,
+    existingOrders []Order,
+) error {
     
-    // Trigger immediate rebalancing
-    go enqueuePlacement(symbol)
+    // 1. Determine which orders need to be placed
+    neededBuys := op.findMissingOrders(levels.BuyLevels, existingOrders, "BUY")
+    neededSells := op.findMissingOrders(levels.SellLevels, existingOrders, "SELL")
+    
+    // 2. Check risk limits before placing
+    for _, level := range neededBuys {
+        if !op.riskManager.CanEnter(symbol, level.Amount, level.Price, "BUY") {
+            op.logger.Warn("Risk limit prevents BUY order",
+                zap.String("symbol", symbol),
+                zap.Float64("price", level.Price))
+            continue
+        }
+        
+        // 3. Place the order
+        order, err := op.client.PlaceLimitOrder(ctx, PlaceOrderRequest{
+            Symbol:   symbol,
+            Side:     "BUY",
+            Price:    level.Price,
+            Quantity: level.Amount,
+            TimeInForce: "GTC",
+        })
+        
+        if err != nil {
+            op.metrics.RecordOrderFailure(symbol, "BUY", err)
+            continue
+        }
+        
+        op.metrics.RecordOrderPlaced(symbol, "BUY", order.OrderID)
+    }
+    
+    // Same for SELL orders...
+    return nil
+}
+
+// findMissingOrders checks which grid levels don't have orders
+func (op *OrderPlacer) findMissingOrders(
+    required []GridLevel,
+    existing []Order,
+    side string,
+) []GridLevel {
+    missing := make([]GridLevel, 0)
+    
+    for _, req := range required {
+        found := false
+        for _, ex := range existing {
+            // Check if existing order is at this price level
+            if ex.Side == side && math.Abs(ex.Price-req.Price) < 0.01 {
+                found = true
+                break
+            }
+        }
+        if !found {
+            missing = append(missing, req)
+        }
+    }
+    
+    return missing
 }
 ```
 
-### **Rebalancing Logic**
-```go
-// Continuous grid maintenance
-1. Fill detected → Empty grid slot
-2. Queue placement → Add to placement queue
-3. Worker processes → Calculate new orders
-4. Place new orders → Fill empty slot
-5. Grid always full → Maximum volume generation
-```
+### 3.3 CanPlaceOrder - Entry Validation
 
+```go
+// From: adaptive_grid/manager.go
+
+func (agm *AdaptiveGridManager) CanPlaceOrder(
+    symbol string,
+    side string,
+    price float64,
+) bool {
+    agm.mu.RLock()
+    defer agm.mu.RUnlock()
+    
+    // 1. Check if grid is paused
+    if agm.pausedSymbols[symbol] {
+        return false
+    }
+    
+    // 2. Check cooldown after losses
+    if agm.IsInCooldown(symbol) {
+        return false
+    }
+    
+    // 3. Check max orders limit
+    currentOrders := agm.countOrdersForSymbol(symbol)
+    if currentOrders >= agm.config.MaxOrdersPerSide*2 {
+        return false
+    }
+    
+    // 4. Check position limits
+    if position, exists := agm.positions[symbol]; exists {
+        if position.NotionalValue >= agm.config.MaxPositionUSDT {
+            return false
+        }
+    }
+    
+    // 5. Check inventory skew
+    if agm.inventoryMgr != nil {
+        skew := agm.inventoryMgr.CalculateSkewRatio(symbol)
+        action := agm.inventoryMgr.GetSkewAction(skew)
+        
+        // Don't add to the skewed side
+        if (action == SkewActionReduceSkewSide || action == SkewActionPauseSkewSide) {
+            if (side == "BUY" && skew > 0) || (side == "SELL" && skew < 0) {
+                agm.logger.Warn("Skipping order due to inventory skew",
+                    zap.String("symbol", symbol),
+                    zap.String("side", side),
+                    zap.Float64("skew", skew))
+                return false
+            }
+        }
+    }
+    
+    // 6. Check trend direction (directional bias)
+    if agm.config.UseDirectionalBias && agm.trendDetector != nil {
+        state := agm.trendDetector.GetTrendState()
+        score := agm.trendDetector.GetTrendScore()
+        
+        // Strong trend - pause trading
+        if score >= 4 {
+            return false
+        }
+        
+        // Block orders against trend
+        if state == TrendStateStrongUp && side == "SELL" {
+            return false
+        }
+        if state == TrendStateStrongDown && side == "BUY" {
+            return false
+        }
+    }
+    
+    return true
+}
+```
 ---
 
-## 📊 Metrics & Performance
+## 4. Exit Logic - Code Implementation
 
-### **Volume Metrics**
+### 4.1 Order Fill Handler
+
 ```go
-type VolumeMetrics struct {
-    totalVolumeUSDT    float64  // Total USDT volume traded
-    totalOrdersPlaced  int       // Total orders placed
-    totalOrdersFilled  int       // Total orders filled
-    fillRate          float64   // Fill rate percentage
-    activeOrders       int       // Currently active orders
+// From: adaptive_grid/manager.go
+
+func (agm *AdaptiveGridManager) handleOrderFill(fill OrderFill) {
+    agm.mu.Lock()
+    defer agm.mu.Unlock()
+    
+    symbol := fill.Symbol
+    side := fill.Side
+    filledQty := fill.Quantity
+    filledPrice := fill.Price
+    
+    agm.logger.Info("Order filled",
+        zap.String("symbol", symbol),
+        zap.String("side", side),
+        zap.Float64("qty", filledQty),
+        zap.Float64("price", filledPrice))
+    
+    // 1. Update position tracking
+    agm.updatePositionTracking(symbol, side, filledQty, filledPrice)
+    
+    // 2. Update metrics
+    agm.metrics.RecordFill(symbol, side, filledQty*filledPrice)
+    
+    // 3. Calculate and place opposite order (auto-rebalance)
+    oppositeSide := "SELL"
+    if side == "SELL" {
+        oppositeSide = "BUY"
+    }
+    
+    // Calculate opposite price with spread
+    spreadAmount := filledPrice * agm.config.GridSpreadPct
+    var oppositePrice float64
+    if oppositeSide == "SELL" {
+        oppositePrice = filledPrice + spreadAmount
+    } else {
+        oppositePrice = filledPrice - spreadAmount
+    }
+    
+    // 4. Queue the opposite order
+    agm.orderQueue = append(agm.orderQueue, OrderRequest{
+        Symbol:   symbol,
+        Side:     oppositeSide,
+        Price:    oppositePrice,
+        Quantity: filledQty,
+    })
+    
+    // 5. Check for realized PnL
+    if agm.canCalculatePnL(symbol, side, filledPrice) {
+        pnl := agm.calculateRealizedPnL(symbol, filledPrice, filledQty)
+        agm.metrics.RecordPnL(symbol, pnl)
+        
+        // Update consecutive loss tracking
+        isWin := pnl > 0
+        agm.RecordTradeResult(symbol, isWin)
+    }
 }
 ```
 
-### **Real-time Tracking**
+### 4.2 PnL Calculation
+
 ```go
-// On order placement
-totalOrdersPlaced++
-totalVolumeUSDT += orderSize * orderPrice
+// From: adaptive_grid/pnl_tracker.go
 
-// On order fill
-totalOrdersFilled++
-// Log fill event with points earned
+type PnLTracker struct {
+    realizedPnL     map[string]float64  // Symbol -> realized PnL
+    unrealizedPnL   map[string]float64  // Symbol -> unrealized PnL
+    avgEntryPrices  map[string]float64  // Symbol -> weighted avg entry
+    positions       map[string]float64    // Symbol -> position size
+}
 
-// Fill rate calculation
-fillRate = float64(totalOrdersFilled) / float64(totalOrdersPlaced)
-```
+// CalculateRealizedPnL computes PnL when a position is closed
+func (pt *PnLTracker) CalculateRealizedPnL(
+    symbol string,
+    exitPrice float64,
+    exitQty float64,
+) float64 {
+    avgEntry := pt.avgEntryPrices[symbol]
+    
+    if pt.positions[symbol] > 0 {  // Long position
+        pnl := (exitPrice - avgEntry) * exitQty
+        pt.realizedPnL[symbol] += pnl
+        return pnl
+    } else {  // Short position
+        pnl := (avgEntry - exitPrice) * exitQty
+        pt.realizedPnL[symbol] += pnl
+        return pnl
+    }
+}
 
-### **Performance Reporting**
+// CalculateUnrealizedPnL computes current open position PnL
+func (pt *PnLTracker) CalculateUnrealizedPnL(
+    symbol string,
+    markPrice float64,
+) float64 {
+    position := pt.positions[symbol]
+    avgEntry := pt.avgEntryPrices[symbol]
+    
+    if position == 0 {
+        return 0
+    }
+    
+    if position > 0 {  // Long
+        return (markPrice - avgEntry) * position
+    } else {  // Short
+        return (avgEntry - markPrice) * math.Abs(position)
+    }
+}
+---
+
+## 5. Risk Management - Code Implementation
+
+### 5.1 Risk Manager Core
+
 ```go
-// 30-second automated reports
-"Volume Farming Metrics" {
-    "total_volume_usdt": 15000.50,
-    "orders_placed": 150,
-    "orders_filled": 127, 
-    "fill_rate": "84.67%",
-    "active_orders": 23
+// From: risk/risk_manager.go
+
+type Manager struct {
+    cfg                 config.RiskConfig
+    log                 *zap.Logger
+    
+    // Daily tracking
+    dailyPnL            float64            // Realized PnL today
+    dailyUnrealizedPnL  float64            // Current unrealized across all
+    dailyStartingEquity float64            // Equity at start of day
+    
+    // Symbol tracking
+    symPositions        map[string]int     // Symbol -> position count
+    symNotional         map[string]float64 // Symbol -> position value
+    symUnrealizedPnL    map[string]float64 // Symbol -> unrealized PnL
+    
+    // Risk state
+    paused              bool               // Bot paused flag
+    lastCumulativePnL   map[string]float64 // For loss tracking
+}
+
+// CanEnter checks if new position can be opened
+func (m *Manager) CanEnter(symbol, side string, qty, price float64) bool {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    // 1. Check if bot is paused
+    if m.paused {
+        return false
+    }
+    
+    // 2. Check daily loss limit
+    if m.dailyPnL < -m.cfg.DailyLossLimitUSDT {
+        m.log.Warn("Daily loss limit reached")
+        m.paused = true
+        return false
+    }
+    
+    // 3. Check drawdown limit (includes unrealized)
+    if m.dailyStartingEquity > 0 {
+        totalEquity := m.dailyStartingEquity + m.dailyPnL + m.dailyUnrealizedPnL
+        drawdown := ((m.dailyStartingEquity - totalEquity) / m.dailyStartingEquity) * 100
+        
+        if drawdown >= m.cfg.DailyDrawdownPct {
+            m.log.Warn("Drawdown limit reached", zap.Float64("drawdown", drawdown))
+            m.paused = true
+            return false
+        }
+    }
+    
+    // 4. Check max positions per symbol
+    if m.symPositions[symbol] >= m.cfg.MaxTradesPerSymbol {
+        return false
+    }
+    
+    // 5. Check position size limit
+    notional := qty * price
+    if m.symNotional[symbol]+notional > m.cfg.MaxPositionUSDTPerSymbol {
+        return false
+    }
+    
+    // 6. Check total exposure
+    totalExposure := m.getTotalExposure()
+    if totalExposure+notional > m.cfg.MaxTotalPositionsUSDT {
+        return false
+    }
+    
+    return true
+}
+
+// UpdateUnrealizedPnL updates current unrealized PnL
+func (m *Manager) UpdateUnrealizedPnL(symbol string, markPrice, avgEntry, positionAmt float64) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    if positionAmt == 0 {
+        m.symUnrealizedPnL[symbol] = 0
+    } else if positionAmt > 0 {  // Long
+        m.symUnrealizedPnL[symbol] = (markPrice - avgEntry) * positionAmt
+    } else {  // Short
+        m.symUnrealizedPnL[symbol] = (avgEntry - markPrice) * math.Abs(positionAmt)
+    }
+    
+    // Recalculate total unrealized
+    m.dailyUnrealizedPnL = 0
+    for _, pnl := range m.symUnrealizedPnL {
+        m.dailyUnrealizedPnL += pnl
+    }
 }
 ```
 
-### **Key Performance Indicators**
-- **Order Success Rate**: Target 100% (no -4164 errors)
-- **Fill Rate**: Higher = better volume generation
-- **Volume per Hour**: USDT volume generated
-- **Points Earned**: Total points from fills
-- **Grid Efficiency**: Orders filled vs total placed
+### 5.2 Consecutive Loss Tracking
 
----
-
-## ⚙️ Configuration
-
-### **Optimized Settings**
-```yaml
-volume_farming:
-  order_size_usdt: 100          # Fixed 100 USDT orders
-  grid_spread_pct: 0.001       # Ultra-small spread for max fills
-  max_orders_side: 3           # 3 BUY + 3 SELL orders
-  placement_cooldown: 5s        # Fast rebalancing
-  
-symbols:
-  quote_currencies: ["USD"]     # Only USD pairs
-  min_quote_volume: 1_000_000  # High volume symbols only
-```
-
-### **Safety Parameters**
 ```go
-// Safety margins
-min_notional: 5.1 USD          # 2% above exchange minimum
-safety_multiplier: 1.02           # Safety margin factor
-min_spread: 0.001 USD           # Minimum spread amount
-min_order_size: 0.000001        # Absolute minimum size
-```
+// From: adaptive_grid/manager.go
 
-### **Worker Configuration**
+// RecordTradeResult tracks wins/losses for cooldown logic
+func (agm *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
+    agm.mu.Lock()
+    defer agm.mu.Unlock()
+    
+    // Also update risk monitor if available
+    if agm.riskMonitor != nil {
+        agm.riskMonitor.RecordTradeResult(isWin)
+    }
+    
+    if isWin {
+        // Reset consecutive losses on win
+        if agm.consecutiveLosses[symbol] > 0 {
+            agm.logger.Info("Win recorded - resetting consecutive losses",
+                zap.String("symbol", symbol),
+                zap.Int("previous_streak", agm.consecutiveLosses[symbol]))
+        }
+        agm.consecutiveLosses[symbol] = 0
+        agm.cooldownActive[symbol] = false
+    } else {
+        // Increment consecutive losses
+        agm.consecutiveLosses[symbol]++
+        agm.lastLossTime[symbol] = time.Now()
+        agm.totalLossesToday++
+        
+        agm.logger.Warn("Loss recorded",
+            zap.String("symbol", symbol),
+            zap.Int("consecutive_losses", agm.consecutiveLosses[symbol]),
+            zap.Int("total_losses_today", agm.totalLossesToday))
+        
+        // Check if max consecutive losses reached
+        maxLosses := agm.config.MaxConsecutiveLosses
+        if maxLosses <= 0 {
+            maxLosses = 3  // Default
+        }
+        
+        if agm.consecutiveLosses[symbol] >= maxLosses {
+            agm.cooldownActive[symbol] = true
+            agm.pauseTrading(symbol)
+            agm.logger.Error("MAX CONSECUTIVE LOSSES REACHED",
+                zap.String("symbol", symbol),
+                zap.Int("losses", agm.consecutiveLosses[symbol]))
+        }
+    }
+}
+
+// IsInCooldown checks if symbol is in cooldown period
+func (agm *AdaptiveGridManager) IsInCooldown(symbol string) bool {
+    agm.mu.RLock()
+    defer agm.mu.RUnlock()
+    
+    if !agm.cooldownActive[symbol] {
+        return false
+    }
+    
+    cooldownDuration := agm.config.CooldownAfterLosses
+    if cooldownDuration <= 0 {
+        cooldownDuration = 5 * time.Minute  // Default
+    }
+    
+    lastLoss := agm.lastLossTime[symbol]
+    elapsed := time.Since(lastLoss)
+    
+    if elapsed >= cooldownDuration {
+        // Cooldown expired - reset
+        agm.mu.RUnlock()
+        agm.mu.Lock()
+        agm.cooldownActive[symbol] = false
+        agm.consecutiveLosses[symbol] = 0
+        agm.mu.Unlock()
+        agm.mu.RLock()
+        
+        agm.logger.Info("Cooldown expired - resuming trading",
+            zap.String("symbol", symbol),
+            zap.Duration("elapsed", elapsed))
+        return false
+    }
+    
+    return true
+}
+---
+
+## 6. Adaptive Grid - Code Implementation
+
+### 6.1 Market Regime Detection
+
 ```go
-// Concurrent processing
-placement_workers: 5           # 5 concurrent placement workers
-websocket_processor: 1         # 1 WebSocket processor
-metrics_reporter: 1             # 1 metrics reporter
-reset_worker: 1                # 1 stale order reset worker
+// From: farming/market_regime/detector.go
+
+type RegimeDetector struct {
+    config   *RegimeDetectorConfig
+    prices   []PricePoint  // Historical prices
+    regime   MarketRegime  // Current regime
+    mu       sync.RWMutex
+}
+
+type PricePoint struct {
+    Price     float64
+    High      float64
+    Low       float64
+    Volume    float64
+    Timestamp time.Time
+}
+
+// DetectRegime analyzes market conditions
+func (rd *RegimeDetector) DetectRegime() MarketRegime {
+    rd.mu.Lock()
+    defer rd.mu.Unlock()
+    
+    if len(rd.prices) < rd.config.LookbackPeriods {
+        return RegimeUnknown
+    }
+    
+    // Get recent prices
+    recent := rd.prices[len(rd.prices)-rd.config.LookbackPeriods:]
+    
+    // Calculate ATR (Average True Range)
+    atr := rd.calculateATR(recent)
+    
+    // Calculate directional movement
+    adx, plusDI, minusDI := rd.calculateADX(recent)
+    
+    // Determine regime
+    if adx > rd.config.TrendingThreshold {
+        if plusDI > minusDI {
+            rd.regime = RegimeTrendingUp
+        } else {
+            rd.regime = RegimeTrendingDown
+        }
+    } else if adx < rd.config.RangingThreshold {
+        rd.regime = RegimeRanging
+    } else {
+        rd.regime = RegimeTransition
+    }
+    
+    return rd.regime
+}
+
+// calculateATR computes Average True Range
+func (rd *RegimeDetector) calculateATR(prices []PricePoint) float64 {
+    if len(prices) < 2 {
+        return 0
+    }
+    
+    var sumTR float64
+    for i := 1; i < len(prices); i++ {
+        tr1 := prices[i].High - prices[i].Low
+        tr2 := math.Abs(prices[i].High - prices[i-1].Price)
+        tr3 := math.Abs(prices[i].Low - prices[i-1].Price)
+        
+        tr := tr1
+        if tr2 > tr {
+            tr = tr2
+        }
+        if tr3 > tr {
+            tr = tr3
+        }
+        sumTR += tr
+    }
+    
+    return sumTR / float64(len(prices)-1)
+}
+```
+
+### 6.2 Grid Adjustment Based on Regime
+
+```go
+// From: adaptive_grid/manager.go - applyNewRegimeParameters
+
+func (agm *AdaptiveGridManager) applyNewRegimeParameters(
+    symbol string,
+    regime MarketRegime,
+) {
+    agm.mu.Lock()
+    defer agm.mu.Unlock()
+    
+    var newSpread float64
+    var newMaxOrders int
+    
+    switch regime {
+    case RegimeTrendingUp:
+        // Reduce buy orders, increase spread
+        newSpread = agm.config.GridSpreadPct * 1.5
+        newMaxOrders = agm.config.MaxOrdersPerSide / 2
+        agm.logger.Info("Adjusting for trending up",
+            zap.String("symbol", symbol),
+            zap.Float64("new_spread", newSpread),
+            zap.Int("max_orders", newMaxOrders))
+        
+    case RegimeTrendingDown:
+        // Reduce sell orders, increase spread
+        newSpread = agm.config.GridSpreadPct * 1.5
+        newMaxOrders = agm.config.MaxOrdersPerSide / 2
+        agm.logger.Info("Adjusting for trending down",
+            zap.String("symbol", symbol),
+            zap.Float64("new_spread", newSpread),
+            zap.Int("max_orders", newMaxOrders))
+        
+    case RegimeRanging:
+        // Tighten spread for more fills
+        newSpread = agm.config.GridSpreadPct * 0.8
+        newMaxOrders = agm.config.MaxOrdersPerSide + 2
+        agm.logger.Info("Adjusting for ranging market",
+            zap.String("symbol", symbol),
+            zap.Float64("new_spread", newSpread),
+            zap.Int("max_orders", newMaxOrders))
+        
+    case RegimeVolatile:
+        // Increase spread to avoid slippage
+        newSpread = agm.config.GridSpreadPct * 2.0
+        newMaxOrders = agm.config.MaxOrdersPerSide
+        agm.logger.Info("Adjusting for volatile market",
+            zap.String("symbol", symbol),
+            zap.Float64("new_spread", newSpread))
+    }
+    
+    // Apply new parameters
+    agm.currentSpread = newSpread
+    agm.currentMaxOrders = newMaxOrders
+    
+    // Trigger grid recalculation
+    agm.needsRecalculation[symbol] = true
+}
 ```
 
 ---
 
-## 🔧 Troubleshooting
+## 7. Các Module Quan Trọng
 
-### **Common Issues & Solutions**
+### 7.1 Inventory Manager
 
-#### **-4164 Notional Errors**
-```
-Problem: "Order's notional must be no smaller than 5.0"
-Cause: Rounding down below minimum
-Solution: Applied 2% safety margin (5.1 USD)
-Code: minRequired := 5.0 * 1.02
+```go
+// From: adaptive_grid/inventory_manager.go
+
+// InventoryManager tracks and manages inventory skew
+type InventoryManager struct {
+    config         *InventoryConfig
+    longPositions  map[string]float64  // Symbol -> long value
+    shortPositions map[string]float64  // Symbol -> short value
+    mu             sync.RWMutex
+    logger         *zap.Logger
+}
+
+// CalculateSkewRatio computes inventory imbalance
+func (im *InventoryManager) CalculateSkewRatio(symbol string) float64 {
+    im.mu.RLock()
+    defer im.mu.RUnlock()
+    
+    long := im.longPositions[symbol]
+    short := im.shortPositions[symbol]
+    total := long + short
+    
+    if total == 0 {
+        return 0
+    }
+    
+    // +1 = 100% long, -1 = 100% short, 0 = balanced
+    return (long - short) / total
+}
+
+// GetSkewAction determines action based on skew
+func (im *InventoryManager) GetSkewAction(skew float64) SkewAction {
+    cfg := im.config.SkewThresholds
+    
+    absSkew := math.Abs(skew)
+    
+    if absSkew >= cfg.Critical {
+        return SkewActionEmergencySkew
+    } else if absSkew >= cfg.High {
+        return SkewActionEmergencySkew
+    } else if absSkew >= cfg.Moderate {
+        return SkewActionPauseSkewSide
+    } else if absSkew >= cfg.Low {
+        return SkewActionReduceSkewSide
+    }
+    
+    return SkewActionNormal
+}
 ```
 
-#### **-4003 Quantity Errors**
-```
-Problem: "Quantity less than zero"  
-Cause: Precision rounding to zero
-Solution: Minimum size fallback
-Code: if finalSize < 0.000001 { finalSize = 0.000001 }
-```
+### 7.2 Cluster Stop Loss
 
-#### **Low Fill Rate**
-```
-Problem: Orders not getting filled
-Cause: Spread too large, orders far from market
-Solution: Ultra-small spread (0.001%)
-Code: spreadAmount < 0.001 { spreadAmount = 0.001 }
-```
+```go
+// From: adaptive_grid/cluster_manager.go
 
-#### **High Latency**
+// ClusterStopLoss tracks position clusters for bulk exit
+type ClusterStopLoss struct {
+    config           *ClusterStopLossConfig
+    positionClusters map[string]*PositionCluster
+    mu               sync.RWMutex
+    logger           *zap.Logger
+}
+
+type PositionCluster struct {
+    Symbol        string
+    EntryPrice    float64
+    TotalAmount   float64
+    EntryTime     time.Time
+    Breakeven50   float64  // 50% breakeven price
+    Breakeven100  float64  // 100% breakeven price
+}
+
+// CheckClusterExit checks if cluster should exit
+func (csl *ClusterStopLoss) CheckClusterExit(
+    symbol string,
+    markPrice float64,
+    totalUnrealizedPnL float64,
+) (exitAction ExitAction, exitPrice float64) {
+    csl.mu.RLock()
+    defer csl.mu.RUnlock()
+    
+    cluster, exists := csl.positionClusters[symbol]
+    if !exists {
+        return ExitActionNone, 0
+    }
+    
+    // Calculate drawdown from breakeven
+    if cluster.EntryPrice > 0 {
+        drawdown := (cluster.EntryPrice - markPrice) / cluster.EntryPrice * 100
+        
+        // Time-based exit (if held too long)
+        heldDuration := time.Since(cluster.EntryTime)
+        if heldDuration > csl.config.MaxStaleDuration {
+            // Check for breakeven exit
+            if math.Abs(totalUnrealizedPnL) < 1.0 {  // Near breakeven
+                if markPrice >= cluster.Breakeven50 {
+                    return ExitActionBreakeven50, markPrice
+                }
+            }
+        }
+        
+        // Drawdown-based exit
+        if drawdown >= csl.config.MaxClusterDrawdown {
+            return ExitActionStopLoss, markPrice
+        }
+    }
+    
+    return ExitActionNone, 0
+}
 ```
-Problem: Slow order placement
-Cause: Sequential processing
-Solution: 5 concurrent workers
-Code: numWorkers := 5
-```
-
-### **Performance Optimization**
-
-#### **Maximum Volume Generation**
-1. **Ultra-Small Spreads**: 0.001% vs 0.02%
-2. **High Frequency**: 5 workers vs 1 worker
-3. **Immediate Rebalancing**: No delay vs 30s cooldown
-4. **Safety Margins**: 2% buffer vs exact minimum
-
-#### **Cost Minimization**
-1. **Efficient Precision**: Price-based precision reduces waste
-2. **Batch Processing**: Concurrent order placement
-3. **Smart Sizing**: Safety margin prevents failed orders
-4. **Real-time Monitoring**: Immediate fill detection
 
 ---
 
-## 🚀 Quick Start
+## 8. Data Flow
 
-### **1. Build & Run**
-```bash
-cd backend
-go build -v ./cmd/volume-farm
-./volume-farm
+### 8.1 Order Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ORDER LIFECYCLE                            │
+└─────────────────────────────────────────────────────────────┘
+
+1. GRID CALCULATION
+   ├─ CalculateGridLevels() → GridLevels
+   └─ Input: Current price, inventory skew, regime
+
+2. RISK CHECK
+   ├─ CanPlaceOrder() → bool
+   ├─ Check: Position limits, drawdown, cooldown
+   └─ Input: Symbol, side, price, quantity
+
+3. ORDER PLACEMENT
+   ├─ PlaceLimitOrder() → Order
+   ├─ Via: FuturesClient (REST API)
+   └─ Stored: In open orders map
+
+4. WAIT FOR FILL
+   ├─ WebSocket listens for updates
+   └─ On PARTIAL_FILL: Continue waiting
+
+5. FILL HANDLING
+   ├─ handleOrderFill() processes fill
+   ├─ Update position tracking
+   ├─ Calculate PnL
+   └─ Queue opposite order (auto-rebalance)
+
+6. OPPOSITE ORDER PLACEMENT
+   ├─ Take opposite side
+   ├─ Price = Fill price ± spread
+   └─ Return to step 2 (risk check)
 ```
 
-### **2. Expected Logs**
-```
-INFO Applied minimum notional with safety margin min_required=5.1
-INFO Grid order placed successfully orderID=12345
-INFO Order filled - triggering rebalancing symbol=SOLUSD1
-INFO Volume Farming Metrics total_volume_usdt=15000 fill_rate=85.2%
-```
+### 8.2 Risk Check Flow
 
-### **3. Monitor Performance**
-- Watch for 100% order placement success
-- Monitor fill rate (target: >80%)
-- Track volume generation per hour
-- Ensure points accumulation
+```
+CanEnter() Flow:
+═══════════════════════════════════════════════
+
+Input: symbol, side, price, quantity
+
+1. Bot Paused? ────────NO──────► 2. Daily Loss? ────────NO──────► 3. Drawdown?
+   │YES                              │YES                            │YES
+   ▼                                 ▼                              ▼
+RETURN FALSE              PAUSE BOT         PAUSE BOT
+                                         RETURN FALSE              ▼
+                                                              4. Max Positions? ──NO──► 5. Position Size?
+                                                                 │YES                       │YES
+                                                                 ▼                          ▼
+                                                           RETURN FALSE          RETURN FALSE
+                                                                                     ▼
+                                                                               6. Total Exposure?
+                                                                                  │YES
+                                                                                  ▼
+                                                                           RETURN FALSE
+                                                                                     ▼
+                                                                               7. Inventory Skew?
+                                                                                  │BLOCK SIDE
+                                                                                  ▼
+                                                                           RETURN FALSE
+                                                                                     ▼
+                                                                               8. Trend Direction?
+                                                                                  │BLOCK COUNTER-TREND
+                                                                                  ▼
+                                                                           RETURN FALSE
+                                                                                     ▼
+                                                                           RETURN TRUE ✓
+```
 
 ---
 
-## 📈 Success Metrics
+## � Tóm Tắt Logic Code
 
-### **Volume Farming KPIs**
-- **Order Placement Success**: 100% (no errors)
-- **Fill Rate**: 80-90% (good performance)
-- **Volume per Hour**: 10,000+ USDT
-- **Points per Day**: 1000+ points
-- **Grid Efficiency**: <5% failed orders
+### Entry Flow
+```
+Ticker → Fetch Price → Detect Regime → Calc Grid → Risk Check → Place Order
+```
 
-### **Optimization Results**
-- **Zero -4164 Errors**: Safety margin implementation
-- **Zero -4003 Errors**: Minimum size fallback  
-- **Ultra-Fast Rebalancing**: Immediate order replacement
-- **Complete Visibility**: Real-time metrics reporting
-- **Maximum Volume**: Optimized for high-frequency trading
+### Exit Flow
+```
+WebSocket → Order Fill → Update Position → Calc PnL → Queue Opposite → Place Order
+```
+
+### Risk Flow
+```
+Position Check → Calc Drawdown (realized + unrealized) → Check Limits → Act if Breached
+```
+
+### Key Files
+| File | Purpose |
+|------|---------|
+| `manager.go` | Core orchestration |
+| `risk_manager.go` | Risk enforcement |
+| `grid_calculator.go` | Price level calculation |
+| `detector.go` | Market regime detection |
+| `inventory_manager.go` | Skew management |
+| `cluster_manager.go` | Bulk exit logic |
 
 ---
 
-## 🎯 Conclusion
-
-This Volume Farming Pure implementation provides:
-
-✅ **100% Order Placement Success** - No more exchange errors
-✅ **Maximum Volume Generation** - Ultra-high frequency trading
-✅ **Minimum Cost Trading** - Optimized spreads and sizing
-✅ **Real-time Monitoring** - Complete fill detection and metrics
-✅ **Auto Grid Management** - Continuous rebalancing
-✅ **Performance Visibility** - Detailed metrics and reporting
-
-**Bot is now optimized for pure volume farming with maximum efficiency! 🚀**
+*Logic code được thiết kế modular để dễ bảo trì và mở rộng. Mỗi nghiệp vụ trong GRID_TRADING_LOGIC.md đều có code implementation tương ứng.*

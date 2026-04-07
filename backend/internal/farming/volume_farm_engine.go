@@ -13,6 +13,7 @@ import (
 	"aster-bot/internal/farming/adaptive_grid"
 	"aster-bot/internal/farming/market_regime"
 	"aster-bot/internal/risk"
+	"aster-bot/internal/strategy/regime"
 
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -126,6 +127,16 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	engine.volumeConfig = volumeConfig
 	engine.futuresClient = client.NewFuturesClient(httpClient, volumeConfig.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
 	engine.riskManager = risk.NewManager(volumeConfig.Risk, logger)
+
+	// NEW: Initialize and inject CorrelationTracker for correlation-based risk checks
+	corrThreshold := volumeConfig.Risk.CorrelationThreshold
+	if corrThreshold <= 0 {
+		corrThreshold = 0.8 // Default 80% correlation threshold
+	}
+	corrTracker := regime.NewCorrelationTracker(nil, corrThreshold)
+	engine.riskManager.SetCorrelationTracker(corrTracker)
+	logger.Info("CorrelationTracker initialized",
+		zap.Float64("threshold", corrThreshold))
 
 	logrusEntry := logrus.NewEntry(logrus.StandardLogger()).WithField("component", "volume_farm")
 	engine.symbolSelector = NewSymbolSelector(engine.futuresClient, logrusEntry.WithField("component", "symbol_selector"), volumeConfig)

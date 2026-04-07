@@ -258,6 +258,13 @@ type EnhancedRiskConfig struct {
 	TrendFollowingOnly   bool          // Only trade with trend (no counter-trend)
 	MaxConsecutiveLosses int           // Pause after N consecutive losses
 	CooldownAfterLosses  time.Duration // Cooldown duration after max losses
+
+	// New fields for take-profit management
+	TakeProfitRRatio   float64 // Target R:R ratio (e.g., 1.5 = 1.5:1)
+	MinTakeProfitPct   float64 // Minimum TP as % (e.g., 0.01 = 1%)
+	MaxTakeProfitPct   float64 // Maximum TP as % (e.g., 0.05 = 5%)
+	UseBreakevenTP     bool    // Enable breakeven-based TP
+	BreakevenBufferPct float64 // Buffer above breakeven (e.g., 0.005 = 0.5%)
 }
 
 // DefaultEnhancedRiskConfig returns default enhanced config
@@ -285,6 +292,13 @@ func DefaultEnhancedRiskConfig() *EnhancedRiskConfig {
 		TrendFollowingOnly:   false, // Allow counter-trend but with reduced size
 		MaxConsecutiveLosses: 3,
 		CooldownAfterLosses:  5 * time.Minute,
+
+		// Take-profit defaults
+		TakeProfitRRatio:   1.5,   // 1.5:1 R:R
+		MinTakeProfitPct:   0.01,  // Minimum 1% TP
+		MaxTakeProfitPct:   0.05,  // Maximum 5% TP
+		UseBreakevenTP:     true,  // Enable breakeven TP
+		BreakevenBufferPct: 0.005, // 0.5% buffer above breakeven
 	}
 }
 

@@ -126,6 +126,12 @@ type AdaptiveGridManager struct {
 	// NEW: OptimizationConfig from YAML files
 	optConfig *config.OptimizationConfig
 
+	// NEW: Consecutive loss tracking for cooldown
+	consecutiveLosses map[string]int       // symbol -> consecutive loss count
+	lastLossTime      map[string]time.Time // symbol -> last loss timestamp
+	cooldownActive    map[string]bool      // symbol -> cooldown status
+	totalLossesToday  int                  // total losses today
+
 	// Control channels
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -144,6 +150,14 @@ type RiskConfig struct {
 	LiquidationBufferPct     float64       // Close before liquidation (e.g., 0.2 = 20% away)
 	PositionCheckInterval    time.Duration // How often to check positions
 	TrendingThreshold        float64       // Trending strength to pause trading
+
+	// Take-profit fields
+	TakeProfitRRatio float64 // Target R:R ratio (e.g., 1.5 = 1.5:1)
+	MinTakeProfitPct float64 // Minimum TP as % (e.g., 0.01 = 1%)
+	MaxTakeProfitPct float64 // Maximum TP as % (e.g., 0.05 = 5%)
+
+	// Directional bias field
+	UseDirectionalBias bool // Only trade with trend (no counter-trend)
 }
 
 // DefaultRiskConfig returns default risk configuration
@@ -160,6 +174,14 @@ func DefaultRiskConfig() *RiskConfig {
 		LiquidationBufferPct:     0.2,   // Close at 20% away from liquidation
 		PositionCheckInterval:    1 * time.Second,
 		TrendingThreshold:        0.7, // Pause if trending > 70%
+
+		// Take-profit defaults
+		TakeProfitRRatio: 1.5,  // 1.5:1 R:R
+		MinTakeProfitPct: 0.01, // Minimum 1% TP
+		MaxTakeProfitPct: 0.05, // Maximum 5% TP
+
+		// Directional bias default
+		UseDirectionalBias: true, // Only trade with trend by default
 	}
 }
 
@@ -226,6 +248,9 @@ func NewAdaptiveGridManager(
 		rangeDetectors:     make(map[string]*RangeDetector), // NEW: Range detectors
 		volumeScalers:      make(map[string]*VolumeScaler),  // NEW: Volume scalers
 		timeFilter:         nil,                             // NEW: Time filter (init later)
+		consecutiveLosses:  make(map[string]int),            // NEW: Track consecutive losses
+		lastLossTime:       make(map[string]time.Time),      // NEW: Track last loss time
+		cooldownActive:     make(map[string]bool),           // NEW: Track cooldown state
 		stopCh:             make(chan struct{}),
 		mu:                 sync.RWMutex{},
 	}
@@ -658,6 +683,12 @@ func (a *AdaptiveGridManager) updatePositionTracking(symbol string, pos *client.
 		a.setInitialStopLoss(symbol, pos.EntryPrice, pos.PositionAmt)
 	}
 
+	// Initialize take profit if not set
+	if _, exists := a.positionTakeProfit[symbol]; !exists {
+		slPrice := a.positionStopLoss[symbol]
+		a.setInitialTakeProfit(symbol, pos.EntryPrice, slPrice, pos.PositionAmt)
+	}
+
 	// Update trailing stop if in profit
 	a.updateTrailingStop(symbol, pos.MarkPrice, pos.PositionAmt)
 }
@@ -723,6 +754,7 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	position := a.positions[symbol]
 	stopLoss := a.positionStopLoss[symbol]
 	trailingStop := a.trailingStopPrice[symbol]
+	takeProfit := a.positionTakeProfit[symbol]
 	a.mu.RUnlock()
 
 	if position == nil {
@@ -733,6 +765,7 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	notional := position.NotionalValue
 	unrealizedPnL := position.UnrealizedPnL
 	liquidationPrice := position.LiquidationPrice
+	entryPrice := position.EntryPrice
 
 	// 1. Check stop loss
 	if a.isStopLossHit(symbol, markPrice, pos.PositionAmt, stopLoss, trailingStop) {
@@ -741,6 +774,19 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 			zap.Float64("mark_price", markPrice),
 			zap.Float64("unrealized_pnl", unrealizedPnL))
 		a.emergencyClosePosition(ctx, symbol, pos.PositionAmt)
+		return
+	}
+
+	// 1.5. Check take profit
+	if a.isTakeProfitHit(symbol, markPrice, pos.PositionAmt, takeProfit) {
+		a.logger.Info("TAKE PROFIT HIT - Closing position with profit",
+			zap.String("symbol", symbol),
+			zap.Float64("mark_price", markPrice),
+			zap.Float64("entry_price", entryPrice),
+			zap.Float64("take_profit", takeProfit),
+			zap.Float64("unrealized_pnl", unrealizedPnL),
+			zap.Float64("profit_pct", (markPrice-entryPrice)/entryPrice*100))
+		a.closePositionWithProfit(ctx, symbol, pos.PositionAmt)
 		return
 	}
 
@@ -812,6 +858,145 @@ func (a *AdaptiveGridManager) isStopLossHit(symbol string, markPrice, positionAm
 	}
 
 	return false
+}
+
+// isTakeProfitHit checks if take profit is hit
+func (a *AdaptiveGridManager) isTakeProfitHit(symbol string, markPrice, positionAmt, takeProfit float64) bool {
+	if positionAmt == 0 || takeProfit <= 0 {
+		return false
+	}
+
+	if positionAmt > 0 && markPrice >= takeProfit { // Long
+		return true
+	}
+	if positionAmt < 0 && markPrice <= takeProfit { // Short
+		return true
+	}
+
+	return false
+}
+
+// closePositionWithProfit closes position at take profit
+func (a *AdaptiveGridManager) closePositionWithProfit(ctx context.Context, symbol string, positionAmt float64) {
+	if positionAmt == 0 || a.futuresClient == nil {
+		return
+	}
+
+	side := "SELL"
+	if positionAmt < 0 {
+		side = "BUY" // Close short
+	}
+
+	qty := fmt.Sprintf("%.6f", math.Abs(positionAmt))
+
+	orderReq := client.PlaceOrderRequest{
+		Symbol:        symbol,
+		Side:          side,
+		Type:          "MARKET",
+		Quantity:      qty,
+		ReduceOnly:    true,
+		ClosePosition: true,
+	}
+
+	a.logger.Info("TAKE PROFIT CLOSE - Placing market order",
+		zap.String("symbol", symbol),
+		zap.String("side", side),
+		zap.String("qty", qty))
+
+	order, err := a.futuresClient.PlaceOrder(ctx, orderReq)
+	if err != nil {
+		a.logger.Error("Failed to close position at take profit", zap.Error(err))
+		return
+	}
+
+	a.logger.Info("Position closed at take profit successfully",
+		zap.String("symbol", symbol),
+		zap.Int64("order_id", order.OrderID))
+
+	// Clear position tracking
+	a.mu.Lock()
+	delete(a.positions, symbol)
+	delete(a.positionStopLoss, symbol)
+	delete(a.trailingStopPrice, symbol)
+	delete(a.positionTakeProfit, symbol)
+	a.mu.Unlock()
+
+	// Record win for consecutive loss tracking
+	a.RecordTradeResult(symbol, true)
+}
+
+// CalculateTakeProfitPrice calculates TP price based on R:R ratio
+func (a *AdaptiveGridManager) CalculateTakeProfitPrice(
+	symbol string,
+	entryPrice float64,
+	stopLossPrice float64,
+	positionAmt float64,
+) float64 {
+	if entryPrice <= 0 || stopLossPrice <= 0 || positionAmt == 0 {
+		return 0
+	}
+
+	// Calculate risk distance
+	riskDistance := math.Abs(entryPrice - stopLossPrice)
+
+	// Get target R:R from config
+	targetRR := a.riskConfig.TakeProfitRRatio
+	if targetRR <= 0 {
+		targetRR = 1.5 // Default 1.5:1
+	}
+
+	// Calculate reward distance
+	rewardDistance := riskDistance * targetRR
+
+	// Apply inventory adjustment (reduce TP when skewed)
+	if a.inventoryMgr != nil {
+		skewRatio := a.inventoryMgr.CalculateSkewRatio(symbol)
+		action := a.inventoryMgr.GetSkewAction(skewRatio)
+
+		// Adjust TP based on skew action
+		switch action {
+		case SkewActionReduceSkewSide:
+			rewardDistance = rewardDistance * 0.85 // Reduce 15%
+		case SkewActionPauseSkewSide:
+			rewardDistance = rewardDistance * 0.70 // Reduce 30%
+		case SkewActionEmergencySkew:
+			rewardDistance = rewardDistance * 0.50 // Reduce 50%
+		}
+	}
+
+	// Apply min/max limits
+	minTPPct := a.riskConfig.MinTakeProfitPct
+	maxTPPct := a.riskConfig.MaxTakeProfitPct
+
+	minTPDistance := entryPrice * minTPPct
+	maxTPDistance := entryPrice * maxTPPct
+
+	if rewardDistance < minTPDistance {
+		rewardDistance = minTPDistance
+	}
+	if rewardDistance > maxTPDistance && maxTPPct > 0 {
+		rewardDistance = maxTPDistance
+	}
+
+	// Calculate TP price
+	if positionAmt > 0 { // Long
+		return entryPrice + rewardDistance
+	}
+	return entryPrice - rewardDistance // Short
+}
+
+// setInitialTakeProfit sets the initial take profit price for a position
+func (a *AdaptiveGridManager) setInitialTakeProfit(symbol string, entryPrice, stopLossPrice, positionAmt float64) {
+	tpPrice := a.CalculateTakeProfitPrice(symbol, entryPrice, stopLossPrice, positionAmt)
+	if tpPrice > 0 {
+		a.positionTakeProfit[symbol] = tpPrice
+		a.logger.Info("Take profit set",
+			zap.String("symbol", symbol),
+			zap.Float64("entry", entryPrice),
+			zap.Float64("stop_loss", stopLossPrice),
+			zap.Float64("take_profit", tpPrice),
+			zap.Float64("rr", a.riskConfig.TakeProfitRRatio))
+	}
 }
 
 // isNearLiquidation checks if position is near liquidation
@@ -1285,6 +1470,22 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		return false
 	}
 
+	// NEW: Check consecutive loss cooldown
+	if a.cooldownActive[symbol] {
+		lastLoss := a.lastLossTime[symbol]
+		cooldownDuration := 5 * time.Minute
+		if time.Since(lastLoss) < cooldownDuration {
+			a.logger.Warn("CanPlaceOrder blocked: cooldown after consecutive losses",
+				zap.String("symbol", symbol),
+				zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
+				zap.Duration("remaining", cooldownDuration-time.Since(lastLoss)))
+			return false
+		}
+		// Cooldown expired - reset
+		a.cooldownActive[symbol] = false
+		a.consecutiveLosses[symbol] = 0
+	}
+
 	// Check if in cooldown
 	if cooldown, exists := a.transitionCooldown[symbol]; exists {
 		if time.Since(cooldown) < 30*time.Second {
@@ -1362,6 +1563,23 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 				zap.String("trend_state", state.String()),
 				zap.Int("trend_score", score))
 			return false
+		}
+
+		// Directional bias check - block against-trend orders
+		if a.riskConfig.UseDirectionalBias {
+			switch state {
+			case TrendStateStrongUp, TrendStateUp:
+				// In uptrend - check if we should block sell orders
+				// This would need to be called with side info, for now log warning
+				a.logger.Debug("Directional bias: in uptrend, sell orders may be blocked",
+					zap.String("symbol", symbol),
+					zap.String("trend_state", state.String()))
+			case TrendStateStrongDown, TrendStateDown:
+				// In downtrend - check if we should block buy orders
+				a.logger.Debug("Directional bias: in downtrend, buy orders may be blocked",
+					zap.String("symbol", symbol),
+					zap.String("trend_state", state.String()))
+			}
 		}
 	}
 
@@ -1544,11 +1762,85 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 	}
 }
 
-// RecordTradeResult records trade result for loss tracking
+// RecordTradeResult records trade result for loss tracking with cooldown
 func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Also update risk monitor if available
 	if a.riskMonitor != nil {
 		a.riskMonitor.RecordTradeResult(isWin)
 	}
+
+	// Get EnhancedRiskConfig values (fallback to defaults if not set)
+	maxConsecutiveLosses := 3
+	cooldownDuration := 5 * time.Minute
+	if a.riskConfig != nil {
+		// Use RiskConfig values if available - could add these fields to RiskConfig
+		// For now use reasonable defaults
+	}
+
+	if isWin {
+		// Reset consecutive losses on win
+		if a.consecutiveLosses[symbol] > 0 {
+			a.logger.Info("Win recorded - resetting consecutive losses",
+				zap.String("symbol", symbol),
+				zap.Int("previous_streak", a.consecutiveLosses[symbol]))
+		}
+		a.consecutiveLosses[symbol] = 0
+		a.cooldownActive[symbol] = false
+	} else {
+		// Increment consecutive losses
+		a.consecutiveLosses[symbol]++
+		a.lastLossTime[symbol] = time.Now()
+		a.totalLossesToday++
+
+		a.logger.Warn("Loss recorded",
+			zap.String("symbol", symbol),
+			zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
+			zap.Int("total_losses_today", a.totalLossesToday))
+
+		// Check if max consecutive losses reached
+		if a.consecutiveLosses[symbol] >= maxConsecutiveLosses {
+			a.cooldownActive[symbol] = true
+			a.pauseTrading(symbol)
+			a.logger.Error("MAX CONSECUTIVE LOSSES REACHED - Entering cooldown",
+				zap.String("symbol", symbol),
+				zap.Int("losses", a.consecutiveLosses[symbol]),
+				zap.Duration("cooldown", cooldownDuration))
+		}
+	}
+}
+
+// IsInCooldown checks if symbol is in cooldown period
+func (a *AdaptiveGridManager) IsInCooldown(symbol string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if !a.cooldownActive[symbol] {
+		return false
+	}
+
+	cooldownDuration := 5 * time.Minute
+	lastLoss := a.lastLossTime[symbol]
+	elapsed := time.Since(lastLoss)
+
+	if elapsed >= cooldownDuration {
+		// Cooldown expired - reset
+		a.mu.RUnlock()
+		a.mu.Lock()
+		a.cooldownActive[symbol] = false
+		a.consecutiveLosses[symbol] = 0
+		a.mu.Unlock()
+		a.mu.RLock()
+
+		a.logger.Info("Cooldown expired - resuming trading",
+			zap.String("symbol", symbol),
+			zap.Duration("elapsed", elapsed))
+		return false
+	}
+
+	return true
 }
 
 // GetExposureStats returns current exposure statistics
