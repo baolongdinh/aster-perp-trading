@@ -118,21 +118,21 @@ func (s *SymbolSelector) processWebSocketTicker(msg map[string]interface{}) {
 
 	s.logger.WithField("data_count", len(data)).Debug("Received WebSocket ticker data")
 
-	// Log first few symbols for debugging
-	if len(data) > 0 {
-		sampleSymbols := make([]string, 0, 5)
-		for i, item := range data {
-			if i >= 5 {
-				break
-			}
-			if ticker, ok := item.(map[string]interface{}); ok {
-				if symbol, ok := ticker["s"].(string); ok {
-					sampleSymbols = append(sampleSymbols, symbol)
-				}
-			}
-		}
-		s.logger.WithField("sample_symbols", sampleSymbols).Info("Sample symbols from WS data")
-	}
+	// // Log first few symbols for debugging
+	// if len(data) > 0 {
+	// 	sampleSymbols := make([]string, 0, 5)
+	// 	for i, item := range data {
+	// 		if i >= 5 {
+	// 			break
+	// 		}
+	// 		if ticker, ok := item.(map[string]interface{}); ok {
+	// 			if symbol, ok := ticker["s"].(string); ok {
+	// 				sampleSymbols = append(sampleSymbols, symbol)
+	// 			}
+	// 		}
+	// 	}
+	// 	s.logger.WithField("sample_symbols", sampleSymbols).Debug("Sample symbols from WS data")
+	// }
 
 	candidates := make([]*SymbolData, 0, len(data))
 	for _, item := range data {
@@ -215,22 +215,22 @@ func (s *SymbolSelector) processWebSocketTicker(msg map[string]interface{}) {
 			}
 		}
 
-		// Add remaining whitelist symbols with dummy data
-		for symbol := range whitelistSymbols {
-			quote := s.extractQuoteCurrency(symbol)
-			if quote != "" && s.isQuoteCurrencySupported(quote) {
-				selected = append(selected, &SymbolData{
-					Symbol:     symbol,
-					BaseAsset:  s.extractBaseAsset(symbol),
-					QuoteAsset: quote,
-					Status:     "TRADING",
-					Volume24h:  1000000, // Dummy volume to pass min check
-					Count24h:   1000,
-				})
-				s.logger.WithField("symbol", symbol).Info("Added whitelist symbol")
-			}
-		}
-	}
+	// 	// Add remaining whitelist symbols with dummy data
+	// 	for symbol := range whitelistSymbols {
+	// 		quote := s.extractQuoteCurrency(symbol)
+	// 		if quote != "" && s.isQuoteCurrencySupported(quote) {
+	// 			selected = append(selected, &SymbolData{
+	// 				Symbol:     symbol,
+	// 				BaseAsset:  s.extractBaseAsset(symbol),
+	// 				QuoteAsset: quote,
+	// 				Status:     "TRADING",
+	// 				Volume24h:  1000000, // Dummy volume to pass min check
+	// 				Count24h:   1000,
+	// 			})
+	// 			s.logger.WithField("symbol", symbol).Debug("Added whitelist symbol")
+	// 		}
+	// 	}
+	// }
 
 	s.mu.Lock()
 	s.activeSymbols = selected

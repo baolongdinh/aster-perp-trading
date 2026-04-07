@@ -372,17 +372,17 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 				"old_price": oldPrice,
 				"new_price": lastPrice,
 				"source":    "websocket",
-			}).Info("Grid price updated")
+			}).Debug("Grid price updated")
 		}
 
 		if oldPrice == 0 {
-			g.logger.WithField("symbol", symbol).Info("Grid initialized with first price")
+			g.logger.WithField("symbol", symbol).Debug("Grid initialized with first price")
 		}
 
 		if g.shouldSchedulePlacement(grid, oldPrice) {
 			grid.PlacementBusy = true
 			symbolsToEnqueue = append(symbolsToEnqueue, symbol)
-			g.logger.WithField("symbol", symbol).Info("Scheduling grid placement due to price update")
+			g.logger.WithField("symbol", symbol).Debug("Scheduling grid placement due to price update")
 		}
 		g.gridsMu.Unlock()
 	}
@@ -394,7 +394,7 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 
 func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64) bool {
 	if grid == nil || !grid.IsActive || grid.CurrentPrice <= 0 {
-		g.logger.WithField("symbol", grid.Symbol).Info("Not scheduling: grid inactive or no price")
+		g.logger.WithField("symbol", grid.Symbol).Debug("Not scheduling: grid inactive or no price")
 		return false
 	}
 
@@ -462,7 +462,7 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 
 	// Only skip if currently busy placing orders
 	if grid.PlacementBusy {
-		g.logger.WithField("symbol", grid.Symbol).Info("Not scheduling: placement busy")
+		g.logger.WithField("symbol", grid.Symbol).Debug("Not scheduling: placement busy")
 		return false
 	}
 
