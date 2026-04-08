@@ -129,6 +129,10 @@ class DashboardApp:
                                             notional = pos.get('notional', 0)
                                             temp['positions'][sym]['size'] = size
                                             temp['positions'][sym]['notional'] = notional
+                                            # P/L data from exchange
+                                            temp['positions'][sym]['unrealized_pnl'] = pos.get('unrealizedPnL', 0)
+                                            temp['positions'][sym]['entry'] = pos.get('entry', 0)
+                                            temp['positions'][sym]['mark'] = pos.get('mark', 0)
                             except:
                                 pass
                         # Parse orders by symbol
@@ -326,6 +330,16 @@ class DashboardApp:
             self.stdscr.addstr(f"{spread_val*100:.2f}%".rjust(20), self.CYAN)
             r += 1
         
+        # Total Unrealized P/L (sum of all positions)
+        total_pnl = 0
+        for sym, p in self.metrics['positions'].items():
+            total_pnl += p.get('unrealized_pnl', 0)
+        if total_pnl != 0:
+            self.stdscr.addstr(r, 4, "P/L:     ", self.WHITE)
+            pnl_color = self.GREEN if total_pnl > 0 else self.RED
+            self.stdscr.addstr(f"${total_pnl:,.2f}".rjust(20), pnl_color + self.BOLD)
+            r += 1
+        
         # Funding Rate (if available)
         funding_rate = self.metrics.get('funding_rate')
         if funding_rate is not None:
@@ -366,9 +380,14 @@ class DashboardApp:
                 # Show real position size and notional
                 size = p.get('size', 0)
                 notional = p.get('notional', 0)
+                pnl = p.get('unrealized_pnl', 0)
                 if size > 0:
                     self.stdscr.addstr(f" {size:.4f}", self.WHITE)
                     self.stdscr.addstr(f" (${notional:,.2f})", self.YELLOW)
+                    # Show P/L with color
+                    pnl_color = self.GREEN if pnl >= 0 else self.RED
+                    pnl_str = f" {'+' if pnl >= 0 else ''}${pnl:,.2f}"
+                    self.stdscr.addstr(pnl_str, pnl_color + self.BOLD)
                 else:
                     self.stdscr.addstr(f" x{p.get('count', 0)}", self.WHITE)
                 r += 1

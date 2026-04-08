@@ -55,10 +55,10 @@ max_orders_per_side: 10
 
 # max_global_pending_limit_orders: Tổng số lệnh pending
 # 20 lệnh = $600 notional, với 100x leverage = $6 margin (60% vốn)
-max_global_pending_limit_orders: 20
+max_global_pending_limit_orders: 30
 
 # max_pending_per_side: Số lệnh pending mỗi bên
-max_pending_per_side: 10
+max_pending_per_side: 15
 
 # replace_immediately: Đặt lại lệnh ngay sau khi fill
 # true = luôn có lệnh trên sách, tăng tần suất giao dịch
@@ -191,7 +191,7 @@ risk:
   # max_position_usdt_per_symbol: Giới hạn position/symbol
   # $300 = 30x vốn, với 100x leverage = $3 margin
   # Cho phép nhiều lệnh chồng lên nhau để farm volume
-  max_position_usdt_per_symbol: 200
+  max_position_usdt_per_symbol: 300
   
   # Dynamic liquidation buffer based on leverage
   liquidation_buffer_dynamic: true
@@ -203,7 +203,7 @@ risk:
 
   # max_total_positions_usdt: Tổng position tối đa
   # $400 notional với 100x leverage = $4 margin
-  max_total_positions_usdt: 600
+  max_total_positions_usdt: 900
 
   # fee_loss_threshold_pct: Ngưỡng lỗ do phí (%)
   fee_loss_threshold_pct: 0.1

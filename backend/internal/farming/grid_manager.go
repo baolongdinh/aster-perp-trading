@@ -103,6 +103,11 @@ type GridManager struct {
 
 	// NEW: Reference to AdaptiveGridManager for optimization features
 	adaptiveMgr *adaptive_grid.AdaptiveGridManager
+
+	// Position rebalancer settings
+	rebalanceThresholdPct   float64       // Threshold to start rebalancing (e.g., 0.8 = 80% of max)
+	rebalanceAggressiveness float64       // How much to reduce (0.0-1.0, e.g., 0.3 = reduce by 30%)
+	rebalanceInterval       time.Duration // How often to check position size
 }
 
 // SetActivityLogger sets the activity logger for the grid manager.
@@ -139,6 +144,8 @@ type GridOrder struct {
 	FeePaid      float64   `json:"fee_paid"`
 	PointsEarned int64     `json:"points_earned"`
 	GridLevel    int       `json:"grid_level"`
+	ReduceOnly   bool      `json:"reduce_only"`  // For position rebalancing orders
+	IsRebalance  bool      `json:"is_rebalance"` // True if this is a rebalancing order
 }
 
 // NewGridManager creates a new grid manager with volume farm config.
@@ -200,6 +207,10 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		orderLockMgr:          adaptive_grid.NewOrderLockManager(zapLogger),
 		deduplicator:          adaptive_grid.NewFillEventDeduplicator(zapLogger),
 		stateValidator:        adaptive_grid.NewStateValidator(zapLogger),
+		// Position rebalancer defaults - start rebalancing at 80% of max position
+		rebalanceThresholdPct:   0.80,
+		rebalanceAggressiveness: 0.30,             // Reduce by 30% of excess
+		rebalanceInterval:       15 * time.Second, // Check every 15s
 	}
 }
 
@@ -290,6 +301,10 @@ func (g *GridManager) Start(ctx context.Context) error {
 	// NEW: Log real exchange data for accurate dashboard display
 	g.wg.Add(1)
 	go g.exchangeDataReporter(ctx)
+
+	// NEW: Start position rebalancer to manage oversized positions
+	g.wg.Add(1)
+	go g.positionRebalancerWorker(ctx)
 
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
@@ -1064,15 +1079,19 @@ func (g *GridManager) placeOrderAsync(ctx context.Context, order *GridOrder, wg 
 }
 func (g *GridManager) placeOrder(order *GridOrder) error {
 	g.logger.WithFields(logrus.Fields{
-		"symbol": order.Symbol,
-		"side":   order.Side,
-		"price":  order.Price,
-		"size":   order.Size,
+		"symbol":       order.Symbol,
+		"side":         order.Side,
+		"price":        order.Price,
+		"size":         order.Size,
+		"reduce_only":  order.ReduceOnly,
+		"is_rebalance": order.IsRebalance,
 	}).Info("Attempting to place order")
 
 	// CRITICAL: Check max position size before placing order
+	// Skip ONLY for rebalancing orders (both ReduceOnly AND IsRebalance must be true)
 	notional := order.Size * order.Price
-	if notional > g.maxNotionalUSD {
+	shouldCheckNotional := !(order.ReduceOnly && order.IsRebalance)
+	if shouldCheckNotional && notional > g.maxNotionalUSD {
 		g.logger.WithFields(logrus.Fields{
 			"symbol":       order.Symbol,
 			"side":         order.Side,
@@ -1085,19 +1104,23 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	}
 
 	// CRITICAL: Check total position exposure before adding new order
-	currentExposure := g.calculateCurrentExposure(context.Background(), order.Symbol)
-	newTotalExposure := currentExposure + notional
-	exposureLimit := g.maxNotionalUSD * 1.2 // STRICT: Only allow 1.2x max position
-	if newTotalExposure > exposureLimit {
-		g.logger.WithFields(logrus.Fields{
-			"symbol":           order.Symbol,
-			"current_exposure": currentExposure,
-			"new_order":        notional,
-			"total_exposure":   newTotalExposure,
-			"max_exposure":     exposureLimit,
-			"max_config":       g.maxNotionalUSD,
-		}).Error("ORDER REJECTED: Total exposure would exceed 1.2x limit - position too large!")
-		return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, exposureLimit)
+	// Skip ONLY for rebalancing orders (both ReduceOnly AND IsRebalance must be true)
+	shouldCheckExposure := !(order.ReduceOnly && order.IsRebalance)
+	if shouldCheckExposure {
+		currentExposure := g.calculateCurrentExposure(context.Background(), order.Symbol)
+		newTotalExposure := currentExposure + notional
+		exposureLimit := g.maxNotionalUSD * 1.2 // STRICT: Only allow 1.2x max position
+		if newTotalExposure > exposureLimit {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":           order.Symbol,
+				"current_exposure": currentExposure,
+				"new_order":        notional,
+				"total_exposure":   newTotalExposure,
+				"max_exposure":     exposureLimit,
+				"max_config":       g.maxNotionalUSD,
+			}).Error("ORDER REJECTED: Total exposure would exceed 1.2x limit - position too large!")
+			return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, exposureLimit)
+		}
 	}
 
 	// NEW: Check if trading is allowed by time filter
@@ -1161,6 +1184,7 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		Quantity:    g.precisionMgr.RoundQty(order.Symbol, order.Size),
 		Price:       g.precisionMgr.RoundPrice(order.Symbol, order.Price),
 		TimeInForce: "GTC",
+		ReduceOnly:  order.ReduceOnly,
 	}
 
 	// Verify notional after rounding - fix for SOL and other high-price assets
@@ -2018,4 +2042,169 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 
 	// Call handleOrderFill to process the fill event
 	g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
+}
+
+// positionRebalancerWorker monitors position sizes and places reduce-only orders when needed
+func (g *GridManager) positionRebalancerWorker(ctx context.Context) {
+	defer g.wg.Done()
+
+	g.rebalanceInterval = 15 * time.Second
+	g.rebalanceAggressiveness = 0.3
+
+	ticker := time.NewTicker(g.rebalanceInterval)
+	defer ticker.Stop()
+
+	g.logger.Info("Position rebalancer started - checking every 15s with 30% excess reduction",
+		logrus.Fields{
+			"threshold_pct":  g.rebalanceThresholdPct,
+			"aggressiveness": g.rebalanceAggressiveness,
+			"check_interval": g.rebalanceInterval,
+		})
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.checkAndRebalancePositions(ctx)
+		}
+	}
+}
+
+// checkAndRebalancePositions checks all active positions and rebalances if needed
+func (g *GridManager) checkAndRebalancePositions(ctx context.Context) {
+	g.gridsMu.RLock()
+	symbols := make([]string, 0, len(g.activeGrids))
+	for symbol := range g.activeGrids {
+		symbols = append(symbols, symbol)
+	}
+	g.gridsMu.RUnlock()
+
+	for _, symbol := range symbols {
+		g.checkAndRebalanceSymbol(ctx, symbol)
+	}
+}
+
+// checkAndRebalanceSymbol checks position for a specific symbol and rebalances if needed
+func (g *GridManager) checkAndRebalanceSymbol(ctx context.Context, symbol string) {
+	// Get current position from exchange
+	positions, err := g.futuresClient.GetPositions(ctx)
+	if err != nil {
+		g.logger.WithError(err).Warn("Failed to get positions for rebalancing")
+		return
+	}
+
+	var position *client.Position
+	for i := range positions {
+		if positions[i].Symbol == symbol && positions[i].PositionAmt != 0 {
+			position = &positions[i]
+			break
+		}
+	}
+
+	if position == nil {
+		return // No position to rebalance
+	}
+
+	positionSize := math.Abs(position.PositionAmt)
+	positionNotional := positionSize * position.MarkPrice
+	positionSide := "LONG"
+	if position.PositionAmt < 0 {
+		positionSide = "SHORT"
+	}
+
+	// Calculate threshold
+	thresholdNotional := g.maxNotionalUSD * g.rebalanceThresholdPct
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":            symbol,
+		"position_side":     positionSide,
+		"position_size":     positionSize,
+		"position_notional": positionNotional,
+		"max_notional":      g.maxNotionalUSD,
+		"threshold":         thresholdNotional,
+	}).Debug("Checking position for rebalancing")
+
+	// Check if position exceeds threshold
+	if positionNotional <= thresholdNotional {
+		return // Position within acceptable range
+	}
+
+	// Position too large - need to reduce
+	excessNotional := positionNotional - g.maxNotionalUSD
+	reduceNotional := excessNotional * g.rebalanceAggressiveness
+	if reduceNotional < 5.0 {
+		reduceNotional = 5.0 // Minimum $5 notional
+	}
+
+	// Determine rebalance order side (opposite of position)
+	rebalanceSide := "SELL"
+	if positionSide == "SHORT" {
+		rebalanceSide = "BUY"
+	}
+
+	// Get current price for rebalancing order
+	var rebalancePrice float64
+	if rebalanceSide == "SELL" {
+		// For SELL to close LONG, place slightly above mark price for better fill
+		rebalancePrice = position.MarkPrice * 1.0002 // 0.02% above mark
+	} else {
+		// For BUY to close SHORT, place slightly below mark price
+		rebalancePrice = position.MarkPrice * 0.9998 // 0.02% below mark
+	}
+
+	reduceSize := reduceNotional / rebalancePrice
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":            symbol,
+		"position_side":     positionSide,
+		"position_notional": positionNotional,
+		"excess_notional":   excessNotional,
+		"reduce_notional":   reduceNotional,
+		"rebalance_side":    rebalanceSide,
+		"rebalance_price":   rebalancePrice,
+		"reduce_size":       reduceSize,
+		"mark_price":        position.MarkPrice,
+	}).Warn("REBALANCING: Position too large, placing reduce-only order")
+
+	// Create rebalancing order
+	order := &GridOrder{
+		Symbol:      symbol,
+		Side:        rebalanceSide,
+		Size:        reduceSize,
+		Price:       rebalancePrice,
+		OrderType:   "LIMIT",
+		Status:      "NEW",
+		CreatedAt:   time.Now(),
+		ReduceOnly:  true, // Critical: only reduces position
+		IsRebalance: true,
+		GridLevel:   999, // Special level for rebalancing orders
+	}
+
+	// Place the rebalancing order
+	if err := g.placeOrder(order); err != nil {
+		g.logger.WithError(err).Error("Failed to place rebalancing order")
+	} else {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":   symbol,
+			"side":     rebalanceSide,
+			"size":     reduceSize,
+			"price":    rebalancePrice,
+			"notional": reduceNotional,
+		}).Info("Rebalancing order placed successfully")
+	}
+}
+
+// SetRebalanceThreshold sets the threshold for position rebalancing
+func (g *GridManager) SetRebalanceThreshold(thresholdPct float64) {
+	g.rebalanceThresholdPct = thresholdPct
+	g.logger.WithField("threshold_pct", thresholdPct).Info("Rebalance threshold updated")
+}
+
+// SetRebalanceAggressiveness sets how aggressive the rebalancing should be
+func (g *GridManager) SetRebalanceAggressiveness(aggressiveness float64) {
+	g.rebalanceAggressiveness = aggressiveness
+	g.logger.WithField("aggressiveness", aggressiveness).Info("Rebalance aggressiveness updated")
 }
