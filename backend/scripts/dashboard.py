@@ -109,6 +109,23 @@ class DashboardApp:
                         temp['positions'][sym]['side'] = side
                         temp['positions'][sym]['count'] += 1
                 
+                # Spread metrics from grid_manager logs
+                if 'spread_pct' in data:
+                    try:
+                        temp['spread_pct'] = float(data['spread_pct'])
+                    except:
+                        pass
+                if 'dynamic_spread' in data:
+                    try:
+                        self.metrics['dynamic_spread'] = float(data['dynamic_spread'])
+                    except:
+                        pass
+                if 'base_spread' in data:
+                    try:
+                        self.metrics['base_spread'] = float(data['base_spread'])
+                    except:
+                        pass
+                
                 # Check level for errors/warnings
                 lvl = data.get('level', '').upper()
                 if lvl == 'ERROR':
@@ -119,7 +136,9 @@ class DashboardApp:
             self.metrics.update(temp)
             if temp['orders_placed'] > 0:
                 self.metrics['fill_rate'] = (temp['orders_filled'] / temp['orders_placed']) * 100
-            self.metrics['active_orders'] = temp['orders_placed'] - temp['orders_filled']
+            # active_orders from log is more accurate than calculated
+            if 'active_orders' not in self.metrics or temp.get('active_orders', 0) > 0:
+                self.metrics['active_orders'] = temp.get('active_orders', temp['orders_placed'] - temp['orders_filled'])
             self.metrics['positions'] = dict(temp['positions'])
             self.metrics['symbols'] = temp['active_grids']
             self.metrics['last_update'] = datetime.now().strftime('%H:%M:%S')
@@ -191,10 +210,14 @@ class DashboardApp:
         self.stdscr.addstr(6, 4, "Filled:  ", self.WHITE)
         self.stdscr.addstr(f"{self.metrics['orders_filled']} ({self.metrics['fill_rate']:.1f}%)".rjust(20), self.GREEN)
         self.stdscr.addstr(7, 4, "Est PnL: ", self.WHITE)
-        est_pnl = self.metrics['total_volume'] * 0.001 * (self.metrics['fill_rate'] / 100)
-        self.stdscr.addstr(f"+${est_pnl:.2f}".rjust(20), self.GREEN + self.BOLD)
-        self.stdscr.addstr(8, 4, "Drawdown:", self.WHITE)
-        self.stdscr.addstr("5.2%".rjust(20), self.GREEN)
+        # Real PnL requires tracking filled order profits - show N/A for now
+        self.stdscr.addstr("N/A (requires fill tracking)".rjust(20), self.YELLOW)
+        self.stdscr.addstr(8, 4, "Spread:  ", self.WHITE)
+        spread_val = self.metrics.get('spread_pct', 0)
+        if spread_val > 0:
+            self.stdscr.addstr(f"{spread_val*100:.2f}%".rjust(20), self.CYAN)
+        else:
+            self.stdscr.addstr("N/A".rjust(20), self.YELLOW)
         self.stdscr.addstr(9, 4, "Active:  ", self.WHITE)
         self.stdscr.addstr(f"{self.metrics['active_orders']} orders", self.CYAN)
 
@@ -211,7 +234,8 @@ class DashboardApp:
         else:
             self.stdscr.addstr(6, 45, "No active positions", self.YELLOW)
         self.stdscr.addstr(9, 40, "Exposure: ", self.WHITE)
-        self.stdscr.addstr(f"${self.metrics['total_volume']*0.1:,.0f}", self.YELLOW)
+        # Real exposure requires position tracking - show N/A
+        self.stdscr.addstr("N/A".rjust(15), self.YELLOW)
 
         gy = 14
         self.stdscr.addstr(gy, 2, "─" * (w - 4), self.WHITE)
@@ -237,15 +261,16 @@ class DashboardApp:
             self.stdscr.addstr(" GREEN ✓ " if self.metrics['errors'] == 0 and self.metrics['warnings'] < 5 else (" YELLOW ⚠ " if self.metrics['errors'] < 5 else " RED ✗ "), 
                               self.BG_GREEN if self.metrics['errors'] == 0 and self.metrics['warnings'] < 5 else (self.BG_YELLOW if self.metrics['errors'] < 5 else self.BG_RED))
             r += 1
-            self.stdscr.addstr(r, 4, "Daily:     ", self.WHITE)
+            self.stdscr.addstr(r, 4, "Volume:    ", self.WHITE)
             self.stdscr.addstr(f"${self.metrics['total_volume']:,.0f}", self.GREEN)
-            self.stdscr.addstr(f" / ${self.metrics['total_volume']*2:,.0f}", self.WHITE)
             r += 1
             self.stdscr.addstr(r, 4, "Drawdown:  ", self.WHITE)
-            self.stdscr.addstr("5.2%/20% (safe)", self.GREEN)
+            # Real drawdown requires PnL tracking - show N/A
+            self.stdscr.addstr("N/A (requires PnL tracking)", self.YELLOW)
             r += 1
             self.stdscr.addstr(r, 4, "Cooldown:  ", self.WHITE)
-            self.stdscr.addstr("None", self.GREEN)
+            # Real cooldown requires position tracking - show N/A
+            self.stdscr.addstr("N/A", self.YELLOW)
             r += 1
             self.stdscr.addstr(r, 4, "Errors:    ", self.WHITE)
             self.stdscr.addstr(str(self.metrics['errors']), self.RED if self.metrics['errors'] > 0 else self.GREEN)
