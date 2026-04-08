@@ -33,13 +33,13 @@ type RangeConfig struct {
 // DefaultRangeConfig returns default range configuration
 func DefaultRangeConfig() *RangeConfig {
 	return &RangeConfig{
-		Method:              "combined",      // Dùng cả BB và ATR
-		Periods:             20,              // 20 periods
-		BBMultiplier:        2.0,             // 2 sigma cho BB
-		ATRMultiplier:       1.5,             // 1.5x ATR cho range
-		BreakoutThreshold:   0.01,            // 1% vượt range = breakout
-		StabilizationPeriod: 5 * time.Minute, // Chờ 5 phút sau breakout
-		MinRangeWidthPct:    0.003,           // Tối thiểu 0.3% range width
+		Method:              "combined",       // Dùng cả BB và ATR
+		Periods:             20,               // 20 periods
+		BBMultiplier:        2.0,              // 2 sigma cho BB
+		ATRMultiplier:       1.5,              // 1.5x ATR cho range
+		BreakoutThreshold:   0.01,             // 1% vượt range = breakout
+		StabilizationPeriod: 30 * time.Second, // Chờ 30s sau breakout để resume nhanh
+		MinRangeWidthPct:    0.003,            // Tối thiểu 0.3% range width
 	}
 }
 
@@ -334,8 +334,8 @@ func (r *RangeDetector) checkStateTransition() {
 		}
 
 	case RangeStateStabilizing:
-		// Kiểm tra xem đã có range mới ổn định chưa
-		if r.currentRange != nil && time.Since(r.stabilizationStart) >= 2*time.Minute {
+		// Kiểm tra xem đã có range mới ổn định chưa (nhanh - 30s)
+		if r.currentRange != nil && time.Since(r.stabilizationStart) >= 30*time.Second {
 			// Kiểm tra giá đang nằm trong range mới
 			if r.currentRange.IsPriceInRange(r.lastPrice) {
 				r.state = RangeStateActive

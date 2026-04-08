@@ -581,6 +581,14 @@ func (g *GridManager) getActiveGridLevels(symbol string) (map[int]bool, map[int]
 func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *SymbolGrid) int {
 	g.logger.WithField("symbol", symbol).Info("Placing grid orders for volume farming (concurrent)")
 
+	// NEW: Try to use BB range-based grid placement if available
+	if g.adaptiveMgr != nil {
+		upper, lower, mid, valid := g.adaptiveMgr.GetBBRangeBands(symbol)
+		if valid && upper > 0 && lower > 0 && mid > 0 {
+			return g.placeBBGridOrders(ctx, symbol, grid, upper, lower, mid)
+		}
+	}
+
 	if grid.CurrentPrice == 0 {
 		g.logger.WithField("symbol", symbol).Error("Cannot place orders: current price is 0")
 		return 0
@@ -830,6 +838,127 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		"total_orders": placedOrders,
 		"spread_pct":   grid.GridSpreadPct,
 	}).Info("Grid orders placed for volume farming (concurrent)")
+
+	return placedOrders
+}
+
+// placeBBGridOrders places grid orders at Bollinger Bands levels
+// Buy orders are placed from lower band up to mid, sell orders from mid up to upper band
+func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid *SymbolGrid, upper, lower, mid float64) int {
+	g.logger.WithFields(logrus.Fields{
+		"symbol":      symbol,
+		"bb_upper":    upper,
+		"bb_lower":    lower,
+		"bb_mid":      mid,
+		"range_width": upper - lower,
+	}).Info("Placing BB range-based grid orders")
+
+	// Get levels that already have active orders
+	existingBuyLevels, existingSellLevels := g.getActiveGridLevels(symbol)
+
+	// Calculate grid levels within BB range
+	// Buy side: from lower band up to mid
+	// Sell side: from mid up to upper band
+	buyRange := mid - lower
+	sellRange := upper - mid
+
+	// Divide range into levels
+	numLevels := float64(grid.MaxOrdersSide)
+	buySpacing := buyRange / numLevels
+	sellSpacing := sellRange / numLevels
+
+	var orders []*GridOrder
+
+	// Place BUY orders from lower band up to mid
+	for i := 0; i < grid.MaxOrdersSide; i++ {
+		gridLevel := -i - 1
+		if existingBuyLevels[gridLevel] {
+			continue
+		}
+
+		// Price increases as we go up from lower band
+		buyPrice := lower + (buySpacing * float64(i))
+		if buyPrice <= 0 || buyPrice >= mid {
+			continue
+		}
+
+		orderSize := g.baseNotionalUSD / buyPrice
+		if g.adaptiveMgr != nil {
+			orderSize = g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "LONG", orderSize)
+		}
+
+		finalSize := g.calculateOrderSize(symbol, orderSize, buyPrice)
+		orders = append(orders, &GridOrder{
+			Symbol:    symbol,
+			Side:      "BUY",
+			Size:      finalSize,
+			Price:     buyPrice,
+			OrderType: "LIMIT",
+			Status:    "NEW",
+			CreatedAt: time.Now(),
+			GridLevel: gridLevel,
+		})
+	}
+
+	// Place SELL orders from mid up to upper band
+	for i := 0; i < grid.MaxOrdersSide; i++ {
+		gridLevel := i + 1
+		if existingSellLevels[gridLevel] {
+			continue
+		}
+
+		// Price increases as we go up from mid to upper band
+		sellPrice := mid + (sellSpacing * float64(i+1))
+		if sellPrice <= mid || sellPrice > upper {
+			continue
+		}
+
+		orderSize := g.baseNotionalUSD / sellPrice
+		if g.adaptiveMgr != nil {
+			orderSize = g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "SHORT", orderSize)
+		}
+
+		finalSize := g.calculateOrderSize(symbol, orderSize, sellPrice)
+		orders = append(orders, &GridOrder{
+			Symbol:    symbol,
+			Side:      "SELL",
+			Size:      finalSize,
+			Price:     sellPrice,
+			OrderType: "LIMIT",
+			Status:    "NEW",
+			CreatedAt: time.Now(),
+			GridLevel: gridLevel,
+		})
+	}
+
+	// Place orders concurrently
+	var wg sync.WaitGroup
+	successChan := make(chan bool, len(orders))
+
+	for _, order := range orders {
+		wg.Add(1)
+		go g.placeOrderAsync(ctx, order, &wg, successChan)
+	}
+
+	go func() {
+		wg.Wait()
+		close(successChan)
+	}()
+
+	placedOrders := 0
+	for success := range successChan {
+		if success {
+			placedOrders++
+		}
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":       symbol,
+		"total_orders": placedOrders,
+		"bb_upper":     upper,
+		"bb_lower":     lower,
+		"bb_mid":       mid,
+	}).Info("BB range-based grid orders placed")
 
 	return placedOrders
 }
