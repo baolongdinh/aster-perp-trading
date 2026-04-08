@@ -1083,19 +1083,15 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	// CRITICAL: Check total position exposure before adding new order
 	currentExposure := g.calculateCurrentExposure(context.Background(), order.Symbol)
 	newTotalExposure := currentExposure + notional
-	// STRICT: Only allow 1.2x max notional to prevent runaway positions
-	// Changed from 2x to 1.2x because 2x allowed positions to grow too large (700+ USD when limit is 300)
-	maxAllowedExposure := g.maxNotionalUSD * 1.2
-	if newTotalExposure > maxAllowedExposure {
+	if newTotalExposure > g.maxNotionalUSD*2 { // Allow 2x for both sides
 		g.logger.WithFields(logrus.Fields{
 			"symbol":           order.Symbol,
 			"current_exposure": currentExposure,
 			"new_order":        notional,
 			"total_exposure":   newTotalExposure,
-			"max_allowed":      maxAllowedExposure,
-			"configured_max":   g.maxNotionalUSD,
-		}).Error("ORDER REJECTED: Total exposure would exceed strict limit - position too large!")
-		return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, maxAllowedExposure)
+			"max_exposure":     g.maxNotionalUSD * 2,
+		}).Error("ORDER REJECTED: Total exposure would exceed limit - position too large!")
+		return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, g.maxNotionalUSD*2)
 	}
 
 	// NEW: Check if trading is allowed by time filter
@@ -1919,4 +1915,26 @@ func (g *GridManager) RebuildGrid(ctx context.Context, symbol string) error {
 	}
 
 	return nil
+}
+
+// OnOrderUpdate handles real-time order updates from UserStream WebSocket
+// This is the WebSocket alternative to polling for fills
+func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
+	// Only process FILLED orders via WebSocket
+	if orderUpdate.Status != "FILLED" {
+		return
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"order_id":  orderUpdate.OrderID,
+		"symbol":    orderUpdate.Symbol,
+		"side":      orderUpdate.Side,
+		"status":    orderUpdate.Status,
+		"quantity":  orderUpdate.Quantity,
+		"price":     orderUpdate.Price,
+		"websocket": true,
+	}).Info("WebSocket order fill detected - processing immediately")
+
+	// Call handleOrderFill to process the fill event
+	g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
 }

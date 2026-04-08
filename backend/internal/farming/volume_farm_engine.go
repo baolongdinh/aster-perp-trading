@@ -3,6 +3,7 @@ package farming
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"aster-bot/internal/farming/market_regime"
 	"aster-bot/internal/risk"
 	"aster-bot/internal/strategy/regime"
+	"aster-bot/internal/stream"
 
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -56,6 +58,7 @@ type VolumeFarmEngine struct {
 	regimeDetector      *market_regime.RegimeDetector
 	configManager       *adaptive_config.AdaptiveConfigManager
 	pointsTracker       *PointsTracker
+	userStream          *stream.UserStream
 	stopCh              chan struct{}
 	wg                  sync.WaitGroup
 }
@@ -304,8 +307,63 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		e.monitorRisk(ctx)
 	}()
 
+	// NEW: Initialize and start UserStream for real-time order updates
+	e.initUserStream(ctx)
+
 	e.logger.Info("Volume Farming Engine started successfully")
 	return nil
+}
+
+// initUserStream initializes and starts the user data stream WebSocket
+func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
+	wsBase := e.config.Exchange.FuturesWSBase
+	if wsBase == "" {
+		wsBase = "wss://fstream.asterdex.com"
+	}
+
+	userStream := stream.NewUserStream(
+		wsBase,
+		e.futuresClient.StartListenKey,
+		e.futuresClient.KeepaliveListenKey,
+		stream.UserStreamHandlers{
+			OnOrderUpdate: func(u stream.WsOrderUpdate) {
+				// Convert WsOrderUpdate to local OrderUpdate
+				orderUpdate := &OrderUpdate{
+					Symbol:      u.Order.Symbol,
+					OrderID:     strconv.FormatInt(u.Order.OrderID, 10),
+					ClientID:    u.Order.ClientOrderID,
+					Side:        u.Order.Side,
+					Type:        u.Order.OrderType,
+					Status:      u.Order.OrderStatus,
+					Price:       u.Order.AvgPrice,
+					Quantity:    u.Order.FilledQty,
+					ExecutedQty: u.Order.CumFilledQty,
+					Timestamp:   u.EventTime,
+				}
+				// Only process FILLED orders
+				if orderUpdate.Status == "FILLED" {
+					e.gridManager.OnOrderUpdate(orderUpdate)
+				}
+			},
+			OnAccountUpdate: func(u stream.WsAccountUpdate) {
+				// Optional: Handle account/position updates
+				e.logger.Debug("Account update received via WebSocket",
+					zap.Int("positions", len(u.Update.Positions)),
+					zap.Int("balances", len(u.Update.Balances)))
+			},
+		},
+		e.logger,
+	)
+	e.userStream = userStream
+
+	// Start user stream in background
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		e.logger.Info("Starting UserStream for real-time order updates")
+		userStream.Run(ctx)
+		e.logger.Info("UserStream stopped")
+	}()
 }
 func (e *VolumeFarmEngine) syncGridSymbols() {
 	e.logger.Info("Syncing grid symbols")

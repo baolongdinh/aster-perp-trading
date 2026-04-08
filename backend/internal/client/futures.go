@@ -281,6 +281,45 @@ func (f *FuturesClient) GetPositions(ctx context.Context) ([]Position, error) {
 	return positions, nil
 }
 
+// StartListenKey creates a new listen key for user data stream
+// POST /fapi/v3/listenKey (signed) → { "listenKey": "..." }
+func (f *FuturesClient) StartListenKey(ctx context.Context) (string, error) {
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return "", fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	data, err := f.http.PostSigned(ctx, f.apiPath("/fapi/v3/listenKey"), nil)
+	if err != nil {
+		return "", fmt.Errorf("start listen key: %w", err)
+	}
+
+	var result struct {
+		ListenKey string `json:"listenKey"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("parse listen key: %w", err)
+	}
+
+	f.log.Info("User data stream listen key created", zap.String("listenKey", result.ListenKey[:10]+"..."))
+	return result.ListenKey, nil
+}
+
+// KeepaliveListenKey extends the validity of a listen key
+// PUT /fapi/v3/listenKey (signed) - call every 30 min
+func (f *FuturesClient) KeepaliveListenKey(ctx context.Context) error {
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	_, err := f.http.PutSigned(ctx, f.apiPath("/fapi/v3/listenKey"), nil)
+	if err != nil {
+		return fmt.Errorf("keepalive listen key: %w", err)
+	}
+
+	f.log.Debug("User data stream listen key keepalive success")
+	return nil
+}
+
 // SetLeverage sets the leverage for a symbol
 func (f *FuturesClient) SetLeverage(ctx context.Context, req SetLeverageRequest) error {
 	// Wait for rate limiter
