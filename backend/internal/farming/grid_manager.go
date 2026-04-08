@@ -1079,15 +1079,19 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	// CRITICAL: Check total position exposure before adding new order
 	currentExposure := g.calculateCurrentExposure(context.Background(), order.Symbol)
 	newTotalExposure := currentExposure + notional
-	if newTotalExposure > g.maxNotionalUSD*2 { // Allow 2x for both sides
+	// STRICT: Only allow 1.2x max notional to prevent runaway positions
+	// Changed from 2x to 1.2x because 2x allowed positions to grow too large (700+ USD when limit is 300)
+	maxAllowedExposure := g.maxNotionalUSD * 1.2
+	if newTotalExposure > maxAllowedExposure {
 		g.logger.WithFields(logrus.Fields{
 			"symbol":           order.Symbol,
 			"current_exposure": currentExposure,
 			"new_order":        notional,
 			"total_exposure":   newTotalExposure,
-			"max_exposure":     g.maxNotionalUSD * 2,
-		}).Error("ORDER REJECTED: Total exposure would exceed limit - position too large!")
-		return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, g.maxNotionalUSD*2)
+			"max_allowed":      maxAllowedExposure,
+			"configured_max":   g.maxNotionalUSD,
+		}).Error("ORDER REJECTED: Total exposure would exceed strict limit - position too large!")
+		return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, maxAllowedExposure)
 	}
 
 	// NEW: Check if trading is allowed by time filter
