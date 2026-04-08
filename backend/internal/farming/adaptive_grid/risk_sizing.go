@@ -584,6 +584,16 @@ func (r *RiskMonitor) GetSmartOrderSize(baseSize float64) float64 {
 		zap.Int("consecutive_losses", consecutiveLosses),
 		zap.Float64("final_size", size))
 
+	// Log Kelly metrics for dashboard (every 60 calls to avoid spam)
+	if r.tradeTracker != nil && r.tradeTracker.GetTradeCount()%60 == 0 {
+		r.logger.Info("Kelly Metrics",
+			zap.Float64("win_rate", winRate),
+			zap.Int("consecutive_losses", consecutiveLosses),
+			zap.Float64("kelly_fraction", r.smartSizingConfig.KellyFraction),
+			zap.Float64("decay_factor", r.smartSizingConfig.ConsecutiveLossDecay),
+			zap.Int("total_trades", r.tradeTracker.GetTradeCount()))
+	}
+
 	return size
 }
 
@@ -711,6 +721,13 @@ func (t *TradeTracker) GetConsecutiveLosses() int {
 		}
 	}
 	return count
+}
+
+// GetTradeCount returns total number of tracked trades
+func (t *TradeTracker) GetTradeCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.results)
 }
 
 // CalculateSmartSize calculates order size using Kelly Criterion and consecutive loss decay
