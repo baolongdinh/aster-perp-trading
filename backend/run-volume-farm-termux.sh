@@ -65,10 +65,8 @@ start() {
         exit 0
     fi
 
-    # Build if binary doesn't exist
-    if [ ! -f "${BIN_PATH}" ]; then
-        build
-    fi
+    # Always rebuild to ensure latest code changes are included
+    build
 
     # Check config exists
     if [ ! -f "${CONFIG_FILE}" ]; then
