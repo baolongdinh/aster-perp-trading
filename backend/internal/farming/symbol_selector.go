@@ -215,22 +215,23 @@ func (s *SymbolSelector) processWebSocketTicker(msg map[string]interface{}) {
 			}
 		}
 
-	// 	// Add remaining whitelist symbols with dummy data
-	// 	for symbol := range whitelistSymbols {
-	// 		quote := s.extractQuoteCurrency(symbol)
-	// 		if quote != "" && s.isQuoteCurrencySupported(quote) {
-	// 			selected = append(selected, &SymbolData{
-	// 				Symbol:     symbol,
-	// 				BaseAsset:  s.extractBaseAsset(symbol),
-	// 				QuoteAsset: quote,
-	// 				Status:     "TRADING",
-	// 				Volume24h:  1000000, // Dummy volume to pass min check
-	// 				Count24h:   1000,
-	// 			})
-	// 			s.logger.WithField("symbol", symbol).Debug("Added whitelist symbol")
-	// 		}
-	// 	}
-	// }
+		// 	// Add remaining whitelist symbols with dummy data
+		// 	for symbol := range whitelistSymbols {
+		// 		quote := s.extractQuoteCurrency(symbol)
+		// 		if quote != "" && s.isQuoteCurrencySupported(quote) {
+		// 			selected = append(selected, &SymbolData{
+		// 				Symbol:     symbol,
+		// 				BaseAsset:  s.extractBaseAsset(symbol),
+		// 				QuoteAsset: quote,
+		// 				Status:     "TRADING",
+		// 				Volume24h:  1000000, // Dummy volume to pass min check
+		// 				Count24h:   1000,
+		// 			})
+		// 			s.logger.WithField("symbol", symbol).Debug("Added whitelist symbol")
+		// 		}
+		// 	}
+		// }
+	}
 
 	s.mu.Lock()
 	s.activeSymbols = selected

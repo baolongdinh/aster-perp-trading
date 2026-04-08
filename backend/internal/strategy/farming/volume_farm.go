@@ -8,7 +8,6 @@ import (
 
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
-	"aster-bot/internal/engine"
 	"aster-bot/internal/farming"
 	"aster-bot/internal/ordermanager"
 	"aster-bot/internal/risk"
@@ -154,44 +153,48 @@ func (s *VolumeFarmStrategy) Stop(ctx context.Context) error {
 }
 
 // OnKline handles kline data
-func (s *VolumeFarmStrategy) OnKline(kline *engine.Kline) {
-	// Volume farming strategy doesn't need kline data
-}
+// TODO: Define engine.Kline type
+// func (s *VolumeFarmStrategy) OnKline(kline *engine.Kline) {
+// 	// Volume farming strategy doesn't need kline data
+// }
 
 // OnMarkPrice handles mark price updates
-func (s *VolumeFarmStrategy) OnMarkPrice(markPrice *engine.MarkPrice) {
-	if !s.IsRunning() {
-		return
-	}
-
-	// Forward mark price to grid manager
-	s.gridManager.OnMarkPrice(markPrice)
-}
+// TODO: Define engine.MarkPrice type and gridManager.OnMarkPrice method
+// func (s *VolumeFarmStrategy) OnMarkPrice(markPrice *engine.MarkPrice) {
+// 	if !s.IsRunning() {
+// 		return
+// 	}
+//
+// 	// Forward mark price to grid manager
+// 	s.gridManager.OnMarkPrice(markPrice)
+// }
 
 // OnOrderUpdate handles order updates
-func (s *VolumeFarmStrategy) OnOrderUpdate(order *engine.OrderUpdate) {
-	if !s.IsRunning() {
-		return
-	}
-
-	// Forward order update to grid manager
-	s.gridManager.OnOrderUpdate(order)
-
-	// Track points for filled orders
-	if order.Status == "FILLED" {
-		s.pointsTracker.OnOrderFilled(order)
-	}
-}
+// TODO: Define engine.OrderUpdate type and related methods
+// func (s *VolumeFarmStrategy) OnOrderUpdate(order *engine.OrderUpdate) {
+// 	if !s.IsRunning() {
+// 		return
+// 	}
+//
+// 	// Forward order update to grid manager
+// 	s.gridManager.OnOrderUpdate(order)
+//
+// 	// Track points for filled orders
+// 	if order.Status == "FILLED" {
+// 		s.pointsTracker.OnOrderFilled(order)
+// 	}
+// }
 
 // OnAccountUpdate handles account updates
-func (s *VolumeFarmStrategy) OnAccountUpdate(account *engine.AccountUpdate) {
-	if !s.IsRunning() {
-		return
-	}
-
-	// Forward account update to risk manager
-	s.riskManager.OnAccountUpdate(account)
-}
+// TODO: Define engine.AccountUpdate type and riskManager.OnAccountUpdate method
+// func (s *VolumeFarmStrategy) OnAccountUpdate(account *engine.AccountUpdate) {
+// 	if !s.IsRunning() {
+// 		return
+// 	}
+//
+// 	// Forward account update to risk manager
+// 	s.riskManager.OnAccountUpdate(account)
+// }
 
 // IsRunning returns whether the strategy is running
 func (s *VolumeFarmStrategy) IsRunning() bool {
@@ -210,7 +213,9 @@ func (s *VolumeFarmStrategy) GetStatus() *VolumeFarmStatus {
 	return &VolumeFarmStatus{
 		IsRunning:     s.IsRunning(),
 		ActiveSymbols: s.symbolSelector.GetActiveSymbolCount(),
-		ActiveGrids:   s.gridManager.GetActiveGridCount(),
+		// TODO: Implement gridManager.GetActiveGridCount
+		// ActiveGrids:   s.gridManager.GetActiveGridCount(),
+		ActiveGrids:   0,
 		CurrentPoints: s.pointsTracker.GetCurrentPoints(),
 		CurrentVolume: s.pointsTracker.GetCurrentVolume(),
 		LastUpdate:    time.Now(),
@@ -229,17 +234,19 @@ func (s *VolumeFarmStrategy) farmingLoop(ctx context.Context) {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
+			// TODO: Implement riskManager.ShouldStop and gridManager.EmergencyStop
 			// Check risk limits
-			if s.riskManager.ShouldStop() {
-				s.logger.Warn("Risk limits reached, stopping grid manager")
-				s.gridManager.EmergencyStop()
-			}
+			// if s.riskManager.ShouldStop() {
+			// 	s.logger.Warn("Risk limits reached, stopping grid manager")
+			// 	s.gridManager.EmergencyStop()
+			// }
 
+			// TODO: Implement symbolSelector.GetSymbolUpdates and gridManager.UpdateSymbol
 			// Update symbol selection
-			symbolUpdates := s.symbolSelector.GetSymbolUpdates()
-			for _, update := range symbolUpdates {
-				s.gridManager.UpdateSymbol(update)
-			}
+			// symbolUpdates := s.symbolSelector.GetSymbolUpdates()
+			// for _, update := range symbolUpdates {
+			// 	s.gridManager.UpdateSymbol(update)
+			// }
 		}
 	}
 }

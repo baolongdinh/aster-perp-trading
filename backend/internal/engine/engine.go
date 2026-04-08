@@ -135,13 +135,16 @@ func (e *Engine) Start(ctx context.Context) error {
 		OnOrderUpdate:   e.onOrderUpdate,
 		OnAccountUpdate: e.onAccountUpdate,
 	}
-	e.userStream = stream.NewUserStream(
-		e.cfg.Exchange.FuturesWSBase,
-		func(ctx context.Context) (string, error) { return e.futures.StartListenKey(ctx) },
-		func(ctx context.Context) error { return e.futures.KeepaliveListenKey(ctx) },
-		userHandlers,
-		e.log,
-	)
+	// TODO: Implement StartListenKey and KeepaliveListenKey in FuturesClient
+	// For now, comment out user stream initialization
+	_ = userHandlers
+	// e.userStream = stream.NewUserStream(
+	// 	e.cfg.Exchange.FuturesWSBase,
+	// 	func(ctx context.Context) (string, error) { return e.futures.StartListenKey(ctx) },
+	// 	func(ctx context.Context) error { return e.futures.KeepaliveListenKey(ctx) },
+	// 	userHandlers,
+	// 	e.log,
+	// )
 
 	e.mu.Lock()
 	e.running = true
@@ -149,7 +152,8 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// 7. Start streams in goroutines
 	go e.marketStream.Run(ctx)
-	go e.userStream.Run(ctx)
+	// TODO: Re-enable when user stream is properly configured
+	// go e.userStream.Run(ctx)
 
 	// 8. Spawn parallel market workers (one per symbol)
 	for _, sym := range symbols {
@@ -370,7 +374,7 @@ func (e *Engine) onOrderUpdate(ou stream.WsOrderUpdate) {
 		go func() {
 			ctx := context.Background()
 			// 1. Fetch fresh account balance
-			if account, err := e.futures.GetAccount(ctx); err == nil {
+			if account, err := e.futures.GetAccountInfo(ctx); err == nil {
 				e.risk.SetAvailableBalance(account.AvailableBalance)
 				e.log.Info("SYNC: Balance refreshed after position close",
 					zap.String("symbol", string(order.Symbol)),
@@ -799,7 +803,7 @@ func (e *Engine) handleLimitEntry(ctx context.Context, sig *strategy.Signal, isC
 // VerifyNoStackingServer queries the exchange to absolutely guarantee no stacking occurs.
 func (e *Engine) VerifyNoStackingServer(ctx context.Context, symbol string) error {
 	// 1. Check Positions
-	positions, err := e.futures.GetPositions(ctx, symbol)
+	positions, err := e.futures.GetPositions(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to verify positions: %w", err)
 	}
@@ -868,7 +872,7 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 				zap.Float64("price", lo.Price),
 				zap.String("strategy", lo.StrategyName),
 			)
-			_, cancelErr := e.futures.CancelOrder(&client.CancelOrderRequest{
+			_, cancelErr := e.futures.CancelOrder(ctx, client.CancelOrderRequest{
 				Symbol:        lo.Symbol,
 				ClientOrderID: lo.ClientOrderID,
 			})
@@ -883,7 +887,7 @@ func (e *Engine) gcOrders(ctx context.Context, symbol string, latestSignals []*s
 }
 
 func (e *Engine) refreshPositions(ctx context.Context) error {
-	positions, err := e.futures.GetPositions(ctx, "")
+	positions, err := e.futures.GetPositions(ctx)
 	if err != nil {
 		return err
 	}
@@ -900,7 +904,7 @@ func (e *Engine) refreshPositions(ctx context.Context) error {
 	e.refreshRiskPositions()
 
 	// Update starting equity and available balance
-	account, err := e.futures.GetAccount(ctx)
+	account, err := e.futures.GetAccountInfo(ctx)
 	if err == nil {
 		e.log.Info("IQ-RISK: Initializing account balance",
 			zap.Float64("total_margin", account.TotalMarginBalance),
