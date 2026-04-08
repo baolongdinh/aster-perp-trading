@@ -243,6 +243,18 @@ func (fm *FundingRateMonitor) CheckAndUpdate(ctx context.Context) error {
 	}
 
 	fm.lastCheck = time.Now()
+
+	// Log funding rates summary for dashboard
+	for symbol, info := range fm.rates {
+		biasSide, strength, shouldSkip := fm.GetFundingBias(symbol)
+		fm.logger.Info("Funding Rate Status",
+			zap.String("symbol", symbol),
+			zap.Float64("funding_rate", info.Rate*100),
+			zap.String("bias_side", biasSide),
+			zap.Float64("bias_strength", strength),
+			zap.Bool("should_skip", shouldSkip))
+	}
+
 	return nil
 }
 
