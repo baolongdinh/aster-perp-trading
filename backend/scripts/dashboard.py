@@ -100,6 +100,52 @@ class DashboardApp:
                     except:
                         pass
                 
+                # Check for Exchange Real Data (REAL data from exchange API)
+                if 'Exchange Real Data' in msg:
+                    try:
+                        if 'exchange_open_orders' in data:
+                            temp['exchange_orders'] = int(data['exchange_open_orders'])
+                        if 'exchange_total_notional' in data:
+                            temp['exchange_notional'] = float(data['exchange_total_notional'])
+                        if 'exchange_positions_count' in data:
+                            temp['exchange_positions'] = int(data['exchange_positions_count'])
+                        # Parse positions list if available
+                        if 'exchange_positions' in data:
+                            try:
+                                positions_str = data['exchange_positions']
+                                if positions_str and positions_str != '[]':
+                                    # Simple parsing for positions
+                                    import json
+                                    positions = json.loads(positions_str.replace("'", '"'))
+                                    for pos in positions:
+                                        sym = pos.get('symbol', '')
+                                        if sym:
+                                            temp['active_grids'].add(sym)
+                                            side = pos.get('side', '')
+                                            if side:
+                                                temp['positions'][sym]['side'] = side
+                                            # Use actual position size, not count
+                                            size = pos.get('size', 0)
+                                            notional = pos.get('notional', 0)
+                                            temp['positions'][sym]['size'] = size
+                                            temp['positions'][sym]['notional'] = notional
+                            except:
+                                pass
+                        # Parse orders by symbol
+                        if 'exchange_orders_by_symbol' in data:
+                            try:
+                                orders_str = data['exchange_orders_by_symbol']
+                                if orders_str and orders_str != '{}':
+                                    import json
+                                    orders_by_sym = json.loads(orders_str.replace("'", '"'))
+                                    for sym, count in orders_by_sym.items():
+                                        if count > 0:
+                                            temp['active_grids'].add(sym)
+                            except:
+                                pass
+                    except:
+                        pass
+                
                 # Extract symbols from various log messages
                 sym = data.get('symbol', '')
                 if sym:
@@ -238,15 +284,40 @@ class DashboardApp:
         self.stdscr.addstr(1, 50, f"Last Update: ", self.WHITE)
         self.stdscr.addstr(self.metrics['last_update'], self.CYAN)
 
-        self.draw_box(3, 2, 8, 35, "METRICS (24h)")
+        self.draw_box(3, 2, 10, 35, "METRICS (24h)")
+        
+        # Use real exchange data if available, otherwise fallback to internal tracking
+        exchange_orders = self.metrics.get('exchange_orders', 0)
+        exchange_notional = self.metrics.get('exchange_notional', 0)
+        exchange_positions = self.metrics.get('exchange_positions', 0)
+        
+        # Orders: prefer exchange data
+        orders_display = exchange_orders if exchange_orders > 0 else self.metrics['orders_placed']
+        filled_display = self.metrics['orders_filled']
+        
         self.stdscr.addstr(4, 4, "Volume:  ", self.WHITE)
-        self.stdscr.addstr(f"${self.metrics['total_volume']:,.2f}".rjust(20), self.GREEN + self.BOLD)
+        vol_display = exchange_notional if exchange_notional > 0 else self.metrics['total_volume']
+        self.stdscr.addstr(f"${vol_display:,.2f}".rjust(20), self.GREEN + self.BOLD)
+        
         self.stdscr.addstr(5, 4, "Orders:  ", self.WHITE)
-        self.stdscr.addstr(f"{self.metrics['orders_placed']} placed / {self.metrics['orders_filled']} filled", self.WHITE)
+        if exchange_orders > 0:
+            self.stdscr.addstr(f"{exchange_orders} open (exch) / {filled_display} filled", self.CYAN + self.BOLD)
+        else:
+            self.stdscr.addstr(f"{orders_display} placed / {filled_display} filled", self.WHITE)
+        
         self.stdscr.addstr(6, 4, "Fill:    ", self.WHITE)
         self.stdscr.addstr(f"{self.metrics['fill_rate']:.1f}%".rjust(20), self.GREEN)
+        
         self.stdscr.addstr(7, 4, "Active:  ", self.WHITE)
-        self.stdscr.addstr(f"{self.metrics['active_orders']} orders", self.CYAN)
+        if exchange_orders > 0:
+            self.stdscr.addstr(f"{exchange_orders} orders (exch)", self.CYAN + self.BOLD)
+        else:
+            self.stdscr.addstr(f"{self.metrics['active_orders']} orders", self.CYAN)
+        
+        # Show positions count from exchange if available
+        if exchange_positions > 0:
+            self.stdscr.addstr(8, 4, "Pos:     ", self.WHITE)
+            self.stdscr.addstr(f"{exchange_positions} positions".rjust(20), self.YELLOW)
         # Additional metrics if available
         r = 8
         spread_val = self.metrics.get('spread_pct', 0)
@@ -284,7 +355,7 @@ class DashboardApp:
                 skew_str += f" ({skew_action})"
             self.safe_addstr(r, 4 + 9, skew_str.rjust(20), self.CYAN if skew_ratio < 0.5 else self.YELLOW)
 
-        self.draw_box(3, 38, 8, w - 40, "POSITIONS")
+        self.draw_box(3, 38, 10, w - 40, "POSITIONS (Exchange)")
         pos = list(self.metrics['positions'].items())[:5]
         r = 4
         if pos:
@@ -292,7 +363,14 @@ class DashboardApp:
                 color = self.GREEN if p.get('side') == 'BUY' else self.RED
                 self.stdscr.addstr(r, 40, f"{sym:8}", self.CYAN)
                 self.stdscr.addstr(f" {p.get('side', 'N/A'):6}", color)
-                self.stdscr.addstr(f" x{p.get('count', 0)}", self.WHITE)
+                # Show real position size and notional
+                size = p.get('size', 0)
+                notional = p.get('notional', 0)
+                if size > 0:
+                    self.stdscr.addstr(f" {size:.4f}", self.WHITE)
+                    self.stdscr.addstr(f" (${notional:,.2f})", self.YELLOW)
+                else:
+                    self.stdscr.addstr(f" x{p.get('count', 0)}", self.WHITE)
                 r += 1
         else:
             self.stdscr.addstr(6, 45, "No active positions", self.YELLOW)

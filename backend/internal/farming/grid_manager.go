@@ -287,6 +287,10 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.orderFillPoller(ctx)
 
+	// NEW: Log real exchange data for accurate dashboard display
+	g.wg.Add(1)
+	go g.exchangeDataReporter(ctx)
+
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
@@ -1395,6 +1399,81 @@ func (g *GridManager) metricsReporter(ctx context.Context) {
 			g.LogVolumeMetrics()
 		}
 	}
+}
+
+// exchangeDataReporter queries real exchange data and logs for dashboard
+func (g *GridManager) exchangeDataReporter(ctx context.Context) {
+	defer g.wg.Done()
+
+	ticker := time.NewTicker(10 * time.Second) // Report every 10 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.logExchangeData(ctx)
+		}
+	}
+}
+
+// logExchangeData queries exchange for real open orders and positions
+func (g *GridManager) logExchangeData(ctx context.Context) {
+	// Get real open orders from exchange
+	openOrders, err := g.futuresClient.GetOpenOrders(ctx, "")
+	if err != nil {
+		g.logger.WithError(err).Debug("Failed to get open orders for dashboard")
+		return
+	}
+
+	// Count orders per symbol
+	orderCountBySymbol := make(map[string]int)
+	var totalNotional float64
+	for _, order := range openOrders {
+		orderCountBySymbol[order.Symbol]++
+		notional := order.OrigQty * order.Price
+		totalNotional += notional
+	}
+
+	// Get positions from exchange
+	positions, err := g.futuresClient.GetPositions(ctx)
+	if err != nil {
+		g.logger.WithError(err).Debug("Failed to get positions for dashboard")
+		return
+	}
+
+	// Build position summary
+	positionSummary := []map[string]interface{}{}
+	for _, pos := range positions {
+		if pos.PositionAmt != 0 {
+			side := "BUY"
+			if pos.PositionAmt < 0 {
+				side = "SELL"
+			}
+			notional := math.Abs(pos.PositionAmt) * pos.MarkPrice
+			positionSummary = append(positionSummary, map[string]interface{}{
+				"symbol":        pos.Symbol,
+				"side":          side,
+				"size":          math.Abs(pos.PositionAmt),
+				"notional":      notional,
+				"entry":         pos.EntryPrice,
+				"mark":          pos.MarkPrice,
+				"unrealizedPnL": pos.UnrealizedProfit,
+			})
+		}
+	}
+
+	// Log real exchange data for dashboard
+	g.logger.WithFields(logrus.Fields{
+		"exchange_open_orders":      len(openOrders),
+		"exchange_total_notional":   totalNotional,
+		"exchange_positions_count":  len(positionSummary),
+		"exchange_orders_by_symbol": orderCountBySymbol,
+		"exchange_positions":        positionSummary,
+	}).Info("Exchange Real Data")
 }
 
 func (g *GridManager) placementWorker(ctx context.Context) {
