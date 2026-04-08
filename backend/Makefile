@@ -380,3 +380,23 @@ dashboard:
 dashboard-script:
 	@chmod +x run-volume-farm-termux.sh 2>/dev/null || true
 	@./run-volume-farm-termux.sh dashboard
+
+# Simple dashboard for Termux/small terminals (no curses)
+dashboard-simple:
+	@echo "============================================"
+	@echo "Starting Simple Dashboard (Termux-friendly)"
+	@echo "============================================"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Real-time metrics (refresh 2s)"
+	@echo "  • Works on any terminal size"
+	@echo "  • Press Q+Enter or Ctrl+C to exit"
+	@echo ""
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 ./scripts/dashboard_simple.py; \
+	elif command -v python >/dev/null 2>&1; then \
+		python ./scripts/dashboard_simple.py; \
+	else \
+		echo "ERROR: Python not found. Install with: pkg install python"; \
+		exit 1; \
+	fi

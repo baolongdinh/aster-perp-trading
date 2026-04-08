@@ -78,7 +78,7 @@ func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 				zap.String("error_msg", apiErr.Message))
 
 			// Try multiple fallback leverage levels
-			fallbacks := []int{99, 50, 20, 10, 5}
+			fallbacks := []int{149, 99, 50, 20, 10, 5}
 			for _, leverage := range fallbacks {
 				f.log.Info("Attempting to set leverage",
 					zap.String("symbol", req.Symbol),

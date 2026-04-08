@@ -151,11 +151,23 @@ class DashboardApp:
         self.stdscr.addstr(y, x + 1, bar, color)
         self.stdscr.addstr(y, x + w - 1, "]", self.WHITE)
 
+    def safe_addstr(self, y, x, text, attr=0):
+        """Safely add string to screen, ignore if out of bounds"""
+        try:
+            h, w = self.stdscr.getmaxyx()
+            if y < 0 or y >= h or x < 0 or x >= w:
+                return
+            if x + len(text) > w:
+                text = text[:w - x - 1]
+            self.stdscr.addstr(y, x, text, attr)
+        except:
+            pass
+
     def render(self):
         self.stdscr.clear()
         h, w = self.stdscr.getmaxyx()
-        if h < 20 or w < 70:
-            self.stdscr.addstr(0, 0, "Terminal too small! Need 70x20+", self.RED)
+        if h < 10 or w < 30:
+            self.safe_addstr(0, 0, "Terminal too small! Need 30x10+", self.RED)
             self.stdscr.refresh()
             return
 
