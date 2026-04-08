@@ -94,12 +94,13 @@ func TestIsNearLiquidationWithDynamicBuffer(t *testing.T) {
 	}
 
 	// Liquidation price for long 100x at $50k entry is roughly $49,500 (1% away)
-	// With 50% buffer, we should trigger at $49,750 (0.5% away from mark)
+	// With 50% buffer, effective buffer = 1/100 * 0.50 = 0.005 (0.5%)
+	// We should trigger when distance < 0.5%
 	markPrice := 50000.0
-	liqPrice := 49750.0 // Exactly at 50% buffer threshold
+	liqPrice := 49760.0 // 0.48% away (< 0.5%, should trigger)
 
 	result := manager.isNearLiquidation("BTCUSD1", markPrice, liqPrice, 0.1)
-	assert.True(t, result, "Should trigger liquidation warning at 50% buffer for 100x leverage")
+	assert.True(t, result, "Should trigger liquidation warning when within effective buffer for 100x leverage")
 
 	// Further away should not trigger
 	liqPriceFar := 49000.0 // 2% away
@@ -113,18 +114,21 @@ func TestIsNearLiquidationWithDynamicBuffer(t *testing.T) {
 		Leverage:    20,
 	}
 
-	// With 25% buffer, trigger at 6.25% distance (25% of 25% = 6.25%)
+	// With 25% buffer on 20x: effective buffer = 1/20 * 0.25 = 0.0125 (1.25%)
+	// Trigger when distance < 1.25%
 	markPrice2 := 3000.0
-	liqPrice2 := 2812.5 // Exactly at 25% buffer threshold (6.25% from mark)
+	liqPrice2 := 2963.0 // 1.233% away (< 1.25%, should trigger)
 
 	result = manager.isNearLiquidation("ETHUSD1", markPrice2, liqPrice2, 1.0)
-	assert.True(t, result, "Should trigger liquidation warning at 25% buffer for 20x leverage")
+	assert.True(t, result, "Should trigger liquidation warning when distance < effective buffer for 20x leverage")
 
-	// Test without symbol (uses default buffer)
+	// Test without symbol (uses fallback 100x leverage assumption)
+	// effective buffer = 0.01 * 0.35 = 0.0035 (0.35%)
+	// liqPrice 49750 is 0.5% away (> 0.35%), should NOT trigger
 	result = manager.isNearLiquidation("", markPrice, liqPrice, 0.1)
-	assert.True(t, result, "Should use default buffer when symbol not provided")
+	assert.False(t, result, "Should use fallback buffer and not trigger when beyond effective buffer")
 
-	// Test with empty position
+	// Test with empty position - same fallback logic
 	result = manager.isNearLiquidation("UNKNOWN", markPrice, liqPrice, 0.1)
-	assert.True(t, result, "Should use default buffer when position not found")
+	assert.False(t, result, "Should use fallback buffer when position not found")
 }

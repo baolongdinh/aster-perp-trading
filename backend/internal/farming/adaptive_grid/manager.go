@@ -1199,20 +1199,37 @@ func (a *AdaptiveGridManager) isNearLiquidation(symbol string, markPrice, liquid
 
 	// Use dynamic buffer if position info available, otherwise use config default
 	bufferPct := a.riskConfig.LiquidationBufferPct
+	leverage := 0.0
 	if symbol != "" {
 		a.mu.RLock()
 		pos := a.positions[symbol]
 		a.mu.RUnlock()
 		if pos != nil && pos.Leverage > 0 {
+			leverage = pos.Leverage
 			bufferPct = a.CalculateLiquidationBuffer(pos.Leverage)
-			a.logger.Debug("Using dynamic liquidation buffer",
-				zap.String("symbol", symbol),
-				zap.Float64("leverage", pos.Leverage),
-				zap.Float64("buffer_pct", bufferPct))
 		}
 	}
 
-	return distancePct < bufferPct
+	// Calculate effective buffer: bufferPct is percentage of liquidation distance
+	// For 100x leverage: liquidation ~1% away, buffer 50% -> effective = 0.5%
+	// For 20x leverage: liquidation ~5% away, buffer 25% -> effective = 1.25%
+	var effectiveBufferPct float64
+	if leverage > 0 {
+		liqDistancePct := 1.0 / leverage // Approximate liquidation distance from entry
+		effectiveBufferPct = liqDistancePct * bufferPct
+	} else {
+		// Fallback: assume 100x leverage if unknown
+		effectiveBufferPct = 0.01 * bufferPct
+	}
+
+	a.logger.Debug("Liquidation check",
+		zap.String("symbol", symbol),
+		zap.Float64("distance_pct", distancePct),
+		zap.Float64("buffer_pct", bufferPct),
+		zap.Float64("effective_buffer_pct", effectiveBufferPct),
+		zap.Float64("leverage", leverage))
+
+	return distancePct < effectiveBufferPct
 }
 
 // emergencyClosePosition closes position immediately with market order
