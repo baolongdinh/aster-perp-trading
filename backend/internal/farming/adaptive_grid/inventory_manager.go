@@ -285,6 +285,82 @@ func (im *InventoryManager) ShouldPauseSide(symbol string, side string) bool {
 	return false
 }
 
+// SetBias sets a funding rate bias for a symbol
+// side: "LONG" or "SHORT" - the side to favor
+// strength: 0.0-1.0 - how much to reduce the opposite side (e.g., 0.7 = 70% reduction)
+type FundingBias struct {
+	Side     string
+	Strength float64 // 0.0-1.0
+	Expires  time.Time
+}
+
+var fundingBiases = make(map[string]*FundingBias)
+var fundingBiasMu sync.RWMutex
+
+// SetBias sets funding rate bias for a symbol
+func (im *InventoryManager) SetBias(symbol string, side string, strength float64) {
+	fundingBiasMu.Lock()
+	defer fundingBiasMu.Unlock()
+
+	fundingBiases[symbol] = &FundingBias{
+		Side:     side,
+		Strength: strength,
+		Expires:  time.Now().Add(8 * time.Hour), // Funding period is typically 8 hours
+	}
+
+	im.logger.Info("Funding bias set",
+		zap.String("symbol", symbol),
+		zap.String("side", side),
+		zap.Float64("strength", strength))
+}
+
+// GetFundingBias returns current funding bias for symbol
+func (im *InventoryManager) GetFundingBias(symbol string) (side string, strength float64, active bool) {
+	fundingBiasMu.RLock()
+	defer fundingBiasMu.RUnlock()
+
+	bias, exists := fundingBiases[symbol]
+	if !exists {
+		return "", 0, false
+	}
+
+	// Check if expired
+	if time.Now().After(bias.Expires) {
+		return "", 0, false
+	}
+
+	return bias.Side, bias.Strength, true
+}
+
+// ClearFundingBias clears the funding bias for a symbol
+func (im *InventoryManager) ClearFundingBias(symbol string) {
+	fundingBiasMu.Lock()
+	defer fundingBiasMu.Unlock()
+	delete(fundingBiases, symbol)
+}
+
+// GetAdjustedOrderSizeWithFunding considers both skew and funding bias
+func (im *InventoryManager) GetAdjustedOrderSizeWithFunding(symbol string, side string, baseSize float64) float64 {
+	// First apply inventory skew adjustment
+	size := im.GetAdjustedOrderSize(symbol, side, baseSize)
+
+	// Then apply funding bias
+	if biasSide, strength, active := im.GetFundingBias(symbol); active {
+		// If this side is against the bias, reduce size
+		if (biasSide == "LONG" && side == "SHORT") || (biasSide == "SHORT" && side == "LONG") {
+			reduction := strength
+			size = size * (1 - reduction)
+			im.logger.Debug("Size reduced due to funding bias",
+				zap.String("symbol", symbol),
+				zap.String("side", side),
+				zap.Float64("reduction", reduction),
+				zap.Float64("new_size", size))
+		}
+	}
+
+	return size
+}
+
 // GetAdjustedTakeProfitDistance returns adjusted take-profit distance
 func (im *InventoryManager) GetAdjustedTakeProfitDistance(symbol string, side string, baseDistance float64) float64 {
 	skewRatio := im.CalculateSkewRatio(symbol)

@@ -418,6 +418,10 @@ type RiskMonitor struct {
 	config          *EnhancedRiskConfig
 	stopCh          chan struct{}
 	wg              sync.WaitGroup
+
+	// NEW: Smart position sizing
+	tradeTracker      *TradeTracker
+	smartSizingConfig *SmartSizingConfig
 }
 
 // NewRiskMonitor creates new risk monitor
@@ -426,15 +430,23 @@ func NewRiskMonitor(
 	config *EnhancedRiskConfig,
 	logger *zap.Logger,
 ) *RiskMonitor {
+	smartConfig := DefaultSmartSizingConfig()
 	return &RiskMonitor{
-		exposureMgr:     NewExposureManager(config.MaxTotalExposurePct, logger),
-		sizeCalc:        NewDynamicSizeCalculator(config.BaseOrderNotional, config.MinOrderNotional, config.MaxOrderNotional, config.ATRMultiplier, config.MaxTotalExposurePct, logger),
-		biasChecker:     NewDirectionalBiasChecker(5, 20),
-		accountProvider: accountProvider,
-		logger:          logger,
-		config:          config,
-		stopCh:          make(chan struct{}),
+		exposureMgr:       NewExposureManager(config.MaxTotalExposurePct, logger),
+		sizeCalc:          NewDynamicSizeCalculator(config.BaseOrderNotional, config.MinOrderNotional, config.MaxOrderNotional, config.ATRMultiplier, config.MaxTotalExposurePct, logger),
+		biasChecker:       NewDirectionalBiasChecker(5, 20),
+		accountProvider:   accountProvider,
+		logger:            logger,
+		config:            config,
+		stopCh:            make(chan struct{}),
+		tradeTracker:      NewTradeTracker(smartConfig.WindowHours),
+		smartSizingConfig: smartConfig,
 	}
+}
+
+// SetSmartSizingConfig updates smart sizing configuration
+func (r *RiskMonitor) SetSmartSizingConfig(config *SmartSizingConfig) {
+	r.smartSizingConfig = config
 }
 
 // Start starts the risk monitor
@@ -533,13 +545,214 @@ func (r *RiskMonitor) GetOrderSize(
 	return size, nil
 }
 
-// RecordTradeResult records trade result for loss tracking
-func (r *RiskMonitor) RecordTradeResult(isWin bool) {
+// RecordTradeResult records trade result for loss tracking and trade history
+func (r *RiskMonitor) RecordTradeResult(symbol string, pnl float64) {
+	isWin := pnl > 0
 	if isWin {
 		r.exposureMgr.RecordWin()
 	} else {
 		r.exposureMgr.RecordLoss()
 	}
+
+	// Record in trade tracker for Kelly calculation
+	if r.tradeTracker != nil {
+		r.tradeTracker.RecordTrade(symbol, pnl)
+	}
+}
+
+// GetSmartOrderSize calculates order size using Kelly Criterion and consecutive loss decay
+func (r *RiskMonitor) GetSmartOrderSize(baseSize float64) float64 {
+	if r.smartSizingConfig == nil || !r.smartSizingConfig.Enabled {
+		return baseSize
+	}
+
+	winRate := 0.5 // Default
+	if r.tradeTracker != nil {
+		winRate = r.tradeTracker.GetWinRate()
+	}
+
+	consecutiveLosses := 0
+	if r.tradeTracker != nil {
+		consecutiveLosses = r.tradeTracker.GetConsecutiveLosses()
+	}
+
+	size := CalculateSmartSize(baseSize, winRate, consecutiveLosses, r.smartSizingConfig)
+
+	r.logger.Debug("Smart order size calculated",
+		zap.Float64("base_size", baseSize),
+		zap.Float64("win_rate", winRate),
+		zap.Int("consecutive_losses", consecutiveLosses),
+		zap.Float64("final_size", size))
+
+	return size
+}
+
+// GetSmartSizingStatus returns current smart sizing metrics
+func (r *RiskMonitor) GetSmartSizingStatus() map[string]interface{} {
+	if r.smartSizingConfig == nil || !r.smartSizingConfig.Enabled {
+		return map[string]interface{}{
+			"enabled": false,
+		}
+	}
+
+	return map[string]interface{}{
+		"enabled":            r.smartSizingConfig.Enabled,
+		"win_rate":           r.tradeTracker.GetWinRate(),
+		"consecutive_losses": r.tradeTracker.GetConsecutiveLosses(),
+		"kelly_fraction":     r.smartSizingConfig.KellyFraction,
+		"decay_factor":       r.smartSizingConfig.ConsecutiveLossDecay,
+	}
+}
+
+// SmartSizingConfig holds Kelly Criterion and consecutive loss decay config
+type SmartSizingConfig struct {
+	Enabled              bool    // Enable smart sizing
+	KellyFraction        float64 // Conservative Kelly (e.g., 0.25)
+	ConsecutiveLossDecay float64 // Size reduction per loss (e.g., 0.8 = 20% reduction)
+	MinSize              float64 // Minimum order size
+	MaxSize              float64 // Maximum order size
+	WindowHours          float64 // Lookback window for win rate calculation
+}
+
+// DefaultSmartSizingConfig returns default smart sizing config
+func DefaultSmartSizingConfig() *SmartSizingConfig {
+	return &SmartSizingConfig{
+		Enabled:              true,
+		KellyFraction:        0.25,  // Conservative Kelly
+		ConsecutiveLossDecay: 0.8,   // 20% reduction per consecutive loss
+		MinSize:              5.0,   // $5 minimum
+		MaxSize:              100.0, // $100 maximum
+		WindowHours:          24.0,  // 24 hour lookback
+	}
+}
+
+// TradeResult tracks individual trade PnL
+type TradeResult struct {
+	Timestamp time.Time
+	Symbol    string
+	PnL       float64
+	IsWin     bool
+}
+
+// TradeTracker tracks trade history for Kelly calculation
+type TradeTracker struct {
+	results              []TradeResult
+	mu                   sync.RWMutex
+	windowSize           int
+	maxConsecutiveLosses int
+}
+
+// NewTradeTracker creates new trade tracker
+func NewTradeTracker(windowHours float64) *TradeTracker {
+	// Estimate max trades in window (1 trade per minute)
+	windowSize := int(windowHours * 60)
+	return &TradeTracker{
+		results:    make([]TradeResult, 0, windowSize),
+		windowSize: windowSize,
+	}
+}
+
+// RecordTrade records a trade result
+func (t *TradeTracker) RecordTrade(symbol string, pnl float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	result := TradeResult{
+		Timestamp: time.Now(),
+		Symbol:    symbol,
+		PnL:       pnl,
+		IsWin:     pnl > 0,
+	}
+
+	t.results = append(t.results, result)
+
+	// Remove old results outside window
+	cutoff := time.Now().Add(-time.Duration(t.windowSize) * time.Minute)
+	newResults := make([]TradeResult, 0, len(t.results))
+	for _, r := range t.results {
+		if r.Timestamp.After(cutoff) {
+			newResults = append(newResults, r)
+		}
+	}
+	t.results = newResults
+}
+
+// GetWinRate calculates win rate over the window
+func (t *TradeTracker) GetWinRate() float64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if len(t.results) == 0 {
+		return 0.5 // Default 50% win rate if no data
+	}
+
+	wins := 0
+	for _, r := range t.results {
+		if r.IsWin {
+			wins++
+		}
+	}
+
+	return float64(wins) / float64(len(t.results))
+}
+
+// GetConsecutiveLosses returns current consecutive loss count
+func (t *TradeTracker) GetConsecutiveLosses() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	count := 0
+	// Count from the end
+	for i := len(t.results) - 1; i >= 0; i-- {
+		if !t.results[i].IsWin {
+			count++
+		} else {
+			break
+		}
+	}
+	return count
+}
+
+// CalculateSmartSize calculates order size using Kelly Criterion and consecutive loss decay
+func CalculateSmartSize(
+	baseSize float64,
+	winRate float64,
+	consecutiveLosses int,
+	config *SmartSizingConfig,
+) float64 {
+	if !config.Enabled {
+		return baseSize
+	}
+
+	// 1. Apply consecutive loss decay
+	decay := math.Pow(config.ConsecutiveLossDecay, float64(consecutiveLosses))
+	size := baseSize * decay
+
+	// 2. Kelly Criterion adjustment (assuming 1.5:1 R:R ratio)
+	// Kelly = (WinRate * 1.5 - (1 - WinRate)) / 1.5
+	rewardRatio := 1.5
+	kelly := (winRate*rewardRatio - (1 - winRate)) / rewardRatio
+
+	// Clamp Kelly to avoid extreme values
+	if kelly < 0.1 {
+		kelly = 0.1 // Minimum 10% Kelly
+	}
+	if kelly > 1.0 {
+		kelly = 1.0 // Maximum 100% Kelly
+	}
+
+	// 3. Conservative Kelly (fractional)
+	size = size * kelly * config.KellyFraction
+
+	// 4. Clamp to min/max
+	if size < config.MinSize {
+		size = config.MinSize
+	}
+	if size > config.MaxSize {
+		size = config.MaxSize
+	}
+
+	return size
 }
 
 // AddPriceData adds price data for ATR calculation

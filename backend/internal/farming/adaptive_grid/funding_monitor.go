@@ -18,13 +18,13 @@ type FundingRateInfo struct {
 
 // FundingRateMonitor monitors and manages funding rate exposure
 type FundingRateMonitor struct {
-	rates          map[string]*FundingRateInfo
-	highThreshold  float64
-	checkInterval  time.Duration
-	client         FundingRateClient
-	logger         *zap.Logger
-	mu             sync.RWMutex
-	lastCheck      time.Time
+	rates         map[string]*FundingRateInfo
+	highThreshold float64
+	checkInterval time.Duration
+	client        FundingRateClient
+	logger        *zap.Logger
+	mu            sync.RWMutex
+	lastCheck     time.Time
 }
 
 // FundingRateClient interface for fetching funding rates
@@ -34,17 +34,33 @@ type FundingRateClient interface {
 
 // FundingProtectionConfig holds configuration
 type FundingProtectionConfig struct {
-	HighThreshold  float64       `yaml:"high_threshold"`  // 0.03%
-	CheckInterval  time.Duration `yaml:"check_interval"` // 4 hours
-	LevelAdjustment int          `yaml:"level_adjustment"` // 2 levels
+	HighThreshold    float64       `yaml:"high_threshold"`    // 0.03%
+	ExtremeThreshold float64       `yaml:"extreme_threshold"` // 0.1%
+	CheckInterval    time.Duration `yaml:"check_interval"`    // 4 hours
+	LevelAdjustment  int           `yaml:"level_adjustment"`  // 2 levels
+	BiasStrength     float64       `yaml:"bias_strength"`     // 0.7 = reduce 70% size against funding
+	SkipThreshold    float64       `yaml:"skip_threshold"`    // Skip opening if funding > threshold
+	Enabled          bool          `yaml:"enabled"`
+}
+
+// FundingBiasConfig holds bias configuration for inventory skew based on funding
+type FundingBiasConfig struct {
+	HighThreshold    float64 // e.g., 0.001 = 0.1%
+	ExtremeThreshold float64 // e.g., 0.005 = 0.5%
+	BiasStrength     float64 // e.g., 0.7 = reduce 70% size
+	SkipThreshold    float64 // e.g., 0.01 = 1% (skip opening)
 }
 
 // DefaultFundingProtectionConfig returns default configuration
 func DefaultFundingProtectionConfig() *FundingProtectionConfig {
 	return &FundingProtectionConfig{
-		HighThreshold:   0.0003, // 0.03%
-		CheckInterval:   4 * time.Hour,
-		LevelAdjustment: 2,
+		HighThreshold:    0.001, // 0.1% - for bias adjustment
+		ExtremeThreshold: 0.005, // 0.5% - for skip opening
+		CheckInterval:    4 * time.Hour,
+		LevelAdjustment:  2,
+		BiasStrength:     0.7,  // Reduce 70% size against funding
+		SkipThreshold:    0.01, // Skip if funding > 1%
+		Enabled:          true,
 	}
 }
 
@@ -87,6 +103,49 @@ func (fm *FundingRateMonitor) GetFundingRate(symbol string) *FundingRateInfo {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
 	return fm.rates[symbol]
+}
+
+// GetCurrentRate returns just the current funding rate value (float64)
+func (fm *FundingRateMonitor) GetCurrentRate(symbol string) float64 {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+	if info, exists := fm.rates[symbol]; exists {
+		return info.Rate
+	}
+	return 0
+}
+
+// GetFundingBias returns bias direction and strength based on funding rate
+// Returns: biasSide ("LONG", "SHORT", or ""), strength (0.0-1.0), shouldSkip
+func (fm *FundingRateMonitor) GetFundingBias(symbol string) (biasSide string, strength float64, shouldSkip bool) {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+
+	info, exists := fm.rates[symbol]
+	if !exists {
+		return "", 0, false
+	}
+
+	rate := info.Rate
+	cfg := fm.getConfig()
+
+	// Check extreme threshold - skip opening positions
+	if abs(rate) > cfg.SkipThreshold {
+		return "", 0, true
+	}
+
+	// Check high threshold - apply bias
+	if abs(rate) > cfg.HighThreshold {
+		if rate > 0 {
+			// Positive funding = longs pay shorts, bias toward SHORT
+			return "SHORT", cfg.BiasStrength, false
+		} else {
+			// Negative funding = shorts pay longs, bias toward LONG
+			return "LONG", cfg.BiasStrength, false
+		}
+	}
+
+	return "", 0, false
 }
 
 // IsHighFunding returns true if funding rate is high (positive or negative)
@@ -170,9 +229,9 @@ func (fm *FundingRateMonitor) CheckAndUpdate(ctx context.Context) error {
 					zap.Error(err))
 				continue
 			}
-			
+
 			fm.rates[symbol] = info
-			
+
 			// Log if funding is high
 			if abs(info.Rate) > fm.highThreshold {
 				fm.logger.Warn("High funding rate detected",
@@ -203,9 +262,9 @@ func (fm *FundingRateMonitor) GetStatus() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"rates":        rates,
+		"rates":          rates,
 		"high_threshold": fm.highThreshold * 100,
-		"last_check":   fm.lastCheck,
+		"last_check":     fm.lastCheck,
 	}
 }
 

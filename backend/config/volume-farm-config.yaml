@@ -41,7 +41,7 @@ max_total_drawdown_pct: 50.0
 # order_size_usdt: Kích thước mỗi lệnh
 # $30 notional với 100x leverage chỉ cần $0.30 margin
 # Tăng size để farm nhiều volume hơn
-order_size_usdt: 30
+order_size_usdt: 50
 
 # grid_spread_pct: Spread giữa các lệnh
 # 0.15% = chặt hơn, fill nhanh hơn, nhiều volume hơn
@@ -131,6 +131,60 @@ exchange:
   requests_per_second: 5  # Giảm xuống 5 để tránh rate limit timeout
 
 # ---------------------------------------------------------------------------
+# FUNDING RATE AWARENESS - Tối ưu funding cost
+# ---------------------------------------------------------------------------
+funding_rate:
+  enabled: true
+  high_threshold: 0.001      # 0.1% - bắt đầu áp dụng bias
+  extreme_threshold: 0.005   # 0.5% - bỏ qua mở position
+  bias_strength: 0.7         # Giảm 70% size ngược hướng funding
+  skip_threshold: 0.01     # Bỏ qua nếu funding > 1%
+  check_interval_minutes: 5  # Kiểm tra mỗi 5 phút
+
+# ---------------------------------------------------------------------------
+# DYNAMIC GRID SPREAD - Điều chỉnh spread theo volatility (ATR)
+# ---------------------------------------------------------------------------
+dynamic_grid:
+  enabled: true
+  base_spread_pct: 0.0015    # 0.15% - spread cơ bản
+  low_atr_threshold: 0.3       # ATR < 0.3% = low volatility
+  normal_atr_threshold: 0.8  # ATR 0.3-0.8% = normal
+  high_atr_threshold: 1.5    # ATR 0.8-1.5% = high
+  low_multiplier: 0.8        # Giảm 20% spread khi low vol
+  normal_multiplier: 1.0     # Spread bình thường
+  high_multiplier: 1.5       # Tăng 50% spread khi high vol
+  extreme_multiplier: 2.0    # Tăng 100% spread khi extreme vol
+  atr_period: 7              # Period ngắn để phản ứng nhanh
+
+# ---------------------------------------------------------------------------
+# SMART POSITION SIZING - Kelly Criterion + Consecutive Loss Decay
+# ---------------------------------------------------------------------------
+smart_sizing:
+  enabled: true
+  kelly_fraction: 0.25          # Conservative Kelly (25%)
+  consecutive_loss_decay: 0.8   # 20% reduction per consecutive loss
+  min_size: 5.0                 # Minimum $5 per order
+  max_size: 100.0               # Maximum $100 per order
+  window_hours: 24              # 24-hour lookback for win rate
+
+# ---------------------------------------------------------------------------
+# PARTIAL CLOSE STRATEGY - Chốt lãi từng phần (30%, 40%, 30%)
+# ---------------------------------------------------------------------------
+partial_close:
+  enabled: true
+  tp1:
+    close_pct: 0.30             # Đóng 30% tại TP1
+    profit_pct: 0.005           # 0.5% lãi
+  tp2:
+    close_pct: 0.40             # Đóng 40% tại TP2
+    profit_pct: 0.01            # 1.0% lãi
+  tp3:
+    close_pct: 0.30             # Đóng 30% tại TP3
+    profit_pct: 0.015            # 1.5% lãi
+  trailing_after_tp2: true      # Bật trailing stop sau TP2
+  trailing_distance: 0.005      # Trailing 0.5%
+
+# ---------------------------------------------------------------------------
 # RISK MANAGEMENT - SIÊU CHẶT CHO VỐN NHỎ
 # ---------------------------------------------------------------------------
 risk:
@@ -138,6 +192,14 @@ risk:
   # $300 = 30x vốn, với 100x leverage = $3 margin
   # Cho phép nhiều lệnh chồng lên nhau để farm volume
   max_position_usdt_per_symbol: 300
+  
+  # Dynamic liquidation buffer based on leverage
+  liquidation_buffer_dynamic: true
+  liquidation_buffer:
+    leverage_100x: 0.50   # 50% buffer for 100x
+    leverage_50x: 0.35    # 35% buffer for 50x
+    leverage_20x: 0.25    # 25% buffer for 20x
+    default: 0.20         # 20% for lower leverage
 
   # max_total_positions_usdt: Tổng position tối đa
   # $300 notional với 100x leverage = $3 margin

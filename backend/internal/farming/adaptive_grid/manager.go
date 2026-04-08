@@ -132,9 +132,63 @@ type AdaptiveGridManager struct {
 	cooldownActive    map[string]bool      // symbol -> cooldown status
 	totalLossesToday  int                  // total losses today
 
+	// NEW: Partial close tracking for TP levels
+	partialCloseConfig *PartialCloseConfig
+	positionSlices     map[string]*PositionSlice // symbol -> position slice tracking
+
 	// Control channels
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+// PartialCloseConfig holds configuration for partial take-profit strategy
+type PartialCloseConfig struct {
+	Enabled          bool    `yaml:"enabled"`
+	TP1_ClosePct     float64 `yaml:"tp1_close_pct"`      // e.g., 0.30 = 30%
+	TP1_ProfitPct    float64 `yaml:"tp1_profit_pct"`     // e.g., 0.005 = 0.5%
+	TP2_ClosePct     float64 `yaml:"tp2_close_pct"`      // e.g., 0.40 = 40%
+	TP2_ProfitPct    float64 `yaml:"tp2_profit_pct"`     // e.g., 0.01 = 1.0%
+	TP3_ClosePct     float64 `yaml:"tp3_close_pct"`      // e.g., 0.30 = 30%
+	TP3_ProfitPct    float64 `yaml:"tp3_profit_pct"`     // e.g., 0.015 = 1.5%
+	TrailingAfterTP2 bool    `yaml:"trailing_after_tp2"` // Enable trailing after TP2
+	TrailingDistance float64 `yaml:"trailing_distance"`  // Trailing distance %
+}
+
+// DefaultPartialCloseConfig returns default partial close configuration
+func DefaultPartialCloseConfig() *PartialCloseConfig {
+	return &PartialCloseConfig{
+		Enabled:          true,
+		TP1_ClosePct:     0.30,  // Close 30% at TP1
+		TP1_ProfitPct:    0.005, // 0.5% profit
+		TP2_ClosePct:     0.40,  // Close 40% at TP2
+		TP2_ProfitPct:    0.01,  // 1.0% profit
+		TP3_ClosePct:     0.30,  // Close 30% at TP3
+		TP3_ProfitPct:    0.015, // 1.5% profit
+		TrailingAfterTP2: true,
+		TrailingDistance: 0.005, // 0.5% trailing distance
+	}
+}
+
+// TPLevel represents a single take-profit level
+type TPLevel struct {
+	TargetPct   float64 // Profit % to trigger
+	ClosePct    float64 // % of position to close
+	IsHit       bool    // Whether this TP was hit
+	ExecutedQty float64 // Actual quantity closed
+}
+
+// PositionSlice tracks position divided into slices for partial close
+type PositionSlice struct {
+	Symbol         string
+	OriginalSize   float64   // Original position size
+	RemainingSize  float64   // Remaining after partial closes
+	ClosedPct      float64   // Total % closed so far
+	EntryPrice     float64   // Entry price
+	Side           string    // "LONG" or "SHORT"
+	TPLevels       []TPLevel // TP1, TP2, TP3
+	TrailingActive bool      // Trailing stop activated
+	TrailingPrice  float64   // Current trailing stop price
+	CreatedAt      time.Time
 }
 
 // RiskConfig holds risk management parameters
@@ -162,6 +216,9 @@ type RiskConfig struct {
 	// NEW: Consecutive loss tracking - GIẢM cho volume farming
 	MaxConsecutiveLosses int           // Max consecutive losses before cooldown (default 5)
 	CooldownDuration     time.Duration // Cooldown duration after max losses (default 30s)
+
+	// NEW: Dynamic spread adjustment
+	BaseGridSpreadPct float64 // Base grid spread percentage (e.g., 0.0015 = 0.15%)
 }
 
 // ConvertRiskConfig converts config.RiskConfig to adaptive_grid.RiskConfig
@@ -190,6 +247,9 @@ func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
 		// Consecutive loss tracking - GIẢM cho volume farming
 		MaxConsecutiveLosses: 5,                // Tăng lên 5 losses (thay vì 3)
 		CooldownDuration:     30 * time.Second, // GIẢM xuống 30s (thay vì 5 phút)
+
+		// Grid spread - default for volume farming
+		BaseGridSpreadPct: 0.0015, // Default 0.15%
 	}
 }
 
@@ -632,6 +692,10 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 	resumeCheckTicker := time.NewTicker(10 * time.Second)
 	defer resumeCheckTicker.Stop()
 
+	// NEW: Funding rate check ticker (every 5 minutes)
+	fundingCheckTicker := time.NewTicker(5 * time.Minute)
+	defer fundingCheckTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -643,6 +707,9 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 		case <-resumeCheckTicker.C:
 			// Check if any paused symbols can resume trading
 			a.CheckAndResumeAll()
+		case <-fundingCheckTicker.C:
+			// NEW: Check and apply funding rate bias
+			a.CheckFundingAndApplyBias()
 		}
 	}
 }
@@ -896,7 +963,7 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	}
 
 	// 2. Check liquidation proximity
-	if a.isNearLiquidation(markPrice, liquidationPrice, pos.PositionAmt) {
+	if a.isNearLiquidation(symbol, markPrice, liquidationPrice, pos.PositionAmt) {
 		a.logger.Warn("NEAR LIQUIDATION - Emergency closing",
 			zap.String("symbol", symbol),
 			zap.Float64("mark_price", markPrice),
@@ -1108,8 +1175,21 @@ func (a *AdaptiveGridManager) setInitialTakeProfit(symbol string, entryPrice, st
 	}
 }
 
+// CalculateLiquidationBuffer calculates dynamic liquidation buffer based on leverage
+// Higher leverage requires larger buffer to prevent liquidation
+func (a *AdaptiveGridManager) CalculateLiquidationBuffer(leverage float64) float64 {
+	if leverage >= 100 {
+		return 0.50 // 50% buffer for 100x leverage
+	} else if leverage >= 50 {
+		return 0.35 // 35% for 50x leverage
+	} else if leverage >= 20 {
+		return 0.25 // 25% for 20x leverage
+	}
+	return 0.20 // 20% for lower leverage
+}
+
 // isNearLiquidation checks if position is near liquidation
-func (a *AdaptiveGridManager) isNearLiquidation(markPrice, liquidationPrice, positionAmt float64) bool {
+func (a *AdaptiveGridManager) isNearLiquidation(symbol string, markPrice, liquidationPrice, positionAmt float64) bool {
 	if liquidationPrice == 0 || positionAmt == 0 {
 		return false
 	}
@@ -1117,7 +1197,22 @@ func (a *AdaptiveGridManager) isNearLiquidation(markPrice, liquidationPrice, pos
 	distance := math.Abs(markPrice - liquidationPrice)
 	distancePct := distance / markPrice
 
-	return distancePct < a.riskConfig.LiquidationBufferPct
+	// Use dynamic buffer if position info available, otherwise use config default
+	bufferPct := a.riskConfig.LiquidationBufferPct
+	if symbol != "" {
+		a.mu.RLock()
+		pos := a.positions[symbol]
+		a.mu.RUnlock()
+		if pos != nil && pos.Leverage > 0 {
+			bufferPct = a.CalculateLiquidationBuffer(pos.Leverage)
+			a.logger.Debug("Using dynamic liquidation buffer",
+				zap.String("symbol", symbol),
+				zap.Float64("leverage", pos.Leverage),
+				zap.Float64("buffer_pct", bufferPct))
+		}
+	}
+
+	return distancePct < bufferPct
 }
 
 // emergencyClosePosition closes position immediately with market order
@@ -1720,7 +1815,90 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		}
 	}
 
+	// NEW: Check FundingRate - skip opening if funding too high
+	if a.fundingMonitor != nil {
+		if biasSide, _, shouldSkip := a.fundingMonitor.GetFundingBias(symbol); shouldSkip {
+			a.logger.Warn("CanPlaceOrder BLOCKED: extreme funding rate",
+				zap.String("symbol", symbol),
+				zap.String("bias_side", biasSide))
+			return false
+		}
+	}
+
 	return true
+}
+
+// ApplyFundingBias applies funding rate bias to inventory manager
+// Called periodically to update bias based on current funding rates
+func (a *AdaptiveGridManager) ApplyFundingBias(symbol string) {
+	if a.fundingMonitor == nil || a.inventoryMgr == nil {
+		return
+	}
+
+	biasSide, strength, shouldSkip := a.fundingMonitor.GetFundingBias(symbol)
+
+	if shouldSkip {
+		a.logger.Info("ApplyFundingBias: extreme funding - consider pausing",
+			zap.String("symbol", symbol),
+			zap.String("side", biasSide))
+		return
+	}
+
+	if biasSide != "" {
+		// Apply bias to inventory manager
+		a.inventoryMgr.SetBias(symbol, biasSide, strength)
+		a.logger.Info("Funding bias applied",
+			zap.String("symbol", symbol),
+			zap.String("favored_side", biasSide),
+			zap.Float64("strength", strength))
+	} else {
+		// Clear bias if funding normal
+		a.inventoryMgr.ClearFundingBias(symbol)
+	}
+}
+
+// CheckFundingAndApplyBias checks funding for all symbols and applies bias
+func (a *AdaptiveGridManager) CheckFundingAndApplyBias() {
+	if a.fundingMonitor == nil {
+		return
+	}
+
+	a.mu.RLock()
+	symbols := make([]string, 0, len(a.positions))
+	for symbol := range a.positions {
+		symbols = append(symbols, symbol)
+	}
+	a.mu.RUnlock()
+
+	for _, symbol := range symbols {
+		a.ApplyFundingBias(symbol)
+	}
+}
+
+// CalculateDynamicSpread calculates dynamic grid spread for a symbol based on ATR
+// Returns the adjusted spread percentage
+func (a *AdaptiveGridManager) CalculateDynamicSpread(symbol string) float64 {
+	if a.dynamicSpreadCalc == nil {
+		// Fallback to base spread from config
+		return a.riskConfig.BaseGridSpreadPct
+	}
+
+	spread := a.dynamicSpreadCalc.GetDynamicSpread()
+	a.logger.Debug("Dynamic spread calculated",
+		zap.String("symbol", symbol),
+		zap.Float64("spread_pct", spread),
+		zap.String("volatility", a.dynamicSpreadCalc.GetVolatilityLevel().String()))
+
+	return spread
+}
+
+// UpdatePriceDataForSpread updates price data for dynamic spread calculation
+func (a *AdaptiveGridManager) UpdatePriceDataForSpread(symbol string, high, low, close float64) {
+	if a.dynamicSpreadCalc == nil {
+		return
+	}
+
+	a.dynamicSpreadCalc.UpdateATR(high, low, close)
 }
 
 // GetCurrentSlot returns the current time slot configuration
@@ -1907,7 +2085,12 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 
 	// Also update risk monitor if available
 	if a.riskMonitor != nil {
-		a.riskMonitor.RecordTradeResult(isWin)
+		// Estimate PnL: win = +1 USDT, loss = -1 USDT (for Kelly calculation)
+		pnl := -1.0
+		if isWin {
+			pnl = 1.0
+		}
+		a.riskMonitor.RecordTradeResult(symbol, pnl)
 	}
 
 	// Get RiskConfig values (fallback to defaults if not set)
@@ -2284,11 +2467,13 @@ func (a *AdaptiveGridManager) GetDynamicSpread() float64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	baseSpread := 0.01 // Default 1% spread
+	baseSpread := 0.0015 // Default 0.15% spread for volume farming
 	if a.optConfig != nil && a.optConfig.DynamicGrid != nil && a.optConfig.DynamicGrid.BaseSpreadPct > 0 {
 		baseSpread = a.optConfig.DynamicGrid.BaseSpreadPct
 	} else if a.dynamicSpreadCalc != nil {
 		baseSpread = a.dynamicSpreadCalc.GetDynamicSpread()
+	} else if a.riskConfig != nil && a.riskConfig.BaseGridSpreadPct > 0 {
+		baseSpread = a.riskConfig.BaseGridSpreadPct
 	}
 
 	// Apply time-based spread multiplier
@@ -2418,5 +2603,250 @@ func (a *AdaptiveGridManager) TrackClusterEntry(symbol string, level int, side s
 
 	if a.clusterMgr != nil {
 		a.clusterMgr.TrackClusterEntry(symbol, level, side, positions)
+	}
+}
+
+// =============================================================================
+// PARTIAL CLOSE STRATEGY (T024-T028)
+// =============================================================================
+
+// InitializePartialClose initializes position slices for partial TP strategy
+func (a *AdaptiveGridManager) InitializePartialClose(symbol string, positionAmt, entryPrice float64) {
+	if a.partialCloseConfig == nil || !a.partialCloseConfig.Enabled {
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.positionSlices == nil {
+		a.positionSlices = make(map[string]*PositionSlice)
+	}
+
+	side := "LONG"
+	if positionAmt < 0 {
+		side = "SHORT"
+	}
+
+	slice := &PositionSlice{
+		Symbol:        symbol,
+		OriginalSize:  math.Abs(positionAmt),
+		RemainingSize: math.Abs(positionAmt),
+		ClosedPct:     0,
+		EntryPrice:    entryPrice,
+		Side:          side,
+		TPLevels: []TPLevel{
+			{TargetPct: a.partialCloseConfig.TP1_ProfitPct, ClosePct: a.partialCloseConfig.TP1_ClosePct},
+			{TargetPct: a.partialCloseConfig.TP2_ProfitPct, ClosePct: a.partialCloseConfig.TP2_ClosePct},
+			{TargetPct: a.partialCloseConfig.TP3_ProfitPct, ClosePct: a.partialCloseConfig.TP3_ClosePct},
+		},
+		TrailingActive: false,
+		CreatedAt:      time.Now(),
+	}
+
+	a.positionSlices[symbol] = slice
+	a.logger.Info("Partial close initialized",
+		zap.String("symbol", symbol),
+		zap.Float64("size", slice.OriginalSize),
+		zap.Float64("entry", entryPrice),
+		zap.String("side", side))
+}
+
+// CheckPartialTakeProfits checks and executes partial take profits
+func (a *AdaptiveGridManager) CheckPartialTakeProfits(ctx context.Context, symbol string, currentPrice float64) (closed bool, err error) {
+	if a.partialCloseConfig == nil || !a.partialCloseConfig.Enabled {
+		return false, nil
+	}
+
+	a.mu.Lock()
+	slice, exists := a.positionSlices[symbol]
+	a.mu.Unlock()
+
+	if !exists || slice == nil {
+		return false, nil
+	}
+
+	// Calculate current profit %
+	var profitPct float64
+	if slice.Side == "LONG" {
+		profitPct = (currentPrice - slice.EntryPrice) / slice.EntryPrice
+	} else {
+		profitPct = (slice.EntryPrice - currentPrice) / slice.EntryPrice
+	}
+
+	// Check each TP level
+	for i := range slice.TPLevels {
+		level := &slice.TPLevels[i]
+		if level.IsHit {
+			continue
+		}
+
+		if profitPct >= level.TargetPct {
+			// Execute partial close
+			qty := slice.RemainingSize * level.ClosePct
+			err := a.closePositionPartial(ctx, symbol, qty, i+1)
+			if err != nil {
+				a.logger.Error("Failed partial close",
+					zap.String("symbol", symbol),
+					zap.Int("tp_level", i+1),
+					zap.Error(err))
+				return false, err
+			}
+
+			a.mu.Lock()
+			level.IsHit = true
+			level.ExecutedQty = qty
+			slice.RemainingSize -= qty
+			slice.ClosedPct += level.ClosePct
+
+			// Activate trailing stop after TP2 if enabled
+			if i == 1 && a.partialCloseConfig.TrailingAfterTP2 {
+				slice.TrailingActive = true
+				if slice.Side == "LONG" {
+					slice.TrailingPrice = currentPrice * (1 - a.partialCloseConfig.TrailingDistance)
+				} else {
+					slice.TrailingPrice = currentPrice * (1 + a.partialCloseConfig.TrailingDistance)
+				}
+			}
+			a.mu.Unlock()
+
+			a.logger.Info("Partial TP executed",
+				zap.String("symbol", symbol),
+				zap.Int("tp_level", i+1),
+				zap.Float64("profit_pct", profitPct*100),
+				zap.Float64("qty", qty),
+				zap.Float64("remaining", slice.RemainingSize))
+
+			return true, nil
+		}
+	}
+
+	// Check trailing stop if active
+	if slice.TrailingActive && slice.RemainingSize > 0 {
+		hitTrailing := false
+		if slice.Side == "LONG" && currentPrice <= slice.TrailingPrice {
+			hitTrailing = true
+		} else if slice.Side == "SHORT" && currentPrice >= slice.TrailingPrice {
+			hitTrailing = true
+		}
+
+		if hitTrailing {
+			err := a.closePositionPartial(ctx, symbol, slice.RemainingSize, 0)
+			if err != nil {
+				return false, err
+			}
+
+			a.mu.Lock()
+			slice.RemainingSize = 0
+			a.mu.Unlock()
+
+			a.logger.Info("Trailing stop executed",
+				zap.String("symbol", symbol),
+				zap.Float64("price", currentPrice))
+
+			return true, nil
+		}
+
+		// Update trailing price if moving in favorable direction
+		a.mu.Lock()
+		if slice.Side == "LONG" && currentPrice > slice.TrailingPrice {
+			newTrailing := currentPrice * (1 - a.partialCloseConfig.TrailingDistance)
+			if newTrailing > slice.TrailingPrice {
+				slice.TrailingPrice = newTrailing
+			}
+		} else if slice.Side == "SHORT" && currentPrice < slice.TrailingPrice {
+			newTrailing := currentPrice * (1 + a.partialCloseConfig.TrailingDistance)
+			if newTrailing < slice.TrailingPrice {
+				slice.TrailingPrice = newTrailing
+			}
+		}
+		a.mu.Unlock()
+	}
+
+	return false, nil
+}
+
+// closePositionPartial closes a partial position
+func (a *AdaptiveGridManager) closePositionPartial(ctx context.Context, symbol string, qty float64, tpLevel int) error {
+	if a.futuresClient == nil || qty <= 0 {
+		return nil
+	}
+
+	slice := a.positionSlices[symbol]
+	if slice == nil {
+		return fmt.Errorf("no position slice found for %s", symbol)
+	}
+
+	side := "SELL"
+	if slice.Side == "SHORT" {
+		side = "BUY"
+	}
+
+	qtyStr := fmt.Sprintf("%.6f", qty)
+
+	orderReq := client.PlaceOrderRequest{
+		Symbol:     symbol,
+		Side:       side,
+		Type:       "MARKET",
+		Quantity:   qtyStr,
+		ReduceOnly: true,
+	}
+
+	levelStr := "trailing"
+	if tpLevel > 0 {
+		levelStr = fmt.Sprintf("TP%d", tpLevel)
+	}
+
+	a.logger.Info("Partial close order",
+		zap.String("symbol", symbol),
+		zap.String("level", levelStr),
+		zap.String("side", side),
+		zap.String("qty", qtyStr))
+
+	_, err := a.futuresClient.PlaceOrder(ctx, orderReq)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SetPartialCloseConfig sets the partial close configuration
+func (a *AdaptiveGridManager) SetPartialCloseConfig(config *PartialCloseConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.partialCloseConfig = config
+}
+
+// GetPartialCloseStatus returns current partial close status
+func (a *AdaptiveGridManager) GetPartialCloseStatus(symbol string) map[string]interface{} {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.partialCloseConfig == nil || !a.partialCloseConfig.Enabled {
+		return map[string]interface{}{
+			"enabled": false,
+		}
+	}
+
+	slice, exists := a.positionSlices[symbol]
+	if !exists || slice == nil {
+		return map[string]interface{}{
+			"enabled": true,
+			"active":  false,
+		}
+	}
+
+	return map[string]interface{}{
+		"enabled":         true,
+		"active":          true,
+		"original_size":   slice.OriginalSize,
+		"remaining_size":  slice.RemainingSize,
+		"closed_pct":      slice.ClosedPct,
+		"entry_price":     slice.EntryPrice,
+		"side":            slice.Side,
+		"tp_levels_hit":   []bool{slice.TPLevels[0].IsHit, slice.TPLevels[1].IsHit, slice.TPLevels[2].IsHit},
+		"trailing_active": slice.TrailingActive,
+		"trailing_price":  slice.TrailingPrice,
 	}
 }
