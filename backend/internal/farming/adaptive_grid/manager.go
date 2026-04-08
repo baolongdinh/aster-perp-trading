@@ -1007,6 +1007,18 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 	a.logger.Debug("RISK CHECK: Position passed all risk checks",
 		zap.String("symbol", symbol),
 		zap.Float64("unrealized_pnl", unrealizedPnL))
+
+	// Log position summary periodically for dashboard visibility
+	if notional > 0 {
+		a.logger.Info("Position Summary",
+			zap.String("symbol", symbol),
+			zap.Float64("notional", notional),
+			zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT),
+			zap.Float64("utilization_pct", (notional/a.riskConfig.MaxPositionUSDT)*100),
+			zap.Float64("unrealized_pnl", unrealizedPnL),
+			zap.Float64("entry_price", entryPrice),
+			zap.Float64("mark_price", markPrice))
+	}
 }
 
 // isStopLossHit checks if stop loss is hit
