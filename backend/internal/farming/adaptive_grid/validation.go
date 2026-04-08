@@ -10,6 +10,7 @@ import (
 type OrderState string
 
 const (
+	OrderStateNew       OrderState = "NEW"
 	OrderStatePending   OrderState = "PENDING"
 	OrderStateFilled    OrderState = "FILLED"
 	OrderStateCancelled OrderState = "CANCELLED"
@@ -29,6 +30,7 @@ func NewStateValidator(logger *zap.Logger) *StateValidator {
 
 // ValidTransitions defines allowed state transitions
 var ValidTransitions = map[OrderState][]OrderState{
+	OrderStateNew:       {OrderStatePending, OrderStateFilled, OrderStateCancelled, OrderStateRejected},
 	OrderStatePending:   {OrderStateFilled, OrderStateCancelled, OrderStateRejected},
 	OrderStateFilled:    {}, // Terminal state
 	OrderStateCancelled: {}, // Terminal state
@@ -59,7 +61,7 @@ func (v *StateValidator) ValidateAndLog(orderID string, from, to OrderState) err
 
 	// Invalid transition detected
 	err := fmt.Errorf("invalid order state transition: %s -> %s for order %s", from, to, orderID)
-	
+
 	v.logger.Error("State transition validation failed",
 		zap.String("orderID", orderID),
 		zap.String("from_state", string(from)),
@@ -71,9 +73,9 @@ func (v *StateValidator) ValidateAndLog(orderID string, from, to OrderState) err
 
 // IsTerminalState checks if state is terminal
 func IsTerminalState(state OrderState) bool {
-	return state == OrderStateFilled || 
-		   state == OrderStateCancelled || 
-		   state == OrderStateRejected
+	return state == OrderStateFilled ||
+		state == OrderStateCancelled ||
+		state == OrderStateRejected
 }
 
 // CanModify checks if order can still be modified/cancelled
@@ -137,7 +139,7 @@ func (h *TransitionHistory) GetInvalidTransitions() []StateTransition {
 func (h *TransitionHistory) GetRecentTransitions(orderID string, n int) []StateTransition {
 	result := make([]StateTransition, 0, n)
 	count := 0
-	
+
 	// Iterate backwards to get most recent
 	for i := len(h.transitions) - 1; i >= 0; i-- {
 		if h.transitions[i].OrderID == orderID {
@@ -148,11 +150,11 @@ func (h *TransitionHistory) GetRecentTransitions(orderID string, n int) []StateT
 			}
 		}
 	}
-	
+
 	// Reverse to get chronological order
 	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
 		result[i], result[j] = result[j], result[i]
 	}
-	
+
 	return result
 }

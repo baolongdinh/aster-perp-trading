@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"aster-bot/internal/config"
+
 	"go.uber.org/zap"
 )
 
@@ -237,7 +238,11 @@ func NewStateValidation(cfg config.StateValidationConfig, logger *zap.Logger) *S
 	}
 
 	// Define default valid transitions
+	// NEW: Initial state when order is created
+	sv.validTransitions["NEW"] = []string{"PENDING", "FILLED", "CANCELLED", "REJECTED"}
+	// PENDING: Order submitted to exchange, waiting for fill
 	sv.validTransitions["PENDING"] = []string{"FILLED", "CANCELLED", "REJECTED"}
+	// Terminal states
 	sv.validTransitions["FILLED"] = []string{}
 	sv.validTransitions["CANCELLED"] = []string{}
 	sv.validTransitions["REJECTED"] = []string{}
