@@ -191,7 +191,7 @@ risk:
   # max_position_usdt_per_symbol: Giới hạn position/symbol
   # $300 = 30x vốn, với 100x leverage = $3 margin
   # Cho phép nhiều lệnh chồng lên nhau để farm volume
-  max_position_usdt_per_symbol: 300
+  max_position_usdt_per_symbol: 400
   
   # Dynamic liquidation buffer based on leverage
   liquidation_buffer_dynamic: true
@@ -202,8 +202,8 @@ risk:
     default: 0.20         # 20% for lower leverage
 
   # max_total_positions_usdt: Tổng position tối đa
-  # $300 notional với 100x leverage = $3 margin
-  max_total_positions_usdt: 900
+  # $400 notional với 100x leverage = $4 margin
+  max_total_positions_usdt: 1200
 
   # fee_loss_threshold_pct: Ngưỡng lỗ do phí (%)
   fee_loss_threshold_pct: 0.1
