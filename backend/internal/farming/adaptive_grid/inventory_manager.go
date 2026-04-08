@@ -459,7 +459,7 @@ func (im *InventoryManager) GetStatus(symbol string) map[string]interface{} {
 	action := im.GetSkewAction(skewRatio)
 	netExposure := im.netExposure[symbol]
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"symbol":            symbol,
 		"net_exposure":      netExposure,
 		"skew_ratio":        skewRatio,
@@ -468,6 +468,17 @@ func (im *InventoryManager) GetStatus(symbol string) map[string]interface{} {
 		"equity":            im.equity,
 		"max_inventory_pct": im.maxInventoryPct,
 	}
+
+	// Log inventory metrics for dashboard
+	im.logger.Info("Inventory Metrics",
+		zap.String("symbol", symbol),
+		zap.Float64("net_exposure", netExposure),
+		zap.Float64("skew_ratio", skewRatio),
+		zap.String("skew_action", action.String()),
+		zap.Int("position_count", len(im.positions[symbol])),
+		zap.Float64("equity", im.equity))
+
+	return result
 }
 
 // Reset clears all data
