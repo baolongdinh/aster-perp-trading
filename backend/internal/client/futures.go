@@ -72,34 +72,62 @@ func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 		// Check if this is a leverage error (-2027)
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && apiErr.IsLeverageError() {
-			f.log.Warn("Leverage exceeds maximum detected, adjusting to x99 and retrying",
+			f.log.Warn("Leverage exceeds maximum detected, trying fallback leverages",
 				zap.String("symbol", req.Symbol),
 				zap.Int("error_code", apiErr.Code),
 				zap.String("error_msg", apiErr.Message))
 
-			// Set leverage to maximum (x99)
-			if leverageErr := f.SetLeverage(ctx, SetLeverageRequest{
-				Symbol:   req.Symbol,
-				Leverage: 99,
-			}); leverageErr != nil {
-				f.log.Error("Failed to set leverage to x99",
+			// Try multiple fallback leverage levels
+			fallbacks := []int{99, 50, 20, 10, 5}
+			for _, leverage := range fallbacks {
+				f.log.Info("Attempting to set leverage",
 					zap.String("symbol", req.Symbol),
-					zap.Error(leverageErr))
-				return nil, fmt.Errorf("place order: %w (failed to adjust leverage: %v)", err, leverageErr)
+					zap.Int("leverage", leverage))
+
+				if leverageErr := f.SetLeverage(ctx, SetLeverageRequest{
+					Symbol:   req.Symbol,
+					Leverage: leverage,
+				}); leverageErr != nil {
+					f.log.Warn("Failed to set leverage, trying next fallback",
+						zap.String("symbol", req.Symbol),
+						zap.Int("leverage", leverage),
+						zap.Error(leverageErr))
+					continue
+				}
+
+				f.log.Info("Leverage adjusted, retrying order placement",
+					zap.String("symbol", req.Symbol),
+					zap.Int("leverage", leverage))
+
+				// Wait for rate limiter again before retry
+				if rateErr := f.rateLimiter.Wait(ctx); rateErr != nil {
+					return nil, fmt.Errorf("rate limit wait on retry: %w", rateErr)
+				}
+
+				// Retry the order
+				data, err = f.http.PostSigned(ctx, f.apiPath("/fapi/v1/order"), params)
+				if err == nil {
+					f.log.Info("Order placed successfully after leverage adjustment",
+						zap.String("symbol", req.Symbol),
+						zap.Int("leverage", leverage))
+					break
+				}
+
+				// If still leverage error, continue to next fallback
+				var retryErr *APIError
+				if errors.As(err, &retryErr) && retryErr.IsLeverageError() {
+					f.log.Warn("Still leverage error, trying next fallback",
+						zap.String("symbol", req.Symbol),
+						zap.Int("tried_leverage", leverage))
+					continue
+				}
+
+				// Other error, return it
+				return nil, fmt.Errorf("place order (after leverage adjustment to x%d): %w", leverage, err)
 			}
 
-			f.log.Info("Leverage adjusted to x99, retrying order placement",
-				zap.String("symbol", req.Symbol))
-
-			// Wait for rate limiter again before retry
-			if rateErr := f.rateLimiter.Wait(ctx); rateErr != nil {
-				return nil, fmt.Errorf("rate limit wait on retry: %w", rateErr)
-			}
-
-			// Retry the order
-			data, err = f.http.PostSigned(ctx, f.apiPath("/fapi/v1/order"), params)
 			if err != nil {
-				return nil, fmt.Errorf("place order (after leverage adjustment): %w", err)
+				return nil, fmt.Errorf("place order: failed after trying all leverage fallbacks: %w", err)
 			}
 		} else {
 			return nil, fmt.Errorf("place order: %w", err)
