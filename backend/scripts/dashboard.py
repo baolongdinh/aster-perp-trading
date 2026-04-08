@@ -132,6 +132,42 @@ class DashboardApp:
                     temp['errors'] += 1
                 elif lvl in ('WARN', 'WARNING'):
                     temp['warnings'] += 1
+                
+                # Funding Rate metrics
+                if 'Funding Rate Status' in msg:
+                    try:
+                        if 'funding_rate' in data:
+                            self.metrics['funding_rate'] = float(data['funding_rate'])
+                        if 'bias_side' in data:
+                            self.metrics['funding_bias_side'] = data['bias_side']
+                        if 'bias_strength' in data:
+                            self.metrics['funding_bias_strength'] = float(data['bias_strength'])
+                    except:
+                        pass
+                
+                # Kelly Metrics
+                if 'Kelly Metrics' in msg:
+                    try:
+                        if 'win_rate' in data:
+                            self.metrics['win_rate'] = float(data['win_rate'])
+                        if 'consecutive_losses' in data:
+                            self.metrics['consecutive_losses'] = int(data['consecutive_losses'])
+                        if 'total_trades' in data:
+                            self.metrics['total_trades'] = int(data['total_trades'])
+                    except:
+                        pass
+                
+                # Inventory Metrics
+                if 'Inventory Metrics' in msg:
+                    try:
+                        if 'skew_ratio' in data:
+                            self.metrics['skew_ratio'] = float(data['skew_ratio'])
+                        if 'net_exposure' in data:
+                            self.metrics['net_exposure'] = float(data['net_exposure'])
+                        if 'skew_action' in data:
+                            self.metrics['skew_action'] = data['skew_action']
+                    except:
+                        pass
 
             self.metrics.update(temp)
             if temp['orders_placed'] > 0:
@@ -211,11 +247,42 @@ class DashboardApp:
         self.stdscr.addstr(f"{self.metrics['fill_rate']:.1f}%".rjust(20), self.GREEN)
         self.stdscr.addstr(7, 4, "Active:  ", self.WHITE)
         self.stdscr.addstr(f"{self.metrics['active_orders']} orders", self.CYAN)
-        # Spread (if available)
+        # Additional metrics if available
+        r = 8
         spread_val = self.metrics.get('spread_pct', 0)
         if spread_val > 0:
-            self.stdscr.addstr(8, 4, "Spread:  ", self.WHITE)
+            self.stdscr.addstr(r, 4, "Spread:  ", self.WHITE)
             self.stdscr.addstr(f"{spread_val*100:.2f}%".rjust(20), self.CYAN)
+            r += 1
+        
+        # Funding Rate (if available)
+        funding_rate = self.metrics.get('funding_rate')
+        if funding_rate is not None:
+            self.safe_addstr(r, 4, "Funding: ", self.WHITE)
+            bias_side = self.metrics.get('funding_bias_side', '')
+            bias_str = f"{funding_rate:.4f}%"
+            if bias_side:
+                bias_str += f" ({bias_side})"
+            self.safe_addstr(r, 4 + 9, bias_str.rjust(20), self.CYAN if abs(funding_rate) < 0.05 else self.YELLOW)
+            r += 1
+        
+        # Kelly Metrics (if available)
+        win_rate = self.metrics.get('win_rate')
+        if win_rate is not None:
+            self.safe_addstr(r, 4, "Kelly:   ", self.WHITE)
+            cons_losses = self.metrics.get('consecutive_losses', 0)
+            self.safe_addstr(r, 4 + 9, f"WR:{win_rate*100:.0f}% CL:{cons_losses}".rjust(20), self.CYAN)
+            r += 1
+        
+        # Inventory Metrics (if available)
+        skew_ratio = self.metrics.get('skew_ratio')
+        if skew_ratio is not None:
+            self.safe_addstr(r, 4, "Skew:    ", self.WHITE)
+            skew_action = self.metrics.get('skew_action', '')
+            skew_str = f"{skew_ratio:.2f}"
+            if skew_action:
+                skew_str += f" ({skew_action})"
+            self.safe_addstr(r, 4 + 9, skew_str.rjust(20), self.CYAN if skew_ratio < 0.5 else self.YELLOW)
 
         self.draw_box(3, 38, 8, w - 40, "POSITIONS")
         pos = list(self.metrics['positions'].items())[:5]
