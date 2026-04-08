@@ -283,6 +283,10 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.ordersResetWorker(ctx)
 
+	// NEW: Poll for filled orders since UserStream is not connected
+	g.wg.Add(1)
+	go g.orderFillPoller(ctx)
+
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
@@ -1724,6 +1728,79 @@ func (g *GridManager) calculateCurrentExposure(ctx context.Context, symbol strin
 	}
 
 	return totalExposure
+}
+
+// orderFillPoller polls for filled orders since UserStream is not connected
+func (g *GridManager) orderFillPoller(ctx context.Context) {
+	defer g.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second) // Poll every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.checkForFilledOrders(ctx)
+		}
+	}
+}
+
+// checkForFilledOrders checks open orders from API and detects fills
+func (g *GridManager) checkForFilledOrders(ctx context.Context) {
+	g.ordersMu.RLock()
+	activeOrderIDs := make(map[string]bool)
+	for orderID := range g.activeOrders {
+		activeOrderIDs[orderID] = true
+	}
+	g.ordersMu.RUnlock()
+
+	if len(activeOrderIDs) == 0 {
+		return // No active orders to check
+	}
+
+	// Get all open orders from exchange
+	openOrders, err := g.futuresClient.GetOpenOrders(ctx, "")
+	if err != nil {
+		g.logger.WithError(err).Warn("Failed to get open orders for fill detection")
+		return
+	}
+
+	// Build map of open order IDs from exchange
+	openOrderIDs := make(map[string]bool)
+	for _, order := range openOrders {
+		openOrderIDs[strconv.FormatInt(order.OrderID, 10)] = true
+	}
+
+	// Find orders that are in our activeOrders but not in exchange open orders
+	// These are likely filled (or cancelled)
+	filledCount := 0
+	for orderID := range activeOrderIDs {
+		if !openOrderIDs[orderID] {
+			// Order not found in open orders - likely filled
+			g.ordersMu.RLock()
+			order, exists := g.activeOrders[orderID]
+			g.ordersMu.RUnlock()
+
+			if exists {
+				g.logger.WithFields(logrus.Fields{
+					"order_id": orderID,
+					"symbol":   order.Symbol,
+					"side":     order.Side,
+				}).Info("Order detected as filled via polling")
+
+				g.handleOrderFill(orderID, order.Symbol)
+				filledCount++
+			}
+		}
+	}
+
+	if filledCount > 0 {
+		g.logger.WithField("filled_count", filledCount).Info("Detected filled orders via polling")
+	}
 }
 
 // SetMaxOrdersPerSide sets the maximum orders per side
