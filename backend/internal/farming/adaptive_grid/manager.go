@@ -1763,25 +1763,27 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		}
 	}
 
-	// Check position limit - Volume farming: vẫn cho phép rebalance để hedge
+	// Check position limit - STRICT: Block if already at or above max position
 	if position, exists := a.positions[symbol]; exists {
 		if position.NotionalValue >= a.riskConfig.MaxPositionUSDT {
-			// HARD CAP: Không cho phép vượt quá 1.5x max position để tránh runaway positions
-			hardCap := a.riskConfig.MaxPositionUSDT * 1.5
+			// HARD CAP: Không cho phép vượt quá 1.2x max position để tránh runaway positions
+			hardCap := a.riskConfig.MaxPositionUSDT * 1.2
 			if position.NotionalValue >= hardCap {
-				a.logger.Error("CanPlaceOrder BLOCKED: hard position cap exceeded",
+				a.logger.Error("CanPlaceOrder BLOCKED: hard position cap (1.2x) exceeded",
 					zap.String("symbol", symbol),
 					zap.Float64("notional", position.NotionalValue),
 					zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT),
 					zap.Float64("hard_cap", hardCap))
 				return false // HARD BLOCK: Không cho phép vượt quá hard cap
 			}
-			a.logger.Warn("CanPlaceOrder: max position reached but allowing rebalance for volume farming",
+			// If position is between max and 1.2x, only allow reducing position (hedge orders)
+			a.logger.Warn("CanPlaceOrder: max position reached - only allowing hedge orders",
 				zap.String("symbol", symbol),
 				zap.Float64("notional", position.NotionalValue),
-				zap.Float64("max", a.riskConfig.MaxPositionUSDT))
-			// Volume farming: Vẫn cho phép đặt lệnh đối ứng để hedge và farm volume
-			// Không return false nếu chưa vượt hard cap
+				zap.Float64("max", a.riskConfig.MaxPositionUSDT),
+				zap.Float64("hard_cap", hardCap))
+			// Note: Actual order side check happens in buildGridOrders
+			// We don't return false here to allow hedge orders, but size will be limited
 		}
 	}
 
