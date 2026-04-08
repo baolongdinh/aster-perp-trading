@@ -41,7 +41,7 @@ max_total_drawdown_pct: 50.0
 # order_size_usdt: Kích thước mỗi lệnh
 # $30 notional với 100x leverage chỉ cần $0.30 margin
 # Tăng size để farm nhiều volume hơn
-order_size_usdt: 50
+order_size_usdt: 20.5
 
 # grid_spread_pct: Spread giữa các lệnh
 # 0.15% = chặt hơn, fill nhanh hơn, nhiều volume hơn
@@ -191,7 +191,7 @@ risk:
   # max_position_usdt_per_symbol: Giới hạn position/symbol
   # $300 = 30x vốn, với 100x leverage = $3 margin
   # Cho phép nhiều lệnh chồng lên nhau để farm volume
-  max_position_usdt_per_symbol: 400
+  max_position_usdt_per_symbol: 200
   
   # Dynamic liquidation buffer based on leverage
   liquidation_buffer_dynamic: true
@@ -203,7 +203,7 @@ risk:
 
   # max_total_positions_usdt: Tổng position tối đa
   # $400 notional với 100x leverage = $4 margin
-  max_total_positions_usdt: 1200
+  max_total_positions_usdt: 600
 
   # fee_loss_threshold_pct: Ngưỡng lỗ do phí (%)
   fee_loss_threshold_pct: 0.1
