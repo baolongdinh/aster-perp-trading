@@ -207,10 +207,10 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		orderLockMgr:          adaptive_grid.NewOrderLockManager(zapLogger),
 		deduplicator:          adaptive_grid.NewFillEventDeduplicator(zapLogger),
 		stateValidator:        adaptive_grid.NewStateValidator(zapLogger),
-		// Position rebalancer defaults - start rebalancing at 80% of max position
-		rebalanceThresholdPct:   0.80,
-		rebalanceAggressiveness: 0.30,             // Reduce by 30% of excess
-		rebalanceInterval:       15 * time.Second, // Check every 15s
+		// Position rebalancer defaults - OPTIMIZED for faster response
+		rebalanceThresholdPct:   0.75,            // Start earlier at 75% of max
+		rebalanceAggressiveness: 0.50,            // Reduce by 50% of excess (faster)
+		rebalanceInterval:       5 * time.Second, // Check every 5s (quicker response)
 	}
 }
 
@@ -305,6 +305,10 @@ func (g *GridManager) Start(ctx context.Context) error {
 	// NEW: Start position rebalancer to manage oversized positions
 	g.wg.Add(1)
 	go g.positionRebalancerWorker(ctx)
+
+	// NEW: Start grid limit enforcer to cancel excess orders beyond max_orders_per_side
+	g.wg.Add(1)
+	go g.gridLimitEnforcerWorker(ctx)
 
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
@@ -742,6 +746,16 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 
 		finalSize := g.calculateOrderSize(symbol, orderSize, buyPrice)
+		if finalSize <= 0 {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"grid_level": -i,
+				"side":       "BUY",
+				"price":      buyPrice,
+				"reason":     "size_calculation_failed",
+			}).Warn("Skipping BUY order: calculateOrderSize returned 0")
+			continue
+		}
 		order := &GridOrder{
 			Symbol:    symbol,
 			Side:      "BUY",
@@ -808,6 +822,16 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 
 		finalSize := g.calculateOrderSize(symbol, orderSize, sellPrice)
+		if finalSize <= 0 {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"grid_level": i,
+				"side":       "SELL",
+				"price":      sellPrice,
+				"reason":     "size_calculation_failed",
+			}).Warn("Skipping SELL order: calculateOrderSize returned 0")
+			continue
+		}
 		order := &GridOrder{
 			Symbol:    symbol,
 			Side:      "SELL",
@@ -911,6 +935,9 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 		}
 
 		finalSize := g.calculateOrderSize(symbol, orderSize, buyPrice)
+		if finalSize <= 0 {
+			continue
+		}
 		orders = append(orders, &GridOrder{
 			Symbol:    symbol,
 			Side:      "BUY",
@@ -942,6 +969,9 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 		}
 
 		finalSize := g.calculateOrderSize(symbol, orderSize, sellPrice)
+		if finalSize <= 0 {
+			continue
+		}
 		orders = append(orders, &GridOrder{
 			Symbol:    symbol,
 			Side:      "SELL",
@@ -997,6 +1027,27 @@ func (g *GridManager) calculateOrderSize(symbol string, orderSize, price float64
 		parsedSize, parseErr := strconv.ParseFloat(roundedSize, 64)
 		if parseErr == nil && parsedSize > 0 {
 			notional = parsedSize * price
+			// CRITICAL: Check if precision rounding inflated size beyond max notional
+			// This can happen when min qty step is large (e.g., BTC 0.01)
+			if notional > g.maxNotionalUSD {
+				// Scale down to max allowed notional
+				scaledSize := g.maxNotionalUSD / price
+				roundedSize = g.precisionMgr.RoundQty(symbol, scaledSize)
+				parsedSize, _ = strconv.ParseFloat(roundedSize, 64)
+				if parsedSize > 0 {
+					notional = parsedSize * price
+				}
+				// If still exceeds max (due to rounding up), skip this order
+				if notional > g.maxNotionalUSD {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":   symbol,
+						"price":    price,
+						"min_step": roundedSize,
+						"reason":   "min_qty_step_too_large",
+					}).Warn("Order size cannot satisfy max notional with symbol's min qty step, skipping")
+					return 0 // Signal to skip this order
+				}
+			}
 			finalSize = parsedSize
 		}
 	}
@@ -1016,15 +1067,46 @@ func (g *GridManager) calculateOrderSize(symbol string, orderSize, price float64
 			}
 
 			multiplier := math.Pow(10, float64(precision))
-			roundedSize := math.Round(minSize*multiplier) / multiplier
+			// CRITICAL: Use Ceil to round UP, ensuring notional >= 5.0
+			roundedSize := math.Ceil(minSize*multiplier) / multiplier
 			adjustedNotional := roundedSize * price
 
+			// Safety loop: ensure notional meets minimum
 			for adjustedNotional < 5.0 {
 				roundedSize += 1.0 / multiplier
 				adjustedNotional = roundedSize * price
 			}
+			// CRITICAL: Ensure fallback size doesn't exceed max notional
+			if adjustedNotional > g.maxNotionalUSD {
+				scaledSize := g.maxNotionalUSD / price
+				scaledRounded := math.Ceil(scaledSize*multiplier) / multiplier
+				if scaledRounded > 0 && scaledRounded*price <= g.maxNotionalUSD {
+					roundedSize = scaledRounded
+					adjustedNotional = roundedSize * price
+				} else {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":    symbol,
+						"price":     price,
+						"precision": precision,
+						"reason":    "precision_too_low_for_max_notional",
+					}).Warn("Fallback size cannot satisfy max notional, skipping")
+					return 0
+				}
+			}
 			finalSize = roundedSize
 		}
+	}
+
+	// FINAL GUARD: Ensure we never exceed max notional regardless of path taken
+	if finalSize > 0 && finalSize*price > g.maxNotionalUSD {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":       symbol,
+			"price":        price,
+			"final_size":   finalSize,
+			"notional":     finalSize * price,
+			"max_notional": g.maxNotionalUSD,
+		}).Error("FINAL GUARD: Order size exceeds max notional, returning 0")
+		return 0
 	}
 
 	// Ensure minimum reasonable size
@@ -1192,7 +1274,9 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	price, _ := strconv.ParseFloat(orderReq.Price, 64)
 	notional = qty * price
 
-	if notional < 5.0 {
+	// Only enforce min notional for non-reduce-only orders
+	// Reduce-only orders are exempt from min notional at API level
+	if notional < 5.0 && !order.ReduceOnly {
 		// Increase quantity to meet minimum notional
 		minQty := 5.0 / price
 		// Add 2% safety margin
@@ -1535,60 +1619,101 @@ func (g *GridManager) ordersResetWorker(ctx context.Context) {
 }
 
 func (g *GridManager) resetStaleOrders() {
-	g.gridsMu.Lock()
-	defer g.gridsMu.Unlock()
-
+	// Get snapshot of grids needing check first
+	g.gridsMu.RLock()
+	type gridInfo struct {
+		symbol string
+		grid   *SymbolGrid
+	}
+	var toCheck []gridInfo
 	for symbol, grid := range g.activeGrids {
-		// Check if grid has been placed but timeout passed
 		if grid.OrdersPlaced && time.Since(grid.LastAttempt) > 3*time.Second {
-			// Check if we have all expected orders
-			expected := grid.MaxOrdersSide * 2
-			actual := 0
-			staleOrders := 0
-			g.ordersMu.RLock()
-			for _, order := range g.activeOrders {
-				if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
-					actual++
-					// Count orders that have been pending for too long (>60s)
-					if time.Since(order.CreatedAt) > 60*time.Second {
-						staleOrders++
-					}
+			toCheck = append(toCheck, gridInfo{symbol, grid})
+		}
+	}
+	g.gridsMu.RUnlock()
+
+	for _, info := range toCheck {
+		symbol := info.symbol
+		grid := info.grid
+		expected := grid.MaxOrdersSide * 2
+		actual := 0
+		staleOrders := 0
+
+		g.ordersMu.RLock()
+		for _, order := range g.activeOrders {
+			if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
+				actual++
+				if time.Since(order.CreatedAt) > 60*time.Second {
+					staleOrders++
 				}
 			}
-			g.ordersMu.RUnlock()
+		}
+		g.ordersMu.RUnlock()
 
-			// Reset if grid is incomplete
-			if actual < expected {
-				grid.OrdersPlaced = false
-				g.logger.WithFields(logrus.Fields{
-					"symbol":   symbol,
-					"expected": expected,
-					"actual":   actual,
-				}).Info("Resetting incomplete grid for re-placement")
-				// QUAN TRỌNG: Enqueue placement để rebuild grid ngay lập tức
-				go g.enqueuePlacement(symbol)
-				continue
-			}
+		// Reset if grid is incomplete
+		if actual < expected {
+			grid.OrdersPlaced = false
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"expected": expected,
+				"actual":   actual,
+			}).Info("Resetting incomplete grid for re-placement")
+			go g.enqueuePlacement(symbol)
+			continue
+		}
 
-			// Also reset if all orders are stale (not getting filled after 60s)
-			// This handles the case where price moved away from order prices
-			if actual > 0 && staleOrders == actual {
-				grid.OrdersPlaced = false
-				g.logger.WithFields(logrus.Fields{
-					"symbol":       symbol,
-					"expected":     expected,
-					"actual":       actual,
-					"stale_orders": staleOrders,
-				}).Info("Resetting stale grid - all orders pending too long without fills")
-				// Enqueue placement để rebuild grid với giá mới
-				go g.enqueuePlacement(symbol)
-			}
+		if actual > 0 && staleOrders == actual {
+			grid.OrdersPlaced = false
+			g.logger.WithFields(logrus.Fields{
+				"symbol":       symbol,
+				"expected":     expected,
+				"actual":       actual,
+				"stale_orders": staleOrders,
+			}).Info("Resetting stale grid - all orders pending too long without fills")
+			go g.enqueuePlacement(symbol)
 		}
 	}
 }
 
 func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	g.logger.WithField("symbol", symbol).Info("Starting placement process for symbol")
+
+	// CRITICAL: Fetch real open orders from exchange before placing
+	exchangeOrders, err := g.futuresClient.GetOpenOrders(ctx, symbol)
+	if err != nil {
+		g.logger.WithError(err).WithField("symbol", symbol).Warn("Failed to fetch open orders from exchange")
+	} else {
+		// Count BUY and SELL orders on exchange
+		exchangeBuyCount := 0
+		exchangeSellCount := 0
+		for _, order := range exchangeOrders {
+			if order.Status == "NEW" || order.Status == "PARTIALLY_FILLED" {
+				if order.Side == "BUY" {
+					exchangeBuyCount++
+				} else if order.Side == "SELL" {
+					exchangeSellCount++
+				}
+			}
+		}
+		g.logger.WithFields(logrus.Fields{
+			"symbol":        symbol,
+			"exchange_buy":  exchangeBuyCount,
+			"exchange_sell": exchangeSellCount,
+			"max_per_side":  g.maxOrdersSide,
+		}).Info("[PLACEMENT] Exchange order count before placing")
+
+		// Skip if already at or over limit (either side)
+		if exchangeBuyCount >= g.maxOrdersSide || exchangeSellCount >= g.maxOrdersSide {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":        symbol,
+				"exchange_buy":  exchangeBuyCount,
+				"exchange_sell": exchangeSellCount,
+				"max_per_side":  g.maxOrdersSide,
+			}).Warn("[PLACEMENT] Exchange at max orders, skipping placement")
+			return
+		}
+	}
 
 	g.gridsMu.Lock()
 	grid, exists := g.activeGrids[symbol]
@@ -2048,13 +2173,13 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 func (g *GridManager) positionRebalancerWorker(ctx context.Context) {
 	defer g.wg.Done()
 
-	g.rebalanceInterval = 15 * time.Second
-	g.rebalanceAggressiveness = 0.3
+	g.rebalanceInterval = 5 * time.Second
+	g.rebalanceAggressiveness = 0.5
 
 	ticker := time.NewTicker(g.rebalanceInterval)
 	defer ticker.Stop()
 
-	g.logger.Info("Position rebalancer started - checking every 15s with 30% excess reduction",
+	g.logger.Info("Position rebalancer started - checking every 5s with 50% excess reduction (OPTIMIZED)",
 		logrus.Fields{
 			"threshold_pct":  g.rebalanceThresholdPct,
 			"aggressiveness": g.rebalanceAggressiveness,
@@ -2207,4 +2332,125 @@ func (g *GridManager) SetRebalanceThreshold(thresholdPct float64) {
 func (g *GridManager) SetRebalanceAggressiveness(aggressiveness float64) {
 	g.rebalanceAggressiveness = aggressiveness
 	g.logger.WithField("aggressiveness", aggressiveness).Info("Rebalance aggressiveness updated")
+}
+
+// gridLimitEnforcerWorker monitors and cancels excess orders beyond max_orders_per_side
+func (g *GridManager) gridLimitEnforcerWorker(ctx context.Context) {
+	defer g.wg.Done()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	g.logger.Info("[LIMIT ENFORCER] Started - checking every 2s for excess orders")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			g.enforceGridLimits(ctx)
+		}
+	}
+}
+
+// enforceGridLimits checks all symbols and cancels excess orders beyond max_orders_per_side
+func (g *GridManager) enforceGridLimits(ctx context.Context) {
+	g.gridsMu.RLock()
+	symbols := make([]string, 0, len(g.activeGrids))
+	for symbol := range g.activeGrids {
+		symbols = append(symbols, symbol)
+	}
+	g.gridsMu.RUnlock()
+
+	for _, symbol := range symbols {
+		g.enforceSymbolLimits(ctx, symbol)
+	}
+}
+
+// enforceSymbolLimits checks and cancels excess orders for a specific symbol
+func (g *GridManager) enforceSymbolLimits(ctx context.Context, symbol string) {
+	maxOrders := g.maxOrdersSide
+
+	g.ordersMu.RLock()
+	var buyOrders []*GridOrder
+	var sellOrders []*GridOrder
+	for _, order := range g.activeOrders {
+		if order.Symbol != symbol || order.Status == "FILLED" || order.Status == "CANCELLED" {
+			continue
+		}
+		if order.Side == "BUY" {
+			buyOrders = append(buyOrders, order)
+		} else if order.Side == "SELL" {
+			sellOrders = append(sellOrders, order)
+		}
+	}
+	g.ordersMu.RUnlock()
+
+	// Cancel excess BUY orders
+	if len(buyOrders) > maxOrders {
+		excess := len(buyOrders) - maxOrders
+		g.logger.WithFields(logrus.Fields{
+			"symbol":    symbol,
+			"side":      "BUY",
+			"current":   len(buyOrders),
+			"max":       maxOrders,
+			"to_cancel": excess,
+		}).Info("[LIMIT ENFORCER] Canceling excess BUY orders")
+		g.cancelExcessOrders(ctx, symbol, buyOrders, excess)
+	}
+
+	// Cancel excess SELL orders
+	if len(sellOrders) > maxOrders {
+		excess := len(sellOrders) - maxOrders
+		g.logger.WithFields(logrus.Fields{
+			"symbol":    symbol,
+			"side":      "SELL",
+			"current":   len(sellOrders),
+			"max":       maxOrders,
+			"to_cancel": excess,
+		}).Info("[LIMIT ENFORCER] Canceling excess SELL orders")
+		g.cancelExcessOrders(ctx, symbol, sellOrders, excess)
+	}
+}
+
+// cancelExcessOrders cancels the specified number of orders from the list
+func (g *GridManager) cancelExcessOrders(ctx context.Context, symbol string, orders []*GridOrder, count int) {
+	for i := 0; i < count && i < len(orders); i++ {
+		order := orders[i]
+		if order.OrderID == "" {
+			continue
+		}
+
+		orderIDInt, _ := strconv.ParseInt(order.OrderID, 10, 64)
+		if orderIDInt == 0 {
+			continue
+		}
+
+		_, err := g.futuresClient.CancelOrder(ctx, client.CancelOrderRequest{
+			Symbol:  symbol,
+			OrderID: orderIDInt,
+		})
+		if err != nil {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"order_id": order.OrderID,
+				"error":    err,
+			}).Warn("[LIMIT ENFORCER] Failed to cancel excess order")
+			continue
+		}
+
+		g.ordersMu.Lock()
+		if o, exists := g.activeOrders[order.OrderID]; exists {
+			o.Status = "CANCELLED"
+		}
+		g.ordersMu.Unlock()
+
+		g.logger.WithFields(logrus.Fields{
+			"symbol":   symbol,
+			"order_id": order.OrderID,
+			"side":     order.Side,
+		}).Info("[LIMIT ENFORCER] Cancelled excess order")
+	}
 }

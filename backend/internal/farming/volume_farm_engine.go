@@ -222,14 +222,17 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		}
 	}()
 
+	// CRITICAL: Initial symbol sync MUST complete before starting grid manager
+	// to ensure activeGrids is populated before rebalancer worker starts
+	e.logger.Info("Initial symbol sync before starting grid manager...")
+	e.syncGridSymbols()
+	e.logger.Info("Initial symbol sync complete - starting grid manager")
+
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
-
-		// Initial symbol sync to avoid waiting for first interval
-		e.syncGridSymbols()
 
 		for {
 			select {

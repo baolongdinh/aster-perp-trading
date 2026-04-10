@@ -2117,6 +2117,10 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 	if a.dynamicSpreadCalc != nil {
 		a.dynamicSpreadCalc.UpdateATR(high, low, close)
 	}
+
+	// CRITICAL: Feed RangeDetector for breakout detection
+	// This enables the "con rắn săn mồi" - patience mechanism + breakout protection
+	a.UpdatePriceForRange(symbol, high, low, close)
 }
 
 // RecordTradeResult records trade result for loss tracking with cooldown

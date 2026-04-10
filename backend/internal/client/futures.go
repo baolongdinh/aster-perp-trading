@@ -185,6 +185,9 @@ func (f *FuturesClient) placeOrderParams(req PlaceOrderRequest) map[string]strin
 	if req.TimeInForce != "" {
 		params["timeInForce"] = req.TimeInForce
 	}
+	if req.ReduceOnly {
+		params["reduceOnly"] = "true"
+	}
 	return params
 }
 

@@ -271,8 +271,9 @@ class DashboardApp:
     def render(self):
         self.stdscr.clear()
         h, w = self.stdscr.getmaxyx()
-        if h < 10 or w < 30:
-            self.safe_addstr(0, 0, "Terminal too small! Need 30x10+", self.RED)
+        if h < 20 or w < 80:
+            self.safe_addstr(0, 0, f"Terminal too small! Need 80x20, got {w}x{h}", self.RED)
+            self.safe_addstr(1, 0, "Please resize your terminal and restart", self.YELLOW)
             self.stdscr.refresh()
             return
 
@@ -399,15 +400,22 @@ class DashboardApp:
         self.stdscr.addstr(gy + 1, 2, f" ACTIVE GRIDS ({len(self.metrics['symbols'])})", self.CYAN + self.BOLD)
         syms = list(self.metrics['symbols'])[:6]
         r = gy + 3
+        h, w = self.stdscr.getmaxyx()
         if syms:
             for sym in syms:
+                if r >= h - 1:
+                    break
                 fp = self.metrics['fill_rate'] if self.metrics['fill_rate'] > 0 else 0
-                self.stdscr.addstr(r, 4, f"{sym:8}", self.CYAN)
-                self.draw_bar(r, 15, 25, fp)
-                self.stdscr.addstr(r, 42, f"{fp:5.1f}%", self.WHITE)
+                try:
+                    self.stdscr.addstr(r, 4, f"{sym:8}", self.CYAN)
+                    self.draw_bar(r, 15, 25, fp)
+                    self.stdscr.addstr(r, 42, f"{fp:5.1f}%", self.WHITE)
+                except curses.error:
+                    pass
                 r += 1
         else:
-            self.stdscr.addstr(r, 10, "Waiting for data...", self.YELLOW)
+            if r < h:
+                self.stdscr.addstr(r, 10, "Waiting for data...", self.YELLOW)
 
         ry = gy + 10
         if ry < h - 3:
