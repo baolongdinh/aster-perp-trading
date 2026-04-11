@@ -1,0 +1,88 @@
+@import './variables.css';
+
+/* Base Styles */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bg-elevated);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-primary);
+}
+
+/* Selection */
+::selection {
+  background-color: var(--accent-primary);
+  color: var(--bg-primary);
+}
+
+/* Focus Styles */
+:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* Page Transitions */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.fade-enter-from {
+  opacity: 0;
+  transform: translateY(5px);
+}
+
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(-5px);
+}
+
+/* Utility Classes */
+.text-positive {
+  color: var(--accent-success);
+}
+
+.text-negative {
+  color: var(--accent-danger);
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}

@@ -40,17 +40,17 @@
 └─────────────┘     └─────────────┘     └─────────────┘     └──────┬──────┘
                                                                     │
                                                                     ↓
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Ready to   │←────│ Regime      │←────│ Hysteresis  │←────│ ADX/BB/ATR  │
-│  Trade      │     │ Detect      │     │ (2 reads)   │     │ EMAs        │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Ready to   │←────│ Regime      │←────│ ADX/BB/ATR  │
+│  Trade      │     │ Detect      │     │ EMAs        │
+└─────────────┘     └─────────────┘     └─────────────┘
 ```
 
 **Mô tả:**
 1. Bot khởi động, gọi REST API lấy 1000 nến lịch sử
 2. Tính toán chỉ báo kỹ thuật (ADX, Bollinger, ATR, các EMA)
-3. Áp dụng Hysteresis: cần 2 lần đọc regime giống nhau mới xác nhận
-4. Chuyển sang trạng thái sẵn sàng giao dịch
+3. Xác định regime hiện tại từ chỉ báo
+4. Chuyển sang trạng thái sẵn sàng giao dịch (không cần hysteresis)
 
 ### 2.2 Real-time Flow (Vận Hành)
 

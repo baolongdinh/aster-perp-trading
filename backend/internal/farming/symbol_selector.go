@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,9 +72,17 @@ func (s *SymbolSelector) Start(ctx context.Context) error {
 
 	s.logger.WithField("supported_quotes", s.config.Symbols.QuoteCurrencies).Info("Supported quote currencies")
 
-	if err := s.wsClient.Connect(ctx); err != nil {
-		s.logger.WithError(err).Error("Failed to connect WebSocket")
-		return fmt.Errorf("failed to connect WebSocket: %w", err)
+	// Only connect if not already connected (e.g., when using shared WebSocket client)
+	if !s.wsClient.IsRunning() {
+		if err := s.wsClient.Connect(ctx); err != nil {
+			s.logger.WithError(err).Error("Failed to connect WebSocket")
+			return fmt.Errorf("failed to connect WebSocket: %w", err)
+		}
+
+		// Subscribe to all ticker array stream
+		if err := s.wsClient.SubscribeToTicker([]string{"!ticker@arr"}); err != nil {
+			s.logger.WithError(err).Warn("Failed to subscribe to ticker stream")
+		}
 	}
 
 	s.logger.Info("WebSocket connected for real-time ticker data")
@@ -141,10 +150,12 @@ func (s *SymbolSelector) processWebSocketTicker(msg map[string]interface{}) {
 			continue
 		}
 
-		symbol, ok := ticker["s"].(string)
+		symbolRaw, ok := ticker["s"].(string)
 		if !ok {
 			continue
 		}
+		// Normalize symbol to uppercase for consistent comparison
+		symbol := strings.ToUpper(symbolRaw)
 
 		// Check blacklist first
 		if s.isSymbolBlacklisted(symbol) {
@@ -461,6 +472,13 @@ func (s *SymbolSelector) IsRunning() bool {
 	return s.isRunning
 }
 
+// SetWebSocketClient sets an external WebSocket client to share connection
+func (s *SymbolSelector) SetWebSocketClient(wsClient *client.WebSocketClient) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wsClient = wsClient
+}
+
 // SetWhitelist updates the whitelist for symbol selection (called by Agentic layer)
 func (s *SymbolSelector) SetWhitelist(symbols []string) {
 	s.mu.Lock()
@@ -473,6 +491,16 @@ func (s *SymbolSelector) SetWhitelist(symbols []string) {
 
 	// Disable auto-discover when using Agentic whitelist
 	s.config.Symbols.AutoDiscover = false
+}
+
+// GetWhitelist returns the current whitelist from symbol selector
+func (s *SymbolSelector) GetWhitelist() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	whitelist := make([]string, len(s.config.Symbols.Whitelist))
+	copy(whitelist, s.config.Symbols.Whitelist)
+	return whitelist
 }
 
 func normalizeVolumeConfig(cfg *config.VolumeFarmConfig) *config.VolumeFarmConfig {

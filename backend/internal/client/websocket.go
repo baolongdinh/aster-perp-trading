@@ -38,7 +38,7 @@ func NewWebSocketClient(baseURL string, logger *zap.Logger) *WebSocketClient {
 		baseURL:           baseURL,
 		logger:            logger,
 		stopCh:            make(chan struct{}),
-		tickerCh:          make(chan map[string]interface{}, 100),
+		tickerCh:          make(chan map[string]interface{}, 2000),
 		subscribedSymbols: make(map[string]bool),
 	}
 }
@@ -168,8 +168,14 @@ func (ws *WebSocketClient) SubscribeToTicker(symbols []string) error {
 	}
 
 	for _, symbol := range symbols {
-		// Convert to lowercase for Aster API
-		stream := fmt.Sprintf("%s@ticker", strings.ToLower(symbol))
+		var stream string
+		if strings.HasPrefix(symbol, "!") {
+			// Special streams like !ticker@arr - use as-is
+			stream = symbol
+		} else {
+			// Regular symbol streams - convert to lowercase and append @ticker
+			stream = fmt.Sprintf("%s@ticker", strings.ToLower(symbol))
+		}
 		subscribeMsg["params"] = append(subscribeMsg["params"].([]string), stream)
 		ws.subscribedSymbols[symbol] = true
 	}

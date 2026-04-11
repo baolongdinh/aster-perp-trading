@@ -271,8 +271,17 @@ func LoadVolumeFarming(configPath string) (*VolumeFarmConfig, error) {
 	}
 
 	var cfg VolumeFarmConfig
-	if err := viper.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal volume farming config: %w", err)
+
+	// Try to unmarshal from "volume_farming" section first (unified config)
+	if viper.IsSet("volume_farming") {
+		if err := viper.UnmarshalKey("volume_farming", &cfg); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal volume_farming section: %w", err)
+		}
+	} else {
+		// Fallback to root level (legacy config)
+		if err := viper.Unmarshal(&cfg); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal volume farming config: %w", err)
+		}
 	}
 
 	if err := validateVolumeFarmConfig(&cfg); err != nil {
@@ -801,6 +810,7 @@ type PositionSizingConfig struct {
 
 // WhitelistConfig configures whitelist management
 type WhitelistConfig struct {
+	Enabled            bool    `mapstructure:"enabled" yaml:"enabled"`
 	MaxSymbols         int     `mapstructure:"max_symbols" yaml:"max_symbols"`
 	MinScoreToAdd      float64 `mapstructure:"min_score_to_add" yaml:"min_score_to_add"`
 	ScoreToRemove      float64 `mapstructure:"score_to_remove" yaml:"score_to_remove"`

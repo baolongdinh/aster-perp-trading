@@ -1,7 +1,9 @@
 package adaptive_grid
 
 import (
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
@@ -410,4 +412,200 @@ func TestCalculateSmartSize_Disabled(t *testing.T) {
 	baseSize := 50.0
 	size := CalculateSmartSize(baseSize, 0.5, 5, config)
 	assert.Equal(t, baseSize, size, "When disabled, should return base size unchanged")
+}
+
+// =============================================================================
+// UPDATE PRICE DATA FLOW TESTS
+// =============================================================================
+
+// TestUpdatePriceData_NoDeadlock ensures UpdatePriceData doesn't cause deadlock
+// when range detector is not initialized
+func TestUpdatePriceData_NoDeadlock(t *testing.T) {
+	logger := zap.NewNop()
+	manager := &AdaptiveGridManager{
+		logger:            logger,
+		rangeDetectors:    make(map[string]*RangeDetector),
+		atrCalc:           nil, // No calculators
+		rsiCalc:           nil,
+		trendDetector:     nil,
+		spreadProtection:  nil,
+		dynamicSpreadCalc: nil,
+	}
+
+	// Test directly without goroutine first
+	t.Log("Starting UpdatePriceData call...")
+	manager.UpdatePriceData("BTCUSD1", 50000, 49900, 50100, 49950, 50050)
+	t.Log("UpdatePriceData completed!")
+
+	done := make(chan bool)
+	go func() {
+		// This should NOT block or deadlock
+		manager.UpdatePriceData("BTCUSD1", 50000, 49900, 50100, 49950, 50050)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Success - no deadlock
+	case <-time.After(2 * time.Second):
+		t.Fatal("UpdatePriceData caused deadlock when range detector not initialized")
+	}
+}
+
+// TestUpdatePriceData_WithRangeDetector ensures flow works when detector exists
+func TestUpdatePriceData_WithRangeDetector(t *testing.T) {
+	logger := zap.NewNop()
+	manager := &AdaptiveGridManager{
+		logger:            logger,
+		rangeDetectors:    make(map[string]*RangeDetector),
+		atrCalc:           nil,
+		rsiCalc:           nil,
+		trendDetector:     nil,
+		spreadProtection:  nil,
+		dynamicSpreadCalc: nil,
+	}
+
+	// Pre-initialize range detector
+	manager.InitializeRangeDetector("BTCUSD1", DefaultRangeConfig())
+
+	done := make(chan bool)
+	go func() {
+		manager.UpdatePriceData("BTCUSD1", 50000, 49900, 50100, 49950, 50050)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("UpdatePriceData blocked with initialized range detector")
+	}
+}
+
+// TestUpdatePriceData_ConcurrentAccess ensures thread safety
+func TestUpdatePriceData_ConcurrentAccess(t *testing.T) {
+	logger := zap.NewNop()
+	manager := &AdaptiveGridManager{
+		logger:         logger,
+		rangeDetectors: make(map[string]*RangeDetector),
+	}
+
+	// Initialize detectors for multiple symbols
+	for _, symbol := range []string{"BTCUSD1", "ETHUSD1", "SOLUSD1"} {
+		manager.InitializeRangeDetector(symbol, DefaultRangeConfig())
+	}
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 100)
+
+	// Concurrent updates from multiple goroutines
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			symbols := []string{"BTCUSD1", "ETHUSD1", "SOLUSD1"}
+			for _, symbol := range symbols {
+				// Add multiple price points
+				for j := 0; j < 5; j++ {
+					price := 50000.0 + float64(id*10+j)
+					manager.UpdatePriceData(symbol, price, price-100, price+100, price-50, price+50)
+				}
+			}
+		}(i)
+	}
+
+	// Wait with timeout
+	done := make(chan bool)
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - no deadlocks
+	case <-time.After(5 * time.Second):
+		t.Fatal("Concurrent UpdatePriceData calls caused deadlock")
+	}
+
+	select {
+	case err := <-errors:
+		t.Fatalf("Error during concurrent access: %v", err)
+	default:
+		// No errors
+	}
+}
+
+// TestUpdatePriceForRange_SkipsWhenNoDetector verifies the fix for auto-initialize deadlock
+// NOTE: UpdatePriceForRange now expects caller to hold the lock
+func TestUpdatePriceForRange_SkipsWhenNoDetector(t *testing.T) {
+	logger := zap.NewNop()
+	manager := &AdaptiveGridManager{
+		logger:         logger,
+		rangeDetectors: make(map[string]*RangeDetector),
+	}
+
+	// Must acquire lock before calling UpdatePriceForRange
+	manager.mu.Lock()
+	// Call without initializing detector - should return immediately
+	manager.UpdatePriceForRange("BTCUSD1", 50000, 49900, 50100)
+	manager.mu.Unlock()
+
+	// Verify no detector was auto-created
+	manager.mu.RLock()
+	_, exists := manager.rangeDetectors["BTCUSD1"]
+	manager.mu.RUnlock()
+
+	assert.False(t, exists, "Range detector should NOT be auto-created (deadlock fix)")
+}
+
+// =============================================================================
+// INITIALIZE RANGE DETECTOR TESTS
+// =============================================================================
+
+// TestInitializeRangeDetector_CreatesDetector ensures proper initialization
+func TestInitializeRangeDetector_CreatesDetector(t *testing.T) {
+	logger := zap.NewNop()
+	manager := &AdaptiveGridManager{
+		logger:         logger,
+		rangeDetectors: make(map[string]*RangeDetector),
+	}
+
+	config := DefaultRangeConfig()
+	manager.InitializeRangeDetector("BTCUSD1", config)
+
+	manager.mu.RLock()
+	detector, exists := manager.rangeDetectors["BTCUSD1"]
+	manager.mu.RUnlock()
+
+	assert.True(t, exists, "Range detector should be created")
+	assert.NotNil(t, detector, "Detector should not be nil")
+}
+
+// TestInitializeRangeDetector_ThreadSafe ensures thread-safe initialization
+func TestInitializeRangeDetector_ThreadSafe(t *testing.T) {
+	logger := zap.NewNop()
+	manager := &AdaptiveGridManager{
+		logger:         logger,
+		rangeDetectors: make(map[string]*RangeDetector),
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			symbol := "BTCUSD1"
+			manager.InitializeRangeDetector(symbol, DefaultRangeConfig())
+		}(i)
+	}
+
+	wg.Wait()
+
+	manager.mu.RLock()
+	detector, exists := manager.rangeDetectors["BTCUSD1"]
+	manager.mu.RUnlock()
+
+	assert.True(t, exists, "Range detector should exist after concurrent initialization")
+	assert.NotNil(t, detector, "Detector should not be nil")
 }

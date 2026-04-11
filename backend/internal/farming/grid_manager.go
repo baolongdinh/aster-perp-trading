@@ -108,11 +108,27 @@ type GridManager struct {
 	rebalanceThresholdPct   float64       // Threshold to start rebalancing (e.g., 0.8 = 80% of max)
 	rebalanceAggressiveness float64       // How much to reduce (0.0-1.0, e.g., 0.3 = reduce by 30%)
 	rebalanceInterval       time.Duration // How often to check position size
+
+	// NEW: Exchange orders cache for async fetch (TTL 1s)
+	exchangeOrderCache    map[string]*ExchangeOrderCacheEntry // symbol -> cached orders
+	exchangeOrderCacheMu  sync.RWMutex
+	exchangeOrderCacheTTL time.Duration
+}
+
+// ExchangeOrderCacheEntry stores cached exchange orders with timestamp
+type ExchangeOrderCacheEntry struct {
+	Orders    []client.Order
+	Timestamp time.Time
 }
 
 // SetActivityLogger sets the activity logger for the grid manager.
 func (g *GridManager) SetActivityLogger(al *activitylog.ActivityLogger) {
 	g.activityLog = al
+}
+
+// SetWebSocketClient sets an external WebSocket client to share connection
+func (g *GridManager) SetWebSocketClient(wsClient *client.WebSocketClient) {
+	g.wsClient = wsClient
 }
 
 // SymbolGrid represents a grid for a specific symbol.
@@ -211,6 +227,9 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		rebalanceThresholdPct:   0.75,            // Start earlier at 75% of max
 		rebalanceAggressiveness: 0.50,            // Reduce by 50% of excess (faster)
 		rebalanceInterval:       5 * time.Second, // Check every 5s (quicker response)
+		// Exchange order cache with 1s TTL
+		exchangeOrderCache:    make(map[string]*ExchangeOrderCacheEntry),
+		exchangeOrderCacheTTL: 1 * time.Second,
 	}
 }
 
@@ -274,12 +293,20 @@ func (g *GridManager) Start(ctx context.Context) error {
 		g.logger.WithField("symbols_count", len(exchangeInfoBytes)).Info("Exchange info loaded successfully")
 	}
 
-	zapLogger, _ := zap.NewDevelopment()
-	g.wsClient = client.NewWebSocketClient(g.tickerStreamURL, zapLogger)
+	// Only create WebSocket client if not already set (e.g., via SetWebSocketClient for sharing)
+	if g.wsClient == nil {
+		zapLogger, _ := zap.NewDevelopment()
+		g.wsClient = client.NewWebSocketClient(g.tickerStreamURL, zapLogger)
 
-	if err := g.wsClient.Connect(ctx); err != nil {
-		g.logger.WithError(err).Error("Failed to connect WebSocket to Aster API")
-		return fmt.Errorf("failed to connect WebSocket: %w", err)
+		if err := g.wsClient.Connect(ctx); err != nil {
+			g.logger.WithError(err).Error("Failed to connect WebSocket to Aster API")
+			return fmt.Errorf("failed to connect WebSocket: %w", err)
+		}
+
+		// Subscribe to all ticker array stream
+		if err := g.wsClient.SubscribeToTicker([]string{"!ticker@arr"}); err != nil {
+			g.logger.WithError(err).Warn("Failed to subscribe to ticker stream")
+		}
 	}
 
 	g.wg.Add(1)
@@ -288,8 +315,7 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.metricsReporter(ctx)
 
-	g.wg.Add(1)
-	go g.placementWorker(ctx)
+	// Note: placementWorkers are started below (20 workers)
 
 	g.wg.Add(1)
 	go g.ordersResetWorker(ctx)
@@ -314,7 +340,7 @@ func (g *GridManager) Start(ctx context.Context) error {
 	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
 		g.wg.Add(1)
-		go g.placementWorker(ctx)
+		go g.placementWorker(ctx, i)
 	}
 
 	g.logger.Info("Grid Manager started successfully")
@@ -340,13 +366,23 @@ func (g *GridManager) websocketProcessor(ctx context.Context) {
 
 // processWebSocketTicker processes real-time ticker data from WebSocket.
 func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
+	g.logger.Info("ENTER processWebSocketTicker")
 	data, ok := msg["data"].([]interface{})
 	if !ok {
 		g.logger.Debug("WebSocket message missing data field or wrong format")
 		return
 	}
 
-	g.logger.WithField("ticker_count", len(data)).Debug("Processing WebSocket ticker data")
+	g.logger.WithField("ticker_count", len(data)).Info("Processing WebSocket ticker data")
+
+	// Log all symbols in activeGrids for comparison
+	g.gridsMu.RLock()
+	activeSymbols := make([]string, 0, len(g.activeGrids))
+	for sym := range g.activeGrids {
+		activeSymbols = append(activeSymbols, sym)
+	}
+	g.gridsMu.RUnlock()
+	g.logger.WithField("active_grids", activeSymbols).Warn(">>> ACTIVE GRIDS <<<")
 
 	var symbolsToEnqueue []string
 
@@ -356,10 +392,13 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 			continue
 		}
 
-		symbol, ok := ticker["s"].(string)
+		symbolRaw, ok := ticker["s"].(string)
 		if !ok {
 			continue
 		}
+		// Normalize symbol to uppercase for consistent comparison
+		symbol := strings.ToUpper(symbolRaw)
+		g.logger.WithField("symbol", symbol).Debug(">>> PROCESSING TICKER SYMBOL <<<")
 
 		lastPriceStr, ok := ticker["c"].(string)
 		if !ok {
@@ -375,23 +414,38 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 		g.gridsMu.Lock()
 		grid, exists := g.activeGrids[symbol]
 		if exists {
-			g.logger.WithField("symbol", symbol).Debug("Processing ticker for existing grid")
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"last_price": lastPrice,
+				"old_price":  grid.CurrentPrice,
+			}).Info("Processing ticker for active grid")
 		} else {
-			g.logger.WithField("symbol", symbol).Debug("Ignoring ticker for non-active symbol")
+			// Only log first few non-active symbols to avoid spam
+			if len(data) <= 5 {
+				g.logger.WithField("symbol", symbol).Debug("Ignoring ticker for non-active symbol")
+			}
 			g.gridsMu.Unlock()
 			continue
 		}
 		oldPrice := grid.CurrentPrice
+		g.logger.WithFields(logrus.Fields{
+			"symbol":    symbol,
+			"oldPrice":  oldPrice,
+			"lastPrice": lastPrice,
+		}).Info("CHECK oldPrice value")
 		grid.CurrentPrice = lastPrice
 		grid.MidPrice = lastPrice
 		grid.LastUpdate = time.Now()
 
 		// NEW: Feed price data to AdaptiveGridManager calculators
 		if g.adaptiveMgr != nil {
+			g.logger.WithField("symbol", symbol).Warn(">>> BEFORE UpdatePriceData <<<")
 			// Use lastPrice as high, low, close (ticker only gives last price)
 			// Pass 0 for bid/ask since ticker doesn't provide them
 			g.adaptiveMgr.UpdatePriceData(symbol, lastPrice, lastPrice, lastPrice, 0, 0)
+			g.logger.WithField("symbol", symbol).Warn(">>> AFTER UpdatePriceData <<<")
 		}
+		g.logger.WithField("symbol", symbol).Warn(">>> AFTER adaptiveMgr block <<<")
 
 		if oldPrice != lastPrice && oldPrice != 0 {
 			g.logger.WithFields(logrus.Fields{
@@ -402,18 +456,49 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 			}).Debug("Grid price updated")
 		}
 
+		g.logger.WithField("oldPrice", oldPrice).Warn(">>> ABOUT TO CHECK oldPrice == 0 <<<")
 		if oldPrice == 0 {
-			g.logger.WithField("symbol", symbol).Debug("Grid initialized with first price")
-		}
-
-		if g.shouldSchedulePlacement(grid, oldPrice) {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"last_price":     lastPrice,
+				"placement_busy": grid.PlacementBusy,
+				"grid_exists":    exists,
+			}).Warn(">>> FIRST PRICE RECEIVED - WILL ENQUEUE PLACEMENT <<<")
+			grid.PlacementBusy = true
+			symbolsToEnqueue = append(symbolsToEnqueue, symbol)
+		} else if g.shouldSchedulePlacement(grid, oldPrice) {
 			grid.PlacementBusy = true
 			symbolsToEnqueue = append(symbolsToEnqueue, symbol)
 			g.logger.WithField("symbol", symbol).Debug("Scheduling grid placement due to price update")
+		} else {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"old_price":      oldPrice,
+				"current_price":  grid.CurrentPrice,
+				"placement_busy": grid.PlacementBusy,
+				"orders_placed":  grid.OrdersPlaced,
+			}).Debug("Not scheduling placement")
 		}
 		g.gridsMu.Unlock()
 	}
 
+	g.logger.WithFields(logrus.Fields{
+		"ticker_count":       len(data),
+		"symbols_to_enqueue": symbolsToEnqueue,
+		"enqueue_count":      len(symbolsToEnqueue),
+	}).Debug("Completed processing WebSocket ticker batch")
+
+	g.logger.WithFields(logrus.Fields{
+		"symbols_to_enqueue": symbolsToEnqueue,
+		"enqueue_count":      len(symbolsToEnqueue),
+	}).Info("Enqueuing check completed")
+
+	if len(symbolsToEnqueue) > 0 {
+		g.logger.WithFields(logrus.Fields{
+			"symbols": symbolsToEnqueue,
+			"count":   len(symbolsToEnqueue),
+		}).Info("Enqueuing symbols for placement - WILL PLACE ORDERS")
+	}
 	for _, sym := range symbolsToEnqueue {
 		g.enqueuePlacement(sym)
 	}
@@ -540,6 +625,10 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 			IsActive:      true,
 			LastAttempt:   time.Now().Add(-g.gridPlacementCooldown), // Force initial placement
 		}
+		g.logger.WithFields(logrus.Fields{
+			"symbol":          symbol,
+			"max_orders_side": g.maxOrdersSide,
+		}).Info("DEBUG: Created SymbolGrid with maxOrdersSide")
 		created = append(created, symbolData.Symbol)
 	}
 
@@ -554,6 +643,13 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 
 	for _, symbol := range created {
 		g.logger.WithField("symbol", symbol).Info("Created new grid")
+
+		// Initialize range detector for this symbol
+		if g.adaptiveMgr != nil {
+			g.adaptiveMgr.InitializeRangeDetector(symbol, nil)
+			g.logger.WithField("symbol", symbol).Info("Range detector initialized")
+		}
+
 		// Log grid creation
 		if g.activityLog != nil {
 			g.activityLog.Log(context.Background(), activitylog.EventGridCreated, activitylog.SeverityInfo,
@@ -984,24 +1080,26 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 		})
 	}
 
-	// Place orders concurrently
-	var wg sync.WaitGroup
-	successChan := make(chan bool, len(orders))
-
-	for _, order := range orders {
-		wg.Add(1)
-		go g.placeOrderAsync(ctx, order, &wg, successChan)
-	}
-
-	go func() {
-		wg.Wait()
-		close(successChan)
-	}()
-
+	// Place orders SEQUENTIALLY to avoid hitting notional limits
+	// Changed from concurrent to sequential to prevent "max notional value" errors
 	placedOrders := 0
-	for success := range successChan {
-		if success {
-			placedOrders++
+	for _, order := range orders {
+		// Add small delay between orders to avoid rate limits
+		time.Sleep(100 * time.Millisecond)
+
+		successChan := make(chan bool, 1)
+		go func(o *GridOrder) {
+			err := g.placeOrder(o)
+			successChan <- (err == nil)
+		}(order)
+
+		select {
+		case success := <-successChan:
+			if success {
+				placedOrders++
+			}
+		case <-time.After(5 * time.Second):
+			g.logger.Warn("Order placement timeout", zap.String("symbol", order.Symbol))
 		}
 	}
 
@@ -1057,19 +1155,43 @@ func (g *GridManager) calculateOrderSize(symbol string, orderSize, price float64
 		minRequired := 5.0 * 1.02 // 5.1 USD minimum
 		minSize := minRequired / price
 		if minSize > 0 {
+			// Calculate precision based on price magnitude
+			// BTC ~$100k needs precision=5 (0.00001), ETH ~$2k needs precision=4 (0.0001)
 			var precision int
-			if price < 1 {
-				precision = 6
-			} else if price < 100 {
-				precision = 4
-			} else {
-				precision = 2
+			switch {
+			case price >= 50000: // BTC and very high-priced assets
+				precision = 5 // 0.00001 BTC = $0.5 at $50k, $5 at $100k
+			case price >= 10000:
+				precision = 4 // 0.0001
+			case price >= 1000:
+				precision = 3 // 0.001
+			case price >= 100:
+				precision = 2 // 0.01
+			case price >= 10:
+				precision = 3 // 0.001
+			case price >= 1:
+				precision = 4 // 0.0001
+			default:
+				precision = 6 // 0.000001 for sub-$1 assets
 			}
 
 			multiplier := math.Pow(10, float64(precision))
 			// CRITICAL: Use Ceil to round UP, ensuring notional >= 5.0
 			roundedSize := math.Ceil(minSize*multiplier) / multiplier
 			adjustedNotional := roundedSize * price
+
+			// Log for debugging BTC precision
+			if strings.Contains(symbol, "BTC") {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":           symbol,
+					"price":            price,
+					"precision":        precision,
+					"multiplier":       multiplier,
+					"minSize":          minSize,
+					"roundedSize":      roundedSize,
+					"adjustedNotional": adjustedNotional,
+				}).Debug("BTC precision calculation")
+			}
 
 			// Safety loop: ensure notional meets minimum
 			for adjustedNotional < 5.0 {
@@ -1584,18 +1706,32 @@ func (g *GridManager) logExchangeData(ctx context.Context) {
 	}).Info("Exchange Real Data")
 }
 
-func (g *GridManager) placementWorker(ctx context.Context) {
+func (g *GridManager) placementWorker(ctx context.Context, workerID int) {
 	defer g.wg.Done()
+
+	g.logger.WithField("worker_id", workerID).Info("Placement worker started")
 
 	for {
 		select {
 		case <-ctx.Done():
+			g.logger.WithField("worker_id", workerID).Debug("Placement worker shutting down (context done)")
 			return
 		case <-g.stopCh:
+			g.logger.WithField("worker_id", workerID).Debug("Placement worker shutting down (stop signal)")
 			return
 		case symbol := <-g.placementQueue:
-			g.logger.WithField("symbol", symbol).Info("Processing placement for symbol")
+			start := time.Now()
+			g.logger.WithFields(logrus.Fields{
+				"worker_id": workerID,
+				"symbol":    symbol,
+			}).Info("Processing placement for symbol")
 			g.processPlacement(ctx, symbol)
+			duration := time.Since(start)
+			g.logger.WithFields(logrus.Fields{
+				"worker_id":          workerID,
+				"symbol":             symbol,
+				"processing_time_ms": duration.Milliseconds(),
+			}).Debug("Placement processing completed")
 		}
 	}
 }
@@ -1678,13 +1814,33 @@ func (g *GridManager) resetStaleOrders() {
 
 func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	g.logger.WithField("symbol", symbol).Info("Starting placement process for symbol")
+	placementStart := time.Now()
 
-	// CRITICAL: Fetch real open orders from exchange before placing
-	exchangeOrders, err := g.futuresClient.GetOpenOrders(ctx, symbol)
-	if err != nil {
-		g.logger.WithError(err).WithField("symbol", symbol).Warn("Failed to fetch open orders from exchange")
+	// T016: Use async fetch with timeout (max 500ms)
+	// T017: Check cache first (TTL 1s)
+	exchangeOrders, cacheHit := g.getCachedExchangeOrders(symbol)
+	if !cacheHit {
+		// Cache miss - fetch with timeout
+		fetchCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+
+		orders, err := g.fetchExchangeDataAsync(fetchCtx, symbol)
+		if err != nil {
+			// T019: Fallback - skip exchange check on timeout/error, proceed with placement
+			g.logger.WithError(err).WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"duration": time.Since(placementStart).Milliseconds(),
+			}).Warn("[PLACEMENT] Exchange fetch failed/timeout, proceeding without exchange check")
+		} else {
+			exchangeOrders = orders
+			g.cacheExchangeOrders(symbol, orders)
+		}
 	} else {
-		// Count BUY and SELL orders on exchange
+		g.logger.WithField("symbol", symbol).Debug("[PLACEMENT] Using cached exchange orders")
+	}
+
+	// Process exchange orders if available
+	if len(exchangeOrders) > 0 {
 		exchangeBuyCount := 0
 		exchangeSellCount := 0
 		for _, order := range exchangeOrders {
@@ -1701,6 +1857,7 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 			"exchange_buy":  exchangeBuyCount,
 			"exchange_sell": exchangeSellCount,
 			"max_per_side":  g.maxOrdersSide,
+			"cache_hit":     cacheHit,
 		}).Info("[PLACEMENT] Exchange order count before placing")
 
 		// Skip if already at or over limit (either side)
@@ -1723,11 +1880,41 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 		return
 	}
 
+	// T021: Wait for price if not available (max 5s wait)
+	priceWaitStart := time.Now()
+	for grid.CurrentPrice == 0 && time.Since(priceWaitStart) < 5*time.Second {
+		g.gridsMu.Unlock()
+		g.logger.WithField("symbol", symbol).Debug("[PLACEMENT] Waiting for price update...")
+		time.Sleep(100 * time.Millisecond)
+		g.gridsMu.Lock()
+		grid = g.activeGrids[symbol]
+	}
+
+	// T022: Check if we got a price
+	if grid.CurrentPrice == 0 {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":  symbol,
+			"wait_ms": time.Since(priceWaitStart).Milliseconds(),
+		}).Warn("[PLACEMENT] Price still 0 after wait, skipping placement")
+		grid.PlacementBusy = false
+		g.gridsMu.Unlock()
+		g.finishPlacement(symbol, false)
+		return
+	}
+
 	// Mark as busy immediately to prevent duplicate scheduling
 	grid.PlacementBusy = true
 	grid.LastAttempt = time.Now()
 	snapshot := *grid
 	g.gridsMu.Unlock()
+
+	// T024: Log placement price wait duration
+	g.logger.WithFields(logrus.Fields{
+		"symbol":           symbol,
+		"current_price":    grid.CurrentPrice,
+		"price_wait_ms":    time.Since(priceWaitStart).Milliseconds(),
+		"total_elapsed_ms": time.Since(placementStart).Milliseconds(),
+	}).Info("[PLACEMENT] Price verified, proceeding with placement")
 
 	if ctx.Err() != nil {
 		g.logger.WithField("symbol", symbol).Warn("Context cancelled during placement")
@@ -1748,6 +1935,40 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	minSuccessRate := 0.8
 	successRate := float64(placed) / float64(expectedOrders)
 	g.finishPlacement(symbol, successRate >= minSuccessRate || placed > 0)
+}
+
+// T015: fetchExchangeDataAsync fetches exchange orders with context timeout support
+func (g *GridManager) fetchExchangeDataAsync(ctx context.Context, symbol string) ([]client.Order, error) {
+	return g.futuresClient.GetOpenOrders(ctx, symbol)
+}
+
+// getCachedExchangeOrders returns cached orders if valid (TTL 1s)
+func (g *GridManager) getCachedExchangeOrders(symbol string) ([]client.Order, bool) {
+	g.exchangeOrderCacheMu.RLock()
+	defer g.exchangeOrderCacheMu.RUnlock()
+
+	entry, exists := g.exchangeOrderCache[symbol]
+	if !exists {
+		return nil, false
+	}
+
+	// Check TTL
+	if time.Since(entry.Timestamp) > g.exchangeOrderCacheTTL {
+		return nil, false
+	}
+
+	return entry.Orders, true
+}
+
+// cacheExchangeOrders stores orders in cache with timestamp
+func (g *GridManager) cacheExchangeOrders(symbol string, orders []client.Order) {
+	g.exchangeOrderCacheMu.Lock()
+	defer g.exchangeOrderCacheMu.Unlock()
+
+	g.exchangeOrderCache[symbol] = &ExchangeOrderCacheEntry{
+		Orders:    orders,
+		Timestamp: time.Now(),
+	}
 }
 
 func (g *GridManager) countActiveGridOrders(symbol string) int {
@@ -1782,11 +2003,25 @@ func (g *GridManager) finishPlacement(symbol string, placed bool) {
 }
 
 func (g *GridManager) enqueuePlacement(symbol string) {
+	g.logger.WithField("symbol", symbol).Warn(">>> CALLING ENQUEUE PLACEMENT <<<")
+
+	// T027: Blocking enqueue with 500ms timeout instead of immediate skip
+	start := time.Now()
 	select {
 	case g.placementQueue <- symbol:
-		g.logger.WithField("symbol", symbol).Info("Enqueued placement for symbol")
-	default:
-		g.logger.WithField("symbol", symbol).Warn("Placement queue full, skipping grid seed")
+		// T029: Log queue wait duration
+		waitMs := time.Since(start).Milliseconds()
+		g.logger.WithFields(logrus.Fields{
+			"symbol":        symbol,
+			"queue_wait_ms": waitMs,
+		}).Warn(">>> ENQUEUED PLACEMENT SUCCESS <<<")
+	case <-time.After(500 * time.Millisecond):
+		// T027: Timeout - queue full for too long
+		g.logger.WithFields(logrus.Fields{
+			"symbol":        symbol,
+			"timeout_ms":    500,
+			"queue_wait_ms": time.Since(start).Milliseconds(),
+		}).Error(">>> PLACEMENT QUEUE FULL - TIMEOUT SKIPPING <<<")
 		g.gridsMu.Lock()
 		if grid, exists := g.activeGrids[symbol]; exists {
 			grid.PlacementBusy = false

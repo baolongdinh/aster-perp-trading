@@ -9,17 +9,18 @@ Agentic Trading là hệ thống giao dịch thông minh tự động điều ch
 
 | Chế Độ | Đặc Điểm | Chiến Lược Grid |
 |--------|----------|-----------------|
-| **Sideways** | Giá dao động trong biên độ hẹp, ADX thấp | Grid spacing nhỏ (0.3%), lướt sóng ngắn |
-| **Trending** | Xu hướng rõ ràng, EMA xếp chồng | Grid spacing lớn (1-2%), position size giảm |
-| **Volatile** | Biến động cao, ATR tăng đột biến | **Ngừng giao dịch** hoặc position size cực nhỏ |
-| **Recovery** | Hồi phục sau volatility spike | Chờ confirm trend, spacing vừa phải |
+| **Sideways** | Giá dao động trong biên độ hẹp, ADX thấp | Grid spacing 0.15% (config), lướt sóng ngắn |
+| **Trending** | Xu hướng rõ ràng, EMA xếp chồng | Grid spacing 0.15%, position size giảm theo regime multiplier |
+| **Volatile** | Biến động cao, ATR tăng đột biến | Position size giảm 50% (multiplier 0.5), không ngừng giao dịch |
+| **Recovery** | Hồi phục sau volatility spike | Grid spacing 0.15%, chờ confirm trend |
 
 ### 1.3 Điểm Số Triển Khai (0-100)
 
 ```
-≥75 điểm: Triển khai full size
-60-74 điểm: Triển khai reduced size (50%)
-<60 điểm: Chờ đợi, không triển khai
+≥70 điểm (high_score): Triển khai full size (multiplier 1.0)
+50-69 điểm (medium_score): Triển khai reduced size (multiplier 0.6)
+35-49 điểm (low_score): Monitor only, giảm size (multiplier 0.3)
+<35 điểm (skip_score): Chờ đợi, không triển khai
 ```
 
 ---
@@ -30,7 +31,7 @@ Agentic Trading là hệ thống giao dịch thông minh tự động điều ch
 1. **Load dữ liệu lịch sử**: Hệ thống tự động tải 1000 nến gần nhất từ API
 2. **Tính toán chỉ báo**: ADX, Bollinger Band, ATR, EMA (9, 21, 50, 200)
 3. **Xác định chế độ**: Phân tích chỉ báo để xác định regime hiện tại
-4. **Sẵn sàng giao dịch**: Chờ 2 lần đọc regime liên tiếp giống nhau (hysteresis)
+4. **Sẵn sàng giao dịch**: Chờ tích lũy đủ dữ liệu (không cần 2 lần đọc giống nhau)
 
 ### 2.2 Pattern Learning Phase
 - **Giai đoạn 1 (0-200 trades)**: Chỉ thu thập dữ liệu, chưa dùng pattern
@@ -41,15 +42,15 @@ Agentic Trading là hệ thống giao dịch thông minh tự động điều ch
 
 ## 3. Circuit Breakers - Cầu Chì An Toàn
 
-### 3.1 5 Cầu Chì Tự Động
+### 3.1 3 Cầu Chì Tự Động (Đã Implement)
 
 | Cầu Chì | Điều Kiện Kích Hoạt | Hành Động | Ưu Tiên |
 |---------|---------------------|-----------|---------|
-| **Drawdown Limit** | Drawdown portfolio > 10% | Đóng toàn bộ vị thế, dừng bot | 1 (Cao nhất) |
-| **Volatility Spike** | ATR tăng 3x trong 5 phút | Đóng khẩn cấp, chờ ổn định | 2 |
-| **Liquidity Crisis** | Spread bid-ask > 5x bình thường | Ngừng đặt lệnh mới | 3 |
-| **Consecutive Losses** | 3 chu kỳ grid liên tiếp lỗ | Giảm 50% kích thước lệnh | 4 |
-| **Connection Failure** | Mất kết nối API 3 lần liên tiếp | Ngừng hoạt động, cảnh báo | 5 |
+| **Volatility Spike** | ATR tăng đột biến | Giảm position size, tăng spread | 1 |
+| **Liquidity Crisis** | Spread bid-ask bất thường | Ngừng đặt lệnh mới | 2 |
+| **Consecutive Losses** | Nhiều lệnh lỗ liên tiếp | Giảm 50% kích thước lệnh | 3 |
+
+> **Note**: Drawdown Limit và Connection Failure chưa được implement trong version hiện tại.
 
 ### 3.2 Reset Cầu Chì
 - **Tự động**: Sau thời gian chờ (30s - 5 phút tùy cầu chì)

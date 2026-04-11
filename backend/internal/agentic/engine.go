@@ -204,9 +204,13 @@ func (ae *AgenticEngine) runDetectionCycle(ctx context.Context) error {
 		return nil
 	}
 
-	// 4. Update whitelist
-	if err := ae.whitelistManager.UpdateWhitelist(ctx, scores); err != nil {
-		return fmt.Errorf("failed to update whitelist: %w", err)
+	// 4. Update whitelist (only if enabled)
+	if ae.config.WhitelistManagement.Enabled {
+		if err := ae.whitelistManager.UpdateWhitelist(ctx, scores); err != nil {
+			return fmt.Errorf("failed to update whitelist: %w", err)
+		}
+	} else {
+		ae.logger.Debug("Whitelist management disabled, using VF whitelist")
 	}
 
 	// 5. Store scores

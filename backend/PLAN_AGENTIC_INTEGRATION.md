@@ -130,13 +130,6 @@ agentic:
       - BTCUSD1
       - ETHUSD1
       - SOLUSD1
-      - LINKUSD1
-      - DOGEUSD1
-      - XRPUSD1
-      - ADAUSD1
-      - AVAXUSD1
-      - MATICUSD1
-      - DOTUSD1
     
     # Hoặc auto-discover từ top volume
     auto_discover: false

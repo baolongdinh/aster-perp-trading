@@ -2084,22 +2084,27 @@ func (a *AdaptiveGridManager) AddPriceData(high, low, close float64) {
 
 // UpdatePriceData feeds price data to all calculators (called from WebSocket)
 func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, bid, ask float64) {
+	a.logger.Warn(">>> UpdatePriceData START <<<")
 	a.mu.Lock()
+	a.logger.Warn(">>> UpdatePriceData LOCK ACQUIRED <<<")
 	defer a.mu.Unlock()
 
 	// Feed ATR calculator
 	if a.atrCalc != nil {
 		a.atrCalc.AddPrice(high, low, close)
 	}
+	a.logger.Warn(">>> ATR DONE <<<")
 
 	// Feed RSI calculator
 	if a.rsiCalc != nil {
 		a.rsiCalc.AddPrice(close)
 	}
+	a.logger.Warn(">>> RSI DONE <<<")
 
 	// Feed TrendDetector
 	if a.trendDetector != nil {
 		a.trendDetector.UpdatePrice(close, 0)
+		a.logger.Warn(">>> TREND DETECTOR UPDATE DONE <<<")
 
 		// STRICT: Đóng tất cả lệnh khi strong trend detected
 		if a.trendDetector.GetTrendScore() >= 6 {
@@ -2107,20 +2112,24 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 			a.handleStrongTrend(context.Background(), symbol, close, state)
 		}
 	}
+	a.logger.Warn(">>> TREND DETECTOR DONE <<<")
 
 	// Feed SpreadProtection
 	if a.spreadProtection != nil && bid > 0 && ask > 0 {
 		a.spreadProtection.UpdateOrderbook(bid, ask)
 	}
+	a.logger.Warn(">>> SPREAD PROTECTION DONE <<<")
 
 	// Feed DynamicSpreadCalculator
 	if a.dynamicSpreadCalc != nil {
 		a.dynamicSpreadCalc.UpdateATR(high, low, close)
 	}
+	a.logger.Warn(">>> DYNAMIC SPREAD DONE <<<")
 
 	// CRITICAL: Feed RangeDetector for breakout detection
 	// This enables the "con rắn săn mồi" - patience mechanism + breakout protection
 	a.UpdatePriceForRange(symbol, high, low, close)
+	a.logger.Warn(">>> RANGE UPDATE DONE <<<")
 }
 
 // RecordTradeResult records trade result for loss tracking with cooldown
@@ -2238,22 +2247,22 @@ func (a *AdaptiveGridManager) InitializeRangeDetector(symbol string, config *Ran
 }
 
 // UpdatePriceForRange updates price data for range detection
-func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, close float64) {
-	a.mu.RLock()
-	detector, exists := a.rangeDetectors[symbol]
-	a.mu.RUnlock()
+// NOTE: This function assumes the caller already holds a.mu.Lock()!
+func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, closePrice float64) {
+	// IMPORTANT: Do NOT acquire any lock here - caller UpdatePriceData already holds a.mu.Lock()
+	// Attempting to acquire RLock while holding Lock causes deadlock in Go's sync.RWMutex
 
+	detector, exists := a.rangeDetectors[symbol]
 	if !exists {
-		// Auto-initialize if not exists
-		a.InitializeRangeDetector(symbol, nil)
-		detector, _ = a.rangeDetectors[symbol]
+		// Skip if detector not initialized - will be initialized elsewhere
+		return
 	}
 
-	detector.AddPrice(high, low, close)
+	detector.AddPrice(high, low, closePrice)
 
 	// Check for breakout and handle
 	if detector.IsBreakout() {
-		a.handleBreakout(context.Background(), symbol, close)
+		a.handleBreakout(context.Background(), symbol, closePrice)
 	}
 }
 

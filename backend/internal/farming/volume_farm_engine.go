@@ -143,17 +143,28 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		zap.Float64("threshold", corrThreshold))
 
 	logrusEntry := logrus.NewEntry(logrus.StandardLogger()).WithField("component", "volume_farm")
+
+	// Create shared WebSocket client for both SymbolSelector and GridManager
+	zapLogger, _ := zap.NewDevelopment()
+	wsURL := buildTickerStreamURL(volumeConfig.Exchange.FuturesWSBase, volumeConfig.TickerStream)
+	if wsURL == "" {
+		wsURL = "wss://fstream.asterdex.com/ws/!ticker@arr"
+	}
+	sharedWSClient := client.NewWebSocketClient(wsURL, zapLogger)
+
 	engine.symbolSelector = NewSymbolSelector(engine.futuresClient, logrusEntry.WithField("component", "symbol_selector"), volumeConfig)
+	engine.symbolSelector.SetWebSocketClient(sharedWSClient)
 
 	gridLogger := logrusEntry.WithField("component", "grid_manager")
 	engine.gridManager = NewGridManager(engine.futuresClient, gridLogger, volumeConfig)
+	engine.gridManager.SetWebSocketClient(sharedWSClient)
 	engine.gridManager.ApplyConfig(volumeConfig)
 
 	pointsLogger := logrusEntry.WithField("component", "points_tracker")
 	engine.pointsTracker = NewPointsTracker(volumeConfig, pointsLogger)
 
 	// Initialize adaptive configuration
-	configManager := adaptive_config.NewAdaptiveConfigManager("", logger)
+	configManager := adaptive_config.NewAdaptiveConfigManager("config/adaptive_config.yaml", logger)
 	engine.configManager = configManager
 
 	// Initialize regime detector
@@ -373,18 +384,44 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 	e.logger.Info("Syncing grid symbols")
 
 	activeSymbols := e.symbolSelector.GetActiveSymbols()
+
+	// Get whitelist from symbol selector (updated by Agentic layer)
+	whitelist := e.symbolSelector.GetWhitelist()
+
+	// FALLBACK: If agentic whitelist is empty, use config whitelist
+	if len(whitelist) == 0 && len(e.volumeConfig.Symbols.Whitelist) > 0 {
+		whitelist = e.volumeConfig.Symbols.Whitelist
+		e.logger.Info("Using config whitelist (agentic whitelist empty)", zap.Strings("whitelist", whitelist))
+	}
+
+	// HARDCODE: Always ensure BTC, ETH, SOL are in whitelist
+	hardcodedSymbols := []string{"BTCUSD1", "ETHUSD1", "SOLUSD1"}
+	for _, sym := range hardcodedSymbols {
+		found := false
+		for _, w := range whitelist {
+			if w == sym {
+				found = true
+				break
+			}
+		}
+		if !found {
+			whitelist = append(whitelist, sym)
+			e.logger.Info("HARDCODED symbol added to whitelist", zap.String("symbol", sym))
+		}
+	}
+
 	e.logger.Info("Active symbols from selector", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
 		syms := make([]string, len(activeSymbols))
 		for i, s := range activeSymbols {
 			syms[i] = s.Symbol
 		}
 		return syms
-	}()))
+	}()), zap.Strings("whitelist_from_selector", whitelist))
 
 	// Always include whitelist symbols
-	if len(e.volumeConfig.Symbols.Whitelist) > 0 {
+	if len(whitelist) > 0 {
 		whitelistSymbols := make(map[string]bool)
-		for _, sym := range e.volumeConfig.Symbols.Whitelist {
+		for _, sym := range whitelist {
 			whitelistSymbols[sym] = true
 		}
 		for _, s := range activeSymbols {
@@ -414,10 +451,10 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 		e.logger.Info("Added whitelist to active symbols", zap.Int("total_count", len(activeSymbols)))
 	}
 
-	if len(activeSymbols) == 0 {
+	if len(activeSymbols) == 0 && len(whitelist) > 0 {
 		e.logger.Info("No symbols from selector, adding whitelist symbols only")
 		// Only add whitelist symbols with USD1 quote - NO USDT
-		whitelistOnly := e.createWhitelistSymbols()
+		whitelistOnly := e.createWhitelistSymbolsFromList(whitelist)
 		activeSymbols = append(activeSymbols, whitelistOnly...)
 	}
 
@@ -469,8 +506,14 @@ func (e *VolumeFarmEngine) setLeverageForSymbols(symbols []*SymbolData) {
 }
 
 func (e *VolumeFarmEngine) createWhitelistSymbols() []*SymbolData {
-	symbols := make([]*SymbolData, 0, len(e.volumeConfig.Symbols.Whitelist))
-	for _, symbol := range e.volumeConfig.Symbols.Whitelist {
+	// Use whitelist from symbol selector (updated by Agentic layer)
+	whitelist := e.symbolSelector.GetWhitelist()
+	return e.createWhitelistSymbolsFromList(whitelist)
+}
+
+func (e *VolumeFarmEngine) createWhitelistSymbolsFromList(whitelist []string) []*SymbolData {
+	symbols := make([]*SymbolData, 0, len(whitelist))
+	for _, symbol := range whitelist {
 		// Extract quote currency
 		quote := ""
 		for _, qc := range e.volumeConfig.Symbols.QuoteCurrencies {
@@ -480,6 +523,7 @@ func (e *VolumeFarmEngine) createWhitelistSymbols() []*SymbolData {
 			}
 		}
 		if quote == "" {
+			e.logger.Warn("Cannot extract quote currency for whitelist symbol", zap.String("symbol", symbol))
 			continue
 		}
 
@@ -494,6 +538,7 @@ func (e *VolumeFarmEngine) createWhitelistSymbols() []*SymbolData {
 			Volume24h:  1000000, // Dummy volume
 			Count24h:   1000,
 		})
+		e.logger.Info("Created whitelist symbol", zap.String("symbol", symbol), zap.String("base", base), zap.String("quote", quote))
 	}
 	return symbols
 }

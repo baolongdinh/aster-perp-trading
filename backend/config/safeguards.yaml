@@ -211,7 +211,7 @@ safeguards:
     #   - 50ms: Rất nhạy
     #   - 100ms: Cân bằng (default)
     #   - 200ms: Chỉ log khi rất chậm
-    slow_threshold: 100ms
+    slow_threshold: 100
 
   # ---------------------------------------------------------------------------
   # ALERT SETTINGS

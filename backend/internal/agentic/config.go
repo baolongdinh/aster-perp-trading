@@ -6,31 +6,31 @@ import (
 
 // AgenticConfig holds the agentic decision layer configuration
 type AgenticConfig struct {
-	Enabled              bool                  `mapstructure:"enabled" yaml:"enabled"`
-	Universe             UniverseConfig        `mapstructure:"universe" yaml:"universe"`
-	RegimeDetection      RegimeDetectionConfig `mapstructure:"regime_detection" yaml:"regime_detection"`
-	Scoring              ScoringConfig         `mapstructure:"scoring" yaml:"scoring"`
-	PositionSizing       PositionSizingConfig  `mapstructure:"position_sizing" yaml:"position_sizing"`
-	WhitelistManagement  WhitelistConfig       `mapstructure:"whitelist_management" yaml:"whitelist_management"`
-	CircuitBreakers      CircuitBreakerConfig  `mapstructure:"circuit_breakers" yaml:"circuit_breakers"`
+	Enabled             bool                  `mapstructure:"enabled" yaml:"enabled"`
+	Universe            UniverseConfig        `mapstructure:"universe" yaml:"universe"`
+	RegimeDetection     RegimeDetectionConfig `mapstructure:"regime_detection" yaml:"regime_detection"`
+	Scoring             ScoringConfig         `mapstructure:"scoring" yaml:"scoring"`
+	PositionSizing      PositionSizingConfig  `mapstructure:"position_sizing" yaml:"position_sizing"`
+	WhitelistManagement WhitelistConfig       `mapstructure:"whitelist_management" yaml:"whitelist_management"`
+	CircuitBreakers     CircuitBreakerConfig  `mapstructure:"circuit_breakers" yaml:"circuit_breakers"`
 }
 
 // UniverseConfig defines the symbol universe for monitoring
 type UniverseConfig struct {
-	Symbols          []string `mapstructure:"symbols" yaml:"symbols"`
-	AutoDiscover     bool     `mapstructure:"auto_discover" yaml:"auto_discover"`
-	TopVolumeCount   int      `mapstructure:"top_volume_count" yaml:"top_volume_count"`
-	Min24hVolumeUSD  float64  `mapstructure:"min_24h_volume_usd" yaml:"min_24h_volume_usd"`
+	Symbols         []string `mapstructure:"symbols" yaml:"symbols"`
+	AutoDiscover    bool     `mapstructure:"auto_discover" yaml:"auto_discover"`
+	TopVolumeCount  int      `mapstructure:"top_volume_count" yaml:"top_volume_count"`
+	Min24hVolumeUSD float64  `mapstructure:"min_24h_volume_usd" yaml:"min_24h_volume_usd"`
 }
 
 // RegimeDetectionConfig configures regime detection parameters
 type RegimeDetectionConfig struct {
-	UpdateInterval time.Duration         `mapstructure:"update_interval" yaml:"update_interval"`
-	ADXPeriod      int                   `mapstructure:"adx_period" yaml:"adx_period"`
-	BBPeriod       int                   `mapstructure:"bb_period" yaml:"bb_period"`
-	ATRPeriod      int                   `mapstructure:"atr_period" yaml:"atr_period"`
-	CandleInterval string                `mapstructure:"candle_interval" yaml:"candle_interval"`
-	Thresholds     RegimeThresholdsConfig  `mapstructure:"thresholds" yaml:"thresholds"`
+	UpdateInterval time.Duration          `mapstructure:"update_interval" yaml:"update_interval"`
+	ADXPeriod      int                    `mapstructure:"adx_period" yaml:"adx_period"`
+	BBPeriod       int                    `mapstructure:"bb_period" yaml:"bb_period"`
+	ATRPeriod      int                    `mapstructure:"atr_period" yaml:"atr_period"`
+	CandleInterval string                 `mapstructure:"candle_interval" yaml:"candle_interval"`
+	Thresholds     RegimeThresholdsConfig `mapstructure:"thresholds" yaml:"thresholds"`
 }
 
 // RegimeThresholdsConfig defines thresholds for regime classification
@@ -43,7 +43,7 @@ type RegimeThresholdsConfig struct {
 // ScoringConfig configures the opportunity scoring system
 type ScoringConfig struct {
 	Weights    ScoringWeightsConfig    `mapstructure:"weights" yaml:"weights"`
-	Thresholds  ScoringThresholdsConfig  `mapstructure:"thresholds" yaml:"thresholds"`
+	Thresholds ScoringThresholdsConfig `mapstructure:"thresholds" yaml:"thresholds"`
 }
 
 // ScoringWeightsConfig defines weights for score calculation
@@ -64,23 +64,29 @@ type ScoringThresholdsConfig struct {
 
 // PositionSizingConfig configures dynamic position sizing
 type PositionSizingConfig struct {
-	ScoreMultipliers   map[string]float64 `mapstructure:"score_multipliers" yaml:"score_multipliers"`
-	RegimeMultipliers  map[string]float64 `mapstructure:"regime_multipliers" yaml:"regime_multipliers"`
+	ScoreMultipliers  map[string]float64 `mapstructure:"score_multipliers" yaml:"score_multipliers"`
+	RegimeMultipliers map[string]float64 `mapstructure:"regime_multipliers" yaml:"regime_multipliers"`
 }
 
 // WhitelistConfig configures whitelist management
 type WhitelistConfig struct {
-	MaxSymbols            int    `mapstructure:"max_symbols" yaml:"max_symbols"`
-	MinScoreToAdd         float64 `mapstructure:"min_score_to_add" yaml:"min_score_to_add"`
-	ScoreToRemove         float64 `mapstructure:"score_to_remove" yaml:"score_to_remove"`
-	KeepIfPositionOpen    bool   `mapstructure:"keep_if_position_open" yaml:"keep_if_position_open"`
-	ReplaceImmediately    bool   `mapstructure:"replace_immediately" yaml:"replace_immediately"`
+	Enabled            bool    `mapstructure:"enabled" yaml:"enabled"`
+	MaxSymbols         int     `mapstructure:"max_symbols" yaml:"max_symbols"`
+	MinScoreToAdd      float64 `mapstructure:"min_score_to_add" yaml:"min_score_to_add"`
+	ScoreToRemove      float64 `mapstructure:"score_to_remove" yaml:"score_to_remove"`
+	KeepIfPositionOpen bool    `mapstructure:"keep_if_position_open" yaml:"keep_if_position_open"`
+	ReplaceImmediately bool    `mapstructure:"replace_immediately" yaml:"replace_immediately"`
+}
+
+// IsEnabled returns whether whitelist management is enabled
+func (w WhitelistConfig) IsEnabled() bool {
+	return w.Enabled
 }
 
 // CircuitBreakerConfig configures circuit breaker rules
 type CircuitBreakerConfig struct {
-	VolatilitySpike    VolatilityBreakerConfig    `mapstructure:"volatility_spike" yaml:"volatility_spike"`
-	ConsecutiveLosses  ConsecutiveLossBreakerConfig `mapstructure:"consecutive_losses" yaml:"consecutive_losses"`
+	VolatilitySpike   VolatilityBreakerConfig      `mapstructure:"volatility_spike" yaml:"volatility_spike"`
+	ConsecutiveLosses ConsecutiveLossBreakerConfig `mapstructure:"consecutive_losses" yaml:"consecutive_losses"`
 }
 
 // VolatilityBreakerConfig configures volatility-based circuit breaker
@@ -91,9 +97,9 @@ type VolatilityBreakerConfig struct {
 
 // ConsecutiveLossBreakerConfig configures loss-based circuit breaker
 type ConsecutiveLossBreakerConfig struct {
-	Enabled         bool    `mapstructure:"enabled" yaml:"enabled"`
-	Threshold       int     `mapstructure:"threshold" yaml:"threshold"`
-	SizeReduction   float64 `mapstructure:"size_reduction" yaml:"size_reduction"`
+	Enabled       bool    `mapstructure:"enabled" yaml:"enabled"`
+	Threshold     int     `mapstructure:"threshold" yaml:"threshold"`
+	SizeReduction float64 `mapstructure:"size_reduction" yaml:"size_reduction"`
 }
 
 // DefaultAgenticConfig returns sensible defaults
@@ -102,9 +108,7 @@ func DefaultAgenticConfig() *AgenticConfig {
 		Enabled: true,
 		Universe: UniverseConfig{
 			Symbols: []string{
-				"BTCUSD1", "ETHUSD1", "SOLUSD1", "LINKUSD1",
-				"DOGEUSD1", "XRPUSD1", "ADAUSD1", "AVAXUSD1",
-				"MATICUSD1", "DOTUSD1",
+				"BTCUSD1", "ETHUSD1", "SOLUSD1",
 			},
 			AutoDiscover:    false,
 			TopVolumeCount:  20,

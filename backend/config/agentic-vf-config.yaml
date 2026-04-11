@@ -23,16 +23,9 @@ agentic:
   # Symbol universe - các cặp agentic sẽ theo dõi và đánh giá
   universe:
     symbols:
-      - BTCUSD1
+      - BTCUSD1  # RESTORED: Fixed precision handling
       - ETHUSD1
       - SOLUSD1
-      - LINKUSD1
-      - DOGEUSD1
-      - XRPUSD1
-      - ADAUSD1
-      - AVAXUSD1
-      - MATICUSD1
-      - DOTUSD1
     
     # Hoặc auto-discover từ top volume
     auto_discover: false
@@ -61,9 +54,9 @@ agentic:
       structure: 0.20
     
     thresholds:
-      high_score: 75      # Deploy full
-      medium_score: 60    # Deploy reduced
-      low_score: 40       # Monitor only
+      high_score: 70      # Deploy full (giảm từ 75)
+      medium_score: 50    # Deploy reduced (giảm từ 60)
+      low_score: 35       # Monitor only (giảm từ 40)
       skip_score: 0       # Skip
   
   # Position Sizing per Regime
@@ -79,13 +72,14 @@ agentic:
       VOLATILE: 0.5     # Giảm nhiều hơn
       RECOVERY: 0.8     # Cẩn trọng
   
-  # Whitelist Management
+  # Whitelist Management - DISABLED, use VF whitelist instead
   whitelist_management:
-    max_symbols: 5              # Tối đa symbols trong whitelist
-    min_score_to_add: 60        # Score tối thiểu để thêm vào whitelist
-    score_to_remove: 35         # Score dưới này thì remove
-    keep_if_position_open: true # Giữ symbol nếu đang có position
-    replace_immediately: true   # Thay thế ngay khi có symbol tốt hơn
+    enabled: false              # TẮT - dùng VF whitelist cố định
+    max_symbols: 5              # Không dùng khi enabled=false
+    min_score_to_add: 45
+    score_to_remove: 30
+    keep_if_position_open: true
+    replace_immediately: true
   
   # Circuit Breakers (override VF breakers nếu cần)
   circuit_breakers:
@@ -108,13 +102,23 @@ volume_farming:
 
   max_daily_loss_usdt: 3
   max_total_drawdown_pct: 50.0
+  # RESTORED: larger order size (ensure account has enough margin)
   order_size_usdt: 20.5
   grid_spread_pct: 0.0015
+  # RESTORED: more orders per side (ensure account has enough notional limit)
   max_orders_per_side: 10
   max_global_pending_limit_orders: 30
   max_pending_per_side: 15
   replace_immediately: true
   position_timeout_minutes: 5
+
+  # Time Filter - Enable/disable trading hours restriction
+  time_filter:
+    enabled: false  # Set to true to enable trading hours restriction
+    trading_hours:
+      start: "00:00"  # 24h format, UTC
+      end: "23:59"    # 24h format, UTC
+    days: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
   ticker_stream: "!ticker@arr"
   symbol_refresh_interval_seconds: 60
@@ -146,8 +150,8 @@ volume_farming:
     
     # Whitelist sẽ được agentic quản lý động
     # Nếu agentic.enabled = true, whitelist này sẽ bị override
-    whitelist: ["ETHUSD1"]
-    blacklist: []
+    whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1"]
+    blacklist: []  # BTC restored - precision fixed
 
   # Exchange Configuration
   exchange:
