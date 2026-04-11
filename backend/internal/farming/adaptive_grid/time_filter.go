@@ -113,9 +113,11 @@ func DefaultTradingHoursConfig() *TradingHoursConfig {
 					End:      "01:00",
 					Timezone: "Asia/Ho_Chi_Minh",
 				},
-				Enabled:        false, // Đóng cửa phiên Mỹ
-				SizeMultiplier: 0.0,
-				Description:    "Đóng cửa - Không trade",
+				Enabled:          true, // Enabled for overnight trading
+				SizeMultiplier:   0.5,  // Reduce 50% - Low volume period
+				MaxExposurePct:   0.2,  // Lower exposure
+				SpreadMultiplier: 1.5,  // Wider spreads due to low liquidity
+				Description:      "Phiên khuya Mỹ - Thấp điểm (Cautious)",
 			},
 			{
 				Window: TimeWindow{

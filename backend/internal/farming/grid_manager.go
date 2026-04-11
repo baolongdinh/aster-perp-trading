@@ -133,17 +133,19 @@ func (g *GridManager) SetWebSocketClient(wsClient *client.WebSocketClient) {
 
 // SymbolGrid represents a grid for a specific symbol.
 type SymbolGrid struct {
-	Symbol        string    `json:"symbol"`
-	QuoteCurrency string    `json:"quote_currency"`
-	GridSpreadPct float64   `json:"grid_spread"`
-	MaxOrdersSide int       `json:"max_orders"`
-	CurrentPrice  float64   `json:"current_price"`
-	MidPrice      float64   `json:"mid_price"`
-	IsActive      bool      `json:"is_active"`
-	LastUpdate    time.Time `json:"last_update"`
-	OrdersPlaced  bool      `json:"orders_placed"`
-	PlacementBusy bool      `json:"placement_busy"`
-	LastAttempt   time.Time `json:"last_attempt"`
+	Symbol          string    `json:"symbol"`
+	QuoteCurrency   string    `json:"quote_currency"`
+	GridSpreadPct   float64   `json:"grid_spread"`
+	MaxOrdersSide   int       `json:"max_orders"`
+	CurrentPrice    float64   `json:"current_price"`
+	MidPrice        float64   `json:"mid_price"`
+	GridCenterPrice float64   `json:"grid_center_price"` // Track grid center for dynamic recentering
+	IsActive        bool      `json:"is_active"`
+	LastUpdate      time.Time `json:"last_update"`
+	OrdersPlaced    bool      `json:"orders_placed"`
+	PlacementBusy   bool      `json:"placement_busy"`
+	LastAttempt     time.Time `json:"last_attempt"`
+	LastRecenter    time.Time `json:"last_recenter"` // Prevent excessive recentering
 }
 
 // GridOrder represents an order in the grid.
@@ -169,7 +171,7 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 	zapLogger, _ := zap.NewDevelopment()
 
 	// Use config values or defaults
-	baseNotional := 5.0
+	baseNotional := 20.0
 	gridSpread := 0.005
 	maxOrdersSide := 3
 	placementCooldown := 500 * time.Millisecond
@@ -447,6 +449,15 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 		}
 		g.logger.WithField("symbol", symbol).Warn(">>> AFTER adaptiveMgr block <<<")
 
+		// NEW: Check if grid needs recentering for dynamic grid
+		if recentered := g.checkAndRecenterGrid(grid); recentered {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"old_center": oldPrice,
+				"new_center": grid.GridCenterPrice,
+			}).Info("DYNAMIC GRID: Grid recentered, will rebuild with new center")
+		}
+
 		if oldPrice != lastPrice && oldPrice != 0 {
 			g.logger.WithFields(logrus.Fields{
 				"symbol":    symbol,
@@ -464,6 +475,8 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 				"placement_busy": grid.PlacementBusy,
 				"grid_exists":    exists,
 			}).Warn(">>> FIRST PRICE RECEIVED - WILL ENQUEUE PLACEMENT <<<")
+			// Initialize grid center with first price
+			grid.GridCenterPrice = lastPrice
 			grid.PlacementBusy = true
 			symbolsToEnqueue = append(symbolsToEnqueue, symbol)
 		} else if g.shouldSchedulePlacement(grid, oldPrice) {
@@ -602,6 +615,131 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 	return false
 }
 
+// checkAndRecenterGrid checks if grid needs recentering due to price movement
+// Returns true if recentering was performed
+func (g *GridManager) checkAndRecenterGrid(grid *SymbolGrid) bool {
+	if grid == nil || !grid.IsActive || grid.CurrentPrice <= 0 {
+		return false
+	}
+
+	// Initialize center if not set
+	if grid.GridCenterPrice <= 0 {
+		grid.GridCenterPrice = grid.CurrentPrice
+		return false
+	}
+
+	// Calculate how far price moved from center
+	center := grid.GridCenterPrice
+	current := grid.CurrentPrice
+	distancePct := math.Abs(current-center) / center
+
+	// Calculate grid range (half of total grid span)
+	// Grid spans from: center - (spread * maxOrders) to center + (spread * maxOrders)
+	gridSpread := grid.GridSpreadPct / 100
+	halfGridRange := gridSpread * float64(grid.MaxOrdersSide)
+
+	// Recenter threshold: when price moves beyond 85% of half grid range
+	// Higher threshold for micro profit - let orders live longer to capture fills
+	// 85% means outermost orders are still within effective range
+	recenterThreshold := halfGridRange * 0.85
+
+	// Minimum recenter interval: 2 minutes for micro grid stability
+	// Shorter intervals cause missed fills due to frequent cancellations
+	minRecenterInterval := 2 * time.Minute
+	if time.Since(grid.LastRecenter) < minRecenterInterval {
+		return false
+	}
+
+	// CRITICAL: For micro profit, check if we have pending fills near current price
+	// Don't recenter if recent fills happened - let grid complete its job
+	recentFill := false
+	if g.filledOrders != nil {
+		for _, order := range g.filledOrders {
+			if order.Symbol == grid.Symbol && time.Since(order.FilledAt) < 30*time.Second {
+				recentFill = true
+				break
+			}
+		}
+	}
+
+	if recentFill {
+		g.logger.WithField("symbol", grid.Symbol).Debug("Skipping recenter - recent fill detected, let grid stabilize")
+		return false
+	}
+
+	if distancePct >= recenterThreshold {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":          grid.Symbol,
+			"center":          center,
+			"current":         current,
+			"distance_pct":    distancePct,
+			"threshold":       recenterThreshold,
+			"half_grid_range": halfGridRange,
+			"cooldown":        minRecenterInterval,
+		}).Info("DYNAMIC GRID: Recentering grid due to significant price movement")
+
+		// Cancel all existing grid orders (they're too far from new center)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		cancelled := g.cancelAllGridOrders(ctx, grid.Symbol)
+		g.logger.WithFields(logrus.Fields{
+			"symbol":    grid.Symbol,
+			"cancelled": cancelled,
+		}).Info("DYNAMIC GRID: Cancelled old orders for recentering")
+
+		// Update center to current price
+		grid.GridCenterPrice = current
+		grid.MidPrice = current
+		grid.LastRecenter = time.Now()
+		grid.OrdersPlaced = false // Force full rebuild
+
+		return true
+	}
+
+	return false
+}
+
+// cancelAllGridOrders cancels all active grid orders for a symbol via API
+func (g *GridManager) cancelAllGridOrders(ctx context.Context, symbol string) int {
+	g.ordersMu.Lock()
+	var ordersToCancel []*GridOrder
+	for _, order := range g.activeOrders {
+		if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
+			ordersToCancel = append(ordersToCancel, order)
+		}
+	}
+	g.ordersMu.Unlock()
+
+	cancelled := 0
+	for _, order := range ordersToCancel {
+		orderIDInt, _ := strconv.ParseInt(order.OrderID, 10, 64)
+		if orderIDInt == 0 {
+			// Skip orders without valid order ID
+			continue
+		}
+		_, err := g.futuresClient.CancelOrder(ctx, client.CancelOrderRequest{
+			Symbol:  order.Symbol,
+			OrderID: orderIDInt,
+		})
+		if err != nil {
+			g.logger.WithError(err).WithFields(logrus.Fields{
+				"symbol":  order.Symbol,
+				"orderID": order.OrderID,
+			}).Warn("Failed to cancel order during recenter")
+		} else {
+			// Remove from active orders on success
+			g.ordersMu.Lock()
+			delete(g.activeOrders, order.OrderID)
+			order.Status = "CANCELLED"
+			g.ordersMu.Unlock()
+			cancelled++
+		}
+	}
+
+	return cancelled
+}
+
 // UpdateSymbols updates the list of symbols to manage.
 func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 	desired := make(map[string]*SymbolData, len(symbols))
@@ -618,12 +756,13 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 			continue
 		}
 		g.activeGrids[symbol] = &SymbolGrid{
-			Symbol:        symbolData.Symbol,
-			QuoteCurrency: symbolData.QuoteAsset,
-			GridSpreadPct: g.gridSpreadPct,
-			MaxOrdersSide: g.maxOrdersSide,
-			IsActive:      true,
-			LastAttempt:   time.Now().Add(-g.gridPlacementCooldown), // Force initial placement
+			Symbol:          symbolData.Symbol,
+			QuoteCurrency:   symbolData.QuoteAsset,
+			GridSpreadPct:   g.gridSpreadPct,
+			MaxOrdersSide:   g.maxOrdersSide,
+			IsActive:        true,
+			GridCenterPrice: 0,                                        // Will be set when first price received
+			LastAttempt:     time.Now().Add(-g.gridPlacementCooldown), // Force initial placement
 		}
 		g.logger.WithFields(logrus.Fields{
 			"symbol":          symbol,
@@ -813,6 +952,29 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 		orderSize := g.baseNotionalUSD / buyPrice
 
+		// NEW: Apply time-based size multiplier from TimeFilter
+		if g.adaptiveMgr != nil {
+			sizeMultiplier := g.adaptiveMgr.GetTimeBasedSizeMultiplier()
+			if sizeMultiplier > 0 && sizeMultiplier != 1.0 {
+				adjustedSize := orderSize * sizeMultiplier
+				currentSlot := g.adaptiveMgr.GetCurrentSlot()
+				slotDesc := "unknown"
+				if currentSlot != nil {
+					slotDesc = currentSlot.Description
+				}
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"grid_level":    i,
+					"side":          "BUY",
+					"original_size": orderSize,
+					"multiplier":    sizeMultiplier,
+					"adjusted_size": adjustedSize,
+					"time_slot":     slotDesc,
+				}).Debug("Order size adjusted by time filter")
+				orderSize = adjustedSize
+			}
+		}
+
 		// NEW: Apply inventory-adjusted sizing if AdaptiveGridManager available
 		if g.adaptiveMgr != nil {
 			adjustedSize := g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "LONG", orderSize)
@@ -889,6 +1051,29 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 
 		sellPrice := grid.CurrentPrice + (spreadAmount * float64(i))
 		orderSize := g.baseNotionalUSD / sellPrice
+
+		// NEW: Apply time-based size multiplier from TimeFilter
+		if g.adaptiveMgr != nil {
+			sizeMultiplier := g.adaptiveMgr.GetTimeBasedSizeMultiplier()
+			if sizeMultiplier > 0 && sizeMultiplier != 1.0 {
+				adjustedSize := orderSize * sizeMultiplier
+				currentSlot := g.adaptiveMgr.GetCurrentSlot()
+				slotDesc := "unknown"
+				if currentSlot != nil {
+					slotDesc = currentSlot.Description
+				}
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"grid_level":    i,
+					"side":          "SELL",
+					"original_size": orderSize,
+					"multiplier":    sizeMultiplier,
+					"adjusted_size": adjustedSize,
+					"time_slot":     slotDesc,
+				}).Debug("Order size adjusted by time filter")
+				orderSize = adjustedSize
+			}
+		}
 
 		if g.adaptiveMgr != nil {
 			adjustedSize := g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "SHORT", orderSize)
@@ -1031,6 +1216,15 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 		}
 
 		orderSize := g.baseNotionalUSD / buyPrice
+
+		// NEW: Apply time-based size multiplier from TimeFilter
+		if g.adaptiveMgr != nil {
+			sizeMultiplier := g.adaptiveMgr.GetTimeBasedSizeMultiplier()
+			if sizeMultiplier > 0 && sizeMultiplier != 1.0 {
+				orderSize = orderSize * sizeMultiplier
+			}
+		}
+
 		if g.adaptiveMgr != nil {
 			orderSize = g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "LONG", orderSize)
 		}
@@ -1065,6 +1259,15 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 		}
 
 		orderSize := g.baseNotionalUSD / sellPrice
+
+		// NEW: Apply time-based size multiplier from TimeFilter
+		if g.adaptiveMgr != nil {
+			sizeMultiplier := g.adaptiveMgr.GetTimeBasedSizeMultiplier()
+			if sizeMultiplier > 0 && sizeMultiplier != 1.0 {
+				orderSize = orderSize * sizeMultiplier
+			}
+		}
+
 		if g.adaptiveMgr != nil {
 			orderSize = g.adaptiveMgr.GetInventoryAdjustedSize(symbol, "SHORT", orderSize)
 		}
@@ -1363,6 +1566,26 @@ func (g *GridManager) calculateOrderSize(symbol string, orderSize, price float64
 	// Ensure minimum reasonable size
 	if finalSize < 0.000001 {
 		finalSize = 0.000001
+	}
+
+	// CRITICAL: Re-apply precision manager rounding to ensure we meet symbol's step size
+	// This prevents "Quantity less than zero" errors for high-priced symbols like BTC
+	if g.precisionMgr != nil && finalSize > 0 {
+		roundedSize := g.precisionMgr.RoundQty(symbol, finalSize)
+		parsedSize, parseErr := strconv.ParseFloat(roundedSize, 64)
+		if parseErr == nil && parsedSize > 0 {
+			finalSize = parsedSize
+		} else if roundedSize == "0" || roundedSize == "0.000" {
+			// If precision manager rounds to zero, the order is too small for this symbol
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"price":      price,
+				"final_size": finalSize,
+				"rounded":    roundedSize,
+				"reason":     "step_size_too_large_for_micro_order",
+			}).Warn("Order size rounds to zero with symbol's step size, skipping")
+			return 0
+		}
 	}
 
 	return finalSize

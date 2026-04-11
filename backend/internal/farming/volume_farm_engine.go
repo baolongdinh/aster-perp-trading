@@ -493,6 +493,21 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 
 // setLeverageForSymbols sets the correct leverage for each symbol based on exchange info
 func (e *VolumeFarmEngine) setLeverageForSymbols(symbols []*SymbolData) {
+	// CRITICAL: Ensure exchange info is loaded before checking leverage
+	// This may be called before grid manager Start() completes
+	if e.gridManager.precisionMgr.GetMaxLeverage("BTCUSD1") == 0 {
+		e.logger.Info("Exchange info not loaded yet, fetching directly for leverage setup")
+		marketClient := client.NewMarketClient(e.futuresClient.GetHTTPClient())
+		exchangeInfo, err := marketClient.ExchangeInfo(context.Background())
+		if err != nil {
+			e.logger.Warn("Failed to fetch exchange info for leverage setup", zap.Error(err))
+		} else {
+			exchangeInfoBytes := []byte(exchangeInfo)
+			e.gridManager.precisionMgr.UpdateFromExchangeInfo(exchangeInfoBytes)
+			e.logger.Info("Exchange info loaded for leverage setup", zap.Int("bytes", len(exchangeInfoBytes)))
+		}
+	}
+
 	for _, sym := range symbols {
 		maxLeverage := e.gridManager.precisionMgr.GetMaxLeverage(sym.Symbol)
 		if maxLeverage > 0 {
