@@ -126,6 +126,9 @@ type AdaptiveGridManager struct {
 	// NEW: OptimizationConfig from YAML files
 	optConfig *config.OptimizationConfig
 
+	// NEW: MicroGridCalculator for high-frequency micro grid trading
+	microGridCalc *MicroGridCalculator
+
 	// NEW: Consecutive loss tracking for cooldown
 	consecutiveLosses map[string]int       // symbol -> consecutive loss count
 	lastLossTime      map[string]time.Time // symbol -> last loss timestamp
@@ -282,6 +285,38 @@ func DefaultRiskConfig() *RiskConfig {
 	}
 }
 
+// MultiLayerLiquidationConfig holds 4-tier liquidation protection settings
+type MultiLayerLiquidationConfig struct {
+	Enabled          bool    `yaml:"enabled" mapstructure:"enabled"`                       // Enable multi-layer protection
+	Layer1WarnPct    float64 `yaml:"layer1_warn_pct" mapstructure:"layer1_warn_pct"`       // Warn at 50% distance to liq
+	Layer2ReducePct  float64 `yaml:"layer2_reduce_pct" mapstructure:"layer2_reduce_pct"`   // Reduce 50% at 30% distance
+	Layer3ClosePct   float64 `yaml:"layer3_close_pct" mapstructure:"layer3_close_pct"`     // Close 100% at 15% distance
+	Layer4HedgePct   float64 `yaml:"layer4_hedge_pct" mapstructure:"layer4_hedge_pct"`     // Hedge + close at 10% distance
+	ReducePositionBy float64 `yaml:"reduce_position_by" mapstructure:"reduce_position_by"` // Reduce by 50% (0.5)
+}
+
+// DefaultMultiLayerLiquidationConfig returns default 4-tier protection
+func DefaultMultiLayerLiquidationConfig() *MultiLayerLiquidationConfig {
+	return &MultiLayerLiquidationConfig{
+		Enabled:          false, // Disabled by default
+		Layer1WarnPct:    0.50,  // 50% distance - warning only
+		Layer2ReducePct:  0.30,  // 30% distance - reduce position
+		Layer3ClosePct:   0.15,  // 15% distance - close all
+		Layer4HedgePct:   0.10,  // 10% distance - emergency hedge + close
+		ReducePositionBy: 0.50,  // Reduce by 50%
+	}
+}
+
+// LiquidationTier represents a single protection tier
+type LiquidationTier struct {
+	Name         string    // Tier name (Warn, Reduce, Close, Hedge)
+	DistancePct  float64   // Distance to liquidation (e.g., 0.50 = 50%)
+	Action       string    // Action to take (WARN, REDUCE, CLOSE, HEDGE)
+	ReductionPct float64   // For REDUCE action: reduce by this %
+	IsActive     bool      // Whether this tier is currently active
+	TriggeredAt  time.Time // When this tier was triggered
+}
+
 // CircuitBreaker tự động dừng trading khi trending quá mạnh
 type CircuitBreaker struct {
 	maxTrendingStrength float64       // Ngưỡng trending để dừng (0.7 = 70%)
@@ -348,6 +383,7 @@ func NewAdaptiveGridManager(
 		consecutiveLosses:  make(map[string]int),            // NEW: Track consecutive losses
 		lastLossTime:       make(map[string]time.Time),      // NEW: Track last loss time
 		cooldownActive:     make(map[string]bool),           // NEW: Track cooldown state
+		microGridCalc:      NewMicroGridCalculator(nil),     // NEW: Micro grid calculator (disabled by default)
 		stopCh:             make(chan struct{}),
 		mu:                 sync.RWMutex{},
 	}
@@ -379,8 +415,97 @@ func (a *AdaptiveGridManager) SetOptimizationConfig(optConfig *config.Optimizati
 			zap.Bool("trend_detection", optConfig.TrendDetection != nil),
 			zap.Bool("safeguards", optConfig.Safeguards != nil),
 			zap.Bool("time_filter", optConfig.TimeFilter != nil),
+			zap.Bool("micro_grid", optConfig.MicroGrid != nil && optConfig.MicroGrid.Enabled),
+			zap.Bool("dynamic_leverage", optConfig.DynamicLeverage != nil && optConfig.DynamicLeverage.Enabled),
 		)
+
+		// Initialize micro grid if enabled
+		if optConfig.MicroGrid != nil && optConfig.MicroGrid.Enabled {
+			a.microGridCalc = NewMicroGridCalculator(&MicroGridConfig{
+				Enabled:          optConfig.MicroGrid.Enabled,
+				SpreadPct:        optConfig.MicroGrid.SpreadPct,
+				OrdersPerSide:    optConfig.MicroGrid.OrdersPerSide,
+				OrderSizeUSDT:    optConfig.MicroGrid.OrderSizeUSDT,
+				MinProfitPerFill: optConfig.MicroGrid.MinProfitPerFill,
+			})
+			a.logger.Info("Micro grid mode enabled",
+				zap.Float64("spread_pct", optConfig.MicroGrid.SpreadPct),
+				zap.Int("orders_per_side", optConfig.MicroGrid.OrdersPerSide),
+				zap.Float64("order_size_usdt", optConfig.MicroGrid.OrderSizeUSDT))
+		}
+
+		// Initialize micro partial close if enabled
+		if optConfig.MicroPartialClose != nil && optConfig.MicroPartialClose.Enabled {
+			mp := optConfig.MicroPartialClose
+			// Convert 4 micro TP levels to 3 partial close levels (using first 3)
+			if len(mp.TPLevels) >= 3 {
+				a.partialCloseConfig = &PartialCloseConfig{
+					Enabled:          mp.Enabled,
+					TP1_ClosePct:     mp.TPLevels[0].ClosePct,
+					TP1_ProfitPct:    mp.TPLevels[0].TargetPct,
+					TP2_ClosePct:     mp.TPLevels[1].ClosePct,
+					TP2_ProfitPct:    mp.TPLevels[1].TargetPct,
+					TP3_ClosePct:     mp.TPLevels[2].ClosePct,
+					TP3_ProfitPct:    mp.TPLevels[2].TargetPct,
+					TrailingAfterTP2: mp.TrailingAfterTP3, // Map TP3 trailing to TP2
+					TrailingDistance: mp.TrailingDistance,
+				}
+				a.logger.Info("Micro partial close enabled",
+					zap.Float64("tp1_target", mp.TPLevels[0].TargetPct),
+					zap.Float64("tp2_target", mp.TPLevels[1].TargetPct),
+					zap.Float64("tp3_target", mp.TPLevels[2].TargetPct),
+					zap.Bool("trailing_after_tp3", mp.TrailingAfterTP3))
+			}
+		}
 	}
+}
+
+// SetMicroGridMode enables or disables micro grid mode
+func (a *AdaptiveGridManager) SetMicroGridMode(enabled bool, config *MicroGridConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if enabled && config != nil {
+		a.microGridCalc = NewMicroGridCalculator(config)
+		a.logger.Info("Micro grid mode enabled",
+			zap.Float64("spread_pct", config.SpreadPct),
+			zap.Int("orders_per_side", config.OrdersPerSide),
+			zap.Float64("order_size_usdt", config.OrderSizeUSDT))
+	} else {
+		a.microGridCalc = NewMicroGridCalculator(nil)
+		a.logger.Info("Micro grid mode disabled")
+	}
+}
+
+// IsMicroGridEnabled returns whether micro grid mode is active
+func (a *AdaptiveGridManager) IsMicroGridEnabled() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.microGridCalc != nil && a.microGridCalc.IsEnabled()
+}
+
+// GetMicroGridPrices returns buy and sell prices for micro grid
+func (a *AdaptiveGridManager) GetMicroGridPrices(currentPrice float64) (buyPrices []float64, sellPrices []float64) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.microGridCalc == nil || !a.microGridCalc.IsEnabled() {
+		return nil, nil
+	}
+
+	return a.microGridCalc.CalculateGridPrices(currentPrice)
+}
+
+// GetMicroGridOrderSize returns the order size for micro grid
+func (a *AdaptiveGridManager) GetMicroGridOrderSize(price float64) float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.microGridCalc == nil || !a.microGridCalc.IsEnabled() {
+		return 0
+	}
+
+	return a.microGridCalc.CalculateOrderSize(price)
 }
 
 // Initialize sets up the adaptive grid manager
@@ -2231,7 +2356,27 @@ func (a *AdaptiveGridManager) GetExposureStats() (totalExposure, maxExposure, ut
 	return a.riskMonitor.GetExposureStats()
 }
 
-// InitializeRangeDetector creates a range detector for a symbol
+// InitializeRangeDetectorWithADX initializes range detector with optional ADX filter
+func (a *AdaptiveGridManager) InitializeRangeDetectorWithADX(symbol string, config *RangeConfig, enableADX bool, maxADX float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if config == nil {
+		config = DefaultRangeConfig()
+	}
+
+	detector := NewRangeDetector(config, a.logger)
+	detector.SetADXFilter(enableADX, maxADX)
+
+	a.rangeDetectors[symbol] = detector
+	a.logger.Info("Range detector initialized with ADX filter",
+		zap.String("symbol", symbol),
+		zap.Bool("adx_enabled", enableADX),
+		zap.Float64("max_adx", maxADX))
+}
+
+// InitializeRangeDetector initializes a range detector for a symbol
+// Automatically applies FastRange and ADXFilter config from optConfig if available
 func (a *AdaptiveGridManager) InitializeRangeDetector(symbol string, config *RangeConfig) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -2240,10 +2385,34 @@ func (a *AdaptiveGridManager) InitializeRangeDetector(symbol string, config *Ran
 		config = DefaultRangeConfig()
 	}
 
-	a.rangeDetectors[symbol] = NewRangeDetector(config, a.logger)
+	// Apply FastRange config from optConfig if enabled
+	if a.optConfig != nil && a.optConfig.FastRange != nil && a.optConfig.FastRange.Enabled {
+		fastConfig := a.optConfig.FastRange
+		// Override with fast range settings
+		if fastConfig.BBPeriod > 0 {
+			config.Periods = fastConfig.BBPeriod
+		}
+		a.logger.Info("FastRange config applied",
+			zap.String("symbol", symbol),
+			zap.Int("bb_period", config.Periods))
+	}
+
+	detector := NewRangeDetector(config, a.logger)
+
+	// Apply ADXFilter config from optConfig if enabled
+	if a.optConfig != nil && a.optConfig.ADXFilter != nil && a.optConfig.ADXFilter.Enabled {
+		adxConfig := a.optConfig.ADXFilter
+		detector.SetADXFilter(true, adxConfig.SidewaysADXMax)
+		a.logger.Info("ADXFilter config applied",
+			zap.String("symbol", symbol),
+			zap.Float64("sideways_adx_max", adxConfig.SidewaysADXMax))
+	}
+
+	a.rangeDetectors[symbol] = detector
 	a.logger.Info("RangeDetector initialized for symbol",
 		zap.String("symbol", symbol),
-		zap.String("method", config.Method))
+		zap.String("method", config.Method),
+		zap.Bool("adx_filter_enabled", a.optConfig != nil && a.optConfig.ADXFilter != nil && a.optConfig.ADXFilter.Enabled))
 }
 
 // UpdatePriceForRange updates price data for range detection
@@ -2903,4 +3072,286 @@ func (a *AdaptiveGridManager) GetPartialCloseStatus(symbol string) map[string]in
 		"trailing_active": slice.TrailingActive,
 		"trailing_price":  slice.TrailingPrice,
 	}
+}
+
+// =============================================================================
+// MULTI-LAYER LIQUIDATION PROTECTION (T040-T046)
+// =============================================================================
+
+// MultiLayerLiquidationStatus tracks current liquidation tier status
+type MultiLayerLiquidationStatus struct {
+	CurrentTier   int       `json:"current_tier"`
+	DistanceToLiq float64   `json:"distance_to_liq_pct"`
+	LastCheckTime time.Time `json:"last_check_time"`
+	ActionsTaken  []string  `json:"actions_taken"`
+}
+
+// multiLayerStatus tracks per-symbol liquidation tier status
+var multiLayerStatus = make(map[string]*MultiLayerLiquidationStatus)
+
+// checkMultiLayerLiquidation checks and handles multi-tier liquidation protection
+// Automatically applies config from optConfig.MultiLayerLiq if available
+func (a *AdaptiveGridManager) checkMultiLayerLiquidation(ctx context.Context, symbol string, markPrice, liqPrice, positionAmt float64) {
+	// Calculate distance to liquidation
+	distanceToLiq := math.Abs(markPrice - liqPrice)
+	distancePct := distanceToLiq / markPrice
+
+	// Load config from optConfig if available, otherwise use default
+	config := DefaultMultiLayerLiquidationConfig()
+	if a.optConfig != nil && a.optConfig.MultiLayerLiq != nil {
+		optML := a.optConfig.MultiLayerLiq
+		config.Enabled = optML.Enabled
+		config.Layer1WarnPct = optML.Layer1WarnPct
+		config.Layer2ReducePct = optML.Layer2ReducePct
+		config.Layer3ClosePct = optML.Layer3ClosePct
+		config.Layer4HedgePct = optML.Layer4HedgePct
+		config.ReducePositionBy = optML.ReducePositionBy
+	}
+
+	if !config.Enabled {
+		// Fall back to original single-layer check
+		if a.isNearLiquidation(symbol, markPrice, liqPrice, positionAmt) {
+			a.emergencyClosePosition(ctx, symbol, positionAmt)
+		}
+		return
+	}
+
+	// Initialize status if not exists
+	if multiLayerStatus[symbol] == nil {
+		multiLayerStatus[symbol] = &MultiLayerLiquidationStatus{
+			CurrentTier:   0,
+			ActionsTaken:  []string{},
+			LastCheckTime: time.Now(),
+		}
+	}
+	status := multiLayerStatus[symbol]
+	status.DistanceToLiq = distancePct
+	status.LastCheckTime = time.Now()
+
+	// Tier 4: 10% distance - Emergency hedge + close ALL (CRITICAL)
+	if distancePct < config.Layer4HedgePct {
+		if status.CurrentTier < 4 {
+			status.CurrentTier = 4
+			status.ActionsTaken = append(status.ActionsTaken, "TIER4_EMERGENCY_HEDGE")
+			a.logger.Error("LIQUIDATION TIER 4: Emergency hedge + close ALL!",
+				zap.String("symbol", symbol),
+				zap.Float64("distance_pct", distancePct*100),
+				zap.Float64("mark_price", markPrice),
+				zap.Float64("liq_price", liqPrice))
+			a.emergencyHedgeAndClose(ctx, symbol, positionAmt)
+		}
+		return
+	}
+
+	// Tier 3: 15% distance - Close 100% position
+	if distancePct < config.Layer3ClosePct {
+		if status.CurrentTier < 3 {
+			status.CurrentTier = 3
+			status.ActionsTaken = append(status.ActionsTaken, "TIER3_CLOSE_ALL")
+			a.logger.Error("LIQUIDATION TIER 3: Closing ALL position!",
+				zap.String("symbol", symbol),
+				zap.Float64("distance_pct", distancePct*100),
+				zap.Float64("mark_price", markPrice),
+				zap.Float64("liq_price", liqPrice))
+			a.emergencyClosePosition(ctx, symbol, positionAmt)
+		}
+		return
+	}
+
+	// Tier 2: 30% distance - Reduce 50% position
+	if distancePct < config.Layer2ReducePct {
+		if status.CurrentTier < 2 {
+			status.CurrentTier = 2
+			status.ActionsTaken = append(status.ActionsTaken, "TIER2_REDUCE_50PCT")
+			a.logger.Warn("LIQUIDATION TIER 2: Reducing position by 50%",
+				zap.String("symbol", symbol),
+				zap.Float64("distance_pct", distancePct*100),
+				zap.Float64("mark_price", markPrice),
+				zap.Float64("liq_price", liqPrice))
+			a.reducePositionByPct(ctx, symbol, positionAmt, config.ReducePositionBy)
+		}
+		return
+	}
+
+	// Tier 1: 50% distance - Warning only
+	if distancePct < config.Layer1WarnPct {
+		if status.CurrentTier < 1 {
+			status.CurrentTier = 1
+			status.ActionsTaken = append(status.ActionsTaken, "TIER1_WARNING")
+			a.logger.Warn("LIQUIDATION TIER 1: Approaching liquidation - WARNING",
+				zap.String("symbol", symbol),
+				zap.Float64("distance_pct", distancePct*100),
+				zap.Float64("mark_price", markPrice),
+				zap.Float64("liq_price", liqPrice))
+		}
+		return
+	}
+
+	// Reset tier if moved away from liquidation
+	if distancePct > config.Layer1WarnPct && status.CurrentTier > 0 {
+		status.CurrentTier = 0
+		status.ActionsTaken = []string{}
+		a.logger.Info("Liquidation tier reset - moved away from danger zone",
+			zap.String("symbol", symbol),
+			zap.Float64("distance_pct", distancePct*100))
+	}
+}
+
+// emergencyHedgeAndClose creates hedge position and closes all (Tier 4)
+func (a *AdaptiveGridManager) emergencyHedgeAndClose(ctx context.Context, symbol string, positionAmt float64) {
+	if a.futuresClient == nil {
+		return
+	}
+
+	// Create hedge order (counter-position)
+	side := "BUY"
+	if positionAmt > 0 {
+		side = "SELL"
+	}
+
+	hedgeQty := math.Abs(positionAmt) * 0.5 // Hedge with 50% of position
+
+	a.logger.Error("EMERGENCY HEDGE: Placing counter-position",
+		zap.String("symbol", symbol),
+		zap.String("hedge_side", side),
+		zap.Float64("hedge_qty", hedgeQty))
+
+	hedgeReq := client.PlaceOrderRequest{
+		Symbol:     symbol,
+		Side:       side,
+		Type:       "MARKET",
+		Quantity:   fmt.Sprintf("%.6f", hedgeQty),
+		ReduceOnly: false, // This opens new position as hedge
+	}
+
+	_, err := a.futuresClient.PlaceOrder(ctx, hedgeReq)
+	if err != nil {
+		a.logger.Error("Failed to place hedge order", zap.Error(err))
+	}
+
+	// Then close original position
+	a.emergencyClosePosition(ctx, symbol, positionAmt)
+}
+
+// reducePositionByClose reduces position by specified percentage (Tier 2)
+func (a *AdaptiveGridManager) reducePositionByPct(ctx context.Context, symbol string, positionAmt float64, pct float64) {
+	if a.futuresClient == nil || positionAmt == 0 {
+		return
+	}
+
+	reduceQty := math.Abs(positionAmt) * pct
+	side := "SELL"
+	if positionAmt < 0 {
+		side = "BUY"
+	}
+
+	a.logger.Warn("REDUCING POSITION",
+		zap.String("symbol", symbol),
+		zap.Float64("original_qty", math.Abs(positionAmt)),
+		zap.Float64("reduce_pct", pct*100),
+		zap.Float64("reduce_qty", reduceQty))
+
+	orderReq := client.PlaceOrderRequest{
+		Symbol:     symbol,
+		Side:       side,
+		Type:       "MARKET",
+		Quantity:   fmt.Sprintf("%.6f", reduceQty),
+		ReduceOnly: true,
+	}
+
+	_, err := a.futuresClient.PlaceOrder(ctx, orderReq)
+	if err != nil {
+		a.logger.Error("Failed to reduce position", zap.Error(err))
+	}
+}
+
+// GetLiquidationTierStatus returns current multi-layer liquidation status
+func (a *AdaptiveGridManager) GetLiquidationTierStatus(symbol string) map[string]interface{} {
+	status, exists := multiLayerStatus[symbol]
+	if !exists || status == nil {
+		return map[string]interface{}{
+			"enabled": false,
+			"tier":    0,
+		}
+	}
+
+	return map[string]interface{}{
+		"enabled":         true,
+		"current_tier":    status.CurrentTier,
+		"distance_to_liq": status.DistanceToLiq * 100, // as percentage
+		"last_check_time": status.LastCheckTime,
+		"actions_taken":   status.ActionsTaken,
+	}
+}
+
+// =============================================================================
+// DYNAMIC LEVERAGE INTEGRATION (T033-T039)
+// =============================================================================
+
+// dynamicLeverageCalc holds the dynamic leverage calculator
+var dynamicLeverageCalc *DynamicLeverageCalculator
+
+// InitializeDynamicLeverage initializes the dynamic leverage calculator
+// Automatically applies config from optConfig.DynamicLeverage if available
+func (a *AdaptiveGridManager) InitializeDynamicLeverage(config *DynamicLeverageConfig) {
+	// Priority 1: Use provided config
+	// Priority 2: Use optConfig.DynamicLeverage from YAML
+	// Priority 3: Use default config
+	if config == nil && a.optConfig != nil && a.optConfig.DynamicLeverage != nil {
+		optDL := a.optConfig.DynamicLeverage
+		config = &DynamicLeverageConfig{
+			Enabled:               optDL.Enabled,
+			BaseLeverage:          optDL.BaseLeverage,
+			MinLeverage:           optDL.MinLeverage,
+			MaxLeverage:           optDL.MaxLeverage,
+			ATRThresholdHigh:      optDL.ATRThresholdHigh,
+			ATRThresholdLow:       optDL.ATRThresholdLow,
+			ADXThresholdTrending:  optDL.ADXThresholdTrending,
+			BBWidthThresholdTight: optDL.BBWidthThresholdTight,
+		}
+		a.logger.Info("Dynamic leverage config loaded from YAML")
+	}
+	if config == nil {
+		config = DefaultDynamicLeverageConfig()
+	}
+
+	dynamicLeverageCalc = NewDynamicLeverageCalculator(config)
+	a.logger.Info("Dynamic leverage initialized",
+		zap.Bool("enabled", config.Enabled),
+		zap.Float64("base_leverage", config.BaseLeverage),
+		zap.Float64("min_leverage", config.MinLeverage),
+		zap.Float64("max_leverage", config.MaxLeverage))
+}
+
+// UpdateDynamicLeverageMetrics updates metrics for leverage calculation
+func (a *AdaptiveGridManager) UpdateDynamicLeverageMetrics(atr, adx, bbWidth float64) {
+	if dynamicLeverageCalc == nil {
+		return
+	}
+
+	dynamicLeverageCalc.UpdateATR(atr)
+	dynamicLeverageCalc.UpdateADX(adx)
+	dynamicLeverageCalc.UpdateBBWidth(bbWidth)
+}
+
+// GetOptimalLeverage returns calculated optimal leverage
+func (a *AdaptiveGridManager) GetOptimalLeverage() float64 {
+	if dynamicLeverageCalc == nil {
+		return 50.0 // Default leverage
+	}
+	return dynamicLeverageCalc.CalculateOptimalLeverage()
+}
+
+// GetDynamicLeverageMetrics returns current metrics for display
+func (a *AdaptiveGridManager) GetDynamicLeverageMetrics() map[string]float64 {
+	if dynamicLeverageCalc == nil {
+		return map[string]float64{
+			"calculated_leverage": 50.0,
+			"enabled":             0,
+		}
+	}
+
+	metrics := dynamicLeverageCalc.GetCurrentMetrics()
+	metrics["enabled"] = 1
+	return metrics
 }

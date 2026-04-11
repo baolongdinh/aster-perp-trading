@@ -99,6 +99,7 @@ func (p *PrecisionManager) RoundPrice(symbol string, price float64) string {
 }
 
 // RoundQty rounds a float64 quantity to the correct step size and returns a string.
+// Uses Ceil to ensure quantity never rounds down to 0 (critical for high-priced assets like BTC).
 func (p *PrecisionManager) RoundQty(symbol string, qty float64) string {
 	if math.IsNaN(qty) || math.IsInf(qty, 0) || qty <= 0 {
 		return "0"
@@ -112,7 +113,10 @@ func (p *PrecisionManager) RoundQty(symbol string, qty float64) string {
 		return fmt.Sprintf("%.2f", qty) // Default to 2 decimals for quantity if unknown
 	}
 
-	rounded := math.Floor(qty/sp.StepSize) * sp.StepSize
+	// CRITICAL: Use Ceil to prevent quantity from rounding down to 0
+	// For BTC with StepSize=0.001, a small qty like 0.00069 would Floor to 0
+	// Ceil ensures we always have at least one step size unit
+	rounded := math.Ceil(qty/sp.StepSize) * sp.StepSize
 	return strconv.FormatFloat(rounded, 'f', sp.QuantityPrec, 64)
 }
 

@@ -367,12 +367,18 @@ func validateVolumeFarmConfig(cfg *VolumeFarmConfig) error {
 
 // OptimizationConfig holds all grid optimization configurations
 type OptimizationConfig struct {
-	DynamicGrid     *DynamicGridConfig     `yaml:"dynamic_grid"`
-	InventorySkew   *InventorySkewConfig   `yaml:"inventory_skew"`
-	ClusterStopLoss *ClusterStopLossConfig `yaml:"cluster_stop_loss"`
-	TrendDetection  *TrendDetectionConfig  `yaml:"trend_detection"`
-	Safeguards      *SafeguardsConfig      `yaml:"safeguards"`
-	TimeFilter      *TradingHoursConfig    `yaml:"time_filter"`
+	DynamicGrid       *DynamicGridConfig           `yaml:"dynamic_grid"`
+	InventorySkew     *InventorySkewConfig         `yaml:"inventory_skew"`
+	ClusterStopLoss   *ClusterStopLossConfig       `yaml:"cluster_stop_loss"`
+	TrendDetection    *TrendDetectionConfig        `yaml:"trend_detection"`
+	Safeguards        *SafeguardsConfig            `yaml:"safeguards"`
+	TimeFilter        *TradingHoursConfig          `yaml:"time_filter"`
+	MicroGrid         *MicroGridConfig             `yaml:"micro_grid,omitempty"`              // NEW: Micro grid for high-frequency
+	FastRange         *FastRangeConfig             `yaml:"fast_range,omitempty"`              // NEW: Fast range detection (10 periods)
+	ADXFilter         *ADXFilterConfig             `yaml:"adx_filter,omitempty"`              // NEW: ADX-based sideways filter
+	DynamicLeverage   *DynamicLeverageConfig       `yaml:"dynamic_leverage,omitempty"`        // NEW: Adaptive leverage by volatility
+	MultiLayerLiq     *MultiLayerLiquidationConfig `yaml:"multi_layer_liquidation,omitempty"` // NEW: 4-tier liquidation protection
+	MicroPartialClose *MicroPartialCloseConfig     `yaml:"micro_partial_close,omitempty"`     // NEW: Micro TP levels (8-40 bps)
 }
 
 // DynamicGridConfig mirrors adaptive_grid.DynamicSpreadConfig
@@ -681,6 +687,68 @@ type TimeSlot struct {
 	MaxExposurePct   float64    `yaml:"max_exposure_pct"`
 	SpreadMultiplier float64    `yaml:"spread_multiplier"`
 	Description      string     `yaml:"description"`
+}
+
+// MicroGridConfig mirrors adaptive_grid.MicroGridConfig
+type MicroGridConfig struct {
+	Enabled          bool    `yaml:"enabled" mapstructure:"enabled"`
+	SpreadPct        float64 `yaml:"spread_pct" mapstructure:"spread_pct"`
+	OrdersPerSide    int     `yaml:"orders_per_side" mapstructure:"orders_per_side"`
+	OrderSizeUSDT    float64 `yaml:"order_size_usdt" mapstructure:"order_size_usdt"`
+	MinProfitPerFill float64 `yaml:"min_profit_per_fill" mapstructure:"min_profit_per_fill"`
+}
+
+// FastRangeConfig mirrors adaptive_grid.EnhancedRangeConfig for fast detection
+type FastRangeConfig struct {
+	Enabled          bool    `yaml:"enabled" mapstructure:"enabled"`
+	BBPeriod         int     `yaml:"bb_period" mapstructure:"bb_period"`
+	ADXPeriod        int     `yaml:"adx_period" mapstructure:"adx_period"`
+	SidewaysADXMax   float64 `yaml:"sideways_adx_max" mapstructure:"sideways_adx_max"`
+	StabilizationMin int     `yaml:"stabilization_min" mapstructure:"stabilization_min"`
+	EnableADXFilter  bool    `yaml:"enable_adx_filter" mapstructure:"enable_adx_filter"`
+}
+
+// ADXFilterConfig for ADX-based sideways confirmation
+type ADXFilterConfig struct {
+	Enabled        bool    `yaml:"enabled" mapstructure:"enabled"`
+	ADXPeriod      int     `yaml:"adx_period" mapstructure:"adx_period"`
+	SidewaysADXMax float64 `yaml:"sideways_adx_max" mapstructure:"sideways_adx_max"`
+}
+
+// DynamicLeverageConfig mirrors adaptive_grid.DynamicLeverageConfig
+type DynamicLeverageConfig struct {
+	Enabled               bool    `yaml:"enabled" mapstructure:"enabled"`
+	BaseLeverage          float64 `yaml:"base_leverage" mapstructure:"base_leverage"`
+	MinLeverage           float64 `yaml:"min_leverage" mapstructure:"min_leverage"`
+	MaxLeverage           float64 `yaml:"max_leverage" mapstructure:"max_leverage"`
+	ATRThresholdHigh      float64 `yaml:"atr_threshold_high" mapstructure:"atr_threshold_high"`
+	ATRThresholdLow       float64 `yaml:"atr_threshold_low" mapstructure:"atr_threshold_low"`
+	ADXThresholdTrending  float64 `yaml:"adx_threshold_trending" mapstructure:"adx_threshold_trending"`
+	BBWidthThresholdTight float64 `yaml:"bb_width_threshold_tight" mapstructure:"bb_width_threshold_tight"`
+}
+
+// MultiLayerLiquidationConfig mirrors adaptive_grid.MultiLayerLiquidationConfig
+type MultiLayerLiquidationConfig struct {
+	Enabled          bool    `yaml:"enabled" mapstructure:"enabled"`
+	Layer1WarnPct    float64 `yaml:"layer1_warn_pct" mapstructure:"layer1_warn_pct"`
+	Layer2ReducePct  float64 `yaml:"layer2_reduce_pct" mapstructure:"layer2_reduce_pct"`
+	Layer3ClosePct   float64 `yaml:"layer3_close_pct" mapstructure:"layer3_close_pct"`
+	Layer4HedgePct   float64 `yaml:"layer4_hedge_pct" mapstructure:"layer4_hedge_pct"`
+	ReducePositionBy float64 `yaml:"reduce_position_by" mapstructure:"reduce_position_by"`
+}
+
+// TPLevelConfig represents a single take-profit level
+type TPLevelConfig struct {
+	TargetPct float64 `yaml:"target_pct" mapstructure:"target_pct"`
+	ClosePct  float64 `yaml:"close_pct" mapstructure:"close_pct"`
+}
+
+// MicroPartialCloseConfig mirrors adaptive_grid partial close with micro TP levels
+type MicroPartialCloseConfig struct {
+	Enabled          bool            `yaml:"enabled" mapstructure:"enabled"`
+	TPLevels         []TPLevelConfig `yaml:"tp_levels" mapstructure:"tp_levels"`
+	TrailingAfterTP3 bool            `yaml:"trailing_after_tp3" mapstructure:"trailing_after_tp3"`
+	TrailingDistance float64         `yaml:"trailing_distance" mapstructure:"trailing_distance"`
 }
 
 // LoadOptimizationConfig loads all optimization configs from directory

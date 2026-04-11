@@ -781,3 +781,163 @@ func (r *RiskMonitor) AddPriceData(high, low, close float64) {
 func (r *RiskMonitor) GetExposureStats() (float64, float64, float64) {
 	return r.exposureMgr.GetExposureStats()
 }
+
+// DynamicLeverageConfig holds configuration for adaptive leverage
+type DynamicLeverageConfig struct {
+	Enabled               bool    `yaml:"enabled" mapstructure:"enabled"`
+	BaseLeverage          float64 `yaml:"base_leverage" mapstructure:"base_leverage"`                       // Target leverage for normal conditions (e.g., 50x)
+	MinLeverage           float64 `yaml:"min_leverage" mapstructure:"min_leverage"`                         // Minimum leverage during high volatility (e.g., 10x)
+	MaxLeverage           float64 `yaml:"max_leverage" mapstructure:"max_leverage"`                         // Maximum leverage during tight ranges (e.g., 100x)
+	ATRThresholdHigh      float64 `yaml:"atr_threshold_high" mapstructure:"atr_threshold_high"`             // ATR multiplier for reducing leverage (e.g., 1.5)
+	ATRThresholdLow       float64 `yaml:"atr_threshold_low" mapstructure:"atr_threshold_low"`               // ATR multiplier for increasing leverage (e.g., 0.8)
+	ADXThresholdTrending  float64 `yaml:"adx_threshold_trending" mapstructure:"adx_threshold_trending"`     // ADX above this = trending, reduce leverage (e.g., 30)
+	BBWidthThresholdTight float64 `yaml:"bb_width_threshold_tight" mapstructure:"bb_width_threshold_tight"` // BB width below this = tight range, increase leverage (e.g., 0.005)
+}
+
+// DefaultDynamicLeverageConfig returns default dynamic leverage configuration
+func DefaultDynamicLeverageConfig() *DynamicLeverageConfig {
+	return &DynamicLeverageConfig{
+		Enabled:               false, // Disabled by default
+		BaseLeverage:          50.0,  // 50x base leverage
+		MinLeverage:           10.0,  // 10x minimum during high volatility
+		MaxLeverage:           100.0, // 100x maximum during tight ranges
+		ATRThresholdHigh:      1.5,   // Reduce when ATR > 1.5x average
+		ATRThresholdLow:       0.8,   // Increase when ATR < 0.8x average
+		ADXThresholdTrending:  30.0,  // Reduce when ADX > 30
+		BBWidthThresholdTight: 0.005, // Increase when BB width < 0.5%
+	}
+}
+
+// DynamicLeverageCalculator calculates optimal leverage based on market conditions
+type DynamicLeverageCalculator struct {
+	config         *DynamicLeverageConfig
+	atrHistory     []float64
+	currentATR     float64
+	currentADX     float64
+	currentBBWidth float64
+	mu             sync.RWMutex
+}
+
+// NewDynamicLeverageCalculator creates a new dynamic leverage calculator
+func NewDynamicLeverageCalculator(config *DynamicLeverageConfig) *DynamicLeverageCalculator {
+	if config == nil {
+		config = DefaultDynamicLeverageConfig()
+	}
+	return &DynamicLeverageCalculator{
+		config:     config,
+		atrHistory: make([]float64, 0, 20),
+	}
+}
+
+// UpdateATR updates current ATR value
+func (d *DynamicLeverageCalculator) UpdateATR(atr float64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.currentATR = atr
+	d.atrHistory = append(d.atrHistory, atr)
+	if len(d.atrHistory) > 20 {
+		d.atrHistory = d.atrHistory[1:]
+	}
+}
+
+// UpdateADX updates current ADX value
+func (d *DynamicLeverageCalculator) UpdateADX(adx float64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.currentADX = adx
+}
+
+// UpdateBBWidth updates current Bollinger Bands width
+func (d *DynamicLeverageCalculator) UpdateBBWidth(width float64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.currentBBWidth = width
+}
+
+// CalculateOptimalLeverage returns optimal leverage based on current market conditions
+func (d *DynamicLeverageCalculator) CalculateOptimalLeverage() float64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if !d.config.Enabled {
+		return d.config.BaseLeverage
+	}
+
+	// Default to base leverage
+	leverage := d.config.BaseLeverage
+
+	// Factor 1: ATR-based adjustment
+	if d.currentATR > 0 && len(d.atrHistory) > 5 {
+		avgATR := calculateFloatAverage(d.atrHistory)
+		if avgATR > 0 {
+			atrRatio := d.currentATR / avgATR
+			if atrRatio > d.config.ATRThresholdHigh {
+				// High volatility - reduce leverage
+				reductionFactor := math.Max(0.2, 1.0-(atrRatio-d.config.ATRThresholdHigh)*0.5)
+				leverage = leverage * reductionFactor
+			} else if atrRatio < d.config.ATRThresholdLow {
+				// Low volatility - increase leverage
+				increaseFactor := math.Min(2.0, 1.0+(d.config.ATRThresholdLow-atrRatio)*0.5)
+				leverage = leverage * increaseFactor
+			}
+		}
+	}
+
+	// Factor 2: ADX-based adjustment (trending vs sideways)
+	if d.currentADX > d.config.ADXThresholdTrending {
+		// Trending market - reduce leverage to avoid getting caught in reversals
+		leverage = leverage * 0.5
+	}
+
+	// Factor 3: BB Width adjustment (tight ranges)
+	if d.currentBBWidth > 0 && d.currentBBWidth < d.config.BBWidthThresholdTight {
+		// Very tight range - can increase leverage safely
+		leverage = leverage * 1.5
+	}
+
+	// Clamp to min/max
+	if leverage < d.config.MinLeverage {
+		leverage = d.config.MinLeverage
+	}
+	if leverage > d.config.MaxLeverage {
+		leverage = d.config.MaxLeverage
+	}
+
+	return leverage
+}
+
+// GetCurrentMetrics returns current market metrics for leverage calculation
+func (d *DynamicLeverageCalculator) GetCurrentMetrics() map[string]float64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	avgATR := 0.0
+	if len(d.atrHistory) > 0 {
+		avgATR = calculateFloatAverage(d.atrHistory)
+	}
+
+	return map[string]float64{
+		"current_atr":         d.currentATR,
+		"avg_atr":             avgATR,
+		"current_adx":         d.currentADX,
+		"current_bb_width":    d.currentBBWidth,
+		"calculated_leverage": d.CalculateOptimalLeverage(),
+	}
+}
+
+// IsEnabled returns whether dynamic leverage is enabled
+func (d *DynamicLeverageCalculator) IsEnabled() bool {
+	return d.config != nil && d.config.Enabled
+}
+
+// calculateFloatAverage returns average of float64 slice
+func calculateFloatAverage(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range values {
+		sum += v
+	}
+	return sum / float64(len(values))
+}

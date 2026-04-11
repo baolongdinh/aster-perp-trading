@@ -712,6 +712,11 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 	}
 
+	// NEW: Check if micro grid mode is enabled
+	if g.adaptiveMgr != nil && g.adaptiveMgr.IsMicroGridEnabled() {
+		return g.placeMicroGridOrders(ctx, symbol, grid)
+	}
+
 	if grid.CurrentPrice == 0 {
 		g.logger.WithField("symbol", symbol).Error("Cannot place orders: current price is 0")
 		return 0
@@ -1110,6 +1115,130 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 		"bb_lower":     lower,
 		"bb_mid":       mid,
 	}).Info("BB range-based grid orders placed")
+
+	return placedOrders
+}
+
+// placeMicroGridOrders places grid orders using micro grid configuration
+// Optimized for high-frequency trading with tight spreads (0.05%) and small sizes ($3)
+func (g *GridManager) placeMicroGridOrders(ctx context.Context, symbol string, grid *SymbolGrid) int {
+	g.logger.WithFields(logrus.Fields{
+		"symbol": symbol,
+		"mode":   "micro_grid",
+	}).Info("Placing micro grid orders for volume farming")
+
+	if grid.CurrentPrice == 0 {
+		g.logger.WithField("symbol", symbol).Error("Cannot place micro grid orders: current price is 0")
+		return 0
+	}
+
+	// Get micro grid calculator from adaptive manager
+	if g.adaptiveMgr == nil {
+		g.logger.WithField("symbol", symbol).Error("Adaptive manager not available for micro grid")
+		return 0
+	}
+
+	// Get micro grid prices
+	buyPrices, sellPrices := g.adaptiveMgr.GetMicroGridPrices(grid.CurrentPrice)
+	if len(buyPrices) == 0 && len(sellPrices) == 0 {
+		g.logger.WithField("symbol", symbol).Error("Micro grid returned no prices")
+		return 0
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":        symbol,
+		"current_price": grid.CurrentPrice,
+		"buy_levels":    len(buyPrices),
+		"sell_levels":   len(sellPrices),
+		"buy_prices":    buyPrices,
+		"sell_prices":   sellPrices,
+	}).Info("Micro grid prices calculated")
+
+	// Get order size from micro grid config
+	orderSize := g.adaptiveMgr.GetMicroGridOrderSize(grid.CurrentPrice)
+
+	var orders []*GridOrder
+	orderID := time.Now().UnixNano()
+
+	// Create BUY orders at micro grid prices
+	for i, price := range buyPrices {
+		if price <= 0 || price >= grid.CurrentPrice {
+			continue // Skip invalid prices
+		}
+
+		gridOrder := &GridOrder{
+			OrderID:    fmt.Sprintf("%s-micro-buy-%d-%d", symbol, orderID, i),
+			Symbol:     symbol,
+			Side:       "BUY",
+			Price:      price,
+			Size:       orderSize,
+			OrderType:  "LIMIT",
+			ReduceOnly: false,
+			GridLevel:  -(i + 1),
+			Status:     "PENDING",
+			CreatedAt:  time.Now(),
+		}
+		orders = append(orders, gridOrder)
+	}
+
+	// Create SELL orders at micro grid prices
+	for i, price := range sellPrices {
+		if price <= 0 || price <= grid.CurrentPrice {
+			continue // Skip invalid prices
+		}
+
+		gridOrder := &GridOrder{
+			OrderID:    fmt.Sprintf("%s-micro-sell-%d-%d", symbol, orderID, i),
+			Symbol:     symbol,
+			Side:       "SELL",
+			Price:      price,
+			Size:       orderSize,
+			OrderType:  "LIMIT",
+			ReduceOnly: false,
+			GridLevel:  i + 1,
+			Status:     "PENDING",
+			CreatedAt:  time.Now(),
+		}
+		orders = append(orders, gridOrder)
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":       symbol,
+		"total_orders": len(orders),
+		"order_size":   orderSize,
+	}).Info("Micro grid orders prepared")
+
+	// Place orders concurrently
+	placedOrders := 0
+	successChan := make(chan bool, len(orders))
+
+	for _, order := range orders {
+		go func(o *GridOrder) {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			g.placeOrderAsync(ctx, o, &sync.WaitGroup{}, successChan)
+		}(order)
+	}
+
+	// Wait for results
+	for i := 0; i < len(orders); i++ {
+		select {
+		case success := <-successChan:
+			if success {
+				placedOrders++
+			}
+		case <-time.After(5 * time.Second):
+			g.logger.Warn("Micro grid order placement timeout", zap.String("symbol", symbol))
+		}
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":       symbol,
+		"total_orders": placedOrders,
+		"mode":         "micro_grid",
+		"spread_pct":   0.05,
+		"order_size":   orderSize,
+	}).Info("Micro grid orders placed")
 
 	return placedOrders
 }

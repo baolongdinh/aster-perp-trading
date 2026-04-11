@@ -30,11 +30,46 @@ type RangeConfig struct {
 	MinRangeWidthPct    float64       // Minimum range width as % of price (e.g., 0.005 = 0.5%)
 }
 
+// EnhancedRangeConfig extends RangeConfig with ADX and fast detection support
+type EnhancedRangeConfig struct {
+	RangeConfig `yaml:",inline" mapstructure:",squash"`
+
+	// Fast detection settings (Phase 2 optimization)
+	BBPeriod         int     `yaml:"bb_period" mapstructure:"bb_period"`                 // 10 for fast, 20 for standard
+	ADXPeriod        int     `yaml:"adx_period" mapstructure:"adx_period"`               // 14 periods for ADX
+	SidewaysADXMax   float64 `yaml:"sideways_adx_max" mapstructure:"sideways_adx_max"`   // Max ADX for sideways (20.0)
+	StabilizationMin int     `yaml:"stabilization_min" mapstructure:"stabilization_min"` // Min periods after breakout
+
+	// ADX tracking
+	EnableADXFilter bool    `yaml:"enable_adx_filter" mapstructure:"enable_adx_filter"` // Enable ADX < 20 filter
+	CurrentADX      float64 `yaml:"-" mapstructure:"-"`                                 // Current ADX value (runtime)
+}
+
+// FastRangeConfig returns optimized config for fast range detection (10 periods)
+func FastRangeConfig() *EnhancedRangeConfig {
+	return &EnhancedRangeConfig{
+		RangeConfig: RangeConfig{
+			Method:              "combined",
+			Periods:             10, // Fast: 10 periods instead of 20
+			BBMultiplier:        2.0,
+			ATRMultiplier:       1.5,
+			BreakoutThreshold:   0.01,
+			StabilizationPeriod: 30 * time.Second,
+			MinRangeWidthPct:    0.003,
+		},
+		BBPeriod:         10,
+		ADXPeriod:        14,
+		SidewaysADXMax:   20.0,
+		StabilizationMin: 3,
+		EnableADXFilter:  false, // Disabled by default
+	}
+}
+
 // DefaultRangeConfig returns default range configuration
 func DefaultRangeConfig() *RangeConfig {
 	return &RangeConfig{
 		Method:              "combined",       // Dùng cả BB và ATR
-		Periods:             20,               // 20 periods
+		Periods:             10,               // 10 periods (optimized for faster detection)
 		BBMultiplier:        2.0,              // 2 sigma cho BB
 		ATRMultiplier:       1.5,              // 1.5x ATR cho range
 		BreakoutThreshold:   0.01,             // 1% vượt range = breakout
@@ -96,6 +131,12 @@ type RangeDetector struct {
 	// Grid parameters derived from range
 	gridSpreadPct float64
 	gridLevels    int
+
+	// NEW: ADX tracking for sideways detection
+	currentADX      float64   // Current ADX value
+	adxHistory      []float64 // ADX history for smoothing
+	enableADXFilter bool      // Enable ADX < 20 filter
+	sidewaysADXMax  float64   // Max ADX for sideways (default 20.0)
 }
 
 // NewRangeDetector creates new range detector
@@ -373,10 +414,22 @@ func (r *RangeDetector) GetGridParameters() (spreadPct float64, levels int, vali
 	return r.gridSpreadPct, r.gridLevels, true
 }
 
-// ShouldTrade returns true if trading is allowed (range active)
+// ShouldTrade returns true if trading is allowed (range active + ADX sideways if enabled)
 func (r *RangeDetector) ShouldTrade() bool {
-	state := r.GetState()
-	return state == RangeStateActive
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Must have active range
+	if r.state != RangeStateActive {
+		return false
+	}
+
+	// Must pass ADX filter if enabled
+	if r.enableADXFilter {
+		return r.IsSidewaysConfirmed()
+	}
+
+	return true
 }
 
 // IsBreakout returns true if breakout detected
@@ -435,4 +488,66 @@ func (r *RangeDetector) GetRangeInfo() map[string]interface{} {
 	}
 
 	return info
+}
+
+// SetADXFilter enables/disables ADX filter for sideways detection
+func (r *RangeDetector) SetADXFilter(enabled bool, maxADX float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enableADXFilter = enabled
+	if maxADX > 0 {
+		r.sidewaysADXMax = maxADX
+	} else {
+		r.sidewaysADXMax = 20.0 // Default
+	}
+}
+
+// UpdateADX updates current ADX value
+func (r *RangeDetector) UpdateADX(adx float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.currentADX = adx
+	r.adxHistory = append(r.adxHistory, adx)
+
+	// Keep only last 14 values
+	if len(r.adxHistory) > 14 {
+		r.adxHistory = r.adxHistory[1:]
+	}
+}
+
+// GetCurrentADX returns current ADX value
+func (r *RangeDetector) GetCurrentADX() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.currentADX
+}
+
+// IsSidewaysConfirmed returns true if ADX indicates sideways market (ADX < sidewaysADXMax)
+func (r *RangeDetector) IsSidewaysConfirmed() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// If ADX filter is not enabled, always return true (allow trading)
+	if !r.enableADXFilter {
+		return true
+	}
+
+	// Check if we have enough ADX data
+	if r.currentADX == 0 && len(r.adxHistory) == 0 {
+		return true // Default to allowing trading if no ADX data
+	}
+
+	// Use average ADX for smoother signal
+	avgADX := r.currentADX
+	if len(r.adxHistory) > 0 {
+		sum := 0.0
+		for _, v := range r.adxHistory {
+			sum += v
+		}
+		avgADX = sum / float64(len(r.adxHistory))
+	}
+
+	// Sideways market when ADX < sidewaysADXMax (default 20)
+	return avgADX < r.sidewaysADXMax
 }

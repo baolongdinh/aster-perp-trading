@@ -6,60 +6,121 @@
 # - Agentic (Decision Layer): Chọn symbols dựa trên regime detection
 # - Volume Farm (Execution Layer): Thực hiện grid trading
 #
-# Cấu trúc:
-# 1. agentic: Cấu hình cho decision layer
-# 2. volume_farming: Cấu hình cho execution layer (giữ nguyên từ volume-farm-config.yaml)
+# HƯỚNG DẪN SỬ DỤNG:
+# ==================
+# 1. Tìm section cần chỉnh → Đọc comment phía trên
+# 2. Hiểu TRADE-OFF → Điều chỉnh value phù hợp
+# 3. Restart bot để apply changes
+#
+# CÁC SECTION CHÍNH:
+# 1. optimization.*      - Tối ưu volume/profit (P0) ⭐ NEW
+# 2. volume_farming.*    - Grid execution config
+# 3. agentic.*           - Symbol selection
+# 4. risk.*              - Risk management
 # =============================================================================
 
 bot:
+  # DRY RUN MODE
+  # true:  Chỉ log, không đặt lệnh (test config)
+  # false: Vào lệnh thật (production)
+  # 
+  # ⚠️ Luôn test với dry_run: true trước khi chạy thật
   dry_run: false
 
 # =============================================================================
-# AGENTIC DECISION LAYER
+# AGENTIC DECISION LAYER - Chọn symbol thông minh
+# =============================================================================
+# Agentic phân tích thị trường, chọn symbol tốt nhất để grid trading.
+# Ưu tiên: Sideways market, volatility vừa phải, volume cao.
 # =============================================================================
 agentic:
   enabled: true
   
-  # Symbol universe - các cặp agentic sẽ theo dõi và đánh giá
+  # SYMBOL UNIVERSE - Danh sách cặp giao dịch
+  # =========================================
   universe:
+    # Danh sách cố định - Agentic sẽ chọn từ đây
     symbols:
-      - BTCUSD1  # RESTORED: Fixed precision handling
-      - ETHUSD1
-      - SOLUSD1
+      - BTCUSD1  # Ổn định, spread tốt
+      - ETHUSD1  # Volume cao
+      - SOLUSD1  # Biến động vừa
     
-    # Hoặc auto-discover từ top volume
+    # HOẶC tự động tìm từ top volume
+    # 
+    # TRADE-OFF:
+    #   auto_discover: false → An toàn, kiểm soát cao
+    #   auto_discover: true  → Linh hoạt, có thể bắt trend sớm
     auto_discover: false
+    
+    # Số symbol tối đa khi auto_discover = true
+    # TĂNG: Nhiều cơ hội, nhưng rủi ro spread cao ở coin lạ
+    # GIẢM: Tập trung vào coin chất lượng cao
     top_volume_count: 20
+    
+    # Ngưỡng volume tối thiểu ($10M/ngày)
+    # TĂNG: Chỉ chọn coin lớn, an toàn
+    # GIẢM: Có thể chọn coin nhỏ, rủi ro cao hơn
     min_24h_volume_usd: 10000000  # $10M
   
-  # Regime Detection Settings
+  # REGIME DETECTION - Phát hiện trạng thái thị trường
+  # ===================================================
+  # Xác định: Sideways (tốt cho grid) vs Trending (nguy hiểm)
+  #
+  # THAM SỐ QUAN TRỌNG NHẤT:
+  # - sideways_adx_max: ADX < 25 = sideways (tốt cho grid)
+  # - trending_adx_min: ADX > 25 = trending (nguy hiểm)
+  #
+  # TRADE-OFF ADX:
+  #   ADX thấp (15-20): Chặt chẽ, ít giao dịch, an toàn cao
+  #   ADX cao (25-30): Dễ dãi, nhiều giao dịch, rủi ro cao
+  #
+  # KHUYẾN NGHỊ: sideways_adx_max: 20-25
   regime_detection:
-    update_interval: 30s
-    adx_period: 14
-    bb_period: 20
-    atr_period: 14
-    candle_interval: 5m
+    update_interval: 15s        # Tần suất cập nhật
+    adx_period: 14            # 14 nến cho ADX (chuẩn)
+    bb_period: 20             # 20 nến cho Bollinger Bands
+    atr_period: 14            # 14 nến cho ATR
+    candle_interval: 5m       # Khung thời gian phân tích
     
     thresholds:
-      sideways_adx_max: 25
-      trending_adx_min: 25
-      volatile_atr_spike: 3.0
+      sideways_adx_max: 25      # ADX < 25 = sideways ✓
+      trending_adx_min: 25     # ADX > 25 = trending ✗
+      volatile_atr_spike: 3.0   # ATR spike = volatile
   
-  # Scoring Weights
+  # SCORING WEIGHTS - Trọng số đánh giá symbol
+  # ===========================================
+  # Công thức: Score = trend*0.3 + volatility*0.25 + volume*0.25 + structure*0.2
+  #
+  # ĐIỀU CHỈNH:
+  # - Tăng trend: Ưu tiên đang có xu hướng rõ ràng
+  # - Tăng volatility: Ưu tiên biến động cao (grid lợi nhuận cao)
+  # - Tăng volume: Ưu tiên thanh khoản tốt
   scoring:
     weights:
-      trend: 0.30
-      volatility: 0.25
-      volume: 0.25
-      structure: 0.20
+      trend: 0.30       # Xu hướng (trending strength)
+      volatility: 0.25   # Biến động (ATR)
+      volume: 0.25       # Khối lượng giao dịch
+      structure: 0.20    # Cấu trúc giá (support/resistance)
     
+    # Ngưỡng điểm để hành động
+    # 
+    # TRADE-OFF:
+    #   Ngưỡng thấp: Dễ vào lệnh, nhiều trade, rủi ro cao
+    #   Ngưỡng cao: Khó vào lệnh, ít trade, chất lượng cao
     thresholds:
-      high_score: 70      # Deploy full (giảm từ 75)
-      medium_score: 50    # Deploy reduced (giảm từ 60)
-      low_score: 35       # Monitor only (giảm từ 40)
-      skip_score: 0       # Skip
+      high_score: 70      # Deploy full size
+      medium_score: 50    # Deploy reduced size  
+      low_score: 35       # Monitor only
+      skip_score: 0       # Bỏ qua
   
-  # Position Sizing per Regime
+  # POSITION SIZING - Điều chỉnh size theo điều kiện
+  # =================================================
+  # 
+  # REGIME MULTIPLIERS:
+  #   SIDEWAYS: 1.0  → Grid hoạt động tốt nhất, full size
+  #   TRENDING: 0.7  → Giảm 30%, tránh bị cuốn theo trend
+  #   VOLATILE: 0.5  → Giảm 50%, biến động cao rủi ro cao
+  #   RECOVERY: 0.8  → Thận trọng, chưa rõ xu hướng
   position_sizing:
     score_multipliers:
       HIGH: 1.0
@@ -67,57 +128,116 @@ agentic:
       LOW: 0.3
     
     regime_multipliers:
-      SIDEWAYS: 1.0     # Grid hoạt động tốt
-      TRENDING: 0.7     # Giảm size vì rủi ro
-      VOLATILE: 0.5     # Giảm nhiều hơn
-      RECOVERY: 0.8     # Cẩn trọng
+      SIDEWAYS: 1.0     # Full size - grid hoạt động tốt
+      TRENDING: 0.7     # Giảm 30% - rủi ro trend
+      VOLATILE: 0.5     # Giảm 50% - biến động cao
+      RECOVERY: 0.8     # Giảm 20% - thận trọng
   
-  # Whitelist Management - DISABLED, use VF whitelist instead
+  # WHITELIST MANAGEMENT - Quản lý danh sách symbol
+  # =================================================
+  # 
+  # LƯU Ý: Hiện tại TẮT (enabled: false) để dùng whitelist cố định
+  # Bật lên nếu muốn agentic tự động thay đổi symbol
   whitelist_management:
-    enabled: false              # TẮT - dùng VF whitelist cố định
-    max_symbols: 5              # Không dùng khi enabled=false
-    min_score_to_add: 45
-    score_to_remove: 30
-    keep_if_position_open: true
-    replace_immediately: true
+    enabled: false              # TẮT - dùng VF whitelist
+    max_symbols: 5              # Tối đa 5 symbol cùng lúc
+    min_score_to_add: 45        # Điểm tối thiểu để thêm
+    score_to_remove: 30         # Điểm dưới này thì xóa
+    keep_if_position_open: true  # Giữ symbol nếu đang có position
+    replace_immediately: true    # Thay thế ngay khi tìm được symbol tốt hơn
   
-  # Circuit Breakers (override VF breakers nếu cần)
+  # CIRCUIT BREAKERS - Tự động dừng khi rủi ro
+  # ==============================================
+  # Tự động dừng trading khi phát hiện điều kiện nguy hiểm
   circuit_breakers:
     volatility_spike:
       enabled: true
-      atr_multiplier: 3.0
+      atr_multiplier: 3.0       # ATR > 3x trung bình = dừng
     
     consecutive_losses:
       enabled: true
-      threshold: 3
-      size_reduction: 0.5
+      threshold: 3              # 3 lỗi liên tiếp
+      size_reduction: 0.5       # Giảm 50% size sau đó
 
 # =============================================================================
-# VOLUME FARMING EXECUTION LAYER
+# VOLUME FARMING EXECUTION LAYER - Thực hiện grid trading
 # =============================================================================
-# (Giữ nguyên cấu hình từ volume-farm-config.yaml)
-
+# Đây là phần quan trọng nhất để tối ưu volume và profit.
+# Mỗi tham số ảnh hưởng trực tiếp đến hiệu suất.
+# =============================================================================
 volume_farming:
   enabled: true
 
+  # LOSS LIMITS - Giới hạn lỗ
+  # =========================
+  # 
+  # max_daily_loss_usdt: Lỗ tối đa/ngày trước khi dừng
+  # TRADE-OFF:
+  #   Cao (5-10): Chịu được drawdown lớn, nhưng rủi ro cao
+  #   Thấp (1-3): An toàn, nhưng dễ bị dừng sớm do nhiễu
   max_daily_loss_usdt: 3
+  
+  # max_total_drawdown_pct: Drawdown tối đa cho phép (%)
   max_total_drawdown_pct: 50.0
-  # RESTORED: larger order size (ensure account has enough margin)
+
+  # ORDER CONFIGURATION - Cấu hình lệnh
+  # =====================================
+  # 
+  # order_size_usdt: Kích thước mỗi lệnh (USDT)
+  # TRADE-OFF:
+  #   Lớn (20-50): Lợi nhuận cao mỗi fill, nhưng rủi ro lớn nếu sai
+  #   Nhỏ (3-10): An toàn, nhiều fill, nhưng phí cao/profit
+  #
+  # TỐI ƯU:
+  #   - Sideways chặt: 3-5 USDT (micro grid)
+  #   - Sideways rộng: 10-20 USDT
+  #   - Volatile: 5-10 USDT
   order_size_usdt: 20.5
+  
+  # grid_spread_pct: Khoảng cách giữa các lệnh (%)
+  # =================================================
+  # TRADE-OFF:
+  #   Rộng (0.3-0.5%): Ít fill, lợi nhuận cao/fill
+  #   Hẹp (0.05-0.1%): Nhiều fill, volume cao
+  #
+  # TỐI ƯU THEO ĐIỀU KIỆN:
+  #   - Sideways chặt: 0.05-0.1%
+  #   - Sideways bình thường: 0.15-0.2%
+  #   - Biến động cao: 0.3-0.5%
   grid_spread_pct: 0.0015
-  # RESTORED: more orders per side (ensure account has enough notional limit)
+  
+  # max_orders_per_side: Số lệnh tối đa mỗi bên
+  # ========================================================
+  # TRADE-OFF:
+  #   Nhiều (5-10): Bao phủ range rộng, nhiều fill, cần nhiều margin
+  #   Ít (3-5): Tập trung, ít margin, có thể miss cơ hội
   max_orders_per_side: 10
+  
   max_global_pending_limit_orders: 30
   max_pending_per_side: 15
+  
+  # replace_immediately: Đặt lại lệnh ngay sau khi fill
+  # =====================================================
+  # true: Luôn duy trì grid đầy đủ → Volume cao nhất
+  # false: Chờ điều kiện mới → Volume thấp hơn, an toàn hơn
   replace_immediately: true
+  
+  # position_timeout_minutes: Thời gian tối đa giữ position
+  # ===========================================================
+  # TRADE-OFF:
+  #   Dài (10-15): Chờ cơ hội tốt hơn, nhưng rủi ro biến động
+  #   Ngắn (3-5): Nhanh chóng cắt lỗ, nhưng có thể miss hồi phục
   position_timeout_minutes: 5
 
-  # Time Filter - Enable/disable trading hours restriction
+  # TIME FILTER - Hạn chế giờ giao dịch
+  # ===================================
+  # Ví dụ: Chỉ trade giờ Âu-Mỹ (volume cao)
+  # MẶC ĐỊNH: Tắt (trade 24/7)
   time_filter:
-    enabled: false  # Set to true to enable trading hours restriction
+    enabled: false
     trading_hours:
-      start: "00:00"  # 24h format, UTC
-      end: "23:59"    # 24h format, UTC
+      start: "00:00"         # UTC
+      end: "23:59"           # UTC
     days: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
   ticker_stream: "!ticker@arr"
@@ -130,7 +250,8 @@ volume_farming:
   supported_quote_currencies: ["USD1"]
   min_volume_24h: 1000
 
-  # Symbol Selection - CHỈ USD1
+  # SYMBOL SELECTION
+  # ================
   symbols:
     auto_discover: false
     quote_currency_mode: "USD1"
@@ -138,7 +259,7 @@ volume_farming:
     quote_currencies: ["USD1"]
     allow_mixed_quotes: false
     min_volume_24h: 1000
-    max_spread_pct: 5.0
+    max_spread_pct: 5.0          # Bỏ qua nếu spread > 5%
     boosted_only: false
     max_symbols_per_quote: 1
     spread_ranking: true
@@ -148,12 +269,9 @@ volume_farming:
     spread_volatility_threshold: 0.1
     exclude_high_fee_symbols: true
     
-    # Whitelist sẽ được agentic quản lý động
-    # Nếu agentic.enabled = true, whitelist này sẽ bị override
     whitelist: ["BTCUSD1", "ETHUSD1", "SOLUSD1"]
-    blacklist: []  # BTC restored - precision fixed
+    blacklist: []
 
-  # Exchange Configuration
   exchange:
     api_key: "${ASTER_API_KEY}"
     futures_rest_base: "https://fapi.asterdex.com"
@@ -161,16 +279,22 @@ volume_farming:
     recv_window: 5000
     requests_per_second: 5
 
-  # Funding Rate Awareness
+  # FUNDING RATE
+  # ============
+  # Funding rate cao → Chi phí nắm giữ position cao
   funding_rate:
     enabled: true
-    high_threshold: 0.001
-    extreme_threshold: 0.005
+    high_threshold: 0.001       # Cảnh báo khi > 0.1%
+    extreme_threshold: 0.005    # Nguy hiểm khi > 0.5%
     bias_strength: 0.7
-    skip_threshold: 0.01
+    skip_threshold: 0.01        # Bỏ qua symbol nếu > 1%
     check_interval_minutes: 5
 
-  # Dynamic Grid Spread
+  # DYNAMIC GRID SPREAD
+  # ===================
+  # Tự động điều chỉnh spread theo ATR (volatility)
+  # ATR thấp → Spread hẹp (0.8x)
+  # ATR cao → Spread rộng (1.5-2x)
   dynamic_grid:
     enabled: true
     base_spread_pct: 0.0015
@@ -183,7 +307,11 @@ volume_farming:
     extreme_multiplier: 2.0
     atr_period: 7
 
-  # Smart Position Sizing
+  # SMART POSITION SIZING
+  # =====================
+  # Tự động điều chỉnh size dựa trên hiệu suất gần đây (Kelly Criterion)
+  # Win rate cao → Tăng size
+  # Loss streak → Giảm size (decay 0.8)
   smart_sizing:
     enabled: true
     kelly_fraction: 0.25
@@ -192,7 +320,12 @@ volume_farming:
     max_size: 100.0
     window_hours: 24
 
-  # Partial Close Strategy
+  # PARTIAL CLOSE
+  # =============
+  # Chia position thành 3 phần, chốt dần
+  # TP1 (0.5%): Chốt 30% → Thu hồi vốn nhanh
+  # TP2 (1.0%): Chốt 40% → Lợi nhuận chính
+  # TP3 (1.5%): Chốt 30% + Trailing → Tận dụng trend
   partial_close:
     enabled: true
     tp1:
@@ -207,7 +340,8 @@ volume_farming:
     trailing_after_tp2: true
     trailing_distance: 0.005
 
-  # Risk Management
+  # RISK MANAGEMENT
+  # ===============
   risk:
     max_position_usdt_per_symbol: 300
     max_total_positions_usdt: 500
@@ -237,3 +371,197 @@ api:
 log:
   level: "info"
   file: "logs/agentic-vf.log"
+
+# =============================================================================
+# OPTIMIZATION CONFIGURATION - TỐI ƯU GRID TRADING ⭐ NEW
+# =============================================================================
+# ĐÂY LÀ PHẦN QUAN TRỌNG NHẤT để đạt được:
+#   - Volume cao (nhiều fill)
+#   - Profit micro (8-40 bps)
+#   - Risk thấp (liquidation protection)
+#
+# ⚠️ Tất cả đều mặc định TẮT để test từng cái
+# → Bật lên sau khi hiểu rõ tác dụng
+# =============================================================================
+optimization:
+
+  # ===========================================================================
+  # MICRO GRID - Grid siêu nhỏ cho volume cực cao
+  # ===========================================================================
+  # Mục tiêu: Tối đa số lần fill, micro profit mỗi fill
+  #
+  # KHI NÀO DÙNG:
+  # - Thị trường sideways chặt (BTC/ETH range-bound)
+  # - Muốn tối đa volume farming points
+  #
+  # TRADE-OFFS MICRO_GRID:
+  # ┌────────────────┬──────────────────┬──────────────────┐
+  # │   Tham số      │   TĂNG           │   GIẢM          │
+  # ├────────────────┼──────────────────┼──────────────────┤
+  # │ enabled        │ Volume +200%     │ Risk slippage   │
+  # │                │ Profit/fill thấp │ An toàn hơn    │
+  # ├────────────────┼──────────────────┼──────────────────┤
+  # │ spread_pct     │ Profit/fill cao  │ Ít fill hơn   │
+  # │   (0.05-0.2%)  │ An toàn hơn      │ Volume thấp   │
+  # ├────────────────┼──────────────────┼──────────────────┤
+  # │ orders_per_side│ Bao phủ rộng     │ Cần margin    │
+  # │   (3-7)        │ Nhiều cơ hội     │ nhiều hơn     │
+  # ├────────────────┼──────────────────┼──────────────────┤
+  # │ order_size_usdt│ Profit/lệnh cao  │ Risk lớn      │
+  # │   ($3-10)      │ Lỗ nhiều hơn     │ An toàn       │
+  # └────────────────┴──────────────────┴──────────────────┘
+  #
+  # KHUYẾN NGHỊ: spread_pct: 0.05%, orders_per_side: 5, order_size_usdt: 3.0
+  micro_grid:
+    enabled: true           # ⚠️ Bật sau khi test kỹ
+    spread_pct: 0.0005       # 0.05% = 5 bps (ultra-tight)
+    orders_per_side: 5       # 5 lệnh mỗi side (vs 3 mặc định)
+    order_size_usdt: 3.0     # $3/lệnh (vs $5 mặc định)
+    min_profit_per_fill: 0.0002  # 2 bps min để cover phí
+
+  # ===========================================================================
+  # FAST RANGE DETECTION - Phát hiện range nhanh hơn
+  # ===========================================================================
+  # Giảm BB period từ 20 → 10 để phát hiện range mới nhanh hơn
+  #
+  # LỢI ÍCH:
+  # - Vào lệnh sớm hơn sau breakout
+  # - Bắt kịp range ngắn hạn
+  #
+  # RỦI RO:
+  # - False positive nhiều hơn
+  # - Có thể vào lệnh khi chưa thực sự stable
+  #
+  # KHUYẾN NGHỊ: Luôn bật (enabled: true), BB period 10
+  fast_range:
+    enabled: true            # ✅ Nên bật
+    bb_period: 10            # 10 nến (vs 20 mặc định)
+    adx_period: 14
+    sideways_adx_max: 20.0   # ADX < 20 = sideways
+    stabilization_min: 3     # Chờ 3 period sau breakout
+    enable_adx_filter: true
+
+  # ===========================================================================
+  # ADX FILTER - Chỉ trade khi thực sự sideways
+  # ===========================================================================
+  # ADX (Average Directional Index):
+  #   ADX < 20: Sideways (tốt cho grid)
+  #   ADX > 25: Trending (nguy hiểm cho grid)
+  #
+  # ĐIỀU CHỈNH sideways_adx_max:
+  #   15-18: Rất chặt, chỉ trade chắc chắn sideways
+  #   20-25: Balance (khuyến nghị)
+  #   25-30: Dễ dãi, có thể bắt đầu trend nhẹ
+  #
+  # KHUYẾN NGHỊ: 20.0
+  adx_filter:
+    enabled: true            # ✅ Nên bật
+    adx_period: 14
+    sideways_adx_max: 20.0   # Chỉ trade khi ADX < 20
+
+  # ===========================================================================
+  # DYNAMIC LEVERAGE - Đòn bẩy thay đổi theo điều kiện
+  # ===========================================================================
+  # Tự động điều chỉnh leverage dựa trên ATR/ADX/BB Width
+  #
+  # LOGIC:
+  #   Sideways chặt (ATR thấp) → Max leverage (100x)
+  #   Trending (ATR cao)      → Min leverage (10x)
+  #
+  # TRADE-OFF:
+  #   enabled: true  → Tối ưu leverage, nhưng phức tạp
+  #   enabled: false → Đơn giản, leverage cố định
+  #
+  # KHUYẾN NGHỊ: Người mới để false
+  dynamic_leverage:
+    enabled: false           # ⚠️ Chỉ bật khi hiểu rõ
+    base_leverage: 50.0
+    min_leverage: 10.0
+    max_leverage: 100.0
+    atr_threshold_high: 1.5
+    atr_threshold_low: 0.8
+    adx_threshold_trending: 30.0
+    bb_width_threshold_tight: 0.005
+
+  # ===========================================================================
+  # MULTI-LAYER LIQUIDATION - Bảo vệ 4 lớp trước liquidation
+  # ===========================================================================
+  # 4 tiers thay vì chỉ 1 ngưỡng:
+  #   Tier 1 (50%): Cảnh báo
+  #   Tier 2 (30%): Giảm 50% position
+  #   Tier 3 (15%): Đóng tất cả
+  #   Tier 4 (10%): Emergency hedge
+  #
+  # TRADE-OFF:
+  #   enabled: true  → Bảo vệ tối đa, nhưng có thể đóng sớm
+  #   enabled: false → Chỉ 1 cơ hội trước liquidation
+  #
+  # KHUYẾN NGHỊ: Bật true cho production
+  multi_layer_liquidation:
+    enabled: false           # ⚠️ Bật cho production
+    layer1_warn_pct: 0.50    # Tier 1: 50% distance
+    layer2_reduce_pct: 0.30  # Tier 2: 30% distance
+    layer3_close_pct: 0.15   # Tier 3: 15% distance
+    layer4_hedge_pct: 0.10   # Tier 4: 10% distance
+    reduce_position_by: 0.50 # Giảm 50% ở Tier 2
+
+  # ===========================================================================
+  # MICRO PARTIAL CLOSE - Chốt lời 4 mức micro (8-40 bps)
+  # ===========================================================================
+  # Thay vì 3 TP levels như cũ, có 4 levels micro:
+  #   TP1: 8 bps  → Close 25%
+  #   TP2: 15 bps → Close 25%
+  #   TP3: 25 bps → Close 25%
+  #   TP4: 40 bps → Close 25% + Trailing
+  #
+  # LỢI ÍCH: Chốt lời nhanh (8 bps đã cover phí), nhiều lần chốt lời
+  #
+  # KHUYẾN NGHỊ: Bật nếu dùng micro_grid
+  micro_partial_close:
+    enabled: false           # Bật nếu dùng micro_grid
+    tp_levels:
+      - target_pct: 0.0008   # TP1: 8 bps
+        close_pct: 0.25
+      - target_pct: 0.0015     # TP2: 15 bps
+        close_pct: 0.25
+      - target_pct: 0.0025    # TP3: 25 bps
+        close_pct: 0.25
+      - target_pct: 0.0040     # TP4: 40 bps
+        close_pct: 0.25
+    trailing_after_tp3: true
+    trailing_distance: 0.001
+
+# =============================================================================
+# HƯỚNG DẪN TỐI ƯU THEO MỤC TIÊU
+# =============================================================================
+#
+# MỤC TIÊU 1: Tối đa VOLUME (Farming Points)
+# ────────────────────────────────────────────
+# optimization:
+#   micro_grid: { enabled: true, spread_pct: 0.0005, orders_per_side: 7 }
+#   fast_range: { enabled: true, bb_period: 10 }
+#   adx_filter: { enabled: true }
+# volume_farming:
+#   order_size_usdt: 3
+#   grid_spread_pct: 0.0005
+#   max_orders_per_side: 7
+#
+# MỤC TIÊU 2: Tối đa PROFIT (Risk cao hơn)
+# ────────────────────────────────────────────
+# optimization:
+#   micro_grid: { enabled: false }
+#   dynamic_leverage: { enabled: true }
+# volume_farming:
+#   order_size_usdt: 20
+#   grid_spread_pct: 0.002
+#
+# MỤC TIÊU 3: AN TOÀN (Risk thấp)
+# ─────────────────────────────────────────
+# optimization:
+#   multi_layer_liquidation: { enabled: true }
+#   adx_filter: { enabled: true, sideways_adx_max: 15 }
+# volume_farming:
+#   order_size_usdt: 5
+#   max_daily_loss_usdt: 2
+#
+# =============================================================================

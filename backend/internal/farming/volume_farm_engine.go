@@ -270,18 +270,38 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	go func() {
 		defer e.wg.Done()
 
-		// CRITICAL: Load optimization config (includes trading_hours.yaml) BEFORE Initialize
-		configDir := "config" // Default config directory
-		optConfig, err := config.LoadOptimizationConfig(configDir)
-		if err != nil {
-			e.logger.Warn("Failed to load optimization config, using defaults",
-				zap.Error(err),
-				zap.String("config_dir", configDir))
+		// CRITICAL: Load optimization config BEFORE Initialize
+		// Priority 1: Use unified config if available (from agentic-vf-config.yaml)
+		// Priority 2: Load from separate files in config/ directory
+		var optConfig *config.OptimizationConfig
+
+		if e.config.Optimization != nil {
+			// Use optimization config from unified config file
+			optConfig = e.config.Optimization
+			e.logger.Info("Using optimization config from unified config file",
+				zap.Bool("micro_grid_enabled", optConfig.MicroGrid != nil && optConfig.MicroGrid.Enabled),
+				zap.Bool("fast_range_enabled", optConfig.FastRange != nil && optConfig.FastRange.Enabled),
+				zap.Bool("adx_filter_enabled", optConfig.ADXFilter != nil && optConfig.ADXFilter.Enabled),
+				zap.Bool("dynamic_leverage_enabled", optConfig.DynamicLeverage != nil && optConfig.DynamicLeverage.Enabled),
+				zap.Bool("multi_layer_liq_enabled", optConfig.MultiLayerLiq != nil && optConfig.MultiLayerLiq.Enabled))
 		} else {
-			e.logger.Info("Optimization config loaded successfully",
-				zap.Bool("time_filter_enabled", optConfig.TimeFilter != nil && optConfig.TimeFilter.Enabled),
-				zap.Int("time_slots", len(optConfig.TimeFilter.Slots)))
-			// Pass config to adaptive grid manager BEFORE Initialize
+			// Fall back to loading from separate files
+			configDir := "config" // Default config directory
+			var err error
+			optConfig, err = config.LoadOptimizationConfig(configDir)
+			if err != nil {
+				e.logger.Warn("Failed to load optimization config from files, using defaults",
+					zap.Error(err),
+					zap.String("config_dir", configDir))
+			} else {
+				e.logger.Info("Optimization config loaded from separate files",
+					zap.Bool("time_filter_enabled", optConfig.TimeFilter != nil && optConfig.TimeFilter.Enabled),
+					zap.Int("time_slots", len(optConfig.TimeFilter.Slots)))
+			}
+		}
+
+		// Pass config to adaptive grid manager BEFORE Initialize
+		if optConfig != nil {
 			e.adaptiveGridManager.SetOptimizationConfig(optConfig)
 		}
 
