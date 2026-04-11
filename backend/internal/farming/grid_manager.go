@@ -831,6 +831,36 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		"total_orders":        len(orders),
 	}).Info("Grid orders prepared for placement (smart rebuild)")
 
+	// CRITICAL: Pre-flight check to prevent concurrent orders from exceeding exchange limits
+	// Calculate total notional of all orders to be placed
+	totalNotional := 0.0
+	for _, order := range orders {
+		totalNotional += order.Size * order.Price
+	}
+	// Get current exposure from exchange (including existing positions + active orders)
+	currentExposure := g.calculateCurrentExposure(ctx, symbol)
+	projectedTotal := currentExposure + totalNotional
+	exposureLimit := g.maxNotionalUSD * 1.2
+	if projectedTotal > exposureLimit {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":           symbol,
+			"current_exposure": currentExposure,
+			"batch_notional":   totalNotional,
+			"projected_total":  projectedTotal,
+			"exposure_limit":   exposureLimit,
+			"max_notional_usd": g.maxNotionalUSD,
+			"order_count":      len(orders),
+		}).Error("GRID PLACEMENT REJECTED: Total notional would exceed exchange limit - skip batch placement to avoid error -5018")
+		return 0
+	}
+	g.logger.WithFields(logrus.Fields{
+		"symbol":           symbol,
+		"current_exposure": currentExposure,
+		"batch_notional":   totalNotional,
+		"projected_total":  projectedTotal,
+		"exposure_limit":   exposureLimit,
+	}).Debug("Pre-flight notional check passed")
+
 	// Place all orders concurrently
 	var wg sync.WaitGroup
 	successChan := make(chan bool, len(orders))
