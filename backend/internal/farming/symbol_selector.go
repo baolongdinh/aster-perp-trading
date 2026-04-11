@@ -461,6 +461,20 @@ func (s *SymbolSelector) IsRunning() bool {
 	return s.isRunning
 }
 
+// SetWhitelist updates the whitelist for symbol selection (called by Agentic layer)
+func (s *SymbolSelector) SetWhitelist(symbols []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logger.WithField("whitelist", symbols).Info("Setting whitelist from Agentic layer")
+
+	// Update the config whitelist
+	s.config.Symbols.Whitelist = symbols
+
+	// Disable auto-discover when using Agentic whitelist
+	s.config.Symbols.AutoDiscover = false
+}
+
 func normalizeVolumeConfig(cfg *config.VolumeFarmConfig) *config.VolumeFarmConfig {
 	if cfg == nil {
 		cfg = &config.VolumeFarmConfig{

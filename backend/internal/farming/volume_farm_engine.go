@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"aster-bot/internal/agentic"
 	"aster-bot/internal/auth"
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
@@ -774,4 +775,40 @@ type VolumeFarmStatus struct {
 	DailyLoss     float64   `json:"daily_loss"`
 	RiskStatus    string    `json:"risk_status"`
 	LastUpdate    time.Time `json:"last_update"`
+}
+
+// UpdateWhitelist updates the whitelist for symbol selection (called by Agentic layer)
+func (e *VolumeFarmEngine) UpdateWhitelist(symbols []string) error {
+	e.logger.Info("Updating whitelist from Agentic layer",
+		zap.Strings("symbols", symbols))
+
+	// Update the symbol selector whitelist
+	e.symbolSelector.SetWhitelist(symbols)
+
+	// Trigger a resync of grid symbols
+	e.syncGridSymbols()
+
+	return nil
+}
+
+// GetActivePositions returns the current active positions across all symbols
+func (e *VolumeFarmEngine) GetActivePositions() ([]agentic.PositionStatus, error) {
+	// Get active grids which contain position information
+	activeGrids := e.gridManager.GetActiveGrids()
+
+	positions := make([]agentic.PositionStatus, 0, len(activeGrids))
+	for _, grid := range activeGrids {
+		// Determine if there's an actual position based on grid state
+		// This is simplified - real implementation would check position size from exchange
+		position := agentic.PositionStatus{
+			Symbol:        grid.Symbol,
+			HasPosition:   false, // Will be updated with actual position data
+			Size:          0,
+			UnrealizedPnL: 0,
+			Side:          "",
+		}
+		positions = append(positions, position)
+	}
+
+	return positions, nil
 }

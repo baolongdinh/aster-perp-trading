@@ -1,4 +1,4 @@
-.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script
+.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test
 
 # The name of our output binary
 APP_NAME := aster-bot
@@ -400,3 +400,101 @@ dashboard-simple:
 		echo "ERROR: Python not found. Install with: pkg install python"; \
 		exit 1; \
 	fi
+
+# ============================================================================
+# Agentic Trading Bot Termux Targets
+# ============================================================================
+
+# Start agentic + volume farm trading bot on Termux with wake lock
+agentic-start:
+	@echo "============================================"
+	@echo "Starting Agentic + VF Trading Bot on Termux"
+	@echo "============================================"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Wake lock enabled (runs when screen off)"
+	@echo "  • Agentic regime detection & scoring"
+	@echo "  • Dynamic whitelist management"
+	@echo "  • Volume Farm execution layer"
+	@echo "  • Circuit breakers & risk management"
+	@echo "  • Logs to agentic-vf.log"
+	@echo ""
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh start ./config/agentic-vf-config.yaml
+
+# Start agentic bot in test mode (no real trades)
+agentic-test:
+	@echo "============================================"
+	@echo "Starting Agentic + VF Bot (TEST MODE)"
+	@echo "============================================"
+	@echo ""
+	@echo "Test mode features:"
+	@echo "  • No real orders executed"
+	@echo "  • Regime detection active"
+	@echo "  • Whitelist updates logged"
+	@echo "  • Safe for testing strategies"
+	@echo ""
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh start-test ./config/agentic-vf-config.yaml
+
+# Start volume farm only (skip agentic layer)
+agentic-vf-only:
+	@echo "============================================"
+	@echo "Starting Volume Farm Only (No Agentic)"
+	@echo "============================================"
+	@echo ""
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh start-vf ./config/agentic-vf-config.yaml
+
+# Stop the agentic bot
+agentic-stop:
+	@echo "Stopping Agentic Trading Bot..."
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh stop
+
+# Check agentic bot status
+agentic-status:
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh status
+
+# View agentic bot logs
+agentic-logs:
+	@echo "Viewing logs (Ctrl+C to exit)..."
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh logs
+
+# Restart the agentic bot
+agentic-restart:
+	@echo "Restarting Agentic Trading Bot..."
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh restart ./config/agentic-vf-config.yaml
+
+# Run agentic bot in daemon mode with auto-restart
+agentic-daemon:
+	@echo "Starting in daemon mode (auto-restart on crash)..."
+	@echo "Press Ctrl+C to stop daemon watcher (bot will keep running)"
+	@echo "Use 'make agentic-stop' to stop the bot completely"
+	@echo ""
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh daemon ./config/agentic-vf-config.yaml
+
+# Build agentic binary
+agentic-build:
+	@echo "Building Agentic + VF binary..."
+	@go build -o bin/agentic ./cmd/agentic
+	@echo "Binary built: bin/agentic"
+
+# Quick setup for agentic bot on Termux
+agentic-setup:
+	@echo "Setting up Agentic + VF Bot on Termux..."
+	@echo ""
+	@echo "1. Installing termux-api (for wake lock)..."
+	@pkg install termux-api -y 2>/dev/null || echo "termux-api already installed or manual install needed"
+	@echo ""
+	@echo "2. Building binary..."
+	@go build -o bin/agentic ./cmd/agentic
+	@echo ""
+	@echo "3. Creating config..."
+	@cp config/agentic-vf-config.yaml.example config/agentic-vf-config.yaml 2>/dev/null || echo "Config already exists"
+	@echo ""
+	@echo "Setup complete! Use 'make agentic-start' to run"

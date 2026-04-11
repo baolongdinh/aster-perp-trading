@@ -2454,3 +2454,15 @@ func (g *GridManager) cancelExcessOrders(ctx context.Context, symbol string, ord
 		}).Info("[LIMIT ENFORCER] Cancelled excess order")
 	}
 }
+
+// GetActiveGrids returns the list of currently active symbol grids
+func (g *GridManager) GetActiveGrids() []*SymbolGrid {
+	g.gridsMu.RLock()
+	defer g.gridsMu.RUnlock()
+
+	grids := make([]*SymbolGrid, 0, len(g.activeGrids))
+	for _, grid := range g.activeGrids {
+		grids = append(grids, grid)
+	}
+	return grids
+}
