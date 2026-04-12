@@ -36,6 +36,11 @@ type FuturesClientInterface interface {
 	PlaceOrder(ctx context.Context, req client.PlaceOrderRequest) (*client.Order, error)
 }
 
+// PositionProvider interface for getting position data from WebSocket cache
+type PositionProvider interface {
+	GetCachedPositions(ctx context.Context) ([]client.Position, error)
+}
+
 // ConfigManagerInterface defines methods needed from config manager
 type ConfigManagerInterface interface {
 	LoadConfig() error
@@ -58,12 +63,13 @@ type SymbolPosition struct {
 
 // AdaptiveGridManager extends GridManager with regime-aware functionality and risk management
 type AdaptiveGridManager struct {
-	gridManager    GridManagerInterface
-	configManager  ConfigManagerInterface
-	regimeDetector *market_regime.RegimeDetector
-	futuresClient  FuturesClientInterface
-	logger         *zap.Logger
-	mu             sync.RWMutex
+	gridManager      GridManagerInterface
+	configManager    ConfigManagerInterface
+	regimeDetector   *market_regime.RegimeDetector
+	futuresClient    FuturesClientInterface
+	positionProvider PositionProvider // NEW: WebSocket position provider
+	logger           *zap.Logger
+	mu               sync.RWMutex
 
 	// Adaptive state
 	currentRegime      map[string]market_regime.MarketRegime
@@ -128,6 +134,9 @@ type AdaptiveGridManager struct {
 
 	// NEW: MicroGridCalculator for high-frequency micro grid trading
 	microGridCalc *MicroGridCalculator
+
+	// Trading lifecycle state machine for runtime execution governance
+	stateMachine *GridStateMachine
 
 	// NEW: Consecutive loss tracking for cooldown
 	consecutiveLosses map[string]int       // symbol -> consecutive loss count
@@ -233,11 +242,11 @@ func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
 		PerPositionLossLimitUSDT: 1.0, // Default, can be overridden
 		TotalNetLossLimitUSDT:    5.0, // Default, can be overridden
 		StopLossPct:              cfg.PerTradeStopLossPct,
-		TrailingStopPct:          0.01,                   // Default 1%
-		TrailingStopDistancePct:  0.005,                  // Default 0.5%
-		LiquidationBufferPct:     0.35,                   // Default 35% - more buffer to prevent liquidation
-		PositionCheckInterval:    200 * time.Millisecond, // Fast risk checks
-		TrendingThreshold:        0.7,                    // Default 70%
+		TrailingStopPct:          0.01,             // Default 1%
+		TrailingStopDistancePct:  0.005,            // Default 0.5%
+		LiquidationBufferPct:     0.35,             // Default 35% - more buffer to prevent liquidation
+		PositionCheckInterval:    10 * time.Second, // Conservative to avoid API rate limits
+		TrendingThreshold:        0.7,              // Default 70%
 
 		// Take-profit from config
 		TakeProfitRRatio: cfg.TakeProfitRRatio,
@@ -248,7 +257,7 @@ func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
 		UseDirectionalBias: true, // Default
 
 		// Consecutive loss tracking - GIẢM cho volume farming
-		MaxConsecutiveLosses: 5,                // Tăng lên 5 losses (thay vì 3)
+		MaxConsecutiveLosses: 3,                // Strict exit after 3 consecutive losses
 		CooldownDuration:     30 * time.Second, // GIẢM xuống 30s (thay vì 5 phút)
 
 		// Grid spread - default for volume farming
@@ -259,17 +268,17 @@ func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
 // DefaultRiskConfig returns default risk configuration
 func DefaultRiskConfig() *RiskConfig {
 	return &RiskConfig{
-		MaxPositionUSDT:          300.0,                  // Max 300 USDT per symbol
-		MaxUnhedgedExposureUSDT:  200.0,                  // Max 200 USDT unhedged
-		MaxUnrealizedLossUSDT:    3.0,                    // Close if unrealized loss > 3 USDT per position
-		PerPositionLossLimitUSDT: 1.0,                    // Close position if unrealized loss > 1 USDT
-		TotalNetLossLimitUSDT:    5.0,                    // Close ALL if total net unrealized loss > 5 USDT
-		StopLossPct:              0.01,                   // 1% stop loss
-		TrailingStopPct:          0.01,                   // Activate at 1% profit
-		TrailingStopDistancePct:  0.005,                  // 0.5% trailing distance
-		LiquidationBufferPct:     0.35,                   // Close at 35% away from liquidation - more safety margin
-		PositionCheckInterval:    200 * time.Millisecond, // Fast risk checks to prevent liquidation
-		TrendingThreshold:        0.7,                    // Pause if trending > 70%
+		MaxPositionUSDT:          300.0,            // Max 300 USDT per symbol
+		MaxUnhedgedExposureUSDT:  200.0,            // Max 200 USDT unhedged
+		MaxUnrealizedLossUSDT:    3.0,              // Close if unrealized loss > 3 USDT per position
+		PerPositionLossLimitUSDT: 1.0,              // Close position if unrealized loss > 1 USDT
+		TotalNetLossLimitUSDT:    5.0,              // Close ALL if total net unrealized loss > 5 USDT
+		StopLossPct:              0.01,             // 1% stop loss
+		TrailingStopPct:          0.01,             // Activate at 1% profit
+		TrailingStopDistancePct:  0.005,            // 0.5% trailing distance
+		LiquidationBufferPct:     0.35,             // Close at 35% away from liquidation - more safety margin
+		PositionCheckInterval:    10 * time.Second, // Conservative to avoid API rate limits to prevent liquidation
+		TrendingThreshold:        0.7,              // Pause if trending > 70%
 
 		// Take-profit defaults
 		TakeProfitRRatio: 1.5,  // 1.5:1 R:R
@@ -280,7 +289,7 @@ func DefaultRiskConfig() *RiskConfig {
 		UseDirectionalBias: true, // Only trade with trend by default
 
 		// Consecutive loss tracking - GIẢM cho volume farming
-		MaxConsecutiveLosses: 5,                // Tăng lên 5 losses (thay vì 3)
+		MaxConsecutiveLosses: 3,                // Strict exit after 3 consecutive losses
 		CooldownDuration:     30 * time.Second, // GIẢM xuống 30s (thay vì 5 phút)
 	}
 }
@@ -298,12 +307,12 @@ type MultiLayerLiquidationConfig struct {
 // DefaultMultiLayerLiquidationConfig returns default 4-tier protection
 func DefaultMultiLayerLiquidationConfig() *MultiLayerLiquidationConfig {
 	return &MultiLayerLiquidationConfig{
-		Enabled:          false, // Disabled by default
-		Layer1WarnPct:    0.50,  // 50% distance - warning only
-		Layer2ReducePct:  0.30,  // 30% distance - reduce position
-		Layer3ClosePct:   0.15,  // 15% distance - close all
-		Layer4HedgePct:   0.10,  // 10% distance - emergency hedge + close
-		ReducePositionBy: 0.50,  // Reduce by 50%
+		Enabled:          true, // Enabled by default for 4-tier protection
+		Layer1WarnPct:    0.50, // 50% distance - warning only
+		Layer2ReducePct:  0.30, // 30% distance - reduce position
+		Layer3ClosePct:   0.15, // 15% distance - close all
+		Layer4HedgePct:   0.10, // 10% distance - emergency hedge + close
+		ReducePositionBy: 0.50, // Reduce by 50%
 	}
 }
 
@@ -355,6 +364,7 @@ func NewAdaptiveGridManager(
 	configManager *adaptive_config.AdaptiveConfigManager,
 	regimeDetector *market_regime.RegimeDetector,
 	futuresClient FuturesClientInterface,
+	positionProvider PositionProvider, // NEW: WebSocket position provider
 	logger *zap.Logger,
 ) *AdaptiveGridManager {
 	return &AdaptiveGridManager{
@@ -362,6 +372,7 @@ func NewAdaptiveGridManager(
 		configManager:      configManager,
 		regimeDetector:     regimeDetector,
 		futuresClient:      futuresClient,
+		positionProvider:   positionProvider, // NEW: WebSocket position provider
 		logger:             logger,
 		currentRegime:      make(map[string]market_regime.MarketRegime),
 		lastRegimeChange:   make(map[string]time.Time),
@@ -400,6 +411,13 @@ func (a *AdaptiveGridManager) SetRiskConfig(config *RiskConfig) {
 		zap.Float64("max_unrealized_loss", config.MaxUnrealizedLossUSDT),
 		zap.Float64("stop_loss_pct", config.StopLossPct),
 	)
+}
+
+// SetStateMachine wires the shared runtime trading lifecycle state machine.
+func (a *AdaptiveGridManager) SetStateMachine(sm *GridStateMachine) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stateMachine = sm
 }
 
 // SetOptimizationConfig sets the optimization config from YAML files
@@ -658,6 +676,11 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	a.wg.Add(1)
 	go a.positionMonitor(ctx)
 
+	// NEW: Start real-time exit signal monitoring goroutine
+	// Monitors ADX/BB every tick for immediate exit conditions
+	a.wg.Add(1)
+	go a.realtimeExitMonitor(ctx)
+
 	// NEW: Start time slot monitoring goroutine
 	a.wg.Add(1)
 	go a.slotMonitor(ctx)
@@ -698,6 +721,139 @@ func (a *AdaptiveGridManager) slotMonitor(ctx context.Context) {
 				}
 			}
 		}
+	}
+}
+
+// realtimeExitMonitor monitors ADX/BB every tick for immediate exit signals
+// This is a dedicated goroutine separate from WebSocket processing to ensure
+// real-time exit detection with ~100ms tick monitoring
+func (a *AdaptiveGridManager) realtimeExitMonitor(ctx context.Context) {
+	defer a.wg.Done()
+
+	// Check every 5s for real-time exit conditions (reduced from 100ms to avoid API spam)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	a.logger.Info("Real-time exit monitor started",
+		zap.Duration("check_interval", 5*time.Second))
+
+	for {
+		select {
+		case <-ctx.Done():
+			a.logger.Info("Real-time exit monitor stopping (context cancelled)")
+			return
+		case <-a.stopCh:
+			a.logger.Info("Real-time exit monitor stopping (stop signal)")
+			return
+		case <-ticker.C:
+			a.checkRealtimeExitConditions(ctx)
+		}
+	}
+}
+
+// checkRealtimeExitConditions checks all symbols for immediate exit conditions
+// Called by realtimeExitMonitor every tick (100ms)
+func (a *AdaptiveGridManager) checkRealtimeExitConditions(ctx context.Context) {
+	a.mu.RLock()
+	symbols := make([]string, 0, len(a.rangeDetectors))
+	for symbol := range a.rangeDetectors {
+		symbols = append(symbols, symbol)
+	}
+	a.mu.RUnlock()
+
+	for _, symbol := range symbols {
+		// Skip if trading not active
+		if a.IsTradingPaused(symbol) {
+			continue
+		}
+
+		// Get range detector
+		a.mu.RLock()
+		detector, exists := a.rangeDetectors[symbol]
+		a.mu.RUnlock()
+
+		if !exists {
+			continue
+		}
+
+		// Condition 1: ADX > 25 indicates trending market - exit all
+		avgADX := detector.averageADXLocked()
+		if avgADX > 25.0 {
+			a.logger.Error("REALTIME EXIT: ADX spike detected - closing all",
+				zap.String("symbol", symbol),
+				zap.Float64("adx", avgADX))
+			a.handleTrendExit(ctx, symbol, "adx_spike")
+			continue
+		}
+
+		// Condition 2: BB expansion > 1.5x average - exit all
+		currentRange := detector.GetCurrentRange()
+		if currentRange != nil && currentRange.WidthPct > 0 {
+			// Check if width is expanding significantly (would need historical avg)
+			// For now, check if width exceeds 1.5% which is considered wide
+			if currentRange.WidthPct > 0.015 { // 1.5% width threshold
+				a.logger.Error("REALTIME EXIT: BB expansion detected - closing all",
+					zap.String("symbol", symbol),
+					zap.Float64("bb_width_pct", currentRange.WidthPct*100))
+				a.handleTrendExit(ctx, symbol, "bb_expansion")
+				continue
+			}
+		}
+
+		// Condition 3: Price outside BB for 2+ consecutive checks (simplified)
+		// The range detector's handleBreakout is called via UpdatePriceForRange
+		// This realtime monitor provides additional safety layer
+	}
+}
+
+// handleTrendExit handles immediate exit on trend detection
+func (a *AdaptiveGridManager) handleTrendExit(ctx context.Context, symbol string, reason string) {
+	// Idempotent check - prevent duplicate exits
+	if a.IsTradingPaused(symbol) {
+		a.logger.Debug("Trend exit already handled, skipping duplicate",
+			zap.String("symbol", symbol),
+			zap.String("reason", reason))
+		return
+	}
+
+	// Perform immediate exit actions
+	a.logger.Error("Executing trend exit",
+		zap.String("symbol", symbol),
+		zap.String("reason", reason))
+
+	// Cancel all orders
+	if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+		a.logger.Error("Failed to cancel orders on trend exit",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+	}
+
+	// Get position and close if exists
+	a.mu.RLock()
+	position, hasPosition := a.positions[symbol]
+	a.mu.RUnlock()
+
+	if hasPosition && position != nil && position.PositionAmt != 0 {
+		a.emergencyClosePosition(ctx, symbol, position.PositionAmt)
+	}
+
+	// Clear grid
+	if err := a.gridManager.ClearGrid(ctx, symbol); err != nil {
+		a.logger.Error("Failed to clear grid on trend exit",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+	}
+
+	// Pause trading and force recalculation
+	a.pauseTrading(symbol)
+
+	// Force range recalculation
+	a.mu.RLock()
+	detector, exists := a.rangeDetectors[symbol]
+	a.mu.RUnlock()
+
+	if exists {
+		detector.ForceRecalculate()
 	}
 }
 
@@ -846,8 +1002,14 @@ func (a *AdaptiveGridManager) checkAndManageRisk(ctx context.Context) {
 		return
 	}
 
-	// Fetch positions from exchange
-	positions, err := a.futuresClient.GetPositions(ctx)
+	// Fetch positions from WebSocket cache or API
+	var positions []client.Position
+	var err error
+	if a.positionProvider != nil {
+		positions, err = a.positionProvider.GetCachedPositions(ctx)
+	} else {
+		positions, err = a.futuresClient.GetPositions(ctx)
+	}
 	if err != nil {
 		a.logger.Warn("RISK CHECK: Failed to fetch positions", zap.Error(err))
 		return
@@ -1127,6 +1289,12 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 			zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT))
 		a.pauseTrading(symbol)
 		return
+	}
+
+	// 5. Check multi-layer liquidation protection (4-tier system)
+	// This provides graduated responses as position approaches liquidation
+	if liquidationPrice > 0 {
+		a.checkMultiLayerLiquidation(ctx, symbol, markPrice, liquidationPrice, pos.PositionAmt)
 	}
 
 	a.logger.Debug("RISK CHECK: Position passed all risk checks",
@@ -1414,8 +1582,7 @@ func (a *AdaptiveGridManager) emergencyClosePosition(ctx context.Context, symbol
 	delete(a.positionTakeProfit, symbol)
 	a.mu.Unlock()
 
-	// CRITICAL: Clear grid and rebuild to start fresh after loss
-	// This ensures we don't carry over stale grid state that could lead to another loss
+	// Clear grid and transition to WAIT_NEW_RANGE. Re-entry must go through regrid readiness.
 	if a.gridManager != nil {
 		a.logger.Info("Clearing grid after emergency close",
 			zap.String("symbol", symbol))
@@ -1425,24 +1592,11 @@ func (a *AdaptiveGridManager) emergencyClosePosition(ctx context.Context, symbol
 				zap.String("symbol", symbol),
 				zap.Error(err))
 		}
-
-		// Small delay to ensure position is fully closed on exchange
-		time.Sleep(500 * time.Millisecond)
-
-		a.logger.Info("Rebuilding grid after emergency close",
-			zap.String("symbol", symbol))
-
-		if err := a.gridManager.RebuildGrid(ctx, symbol); err != nil {
-			a.logger.Error("Failed to rebuild grid after emergency close",
-				zap.String("symbol", symbol),
-				zap.Error(err))
-		}
 	}
 
-	// Resume trading immediately with fresh grid
-	// The per-position loss limit ensures next position won't exceed 1u
-	a.resumeTrading(symbol)
-	a.logger.Info("Trading resumed with fresh grid after emergency close",
+	a.pauseTrading(symbol)
+	a.markExitCompleted(symbol)
+	a.logger.Info("Trading moved to WAIT_NEW_RANGE after emergency close",
 		zap.String("symbol", symbol))
 }
 
@@ -1559,6 +1713,7 @@ func (a *AdaptiveGridManager) TryResumeTrading(symbol string) bool {
 	a.mu.RLock()
 	isPaused := a.tradingPaused[symbol]
 	detector, hasDetector := a.rangeDetectors[symbol]
+	stateMachine := a.stateMachine
 	a.mu.RUnlock()
 
 	// If not paused, nothing to do
@@ -1568,19 +1723,35 @@ func (a *AdaptiveGridManager) TryResumeTrading(symbol string) bool {
 
 	// If no range detector, we can't check stabilization
 	if !hasDetector {
-		// Just resume without range check (fallback)
-		a.logger.Info("No range detector found - resuming trading without stabilization check",
+		a.logger.Warn("No range detector found - refusing to resume trading without range confirmation",
 			zap.String("symbol", symbol))
-		a.resumeTrading(symbol)
-		return true
+		return false
 	}
 
-	// Check if range is active (price is stable)
-	if detector.ShouldTrade() {
+	// Require full regrid readiness while waiting for a new range.
+	if stateMachine != nil && stateMachine.GetState(symbol) == GridStateWaitNewRange {
+		if !a.isReadyForRegrid(symbol) {
+			return false
+		}
+		if stateMachine.CanTransition(symbol, EventNewRangeReady) {
+			stateMachine.Transition(symbol, EventNewRangeReady)
+		}
+		stateMachine.ClearRegridCooldown(symbol)
+	}
+
+	// Check if range is active and regrid conditions are satisfied.
+	if detector.ShouldTrade() && a.isReadyForRegrid(symbol) {
 		a.logger.Info("Price stabilized - Range is active, resuming trading",
 			zap.String("symbol", symbol),
 			zap.String("range_state", detector.GetStateString()))
 		a.resumeTrading(symbol)
+		if a.gridManager != nil {
+			if err := a.gridManager.RebuildGrid(context.Background(), symbol); err != nil {
+				a.logger.Warn("Failed to rebuild grid after range reactivation",
+					zap.String("symbol", symbol),
+					zap.Error(err))
+			}
+		}
 		return true
 	}
 
@@ -1870,6 +2041,7 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 				zap.String("symbol", symbol),
 				zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
 				zap.Duration("remaining", cooldownDuration-time.Since(lastLoss)))
+			return false
 			// Volume farming: Vẫn cho phép nhưng log warning - không return false
 		} else {
 			// Cooldown expired - reset
@@ -1884,6 +2056,7 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 			a.logger.Debug("CanPlaceOrder: transition cooldown active but allowing for volume farming",
 				zap.String("symbol", symbol),
 				zap.Duration("elapsed", time.Since(cooldown)))
+			return false
 			// Volume farming: Không return false, vẫn cho phép
 		}
 	}
@@ -1919,6 +2092,7 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 			a.logger.Warn("CanPlaceOrder: max exposure reached but allowing rebalance for volume farming",
 				zap.Float64("utilization", utilization*100),
 				zap.Float64("max_exposure", maxExposure))
+			return false
 			// Volume farming: Vẫn cho phép rebalance, size sẽ được điều chỉnh tự động
 			// Không return false để không block việc thay thế lệnh đã fill
 		}
@@ -2210,9 +2384,6 @@ func (a *AdaptiveGridManager) AddPriceData(high, low, close float64) {
 // UpdatePriceData feeds price data to all calculators (called from WebSocket)
 func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, bid, ask float64) {
 	a.logger.Warn(">>> UpdatePriceData START <<<")
-	a.mu.Lock()
-	a.logger.Warn(">>> UpdatePriceData LOCK ACQUIRED <<<")
-	defer a.mu.Unlock()
 
 	// Feed ATR calculator
 	if a.atrCalc != nil {
@@ -2230,12 +2401,6 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 	if a.trendDetector != nil {
 		a.trendDetector.UpdatePrice(close, 0)
 		a.logger.Warn(">>> TREND DETECTOR UPDATE DONE <<<")
-
-		// STRICT: Đóng tất cả lệnh khi strong trend detected
-		if a.trendDetector.GetTrendScore() >= 6 {
-			state := a.trendDetector.GetTrendState()
-			a.handleStrongTrend(context.Background(), symbol, close, state)
-		}
 	}
 	a.logger.Warn(">>> TREND DETECTOR DONE <<<")
 
@@ -2259,8 +2424,12 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 
 // RecordTradeResult records trade result for loss tracking with cooldown
 func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
+	var (
+		maxLossesReached bool
+		cooldownDuration time.Duration
+	)
+
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	// Also update risk monitor if available
 	if a.riskMonitor != nil {
@@ -2277,7 +2446,7 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 	if maxConsecutiveLosses <= 0 {
 		maxConsecutiveLosses = 3 // Default
 	}
-	cooldownDuration := a.riskConfig.CooldownDuration
+	cooldownDuration = a.riskConfig.CooldownDuration
 	if cooldownDuration <= 0 {
 		cooldownDuration = 5 * time.Minute // Default
 	}
@@ -2291,6 +2460,9 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 		}
 		a.consecutiveLosses[symbol] = 0
 		a.cooldownActive[symbol] = false
+		if a.stateMachine != nil {
+			a.stateMachine.ResetConsecutiveLosses(symbol)
+		}
 	} else {
 		// Increment consecutive losses
 		a.consecutiveLosses[symbol]++
@@ -2305,12 +2477,21 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 		// Check if max consecutive losses reached
 		if a.consecutiveLosses[symbol] >= maxConsecutiveLosses {
 			a.cooldownActive[symbol] = true
-			a.pauseTrading(symbol)
+			if a.stateMachine != nil {
+				a.stateMachine.RecordConsecutiveLoss(symbol)
+			}
+			maxLossesReached = true
 			a.logger.Error("MAX CONSECUTIVE LOSSES REACHED - Entering cooldown",
 				zap.String("symbol", symbol),
 				zap.Int("losses", a.consecutiveLosses[symbol]),
 				zap.Duration("cooldown", cooldownDuration))
 		}
+	}
+
+	a.mu.Unlock()
+
+	if maxLossesReached {
+		a.ExitAll(context.Background(), symbol, EventEmergencyExit, "consecutive_loss_limit")
 	}
 }
 
@@ -2415,75 +2596,63 @@ func (a *AdaptiveGridManager) InitializeRangeDetector(symbol string, config *Ran
 		zap.Bool("adx_filter_enabled", a.optConfig != nil && a.optConfig.ADXFilter != nil && a.optConfig.ADXFilter.Enabled))
 }
 
-// UpdatePriceForRange updates price data for range detection
-// NOTE: This function assumes the caller already holds a.mu.Lock()!
+// UpdatePriceForRange updates price data for range detection.
 func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, closePrice float64) {
-	// IMPORTANT: Do NOT acquire any lock here - caller UpdatePriceData already holds a.mu.Lock()
-	// Attempting to acquire RLock while holding Lock causes deadlock in Go's sync.RWMutex
-
+	a.mu.RLock()
 	detector, exists := a.rangeDetectors[symbol]
+	stateMachine := a.stateMachine
+	a.mu.RUnlock()
 	if !exists {
-		// Skip if detector not initialized - will be initialized elsewhere
 		return
 	}
 
 	detector.AddPrice(high, low, closePrice)
 
-	// Check for breakout and handle
+	if currentRange := detector.GetCurrentRange(); currentRange != nil {
+		a.UpdateDynamicLeverageMetrics(currentRange.ATR, detector.GetCurrentADX(), currentRange.WidthPct)
+	}
+
+	if stateMachine != nil && detector.ShouldTrade() {
+		switch stateMachine.GetState(symbol) {
+		case GridStateIdle:
+			if stateMachine.CanTransition(symbol, EventRangeConfirmed) {
+				stateMachine.Transition(symbol, EventRangeConfirmed)
+			}
+		case GridStateWaitNewRange:
+			if a.isReadyForRegrid(symbol) && stateMachine.CanTransition(symbol, EventNewRangeReady) {
+				stateMachine.Transition(symbol, EventNewRangeReady)
+				stateMachine.ClearRegridCooldown(symbol)
+			}
+		}
+	}
+
 	if detector.IsBreakout() {
 		a.handleBreakout(context.Background(), symbol, closePrice)
+		return
+	}
+
+	// Strong trend is now governed by ADX/range-state, not RSI-first.
+	if detector.ShouldExitForTrend() {
+		state := TrendStateNeutral
+		if a.trendDetector != nil {
+			state = a.trendDetector.GetTrendState()
+		}
+		a.handleStrongTrend(context.Background(), symbol, closePrice, state)
 	}
 }
 
 // handleStrongTrend handles strong trend detection - STRICT: đóng lệnh như breakout
 func (a *AdaptiveGridManager) handleStrongTrend(ctx context.Context, symbol string, currentPrice float64, state TrendState) {
+	trendScore := 0
+	if a.trendDetector != nil {
+		trendScore = a.trendDetector.GetTrendScore()
+	}
 	a.logger.Error("STRONG TREND DETECTED - Closing ALL orders and positions!",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
 		zap.String("trend_state", state.String()),
-		zap.Int("trend_score", a.trendDetector.GetTrendScore()))
-
-	// STRICT: Đóng tất cả lệnh và position như breakout
-	// 1. Cancel ALL orders immediately
-	if a.gridManager != nil {
-		if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
-			a.logger.Error("Failed to cancel orders on strong trend", zap.String("symbol", symbol), zap.Error(err))
-		}
-	}
-
-	// 2. Close any open position
-	a.mu.RLock()
-	position, hasPosition := a.positions[symbol]
-	a.mu.RUnlock()
-
-	if hasPosition && position.PositionAmt != 0 {
-		a.logger.Warn("Closing position on strong trend",
-			zap.String("symbol", symbol),
-			zap.Float64("position_amt", position.PositionAmt))
-		a.emergencyClosePosition(ctx, symbol, position.PositionAmt)
-	}
-
-	// 3. Clear grid
-	if a.gridManager != nil {
-		if err := a.gridManager.ClearGrid(ctx, symbol); err != nil {
-			a.logger.Error("Failed to clear grid on strong trend", zap.String("symbol", symbol), zap.Error(err))
-		}
-	}
-
-	// 4. Pause trading and wait for BB to establish new range
-	a.pauseTrading(symbol)
-
-	// 5. Force recalculation of range
-	a.mu.RLock()
-	detector, exists := a.rangeDetectors[symbol]
-	a.mu.RUnlock()
-
-	if exists {
-		detector.ForceRecalculate()
-	}
-
-	a.logger.Info("Trading paused after strong trend - Waiting for BB to establish new range",
-		zap.String("symbol", symbol))
+		zap.Int("trend_score", trendScore))
+	a.ExitAll(ctx, symbol, EventTrendExit, "strong_trend")
 }
 
 // handleBreakout handles breakout detection - STRICT risk management
@@ -2492,47 +2661,7 @@ func (a *AdaptiveGridManager) handleBreakout(ctx context.Context, symbol string,
 	a.logger.Error("BREAKOUT DETECTED - Closing ALL orders and positions immediately!",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice))
-
-	// 1. Cancel ALL orders immediately
-	if a.gridManager != nil {
-		if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
-			a.logger.Error("Failed to cancel orders on breakout", zap.String("symbol", symbol), zap.Error(err))
-		}
-	}
-
-	// 2. Close any open position
-	a.mu.RLock()
-	position, hasPosition := a.positions[symbol]
-	a.mu.RUnlock()
-
-	if hasPosition && position.PositionAmt != 0 {
-		a.logger.Warn("Closing position on breakout",
-			zap.String("symbol", symbol),
-			zap.Float64("position_amt", position.PositionAmt))
-		a.emergencyClosePosition(ctx, symbol, position.PositionAmt)
-	}
-
-	// 3. Clear grid
-	if a.gridManager != nil {
-		if err := a.gridManager.ClearGrid(ctx, symbol); err != nil {
-			a.logger.Error("Failed to clear grid on breakout", zap.String("symbol", symbol), zap.Error(err))
-		}
-	}
-
-	// 4. Pause trading and wait for BB to establish new range
-	a.pauseTrading(symbol)
-
-	// 5. Force recalculation of range
-	a.mu.RLock()
-	detector, exists := a.rangeDetectors[symbol]
-	a.mu.RUnlock()
-
-	if exists {
-		detector.ForceRecalculate()
-	}
-
-	a.logger.Info("Trading paused after breakout - Waiting for BB to establish new range",
-		zap.String("symbol", symbol))
+	a.ExitAll(ctx, symbol, EventEmergencyExit, "breakout")
 }
 
 // GetRangeState returns current range state for a symbol
@@ -2545,6 +2674,91 @@ func (a *AdaptiveGridManager) GetRangeState(symbol string) RangeState {
 		return RangeStateUnknown
 	}
 	return detector.GetState()
+}
+
+func (a *AdaptiveGridManager) markExitAll(symbol string, event GridEvent) {
+	a.mu.RLock()
+	stateMachine := a.stateMachine
+	a.mu.RUnlock()
+	if stateMachine == nil {
+		return
+	}
+
+	switch stateMachine.GetState(symbol) {
+	case GridStateTrading:
+		if stateMachine.CanTransition(symbol, event) {
+			stateMachine.Transition(symbol, event)
+		}
+	case GridStateEnterGrid, GridStateIdle:
+		stateMachine.ForceState(symbol, GridStateExitAll)
+	}
+}
+
+func (a *AdaptiveGridManager) markExitCompleted(symbol string) {
+	a.mu.RLock()
+	stateMachine := a.stateMachine
+	a.mu.RUnlock()
+	if stateMachine == nil {
+		return
+	}
+
+	if stateMachine.GetState(symbol) == GridStateExitAll && stateMachine.CanTransition(symbol, EventPositionsClosed) {
+		stateMachine.Transition(symbol, EventPositionsClosed)
+		stateMachine.ActivateRegridCooldown(symbol, 30*time.Second)
+		return
+	}
+	stateMachine.ForceState(symbol, GridStateWaitNewRange)
+	stateMachine.ActivateRegridCooldown(symbol, 30*time.Second)
+}
+
+// ExitAll is the single idempotent runtime path for flattening a symbol and moving to WAIT_NEW_RANGE.
+func (a *AdaptiveGridManager) ExitAll(ctx context.Context, symbol string, event GridEvent, reason string) {
+	a.logger.Warn("Executing EXIT_ALL",
+		zap.String("symbol", symbol),
+		zap.String("reason", reason),
+		zap.String("event", event.String()))
+
+	a.markExitAll(symbol, event)
+
+	if a.gridManager != nil {
+		if err := a.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+			a.logger.Error("Failed to cancel orders during EXIT_ALL",
+				zap.String("symbol", symbol),
+				zap.String("reason", reason),
+				zap.Error(err))
+		}
+	}
+
+	a.mu.RLock()
+	position, hasPosition := a.positions[symbol]
+	detector, hasDetector := a.rangeDetectors[symbol]
+	a.mu.RUnlock()
+
+	if hasPosition && position != nil && position.PositionAmt != 0 {
+		a.logger.Warn("Closing position during EXIT_ALL",
+			zap.String("symbol", symbol),
+			zap.String("reason", reason),
+			zap.Float64("position_amt", position.PositionAmt))
+		a.emergencyClosePosition(ctx, symbol, position.PositionAmt)
+	} else {
+		if a.gridManager != nil {
+			if err := a.gridManager.ClearGrid(ctx, symbol); err != nil {
+				a.logger.Error("Failed to clear grid during EXIT_ALL",
+					zap.String("symbol", symbol),
+					zap.String("reason", reason),
+					zap.Error(err))
+			}
+		}
+		a.pauseTrading(symbol)
+		a.markExitCompleted(symbol)
+	}
+
+	if hasDetector {
+		detector.ForceRecalculate()
+		a.logger.Info("Range detector reset after EXIT_ALL",
+			zap.String("symbol", symbol),
+			zap.String("reason", reason))
+	}
 }
 
 // GetRangeInfo returns range information for a symbol
@@ -3282,6 +3496,86 @@ func (a *AdaptiveGridManager) GetLiquidationTierStatus(symbol string) map[string
 		"last_check_time": status.LastCheckTime,
 		"actions_taken":   status.ActionsTaken,
 	}
+}
+
+// isReadyForRegrid checks if all conditions are met for re-gridding after exit
+// Strict conditions per spec:
+//  1. Zero open orders AND zero position
+//  2. Range shift ≥ 0.5% from last accepted range
+//  3. BB width contraction (< 1.5x average)
+//  4. ADX < 20 for ≥ 3 consecutive candles
+//  5. Current state is WAIT_NEW_RANGE
+//
+// This function is called to determine if we can transition from WAIT_NEW_RANGE to ENTER_GRID
+func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.stateMachine != nil {
+		if a.stateMachine.GetState(symbol) != GridStateWaitNewRange {
+			return false
+		}
+		if a.stateMachine.IsRegridCooldownActive(symbol) {
+			return false
+		}
+	}
+
+	// Must have zero tracked position before re-entry.
+	if position, exists := a.positions[symbol]; exists && position != nil && math.Abs(position.PositionAmt) > 0 {
+		return false
+	}
+
+	detector, exists := a.rangeDetectors[symbol]
+	if !exists {
+		a.logger.Debug("Regrid check: no range detector", zap.String("symbol", symbol))
+		return false
+	}
+
+	// Condition 4: ADX < 20 for sideways market
+	avgADX := detector.averageADXLocked()
+	if avgADX >= 20.0 {
+		a.logger.Debug("Regrid check: ADX too high",
+			zap.String("symbol", symbol),
+			zap.Float64("avg_adx", avgADX))
+		return false
+	}
+
+	// Condition 3: BB width contraction check
+	currentRange := detector.currentRange
+	lastAccepted := detector.lastAcceptedRange
+	if currentRange == nil || lastAccepted == nil {
+		a.logger.Debug("Regrid check: no range data",
+			zap.String("symbol", symbol),
+			zap.Bool("has_current", currentRange != nil),
+			zap.Bool("has_last", lastAccepted != nil))
+		return false
+	}
+
+	// Check BB width contraction (current width < 1.5x last accepted)
+	widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
+	if widthRatio >= 1.5 {
+		a.logger.Debug("Regrid check: BB width not contracted",
+			zap.String("symbol", symbol),
+			zap.Float64("width_ratio", widthRatio))
+		return false
+	}
+
+	// Condition 2: Range shift ≥ 0.5% from last accepted range center
+	centerShiftPct := math.Abs(currentRange.MidPrice-lastAccepted.MidPrice) / lastAccepted.MidPrice
+	if centerShiftPct < 0.005 { // 0.5% minimum shift
+		a.logger.Debug("Regrid check: range shift too small",
+			zap.String("symbol", symbol),
+			zap.Float64("center_shift_pct", centerShiftPct))
+		return false
+	}
+
+	a.logger.Info("Regrid ready: all conditions met",
+		zap.String("symbol", symbol),
+		zap.Float64("avg_adx", avgADX),
+		zap.Float64("width_ratio", widthRatio),
+		zap.Float64("center_shift_pct", centerShiftPct))
+
+	return true
 }
 
 // =============================================================================

@@ -3,6 +3,7 @@ package farming
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -177,9 +178,14 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		configManager,
 		regimeDetector,
 		engine.futuresClient,
+		engine.gridManager, // GridManager implements PositionProvider interface
 		logger,
 	)
 	engine.adaptiveGridManager = adaptiveGridManager
+
+	stateMachine := adaptive_grid.NewGridStateMachine(logger)
+	engine.gridManager.SetStateMachine(stateMachine)
+	engine.adaptiveGridManager.SetStateMachine(stateMachine)
 
 	// CRITICAL: Set risk config from volume config (not hardcode)
 	adaptiveGridManager.SetRiskConfig(adaptive_grid.ConvertRiskConfig(volumeConfig.Risk))
@@ -305,6 +311,8 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 			e.adaptiveGridManager.SetOptimizationConfig(optConfig)
 		}
 
+		e.adaptiveGridManager.InitializeDynamicLeverage(nil)
+
 		// Initialize adaptive grid manager
 		if err := e.adaptiveGridManager.Initialize(ctx); err != nil {
 			e.logger.Error("Adaptive grid manager initialization error", zap.Error(err))
@@ -414,22 +422,6 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 		e.logger.Info("Using config whitelist (agentic whitelist empty)", zap.Strings("whitelist", whitelist))
 	}
 
-	// HARDCODE: Always ensure BTC, ETH, SOL are in whitelist
-	hardcodedSymbols := []string{"BTCUSD1", "ETHUSD1", "SOLUSD1"}
-	for _, sym := range hardcodedSymbols {
-		found := false
-		for _, w := range whitelist {
-			if w == sym {
-				found = true
-				break
-			}
-		}
-		if !found {
-			whitelist = append(whitelist, sym)
-			e.logger.Info("HARDCODED symbol added to whitelist", zap.String("symbol", sym))
-		}
-	}
-
 	e.logger.Info("Active symbols from selector", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
 		syms := make([]string, len(activeSymbols))
 		for i, s := range activeSymbols {
@@ -515,8 +507,22 @@ func (e *VolumeFarmEngine) setLeverageForSymbols(symbols []*SymbolData) {
 				zap.String("symbol", sym.Symbol),
 				zap.Float64("max_leverage", maxLeverage))
 
-			// Set leverage to 80% of max to have some buffer
-			targetLeverage := int(maxLeverage * 0.8)
+			// CRITICAL: Use dynamic leverage based on BB/ADX market conditions
+			// Falls back to 80% of max if dynamic calculator not available
+			calculatedLeverage := maxLeverage * 0.8
+			if e.adaptiveGridManager != nil {
+				calculatedLeverage = e.adaptiveGridManager.GetOptimalLeverage()
+				e.logger.Info("Dynamic leverage calculated",
+					zap.String("symbol", sym.Symbol),
+					zap.Float64("calculated_leverage", calculatedLeverage),
+					zap.Float64("max_leverage", maxLeverage))
+			}
+
+			// Clamp to max leverage and ensure minimum of 1
+			targetLeverage := int(calculatedLeverage)
+			if targetLeverage > int(maxLeverage) {
+				targetLeverage = int(maxLeverage)
+			}
 			if targetLeverage < 1 {
 				targetLeverage = 1
 			}
@@ -658,37 +664,8 @@ func (e *VolumeFarmEngine) GetStatus() *VolumeFarmStatus {
 
 // monitorRegimeChanges monitors and handles regime changes for all symbols
 func (e *VolumeFarmEngine) monitorRegimeChanges(ctx context.Context) {
-	e.logger.Info("Monitoring regime changes")
-
-	// Get active symbols
-	activeSymbols := e.symbolSelector.GetActiveSymbols()
-
-	for _, symbolData := range activeSymbols {
-		symbol := symbolData.Symbol
-
-		// Get current price (simplified - in real implementation would get from price feed)
-		currentPrice := 0.0 // Placeholder
-
-		// Detect regime
-		newRegime := e.regimeDetector.DetectRegime(symbol, currentPrice)
-
-		// Get current regime
-		currentRegime := e.adaptiveGridManager.GetCurrentRegime(symbol)
-
-		// Check if regime changed
-		if newRegime != currentRegime {
-			e.logger.Info("Regime change detected",
-				zap.String("symbol", symbol),
-				zap.String("from", string(currentRegime)),
-				zap.String("to", string(newRegime)))
-
-			// Handle regime change
-			e.adaptiveGridManager.OnRegimeChange(symbol, currentRegime, newRegime)
-
-			// TODO: Trigger parameter application and grid rebuild
-			// This would be handled by the transition handler
-		}
-	}
+	_ = ctx
+	e.logger.Debug("Regime monitoring delegated to AdaptiveGridManager range/ADX state machine")
 }
 
 // monitorRisk monitors risk levels and takes action.
@@ -873,21 +850,31 @@ func (e *VolumeFarmEngine) UpdateWhitelist(symbols []string) error {
 
 // GetActivePositions returns the current active positions across all symbols
 func (e *VolumeFarmEngine) GetActivePositions() ([]agentic.PositionStatus, error) {
-	// Get active grids which contain position information
-	activeGrids := e.gridManager.GetActiveGrids()
+	if e.adaptiveGridManager == nil {
+		return nil, nil
+	}
 
-	positions := make([]agentic.PositionStatus, 0, len(activeGrids))
-	for _, grid := range activeGrids {
-		// Determine if there's an actual position based on grid state
-		// This is simplified - real implementation would check position size from exchange
-		position := agentic.PositionStatus{
-			Symbol:        grid.Symbol,
-			HasPosition:   false, // Will be updated with actual position data
-			Size:          0,
-			UnrealizedPnL: 0,
-			Side:          "",
+	tracked := e.adaptiveGridManager.GetAllPositions()
+	positions := make([]agentic.PositionStatus, 0, len(tracked))
+	for symbol, pos := range tracked {
+		if pos == nil {
+			continue
 		}
-		positions = append(positions, position)
+
+		side := ""
+		if pos.PositionAmt > 0 {
+			side = "LONG"
+		} else if pos.PositionAmt < 0 {
+			side = "SHORT"
+		}
+
+		positions = append(positions, agentic.PositionStatus{
+			Symbol:        symbol,
+			HasPosition:   pos.PositionAmt != 0,
+			Size:          math.Abs(pos.PositionAmt),
+			UnrealizedPnL: pos.UnrealizedPnL,
+			Side:          side,
+		})
 	}
 
 	return positions, nil

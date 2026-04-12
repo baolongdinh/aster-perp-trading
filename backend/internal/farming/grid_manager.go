@@ -2,6 +2,7 @@ package farming
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/farming/adaptive_grid"
+	"aster-bot/internal/stream"
 
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -47,6 +49,10 @@ type GridManager struct {
 
 	// WebSocket client for real-time data.
 	wsClient *client.WebSocketClient
+
+	// Warm-up tracking for RangeDetector via WebSocket klines
+	warmupActive map[string]bool // Symbol -> is in warmup phase
+	warmupMu     sync.RWMutex
 
 	// Order tracking.
 	pendingOrders map[string]*GridOrder
@@ -104,6 +110,9 @@ type GridManager struct {
 	// NEW: Reference to AdaptiveGridManager for optimization features
 	adaptiveMgr *adaptive_grid.AdaptiveGridManager
 
+	// NEW: Trading lifecycle state machine for strict state transitions
+	stateMachine *adaptive_grid.GridStateMachine
+
 	// Position rebalancer settings
 	rebalanceThresholdPct   float64       // Threshold to start rebalancing (e.g., 0.8 = 80% of max)
 	rebalanceAggressiveness float64       // How much to reduce (0.0-1.0, e.g., 0.3 = reduce by 30%)
@@ -113,6 +122,11 @@ type GridManager struct {
 	exchangeOrderCache    map[string]*ExchangeOrderCacheEntry // symbol -> cached orders
 	exchangeOrderCacheMu  sync.RWMutex
 	exchangeOrderCacheTTL time.Duration
+
+	// NEW: Position cache from WebSocket to avoid API polling
+	cachedPositions    map[string]*client.Position // symbol -> position
+	cachedPositionsMu  sync.RWMutex
+	lastPositionUpdate time.Time
 }
 
 // ExchangeOrderCacheEntry stores cached exchange orders with timestamp
@@ -207,6 +221,7 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		pendingOrders:         make(map[string]*GridOrder),
 		activeOrders:          make(map[string]*GridOrder),
 		filledOrders:          make(map[string]*GridOrder),
+		warmupActive:          make(map[string]bool),
 		stopCh:                make(chan struct{}),
 		baseNotionalUSD:       baseNotional,
 		minNotionalUSD:        5.0,
@@ -232,6 +247,9 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		// Exchange order cache with 1s TTL
 		exchangeOrderCache:    make(map[string]*ExchangeOrderCacheEntry),
 		exchangeOrderCacheTTL: 1 * time.Second,
+		// Position cache from WebSocket
+		cachedPositions:    make(map[string]*client.Position),
+		lastPositionUpdate: time.Now(),
 	}
 }
 
@@ -322,6 +340,9 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.ordersResetWorker(ctx)
 
+	// NEW: Initialize UserStream for real-time position and order updates
+	g.initUserStream(ctx)
+
 	// NEW: Poll for filled orders since UserStream is not connected
 	g.wg.Add(1)
 	go g.orderFillPoller(ctx)
@@ -345,8 +366,32 @@ func (g *GridManager) Start(ctx context.Context) error {
 		go g.placementWorker(ctx, i)
 	}
 
+	// Trigger warm-up for any existing grids immediately (don't wait for UpdateSymbols)
+	g.triggerWarmupForExistingGrids()
+
 	g.logger.Info("Grid Manager started successfully")
 	return nil
+}
+
+// triggerWarmupForExistingGrids starts warm-up for grids that exist at startup
+func (g *GridManager) triggerWarmupForExistingGrids() {
+	g.gridsMu.RLock()
+	existingGrids := make([]string, 0, len(g.activeGrids))
+	for symbol := range g.activeGrids {
+		existingGrids = append(existingGrids, symbol)
+	}
+	g.gridsMu.RUnlock()
+
+	for _, symbol := range existingGrids {
+		g.warmupMu.RLock()
+		_, warmupStarted := g.warmupActive[symbol]
+		g.warmupMu.RUnlock()
+
+		if !warmupStarted {
+			g.logger.WithField("symbol", symbol).Info("🔄 Startup: Existing grid needs warm-up - starting now")
+			go g.startKlineWarmup(symbol)
+		}
+	}
 }
 
 // websocketProcessor processes real-time WebSocket data.
@@ -517,9 +562,50 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 	}
 }
 
+func (g *GridManager) canPlaceForSymbol(symbol string) bool {
+	if g.adaptiveMgr != nil {
+		rangeState := g.adaptiveMgr.GetRangeState(symbol)
+		if rangeState != adaptive_grid.RangeStateActive {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":      symbol,
+				"range_state": rangeState,
+				"expected":    adaptive_grid.RangeStateActive,
+			}).Warn(">>> GATE BLOCKED: Range not active <<<")
+			return false
+		}
+		if !g.adaptiveMgr.CanPlaceOrder(symbol) {
+			g.logger.WithField("symbol", symbol).Warn(">>> GATE BLOCKED: Adaptive manager disallows order <<<")
+			return false
+		}
+		if g.adaptiveMgr.IsInCooldown(symbol) {
+			g.logger.WithField("symbol", symbol).Warn(">>> GATE BLOCKED: Symbol in cooldown <<<")
+			return false
+		}
+	}
+
+	if g.stateMachine != nil && !g.stateMachine.ShouldEnqueuePlacement(symbol) {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":     symbol,
+			"grid_state": g.stateMachine.GetState(symbol),
+		}).Warn(">>> GATE BLOCKED: Grid state machine not in placement state <<<")
+		return false
+	}
+
+	g.logger.WithField("symbol", symbol).Info(">>> ALL GATES PASSED - CAN PLACE <<<")
+	return true
+}
+
 func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64) bool {
 	if grid == nil || !grid.IsActive || grid.CurrentPrice <= 0 {
-		g.logger.WithField("symbol", grid.Symbol).Debug("Not scheduling: grid inactive or no price")
+		symbol := ""
+		if grid != nil {
+			symbol = grid.Symbol
+		}
+		g.logger.WithField("symbol", symbol).Debug("Not scheduling: grid inactive or no price")
+		return false
+	}
+
+	if !g.canPlaceForSymbol(grid.Symbol) {
 		return false
 	}
 
@@ -773,6 +859,24 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 
 	for symbol := range g.activeGrids {
 		if _, found := desired[symbol]; found {
+			// Ensure range detector is initialized for existing grid
+			if g.adaptiveMgr != nil {
+				rangeState := g.adaptiveMgr.GetRangeState(symbol)
+				if rangeState == adaptive_grid.RangeStateUnknown {
+					g.logger.WithField("symbol", symbol).Warn("Existing grid missing range detector - initializing now")
+					g.adaptiveMgr.InitializeRangeDetector(symbol, nil)
+				}
+			}
+
+			// Check if existing grid needs warm-up (not yet warmed up)
+			g.warmupMu.RLock()
+			_, warmupStarted := g.warmupActive[symbol]
+			g.warmupMu.RUnlock()
+			if !warmupStarted {
+				// Grid exists but warm-up not started - start it now
+				g.logger.WithField("symbol", symbol).Info("Existing grid needs warm-up - starting now")
+				go g.startKlineWarmup(symbol)
+			}
 			continue
 		}
 		delete(g.activeGrids, symbol)
@@ -800,17 +904,9 @@ func (g *GridManager) UpdateSymbols(symbols []*SymbolData) {
 				},
 			)
 		}
-		// Only enqueue if we already have a price, otherwise wait for WebSocket
-		g.gridsMu.RLock()
-		grid, exists := g.activeGrids[symbol]
-		hasPrice := exists && grid.CurrentPrice > 0
-		g.gridsMu.RUnlock()
-
-		if hasPrice {
-			g.enqueuePlacement(symbol)
-		} else {
-			g.logger.WithField("symbol", symbol).Info("Grid created without price - waiting for WebSocket price update")
-		}
+		// Start WebSocket kline warm-up phase for RangeDetector
+		// This feeds OHLC data via WebSocket instead of REST API to avoid spam
+		g.startKlineWarmup(symbol)
 	}
 	for _, symbol := range removed {
 		g.logger.WithField("symbol", symbol).Info("Removed grid")
@@ -838,22 +934,189 @@ func (g *GridManager) getActiveGridLevels(symbol string) (map[int]bool, map[int]
 	return buyLevels, sellLevels
 }
 
+// startKlineWarmup starts the WebSocket kline warm-up phase for a symbol
+// This feeds OHLC data to RangeDetector via WebSocket instead of REST API
+func (g *GridManager) startKlineWarmup(symbol string) {
+	if g.wsClient == nil {
+		g.logger.WithField("symbol", symbol).Warn("Cannot start warm-up: WebSocket client not available")
+		return
+	}
+
+	if g.adaptiveMgr == nil {
+		g.logger.WithField("symbol", symbol).Warn("Cannot start warm-up: adaptive manager not available")
+		return
+	}
+
+	// Mark symbol as in warmup phase
+	g.warmupMu.Lock()
+	g.warmupActive[symbol] = true
+	g.warmupMu.Unlock()
+
+	g.logger.WithField("symbol", symbol).Info("🚀 Starting WebSocket kline warm-up phase")
+
+	// Subscribe to kline stream for this symbol (1m interval)
+	if err := g.wsClient.SubscribeToKlines([]string{symbol}, "1m"); err != nil {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"error":  err.Error(),
+		}).Warn("Failed to subscribe to kline stream, will use ticker fallback")
+		// Fallback: just wait for ticker
+		g.warmupMu.Lock()
+		delete(g.warmupActive, symbol)
+		g.warmupMu.Unlock()
+		return
+	}
+
+	// Start warmup processor goroutine
+	g.wg.Add(1)
+	go g.klineWarmupProcessor(symbol)
+}
+
+// klineWarmupProcessor processes kline messages until RangeDetector is ready
+// Then triggers placement and switches to ticker mode
+func (g *GridManager) klineWarmupProcessor(symbol string) {
+	defer g.wg.Done()
+
+	g.logger.WithField("symbol", symbol).Info("📊 Kline warm-up processor started")
+
+	if g.wsClient == nil {
+		g.logger.WithField("symbol", symbol).Error("WARM-UP: WebSocket client is nil!")
+		return
+	}
+
+	klineCh := g.wsClient.GetKlineChannel()
+	if klineCh == nil {
+		g.logger.WithField("symbol", symbol).Error("WARM-UP: Kline channel is nil!")
+		return
+	}
+	g.logger.WithField("symbol", symbol).Info("WARM-UP: Got kline channel, waiting for data...")
+
+	ticker := time.NewTicker(30 * time.Second) // Timeout for warmup
+	defer ticker.Stop()
+
+	warmupComplete := false
+	klineCount := 0
+
+	for !warmupComplete {
+		select {
+		case <-g.stopCh:
+			g.logger.WithField("symbol", symbol).Info("Warm-up stopped")
+			return
+
+		case kline := <-klineCh:
+			klineCount++
+			// Debug: log all klines received
+			g.logger.WithFields(logrus.Fields{
+				"kline_count":     klineCount,
+				"received_symbol": kline.Symbol,
+				"expected_symbol": symbol,
+				"match":           kline.Symbol == symbol,
+				"is_closed":       kline.IsClosed,
+				"high":            kline.High,
+				"low":             kline.Low,
+				"close":           kline.Close,
+			}).Info("WARM-UP: received kline")
+
+			// Only process klines for our symbol
+			if kline.Symbol == symbol {
+				g.logger.WithField("symbol", symbol).Warn("WARM-UP: processing kline for our symbol!")
+
+				// Feed OHLC data to RangeDetector
+				g.adaptiveMgr.UpdatePriceForRange(symbol, kline.High, kline.Low, kline.Close)
+
+				rangeState := g.adaptiveMgr.GetRangeState(symbol)
+				g.logger.WithFields(logrus.Fields{
+					"symbol":      symbol,
+					"range_state": rangeState,
+					"is_closed":   kline.IsClosed,
+					"close":       kline.Close,
+				}).Warn("WARM-UP: kline processed and fed to RangeDetector")
+
+				// Check if warmup complete (RangeStateActive)
+				if rangeState == adaptive_grid.RangeStateActive {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":      symbol,
+						"klines":      "sufficient",
+						"range_state": rangeState,
+					}).Info(" Warm-up complete - RangeDetector ready")
+					warmupComplete = true
+				}
+			}
+
+		case <-ticker.C:
+			// Check current state
+			rangeState := g.adaptiveMgr.GetRangeState(symbol)
+			if rangeState == adaptive_grid.RangeStateActive {
+				g.logger.WithField("symbol", symbol).Warn(" WARM-UP COMPLETE (timeout check)!")
+				warmupComplete = true
+			} else {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":      symbol,
+					"range_state": rangeState,
+				}).Warn("⏳ WARM-UP: still in progress...")
+			}
+		}
+	}
+
+	// Warmup complete - finalize and trigger placement
+	g.finalizeWarmup(symbol)
+}
+
+// finalizeWarmup completes the warmup phase and triggers order placement
+func (g *GridManager) finalizeWarmup(symbol string) {
+	// Mark warmup as complete
+	g.warmupMu.Lock()
+	delete(g.warmupActive, symbol)
+	g.warmupMu.Unlock()
+
+	// Unsubscribe from klines (optional - can keep for continuous BB updates)
+	// g.wsClient.UnsubscribeFromKlines([]string{symbol}, "1m")
+
+	// Get current price from range detector
+	rangeInfo := g.adaptiveMgr.GetRangeInfo(symbol)
+	currentPrice, _ := rangeInfo["last_price"].(float64)
+	if currentPrice == 0 {
+		g.logger.WithField("symbol", symbol).Warn("Warm-up complete but no valid price, waiting for ticker")
+		return
+	}
+
+	// Update grid price
+	g.gridsMu.Lock()
+	if grid, exists := g.activeGrids[symbol]; exists {
+		grid.CurrentPrice = currentPrice
+		grid.GridCenterPrice = currentPrice
+	}
+	g.gridsMu.Unlock()
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":    symbol,
+		"price":     currentPrice,
+		"next_step": "enqueue_placement",
+	}).Info("🎯 Warm-up finalized - triggering placement")
+
+	// Trigger placement
+	g.enqueuePlacement(symbol)
+}
+
 // placeGridOrders places initial grid orders for a symbol concurrently.
 // For rebuilds, it only places orders at levels that don't have active orders.
 func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *SymbolGrid) int {
 	g.logger.WithField("symbol", symbol).Info("Placing grid orders for volume farming (concurrent)")
 
-	// NEW: Try to use BB range-based grid placement if available
+	// CRITICAL: Micro grid takes PRECEDENCE over BB bands
+	// BB/ADX gates permission to trade, micro grid determines order geometry
+	// This ensures consistent 0.05% spread + 5 orders/side as per spec
+	if g.adaptiveMgr != nil && g.adaptiveMgr.IsMicroGridEnabled() {
+		return g.placeMicroGridOrders(ctx, symbol, grid)
+	}
+
+	// FALLBACK: Use BB range-based grid placement if micro grid disabled
+	// BB bands are used for geometry only when micro grid is not available
 	if g.adaptiveMgr != nil {
 		upper, lower, mid, valid := g.adaptiveMgr.GetBBRangeBands(symbol)
 		if valid && upper > 0 && lower > 0 && mid > 0 {
 			return g.placeBBGridOrders(ctx, symbol, grid, upper, lower, mid)
 		}
-	}
-
-	// NEW: Check if micro grid mode is enabled
-	if g.adaptiveMgr != nil && g.adaptiveMgr.IsMicroGridEnabled() {
-		return g.placeMicroGridOrders(ctx, symbol, grid)
 	}
 
 	if grid.CurrentPrice == 0 {
@@ -2020,8 +2283,8 @@ func (g *GridManager) logExchangeData(ctx context.Context) {
 		totalNotional += notional
 	}
 
-	// Get positions from exchange
-	positions, err := g.futuresClient.GetPositions(ctx)
+	// Get positions from WebSocket cache or API
+	positions, err := g.GetCachedPositions(ctx)
 	if err != nil {
 		g.logger.WithError(err).Debug("Failed to get positions for dashboard")
 		return
@@ -2091,7 +2354,7 @@ func (g *GridManager) placementWorker(ctx context.Context, workerID int) {
 func (g *GridManager) ordersResetWorker(ctx context.Context) {
 	defer g.wg.Done()
 
-	ticker := time.NewTicker(3 * time.Second) // 3s for rapid grid reset
+	ticker := time.NewTicker(10 * time.Second) // 10s for grid reset
 	defer ticker.Stop()
 
 	for {
@@ -2260,6 +2523,12 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	snapshot := *grid
 	g.gridsMu.Unlock()
 
+	if !g.canPlaceForSymbol(symbol) {
+		g.logger.WithField("symbol", symbol).Info("[PLACEMENT] Blocked by runtime state/range gate")
+		g.finishPlacement(symbol, false)
+		return
+	}
+
 	// T024: Log placement price wait duration
 	g.logger.WithFields(logrus.Fields{
 		"symbol":           symbol,
@@ -2274,8 +2543,35 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 		return
 	}
 
+	if maxLeverage := g.precisionMgr.GetMaxLeverage(symbol); maxLeverage > 0 && g.adaptiveMgr != nil {
+		calculatedLeverage := g.adaptiveMgr.GetOptimalLeverage()
+		targetLeverage := int(calculatedLeverage)
+		if targetLeverage > int(maxLeverage) {
+			targetLeverage = int(maxLeverage)
+		}
+		if targetLeverage < 1 {
+			targetLeverage = 1
+		}
+		if err := g.futuresClient.SetLeverage(ctx, client.SetLeverageRequest{
+			Symbol:   symbol,
+			Leverage: targetLeverage,
+		}); err != nil {
+			g.logger.WithError(err).WithFields(logrus.Fields{
+				"symbol":           symbol,
+				"target_leverage":  targetLeverage,
+				"calculated_value": calculatedLeverage,
+			}).Warn("[PLACEMENT] Failed to set leverage before placement")
+		}
+	}
+
 	placed := g.placeGridOrders(ctx, symbol, &snapshot)
 	expectedOrders := snapshot.MaxOrdersSide * 2 // BUY + SELL sides
+
+	if placed > 0 && g.stateMachine != nil && g.stateMachine.GetState(symbol) == adaptive_grid.GridStateEnterGrid {
+		if g.stateMachine.CanTransition(symbol, adaptive_grid.EventEntryPlaced) {
+			g.stateMachine.Transition(symbol, adaptive_grid.EventEntryPlaced)
+		}
+	}
 
 	g.logger.WithFields(logrus.Fields{
 		"symbol":   symbol,
@@ -2356,6 +2652,16 @@ func (g *GridManager) finishPlacement(symbol string, placed bool) {
 
 func (g *GridManager) enqueuePlacement(symbol string) {
 	g.logger.WithField("symbol", symbol).Warn(">>> CALLING ENQUEUE PLACEMENT <<<")
+
+	if !g.canPlaceForSymbol(symbol) {
+		g.logger.WithField("symbol", symbol).Info("Skipping enqueue: runtime gate blocks placement")
+		g.gridsMu.Lock()
+		if grid, exists := g.activeGrids[symbol]; exists {
+			grid.PlacementBusy = false
+		}
+		g.gridsMu.Unlock()
+		return
+	}
 
 	// T027: Blocking enqueue with 500ms timeout instead of immediate skip
 	start := time.Now()
@@ -2519,8 +2825,8 @@ func (g *GridManager) SetGridSpread(spread float64) {
 
 // calculateCurrentExposure calculates total exposure for a symbol from exchange positions
 func (g *GridManager) calculateCurrentExposure(ctx context.Context, symbol string) float64 {
-	// Get actual positions from exchange
-	positions, err := g.futuresClient.GetPositions(ctx)
+	// Get actual positions from WebSocket cache or API
+	positions, err := g.GetCachedPositions(ctx)
 	if err != nil {
 		g.logger.WithError(err).Warn("Failed to get positions for exposure check")
 		return 0
@@ -2645,6 +2951,14 @@ func (g *GridManager) SetAdaptiveManager(mgr *adaptive_grid.AdaptiveGridManager)
 	g.logger.Info("Adaptive grid manager reference set")
 }
 
+// SetStateMachine sets the trading lifecycle state machine
+func (g *GridManager) SetStateMachine(sm *adaptive_grid.GridStateMachine) {
+	g.gridsMu.Lock()
+	defer g.gridsMu.Unlock()
+	g.stateMachine = sm
+	g.logger.Info("Grid state machine set")
+}
+
 // canRebalance checks if rebalancing is allowed for a symbol
 func (g *GridManager) canRebalance(symbol string) bool {
 	g.riskCheckerMu.RLock()
@@ -2756,6 +3070,119 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 	g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
 }
 
+// OnAccountUpdate handles real-time position updates from UserStream WebSocket
+// This replaces polling GetPositions() API calls
+func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
+	g.cachedPositionsMu.Lock()
+	defer g.cachedPositionsMu.Unlock()
+
+	// Update cached positions from WebSocket data
+	for _, pos := range accountUpdate.Update.Positions {
+		if pos.PositionAmt != 0 {
+			// Convert WebSocket position to client.Position
+			cachedPos := &client.Position{
+				Symbol:           pos.Symbol,
+				PositionAmt:      pos.PositionAmt,
+				EntryPrice:       pos.EntryPrice,
+				MarkPrice:        pos.EntryPrice, // Use entry price as fallback
+				UnrealizedProfit: pos.UnrealizedPnL,
+				Leverage:         1.0, // Default leverage
+				MarginType:       pos.MarginType,
+				PositionSide:     pos.PositionSide,
+			}
+			g.cachedPositions[pos.Symbol] = cachedPos
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         pos.Symbol,
+				"position_amt":   pos.PositionAmt,
+				"entry_price":    pos.EntryPrice,
+				"unrealized_pnl": pos.UnrealizedPnL,
+				"websocket":      true,
+			}).Debug("Position updated from WebSocket")
+		} else {
+			// Remove zero positions from cache
+			delete(g.cachedPositions, pos.Symbol)
+		}
+	}
+	g.lastPositionUpdate = time.Now()
+}
+
+// GetCachedPositions returns cached positions from WebSocket data
+// This replaces API calls to avoid rate limiting
+func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position, error) {
+	g.cachedPositionsMu.RLock()
+	defer g.cachedPositionsMu.RUnlock()
+
+	// If cache is empty, fetch initial positions via API once
+	if len(g.cachedPositions) == 0 {
+		g.logger.Info("Position cache empty - fetching initial positions via API")
+		positions, err := g.futuresClient.GetPositions(ctx)
+		if err != nil {
+			g.logger.WithError(err).Error("Failed to fetch initial positions")
+			return nil, err
+		}
+		// Cache the initial positions
+		for i := range positions {
+			if positions[i].PositionAmt != 0 {
+				g.cachedPositions[positions[i].Symbol] = &positions[i]
+			}
+		}
+		g.lastPositionUpdate = time.Now()
+		g.logger.WithField("count", len(g.cachedPositions)).Info("Initial positions cached")
+		return positions, nil
+	}
+
+	// Return cached positions (not stale check for now - WebSocket will keep it fresh)
+	positions := make([]client.Position, 0, len(g.cachedPositions))
+	for _, pos := range g.cachedPositions {
+		positions = append(positions, *pos)
+	}
+
+	return positions, nil
+}
+
+// initUserStream initializes and starts the user data stream WebSocket
+// This provides real-time position and order updates, eliminating API polling
+func (g *GridManager) initUserStream(ctx context.Context) {
+	wsBase := "wss://fstream.asterdex.com"
+
+	// Create zap logger for UserStream (it expects zap.Logger, not logrus)
+	zapLogger, _ := zap.NewDevelopment()
+
+	userStream := stream.NewUserStream(
+		wsBase,
+		g.futuresClient.StartListenKey,
+		g.futuresClient.KeepaliveListenKey,
+		stream.UserStreamHandlers{
+			OnOrderUpdate: func(u stream.WsOrderUpdate) {
+				// Convert WsOrderUpdate to local OrderUpdate
+				orderUpdate := &OrderUpdate{
+					OrderID:  fmt.Sprintf("%d", u.Order.OrderID),
+					Symbol:   u.Order.Symbol,
+					Side:     u.Order.Side,
+					Status:   u.Order.OrderStatus,
+					Quantity: u.Order.FilledQty,
+					Price:    u.Order.AvgPrice,
+				}
+				g.OnOrderUpdate(orderUpdate)
+			},
+			OnAccountUpdate: g.OnAccountUpdate,
+			OnMarginCall: func(msg json.RawMessage) {
+				g.logger.Warn("Margin call received", string(msg))
+			},
+		},
+		zapLogger,
+	)
+
+	// Start user stream in background
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.logger.Info("Starting UserStream for real-time position and order updates")
+		userStream.Run(ctx)
+		g.logger.Info("UserStream stopped")
+	}()
+}
+
 // positionRebalancerWorker monitors position sizes and places reduce-only orders when needed
 func (g *GridManager) positionRebalancerWorker(ctx context.Context) {
 	defer g.wg.Done()
@@ -2801,8 +3228,8 @@ func (g *GridManager) checkAndRebalancePositions(ctx context.Context) {
 
 // checkAndRebalanceSymbol checks position for a specific symbol and rebalances if needed
 func (g *GridManager) checkAndRebalanceSymbol(ctx context.Context, symbol string) {
-	// Get current position from exchange
-	positions, err := g.futuresClient.GetPositions(ctx)
+	// Get current position from WebSocket cache or API
+	positions, err := g.GetCachedPositions(ctx)
 	if err != nil {
 		g.logger.WithError(err).Warn("Failed to get positions for rebalancing")
 		return
@@ -2925,10 +3352,10 @@ func (g *GridManager) SetRebalanceAggressiveness(aggressiveness float64) {
 func (g *GridManager) gridLimitEnforcerWorker(ctx context.Context) {
 	defer g.wg.Done()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	g.logger.Info("[LIMIT ENFORCER] Started - checking every 2s for excess orders")
+	g.logger.Info("[LIMIT ENFORCER] Started - checking every 10s for excess orders")
 
 	for {
 		select {

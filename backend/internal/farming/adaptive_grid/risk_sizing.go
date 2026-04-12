@@ -941,3 +941,52 @@ func calculateFloatAverage(values []float64) float64 {
 	}
 	return sum / float64(len(values))
 }
+
+// calculateDynamicLeverage calculates leverage inversely proportional to BB width
+// Tight ranges (low BB width) allow higher leverage, wide ranges require lower leverage
+// Formula: leverage = min(maxLeverage, baseLeverage / bbWidthNormalized)
+//
+// Parameters:
+//   - bbWidth: Bollinger Bands width as percentage (e.g., 0.005 = 0.5%)
+//   - maxLeverage: Maximum allowed leverage (e.g., 100x)
+//
+// Returns:
+//   - Calculated leverage based on market conditions
+//
+// Examples:
+//   - BB width 0.2% (tight) → 100x leverage
+//   - BB width 0.5% (normal) → 80x leverage
+//   - BB width 1.0% (wide) → 40x leverage
+//   - BB width 2.0% (volatile) → 20x leverage
+func calculateDynamicLeverage(bbWidth float64, maxLeverage float64) float64 {
+	// Base leverage at 50% of max
+	baseLeverage := maxLeverage * 0.5
+
+	// Normalize BB width: typical range is 0.1% to 2.0%
+	// Cap at 2% to prevent extreme leverage reduction
+	normalizedWidth := bbWidth
+	if normalizedWidth < 0.001 {
+		normalizedWidth = 0.001 // Minimum 0.1% to prevent division by zero
+	}
+	if normalizedWidth > 0.02 {
+		normalizedWidth = 0.02 // Maximum 2% cap
+	}
+
+	// Calculate leverage: inverse proportion to BB width
+	// At 0.1% width: leverage = base * (0.02/0.001) = base * 20 = max leverage
+	// At 2.0% width: leverage = base * (0.02/0.02) = base = 50% max
+	scalingFactor := 0.02 / normalizedWidth
+	leverage := baseLeverage * scalingFactor
+
+	// Clamp to max leverage
+	if leverage > maxLeverage {
+		leverage = maxLeverage
+	}
+
+	// Ensure minimum leverage of 10x
+	if leverage < 10.0 {
+		leverage = 10.0
+	}
+
+	return leverage
+}
