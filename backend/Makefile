@@ -1,4 +1,4 @@
-.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test
+.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon termux-agentic-start termux-agentic-stop termux-agentic-status termux-agentic-logs termux-agentic-restart termux-agentic-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test
 
 # The name of our output binary
 APP_NAME := aster-bot
@@ -350,6 +350,58 @@ termux-setup:
 	@go build -o bin/volume-farm ./cmd/volume-farm
 	@echo ""
 	@echo "Setup complete! Use 'make termux-start' to run"
+
+# ============================================================================
+# Termux Agentic Trading Bot Targets
+# ============================================================================
+
+# Start agentic trading bot on Termux with wake lock (keeps running when screen off)
+termux-agentic-start:
+	@echo "============================================"
+	@echo "Starting Agentic Trading Bot on Termux"
+	@echo "============================================"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Wake lock enabled (runs when screen off)"
+	@echo "  • Agentic regime detection & scoring"
+	@echo "  • Dynamic whitelist management"
+	@echo "  • Volume Farm execution layer"
+	@echo "  • Logs to agentic-vf.log"
+	@echo ""
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh start ./config/agentic-vf-config.yaml
+
+# Stop the agentic trading bot
+termux-agentic-stop:
+	@echo "Stopping Agentic Trading Bot..."
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh stop
+
+# Check agentic bot status
+termux-agentic-status:
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh status
+
+# View agentic bot logs
+termux-agentic-logs:
+	@echo "Viewing logs (Ctrl+C to exit)..."
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh logs
+
+# Restart the agentic bot
+termux-agentic-restart:
+	@echo "Restarting Agentic Trading Bot..."
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh restart ./config/agentic-vf-config.yaml
+
+# Run agentic bot in daemon mode with auto-restart
+termux-agentic-daemon:
+	@echo "Starting in daemon mode (auto-restart on crash)..."
+	@echo "Press Ctrl+C to stop daemon watcher (bot will keep running)"
+	@echo "Use 'make termux-agentic-stop' to stop the bot completely"
+	@echo ""
+	@chmod +x run-agentic-termux.sh 2>/dev/null || true
+	@./run-agentic-termux.sh daemon ./config/agentic-vf-config.yaml
 
 # ============================================================================
 # Dashboard (Real-time Metrics)

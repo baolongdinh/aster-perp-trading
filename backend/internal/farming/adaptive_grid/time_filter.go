@@ -253,6 +253,11 @@ func (t *TimeFilter) CanTrade() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	// // CRITICAL FIX: If time filter is disabled, always allow trading
+	// if !t.config.Enabled {
+	// 	return true
+	// }
+
 	switch t.config.Mode {
 	case TimeFilterAll:
 		return true

@@ -338,6 +338,14 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.gridLimitEnforcerWorker(ctx)
 
+	// NEW: Sync exchange data every 30s to keep internal state accurate (uses websocket, not API)
+	g.wg.Add(1)
+	go g.exchangeSyncWorker(ctx)
+
+	// NEW: Time filter monitor - cancels orders when outside hours, reopens when hours resume
+	g.wg.Add(1)
+	go g.timeFilterMonitorWorker(ctx)
+
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
@@ -2048,6 +2056,16 @@ func (g *GridManager) logExchangeData(ctx context.Context) {
 		}
 	}
 
+	// Get internal active orders count
+	g.ordersMu.RLock()
+	internalActiveCount := 0
+	for _, order := range g.activeOrders {
+		if order.Status != "FILLED" && order.Status != "CANCELLED" {
+			internalActiveCount++
+		}
+	}
+	g.ordersMu.RUnlock()
+
 	// Log real exchange data for dashboard
 	g.logger.WithFields(logrus.Fields{
 		"exchange_open_orders":      len(openOrders),
@@ -2055,7 +2073,56 @@ func (g *GridManager) logExchangeData(ctx context.Context) {
 		"exchange_positions_count":  len(positionSummary),
 		"exchange_orders_by_symbol": orderCountBySymbol,
 		"exchange_positions":        positionSummary,
+		"internal_active_orders":    internalActiveCount,
 	}).Info("Exchange Real Data")
+
+	// FORCE SYNC: If exchange has 0 orders but internal has active orders → DESYNC DETECTED
+	if len(openOrders) == 0 && internalActiveCount > 0 {
+		g.logger.WithFields(logrus.Fields{
+			"internal_active": internalActiveCount,
+			"exchange_open":   len(openOrders),
+		}).Warn("[FORCE SYNC] Desync detected: Exchange has 0 orders but internal has active orders - forcing reset")
+		g.forceResetAllGrids(ctx)
+	}
+}
+
+// forceResetAllGrids resets all grids and clears internal state when desync detected
+func (g *GridManager) forceResetAllGrids(ctx context.Context) {
+	g.gridsMu.Lock()
+	g.ordersMu.Lock()
+
+	resetCount := 0
+	for symbol, grid := range g.activeGrids {
+		// Mark all internal orders as filled (since exchange has none)
+		for orderID, order := range g.activeOrders {
+			if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
+				order.Status = "FILLED"
+				order.FilledAt = time.Now()
+				g.filledOrders[orderID] = order
+				delete(g.activeOrders, orderID)
+			}
+		}
+
+		// Reset grid to allow recreation
+		if grid.OrdersPlaced {
+			grid.OrdersPlaced = false
+			grid.PlacementBusy = false
+			resetCount++
+
+			// Trigger immediate placement
+			go func(sym string) {
+				g.enqueuePlacement(sym)
+			}(symbol)
+		}
+	}
+
+	g.ordersMu.Unlock()
+	g.gridsMu.Unlock()
+
+	g.logger.WithFields(logrus.Fields{
+		"grids_reset": resetCount,
+		"reason":      "exchange_desync",
+	}).Info("[FORCE SYNC] All grids force reset due to exchange desync - grids will be recreated")
 }
 
 func (g *GridManager) placementWorker(ctx context.Context, workerID int) {
@@ -2115,11 +2182,17 @@ func (g *GridManager) resetStaleOrders() {
 	}
 	var toCheck []gridInfo
 	for symbol, grid := range g.activeGrids {
-		if grid.OrdersPlaced && time.Since(grid.LastAttempt) > 3*time.Second {
+		// Check all active grids that have attempted placement
+		// RELAX: Check all placed grids regardless of time since last attempt
+		if grid.OrdersPlaced {
 			toCheck = append(toCheck, gridInfo{symbol, grid})
 		}
 	}
 	g.gridsMu.RUnlock()
+
+	if len(toCheck) > 0 {
+		g.logger.WithField("grids_to_check", len(toCheck)).Debug("Checking grids for reset")
+	}
 
 	for _, info := range toCheck {
 		symbol := info.symbol
@@ -2127,30 +2200,37 @@ func (g *GridManager) resetStaleOrders() {
 		expected := grid.MaxOrdersSide * 2
 		actual := 0
 		staleOrders := 0
+		filledCount := 0
 
 		g.ordersMu.RLock()
 		for _, order := range g.activeOrders {
-			if order.Symbol == symbol && order.Status != "FILLED" && order.Status != "CANCELLED" {
-				actual++
-				if time.Since(order.CreatedAt) > 60*time.Second {
-					staleOrders++
+			if order.Symbol == symbol {
+				if order.Status != "FILLED" && order.Status != "CANCELLED" {
+					actual++
+					if time.Since(order.CreatedAt) > 60*time.Second {
+						staleOrders++
+					}
+				} else if order.Status == "FILLED" {
+					filledCount++
 				}
 			}
 		}
 		g.ordersMu.RUnlock()
 
-		// Reset if grid is incomplete
+		// CASE 1: Grid is incomplete (some orders missing/not placed)
 		if actual < expected {
 			grid.OrdersPlaced = false
 			g.logger.WithFields(logrus.Fields{
 				"symbol":   symbol,
 				"expected": expected,
 				"actual":   actual,
+				"filled":   filledCount,
 			}).Info("Resetting incomplete grid for re-placement")
 			go g.enqueuePlacement(symbol)
 			continue
 		}
 
+		// CASE 2: All active orders are stale (pending too long)
 		if actual > 0 && staleOrders == actual {
 			grid.OrdersPlaced = false
 			g.logger.WithFields(logrus.Fields{
@@ -2160,6 +2240,39 @@ func (g *GridManager) resetStaleOrders() {
 				"stale_orders": staleOrders,
 			}).Info("Resetting stale grid - all orders pending too long without fills")
 			go g.enqueuePlacement(symbol)
+			continue
+		}
+
+		// CASE 3: Grid complete but all orders filled - RECREATE GRID!
+		// This happens when a full grid cycle completes successfully
+		if actual == 0 && grid.OrdersPlaced {
+			// Check if enough time passed since last placement to avoid rapid recreation
+			if time.Since(grid.LastAttempt) > 3*time.Second {
+				grid.OrdersPlaced = false
+				g.logger.WithFields(logrus.Fields{
+					"symbol":       symbol,
+					"expected":     expected,
+					"actual":       actual,
+					"filled_count": filledCount,
+					"since_last":   time.Since(grid.LastAttempt),
+				}).Info("Grid cycle complete - all orders filled, recreating grid")
+				go g.enqueuePlacement(symbol)
+			} else {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":     symbol,
+					"since_last": time.Since(grid.LastAttempt),
+				}).Debug("Grid complete but waiting cooldown before recreation")
+			}
+			continue
+		}
+
+		// CASE 4: Grid complete with active orders - normal state, no action
+		if actual >= expected {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"expected": expected,
+				"actual":   actual,
+			}).Debug("Grid complete and healthy")
 		}
 	}
 }
@@ -3052,4 +3165,318 @@ func (g *GridManager) GetActiveGrids() []*SymbolGrid {
 		grids = append(grids, grid)
 	}
 	return grids
+}
+
+// exchangeSyncWorker runs every 30s to sync internal state with exchange data
+// Uses websocket data (ticker stream) to avoid API rate limits
+func (g *GridManager) exchangeSyncWorker(ctx context.Context) {
+	defer g.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	g.logger.Info("[SYNC] Exchange sync worker started - syncing every 30s via websocket")
+
+	for {
+		select {
+		case <-ctx.Done():
+			g.logger.Debug("[SYNC] Exchange sync worker shutting down (context done)")
+			return
+		case <-g.stopCh:
+			g.logger.Debug("[SYNC] Exchange sync worker shutting down (stop signal)")
+			return
+		case <-ticker.C:
+			g.syncExchangeData(ctx)
+		}
+	}
+}
+
+// syncExchangeData performs the actual sync of internal state with exchange
+// Uses websocket ticker data (already in memory) + lightweight exchange queries
+func (g *GridManager) syncExchangeData(ctx context.Context) {
+	start := time.Now()
+
+	// Get list of active symbols
+	g.gridsMu.RLock()
+	symbols := make([]string, 0, len(g.activeGrids))
+	for symbol := range g.activeGrids {
+		symbols = append(symbols, symbol)
+	}
+	g.gridsMu.RUnlock()
+
+	if len(symbols) == 0 {
+		return
+	}
+
+	// Sync each symbol's data
+	syncedCount := 0
+	for _, symbol := range symbols {
+		if err := g.syncSymbolData(ctx, symbol); err != nil {
+			g.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"error":  err,
+			}).Warn("[SYNC] Failed to sync symbol data")
+		} else {
+			syncedCount++
+		}
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbols_total":  len(symbols),
+		"symbols_synced": syncedCount,
+		"duration_ms":    time.Since(start).Milliseconds(),
+	}).Debug("[SYNC] Exchange data sync completed")
+}
+
+// syncSymbolData syncs data for a single symbol
+// Uses websocket price data (already in memory) + cache for orders
+func (g *GridManager) syncSymbolData(ctx context.Context, symbol string) error {
+	// 1. Update grid price from websocket data (already in memory, no API call)
+	g.gridsMu.RLock()
+	grid, exists := g.activeGrids[symbol]
+	g.gridsMu.RUnlock()
+
+	if !exists {
+		return nil
+	}
+
+	// Price is already updated via websocketProcessor, just verify
+	if grid.CurrentPrice <= 0 {
+		g.logger.WithField("symbol", symbol).Warn("[SYNC] Grid has no price from websocket")
+	}
+
+	// 2. Sync orders with exchange (use cache first, avoid API rate limit)
+	// Try cache first with 1s TTL
+	exchangeOrders, cacheHit := g.getCachedExchangeOrders(symbol)
+	if !cacheHit {
+		// Cache miss - fetch with very short timeout to avoid blocking
+		fetchCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		orders, err := g.fetchExchangeDataAsync(fetchCtx, symbol)
+		cancel()
+
+		if err != nil {
+			// Don't fail sync on fetch error - use existing data
+			g.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"error":  err,
+			}).Debug("[SYNC] Exchange fetch failed, using cached data")
+		} else {
+			exchangeOrders = orders
+			g.cacheExchangeOrders(symbol, orders)
+		}
+	}
+
+	// 3. Reconcile internal orders with exchange orders
+	g.reconcileOrders(symbol, exchangeOrders)
+
+	return nil
+}
+
+// reconcileOrders compares internal activeOrders with exchange data and updates
+// Removes orders that no longer exist on exchange (filled/cancelled)
+// Adds orders that exist on exchange but not in internal state
+func (g *GridManager) reconcileOrders(symbol string, exchangeOrders []client.Order) {
+	g.ordersMu.Lock()
+	defer g.ordersMu.Unlock()
+
+	// Build map of exchange order IDs
+	exchangeOrderIDs := make(map[string]bool)
+	for _, eo := range exchangeOrders {
+		exchangeOrderIDs[fmt.Sprintf("%d", eo.OrderID)] = true
+	}
+
+	// Find internal orders that no longer exist on exchange (filled/cancelled)
+	orphanedCount := 0
+	for orderID, order := range g.activeOrders {
+		if order.Symbol != symbol {
+			continue
+		}
+
+		// Skip already filled/cancelled
+		if order.Status == "FILLED" || order.Status == "CANCELLED" {
+			continue
+		}
+
+		// Check if order exists on exchange
+		if !exchangeOrderIDs[orderID] {
+			// Order not on exchange - likely filled or cancelled
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"order_id": orderID,
+				"side":     order.Side,
+				"price":    order.Price,
+			}).Info("[SYNC] Order not found on exchange, marking as filled")
+
+			order.Status = "FILLED"
+			order.FilledAt = time.Now()
+			g.filledOrders[orderID] = order
+			delete(g.activeOrders, orderID)
+			orphanedCount++
+		}
+	}
+
+	// Find exchange orders that don't exist internally (shouldn't happen often)
+	missingCount := 0
+	for _, eo := range exchangeOrders {
+		orderID := fmt.Sprintf("%d", eo.OrderID)
+		if _, exists := g.activeOrders[orderID]; !exists {
+			// Order exists on exchange but not tracked internally
+			// This can happen if orders were placed outside the bot
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"order_id": orderID,
+				"side":     eo.Side,
+				"price":    eo.Price,
+				"qty":      eo.OrigQty,
+			}).Debug("[SYNC] Untracked order found on exchange")
+			missingCount++
+		}
+	}
+
+	if orphanedCount > 0 || missingCount > 0 {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":          symbol,
+			"orphaned_orders": orphanedCount,
+			"missing_orders":  missingCount,
+			"exchange_count":  len(exchangeOrders),
+			"internal_count":  len(g.activeOrders),
+		}).Info("[SYNC] Order reconciliation completed")
+	}
+}
+
+// timeFilterMonitorWorker monitors trading hours and cancels/reopens orders accordingly
+func (g *GridManager) timeFilterMonitorWorker(ctx context.Context) {
+	defer g.wg.Done()
+
+	// Check every 10 seconds
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	wasTradingAllowed := true // Assume initially allowed
+
+	g.logger.Info("[TIME FILTER] Monitor worker started")
+
+	for {
+		select {
+		case <-ctx.Done():
+			g.logger.Debug("[TIME FILTER] Monitor shutting down")
+			return
+		case <-g.stopCh:
+			g.logger.Debug("[TIME FILTER] Monitor shutting down (stop signal)")
+			return
+		case <-ticker.C:
+			canTrade := g.canTradeNow()
+
+			if canTrade && !wasTradingAllowed {
+				// Trading hours just resumed - reopen grids
+				g.logger.Info("[TIME FILTER] Trading hours resumed - reopening grids")
+				g.reopenGridsAfterHoursResume()
+			} else if !canTrade && wasTradingAllowed {
+				// Trading hours just ended - close all orders
+				g.logger.Info("[TIME FILTER] Trading hours ended - closing all orders")
+				g.closeAllOrdersForHoursEnd(ctx)
+			}
+
+			wasTradingAllowed = canTrade
+		}
+	}
+}
+
+// canTradeNow checks if trading is allowed now via risk checker
+func (g *GridManager) canTradeNow() bool {
+	if g.riskChecker == nil {
+		return true
+	}
+	return g.riskChecker.CanPlaceOrder("") // Empty symbol = global check
+}
+
+// closeAllOrdersForHoursEnd cancels all open orders when trading hours end
+func (g *GridManager) closeAllOrdersForHoursEnd(ctx context.Context) {
+	g.logger.Info("[TIME FILTER] Closing all orders due to trading hours end")
+
+	// Get all active orders
+	g.ordersMu.RLock()
+	ordersToCancel := make([]*GridOrder, 0)
+	for _, order := range g.activeOrders {
+		if order.Status != "FILLED" && order.Status != "CANCELLED" {
+			ordersToCancel = append(ordersToCancel, order)
+		}
+	}
+	g.ordersMu.RUnlock()
+
+	cancelCount := 0
+	for _, order := range ordersToCancel {
+		if order.OrderID == "" {
+			continue
+		}
+
+		orderIDInt, _ := strconv.ParseInt(order.OrderID, 10, 64)
+		if orderIDInt == 0 {
+			continue
+		}
+
+		_, err := g.futuresClient.CancelOrder(ctx, client.CancelOrderRequest{
+			Symbol:  order.Symbol,
+			OrderID: orderIDInt,
+		})
+		if err != nil {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   order.Symbol,
+				"order_id": order.OrderID,
+				"error":    err,
+			}).Warn("[TIME FILTER] Failed to cancel order after hours end")
+			continue
+		}
+
+		// Update internal state
+		g.ordersMu.Lock()
+		if o, exists := g.activeOrders[order.OrderID]; exists {
+			o.Status = "CANCELLED"
+		}
+		g.ordersMu.Unlock()
+
+		cancelCount++
+		g.logger.WithFields(logrus.Fields{
+			"symbol":   order.Symbol,
+			"order_id": order.OrderID,
+			"side":     order.Side,
+		}).Info("[TIME FILTER] Order cancelled due to trading hours end")
+	}
+
+	// Reset all grids
+	g.gridsMu.Lock()
+	for _, grid := range g.activeGrids {
+		grid.OrdersPlaced = false
+		grid.PlacementBusy = false
+	}
+	g.gridsMu.Unlock()
+
+	g.logger.WithFields(logrus.Fields{
+		"orders_cancelled": cancelCount,
+		"grids_reset":      len(g.activeGrids),
+	}).Info("[TIME FILTER] All orders closed and grids reset for hours end")
+}
+
+// reopenGridsAfterHoursResume resets grids to allow reopening when trading hours resume
+func (g *GridManager) reopenGridsAfterHoursResume() {
+	g.logger.Info("[TIME FILTER] Preparing grids for reopening after hours resume")
+
+	g.gridsMu.Lock()
+	reopenedCount := 0
+	for symbol, grid := range g.activeGrids {
+		// Reset grid to allow placement
+		grid.OrdersPlaced = false
+		grid.PlacementBusy = false
+		reopenedCount++
+
+		// Trigger placement
+		go func(sym string) {
+			g.enqueuePlacement(sym)
+		}(symbol)
+	}
+	g.gridsMu.Unlock()
+
+	g.logger.WithFields(logrus.Fields{
+		"grids_reopened": reopenedCount,
+	}).Info("[TIME FILTER] Grids reset for reopening after trading hours resume")
 }
