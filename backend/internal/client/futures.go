@@ -141,8 +141,13 @@ func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 }
 
 // Get24hrTicker returns 24hr ticker price change statistics for all symbols
-func (f *FuturesClient) Get24hrTicker() ([]Ticker, error) {
-	data, err := f.http.GetPublic(context.Background(), "/fapi/v1/ticker/24hr", nil)
+func (f *FuturesClient) Get24hrTicker(ctx context.Context) ([]Ticker, error) {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	data, err := f.http.GetPublic(ctx, "/fapi/v1/ticker/24hr", nil)
 	if err != nil {
 		return nil, err
 	}

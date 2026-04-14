@@ -36,11 +36,6 @@ type FuturesClientInterface interface {
 	PlaceOrder(ctx context.Context, req client.PlaceOrderRequest) (*client.Order, error)
 }
 
-// PositionProvider interface for getting position data from WebSocket cache
-type PositionProvider interface {
-	GetCachedPositions(ctx context.Context) ([]client.Position, error)
-}
-
 // ConfigManagerInterface defines methods needed from config manager
 type ConfigManagerInterface interface {
 	LoadConfig() error
@@ -2605,6 +2600,12 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 	if !exists {
 		return
 	}
+
+	a.logger.Info("UpdatePriceForRange: feeding to detector",
+		zap.String("symbol", symbol),
+		zap.Float64("high", high),
+		zap.Float64("low", low),
+		zap.Float64("close", closePrice))
 
 	detector.AddPrice(high, low, closePrice)
 

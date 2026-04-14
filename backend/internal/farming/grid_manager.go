@@ -127,6 +127,11 @@ type GridManager struct {
 	cachedPositions    map[string]*client.Position // symbol -> position
 	cachedPositionsMu  sync.RWMutex
 	lastPositionUpdate time.Time
+
+	// NEW: Singleton kline processor - only one goroutine reads from kline channel
+	warmupOnce   sync.Once
+	warmupStopCh chan struct{}
+	warmupWg     sync.WaitGroup
 }
 
 // ExchangeOrderCacheEntry stores cached exchange orders with timestamp
@@ -967,99 +972,131 @@ func (g *GridManager) startKlineWarmup(symbol string) {
 		return
 	}
 
-	// Start warmup processor goroutine
+	// Start global kline processor singleton (only once for all symbols)
+	g.warmupOnce.Do(func() {
+		g.warmupStopCh = make(chan struct{})
+		g.warmupWg.Add(1)
+		go g.globalKlineProcessor()
+	})
+
+	// Start per-symbol warmup completion checker
 	g.wg.Add(1)
-	go g.klineWarmupProcessor(symbol)
+	go g.warmupCompletionChecker(symbol)
 }
 
-// klineWarmupProcessor processes kline messages until RangeDetector is ready
-// Then triggers placement and switches to ticker mode
-func (g *GridManager) klineWarmupProcessor(symbol string) {
-	defer g.wg.Done()
+// globalKlineProcessor is a SINGLETON that reads from kline channel and broadcasts
+// to ALL symbols in warm-up phase. This fixes race condition where multiple goroutines
+// read from the same channel causing messages to be lost.
+func (g *GridManager) globalKlineProcessor() {
+	defer g.warmupWg.Done()
 
-	g.logger.WithField("symbol", symbol).Info("📊 Kline warm-up processor started")
+	g.logger.Info("🌐 Global kline processor started (singleton)")
 
 	if g.wsClient == nil {
-		g.logger.WithField("symbol", symbol).Error("WARM-UP: WebSocket client is nil!")
+		g.logger.Error("GLOBAL WARM-UP: WebSocket client is nil!")
 		return
 	}
 
 	klineCh := g.wsClient.GetKlineChannel()
 	if klineCh == nil {
-		g.logger.WithField("symbol", symbol).Error("WARM-UP: Kline channel is nil!")
+		g.logger.Error("GLOBAL WARM-UP: Kline channel is nil!")
 		return
 	}
-	g.logger.WithField("symbol", symbol).Info("WARM-UP: Got kline channel, waiting for data...")
 
-	ticker := time.NewTicker(30 * time.Second) // Timeout for warmup
-	defer ticker.Stop()
-
-	warmupComplete := false
-	klineCount := 0
-
-	for !warmupComplete {
+	for {
 		select {
-		case <-g.stopCh:
-			g.logger.WithField("symbol", symbol).Info("Warm-up stopped")
+		case <-g.warmupStopCh:
+			g.logger.Info("Global kline processor stopped")
 			return
 
 		case kline := <-klineCh:
-			klineCount++
-			// Debug: log all klines received
-			g.logger.WithFields(logrus.Fields{
-				"kline_count":     klineCount,
-				"received_symbol": kline.Symbol,
-				"expected_symbol": symbol,
-				"match":           kline.Symbol == symbol,
-				"is_closed":       kline.IsClosed,
-				"high":            kline.High,
-				"low":             kline.Low,
-				"close":           kline.Close,
-			}).Info("WARM-UP: received kline")
+			symbol := strings.ToUpper(kline.Symbol)
 
-			// Only process klines for our symbol
-			if kline.Symbol == symbol {
-				g.logger.WithField("symbol", symbol).Warn("WARM-UP: processing kline for our symbol!")
+			// Check if this symbol is in warm-up phase
+			g.warmupMu.RLock()
+			isWarmupActive := g.warmupActive[symbol]
+			g.warmupMu.RUnlock()
 
-				// Feed OHLC data to RangeDetector
-				g.adaptiveMgr.UpdatePriceForRange(symbol, kline.High, kline.Low, kline.Close)
-
-				rangeState := g.adaptiveMgr.GetRangeState(symbol)
-				g.logger.WithFields(logrus.Fields{
-					"symbol":      symbol,
-					"range_state": rangeState,
-					"is_closed":   kline.IsClosed,
-					"close":       kline.Close,
-				}).Warn("WARM-UP: kline processed and fed to RangeDetector")
-
-				// Check if warmup complete (RangeStateActive)
-				if rangeState == adaptive_grid.RangeStateActive {
-					g.logger.WithFields(logrus.Fields{
-						"symbol":      symbol,
-						"klines":      "sufficient",
-						"range_state": rangeState,
-					}).Info(" Warm-up complete - RangeDetector ready")
-					warmupComplete = true
-				}
+			if !isWarmupActive {
+				// Symbol not in warm-up, skip
+				continue
 			}
 
+			g.logger.WithFields(logrus.Fields{
+				"symbol":    symbol,
+				"is_closed": kline.IsClosed,
+				"close":     kline.Close,
+			}).Info("GLOBAL: feeding kline to RangeDetector")
+
+			// Feed OHLC data to RangeDetector for this symbol
+			g.adaptiveMgr.UpdatePriceForRange(symbol, kline.High, kline.Low, kline.Close)
+
+		case <-time.After(5 * time.Second):
+			// Periodic check - continue loop
+		}
+	}
+}
+
+// warmupCompletionChecker monitors a single symbol's warm-up progress
+// and triggers placement when range becomes active
+func (g *GridManager) warmupCompletionChecker(symbol string) {
+	defer g.wg.Done()
+
+	g.logger.WithField("symbol", symbol).Info("📊 Warm-up completion checker started")
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.NewTimer(5 * time.Minute)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-g.stopCh:
+			g.logger.WithField("symbol", symbol).Info("Warm-up checker stopped")
+			return
+
+		case <-g.warmupStopCh:
+			g.logger.WithField("symbol", symbol).Info("Warm-up checker stopped (global)")
+			return
+
+		case <-timeout.C:
+			g.logger.WithField("symbol", symbol).Warn("⏰ Warm-up TIMEOUT after 5 minutes")
+			g.warmupMu.Lock()
+			delete(g.warmupActive, symbol)
+			g.warmupMu.Unlock()
+			return
+
 		case <-ticker.C:
-			// Check current state
+			// Check if still in warm-up
+			g.warmupMu.RLock()
+			inWarmup := g.warmupActive[symbol]
+			g.warmupMu.RUnlock()
+
+			if !inWarmup {
+				// Warm-up was cancelled or completed by another path
+				return
+			}
+
+			// Check range state
 			rangeState := g.adaptiveMgr.GetRangeState(symbol)
 			if rangeState == adaptive_grid.RangeStateActive {
-				g.logger.WithField("symbol", symbol).Warn(" WARM-UP COMPLETE (timeout check)!")
-				warmupComplete = true
-			} else {
 				g.logger.WithFields(logrus.Fields{
 					"symbol":      symbol,
 					"range_state": rangeState,
-				}).Warn("⏳ WARM-UP: still in progress...")
+				}).Info("✅ Warm-up COMPLETE - RangeDetector ready")
+
+				// Mark warm-up complete
+				g.warmupMu.Lock()
+				delete(g.warmupActive, symbol)
+				g.warmupMu.Unlock()
+
+				// Finalize and trigger placement
+				g.finalizeWarmup(symbol)
+				return
 			}
 		}
 	}
-
-	// Warmup complete - finalize and trigger placement
-	g.finalizeWarmup(symbol)
 }
 
 // finalizeWarmup completes the warmup phase and triggers order placement
@@ -3112,26 +3149,13 @@ func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position
 	g.cachedPositionsMu.RLock()
 	defer g.cachedPositionsMu.RUnlock()
 
-	// If cache is empty, fetch initial positions via API once
-	if len(g.cachedPositions) == 0 {
-		g.logger.Info("Position cache empty - fetching initial positions via API")
-		positions, err := g.futuresClient.GetPositions(ctx)
-		if err != nil {
-			g.logger.WithError(err).Error("Failed to fetch initial positions")
-			return nil, err
-		}
-		// Cache the initial positions
-		for i := range positions {
-			if positions[i].PositionAmt != 0 {
-				g.cachedPositions[positions[i].Symbol] = &positions[i]
-			}
-		}
-		g.lastPositionUpdate = time.Now()
-		g.logger.WithField("count", len(g.cachedPositions)).Info("Initial positions cached")
-		return positions, nil
+	// If cache is empty or stale, fallback to API call
+	if len(g.cachedPositions) == 0 || time.Since(g.lastPositionUpdate) > 30*time.Second {
+		g.logger.Warn("Position cache empty or stale, falling back to API call")
+		return g.futuresClient.GetPositions(ctx)
 	}
 
-	// Return cached positions (not stale check for now - WebSocket will keep it fresh)
+	// Convert cached positions to slice
 	positions := make([]client.Position, 0, len(g.cachedPositions))
 	for _, pos := range g.cachedPositions {
 		positions = append(positions, *pos)

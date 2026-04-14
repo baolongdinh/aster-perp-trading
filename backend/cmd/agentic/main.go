@@ -93,8 +93,10 @@ func main() {
 		logger.Fatal("Failed to initialize Volume Farm Engine", zap.Error(err))
 	}
 
-	// Start Volume Farm Engine
+	// Start Volume Farm Engine with delay to prevent API rate limiting
 	go func() {
+		logger.Info("⏳ Waiting 3s before starting Volume Farm Engine to avoid API burst...")
+		time.Sleep(3 * time.Second)
 		logger.Info("▶️ Starting Volume Farm Engine")
 		if err := vfEngine.Start(ctx); err != nil {
 			logger.Error("Volume Farm Engine error", zap.Error(err))

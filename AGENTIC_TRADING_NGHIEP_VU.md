@@ -5,14 +5,33 @@
 ### 1.1 Định Nghĩa
 Agentic Trading là hệ thống giao dịch thông minh tự động điều chỉnh chiến lược dựa trên phân tích thị trường theo thời gian thực. Hệ thống tự động nhận biết chế độ thị trường, tính toán điểm số đa yếu tố, và điều chỉnh kích thước lệnh/grid spacing phù hợp.
 
-### 1.2 Các Chế Độ Thị Trường (Regime)
+### 1.2 Các Chế Độ Thị Trường (Regime) & State Machine
 
-| Chế Độ | Đặc Điểm | Chiến Lược Grid |
-|--------|----------|-----------------|
-| **Sideways** | Giá dao động trong biên độ hẹp, ADX thấp | Grid spacing 0.15% (config), lướt sóng ngắn |
-| **Trending** | Xu hướng rõ ràng, EMA xếp chồng | Grid spacing 0.15%, position size giảm theo regime multiplier |
-| **Volatile** | Biến động cao, ATR tăng đột biến | Position size giảm 50% (multiplier 0.5), không ngừng giao dịch |
-| **Recovery** | Hồi phục sau volatility spike | Grid spacing 0.15%, chờ confirm trend |
+Hệ thống sử dụng **Unified State Machine** với 5 states:
+
+```
+IDLE → ENTER_GRID → TRADING → EXIT_ALL → WAIT_NEW_RANGE → (loop)
+```
+
+| State | Điều Kiện Vào | Cho Phép Đặt Lệnh | Mô Tả |
+|-------|---------------|-------------------|-------|
+| **IDLE** | Khởi động | ❌ | Chờ phát hiện range từ Agentic |
+| **ENTER_GRID** | Range confirmed (BB tight + ADX < 20) | ✅ | Đặt lệnh entry theo micro grid |
+| **TRADING** | Orders placed | ✅ | Đang trading, có thể rebalancing |
+| **EXIT_ALL** | Breakout/Trend/ADX > 25/Emergency | ❌ | Đang thoát toàn bộ vị thế |
+| **WAIT_NEW_RANGE** | Positions closed | ❌ | Chờ điều kiện regrid (shift ≥ 0.5%, BB contract) |
+
+| Chế Độ Thị Trường | Đặc Điểm | Chiến Lược Grid |
+|-------------------|----------|-----------------|
+| **Sideways** | Giá dao động trong biên độ hẹp, ADX < 20 | Micro grid 0.05%, 5 orders/side, dynamic leverage cao |
+| **Trending** | Xu hướng rõ ràng, ADX > 25 | **EXIT ALL** - không grid |
+| **Breakout** | Vượt BB bands | **EXIT ALL** - chờ stabilizing |
+| **Stabilizing** | Sau breakout, chờ BB mới | Không trading |
+
+**Lưu ý Quan Trọng:**
+- Chỉ schedule placement khi `RangeState == Active` **VÀ** `GridState ∈ {ENTER_GRID, TRADING}`
+- Micro grid (0.05% spread) là **primary geometry**, BB chỉ dùng để gate permission
+- Re-grid chỉ xảy ra sau khi qua WAIT_NEW_RANGE với điều kiện nghiêm ngặt
 
 ### 1.3 Điểm Số Triển Khai (0-100)
 
@@ -22,6 +41,15 @@ Agentic Trading là hệ thống giao dịch thông minh tự động điều ch
 35-49 điểm (low_score): Monitor only, giảm size (multiplier 0.3)
 <35 điểm (skip_score): Chờ đợi, không triển khai
 ```
+
+### 1.4 Whitelist Management (Enabled by Default)
+
+| Tham Số | Giá Trị | Mô Tả |
+|---------|---------|-------|
+| Enabled | `true` | Tự động quản lý whitelist |
+| Max Symbols | 5 | Số symbol tối đa trong whitelist |
+| Min Score to Add | 60 | Ngưỡng điểm tối thiểu để thêm symbol |
+| Universe | BTCUSD1, ETHUSD1, SOLUSD1 | Danh sách mặc định |
 
 ---
 
@@ -42,15 +70,21 @@ Agentic Trading là hệ thống giao dịch thông minh tự động điều ch
 
 ## 3. Circuit Breakers - Cầu Chì An Toàn
 
-### 3.1 3 Cầu Chì Tự Động (Đã Implement)
+### 3.1 5 Cầu Chì Tự Động (Đã Implement)
 
 | Cầu Chì | Điều Kiện Kích Hoạt | Hành Động | Ưu Tiên |
 |---------|---------------------|-----------|---------|
-| **Volatility Spike** | ATR tăng đột biến | Giảm position size, tăng spread | 1 |
-| **Liquidity Crisis** | Spread bid-ask bất thường | Ngừng đặt lệnh mới | 2 |
-| **Consecutive Losses** | Nhiều lệnh lỗ liên tiếp | Giảm 50% kích thước lệnh | 3 |
+| **ADX Spike** | ADX > 25 (trend mạnh) | Exit all, transition EXIT_ALL | 1 |
+| **BB Expansion** | BB width > 1.5% | Exit all, chờ contraction | 1 |
+| **Breakout** | Giá ngoài BB 2+ candles | Cancel orders, close positions | 1 |
+| **Consecutive Losses** | > 3 losses liên tiếp | Pause + 30s cooldown | 2 |
+| **Multi-Layer Liquidation** | Tier 1-4 distance | Tier1: warn, Tier2: reduce 50%, Tier3: close all, Tier4: hedge+close | 3 |
 
-> **Note**: Drawdown Limit và Connection Failure chưa được implement trong version hiện tại.
+**Real-time Exit Monitor:**
+- Goroutine riêng kiểm tra ADX/BB mỗi **100ms** (không phụ thuộc WebSocket)
+- Thread-safe với mutex, idempotent (tránh duplicate exit)
+
+> **Note**: State machine đảm bảo chỉ có 1 exit path duy nhất, không bị race condition
 
 ### 3.2 Reset Cầu Chì
 - **Tự động**: Sau thời gian chờ (30s - 5 phút tùy cầu chì)
@@ -85,21 +119,36 @@ Recovery: Dần dần trở về bình thường
 ### 5.1 Công Thức Kích Thước Lệnh
 
 ```
-final_size = base_size × score_multiplier × volatility_multiplier × pattern_multiplier
+final_size = base_size × score_multiplier × volatility_multiplier × leverage_multiplier
 
 Trong đó:
-- score_multiplier: 1.0 (≥75đ), 0.5 (60-74đ), 0.0 (<60đ)
+- score_multiplier: 1.0 (≥75đ), 0.6 (60-74đ), 0.3 (<60đ)
 - volatility_multiplier: 1.0 (normal), 0.5 (high), 0.0 (extreme)
-- pattern_multiplier: ±5% từ pattern matching (nếu accuracy ≥60%)
+- leverage_multiplier: Dynamic leverage theo BB width (inverse proportion)
+
+Dynamic Leverage Formula:
+- BB width 0.2% → 100x (tight range)
+- BB width 0.5% → 80x (normal)
+- BB width 1.0% → 40x (wide)
+- BB width 2.0% → 20x (volatile, capped)
 ```
 
-### 5.2 Grid Spacing Theo Volatility
+**T012: BB Period Unified = 10** (Cả Agentic và Execution dùng chung)
 
-| Điều Kiện Volatility | Grid Spacing | Mô Tả |
-|---------------------|--------------|-------|
-| Low Vol (ATR nhỏ) | 0.3% | Biên độ hẹp, nhiều lưới |
-| Normal Vol | 1.0% | Lưới tiêu chuẩn |
-| High Vol (ATR lớn) | 2.0% | Biên độ rộng, ít lưới hơn |
+### 5.2 Grid Configuration (Micro Grid Priority)
+
+**T003: Micro Grid là Primary Geometry** (Ưu tiên cao nhất)
+
+| Tham Số | Giá Trị | Mô Tả |
+|---------|---------|-------|
+| Spread | **0.05%** (0.0005) | Khoảng cách giữa các lệnh |
+| Orders/Side | **5** | Tổng 10 lệnh (5 buy + 5 sell) |
+| Min Order | **$3** | Minimum order size USDT |
+| BB Period | **10** | Fast detection (T012) |
+| BB Multiplier | 2.0 | Standard deviation |
+| ADX Threshold | 20 | Ngưỡng sideways vs trending |
+
+**Fallback:** Nếu micro grid disabled → Dùng BB bands để tính grid geometry
 
 ---
 
@@ -122,7 +171,7 @@ Mỗi quyết định được ghi nhận:
 
 ---
 
-## 7. Các Cặp Giao Dịch Hỗ Trợ
+## 8. Các Cặp Giao Dịch Hỗ Trợ
 
 | Cặp | Pattern Storage File | Min Trades để Active |
 |-----|---------------------|---------------------|
@@ -134,22 +183,42 @@ Mỗi cặp có pattern storage riêng, accuracy tracking riêng.
 
 ---
 
-## 8. Monitoring & Alert
+## 7. Re-grid Logic (Strict Conditions)
 
-### 8.1 Tình Huống Cảnh Báo
+Chỉ cho phép re-grid khi **TẤT CẢ** điều kiện sau đúng:
+
+| Điều Kiện | Ngưỡng | Kiểm Tra |
+|-----------|--------|----------|
+| 1. Zero open orders | actual == 0 | GridManager |
+| 2. Zero position | positionAmt == 0 | Position tracker |
+| 3. Range shift | ≥ 0.5% from last accepted | RangeDetector |
+| 4. BB width contraction | < 1.5x average | RangeDetector |
+| 5. ADX low | < 20 for 3+ candles | TrendDetector |
+| 6. State | WAIT_NEW_RANGE | GridStateMachine |
+
+**Flow:**
+```
+EXIT_ALL → PositionsClosed → WAIT_NEW_RANGE → [check conditions] → NewRangeReady → ENTER_GRID
+```
+
+---
+
+## 9. Monitoring & Alert
+
+### 9.1 Tình Huống Cảnh Báo
 - **Regime Change**: Thông báo ngay khi chế độ thị trường thay đổi
 - **Circuit Breaker**: Cảnh báo khẩn cấp + SMS/email nếu cầu chì drawdown/volatility kích hoạt
 - **High Drawdown**: Cảnh báo khi drawdown > 5% (trước khi chạm 10% cầu chì)
 
-### 8.2 Rate Limiting Alert
+### 9.2 Rate Limiting Alert
 - Tối đa 1 alert/5 phút cho mỗi loại
 - Tránh spam khi thị trường biến động liên tục
 
 ---
 
-## 9. Operational Commands
+## 10. Operational Commands
 
-### 9.1 Khởi Động Bot
+### 10.1 Khởi Động Bot
 ```
 # Test mode (không giao dịch thật)
 ./agentic-bot --config=config.yaml --symbol=BTCUSDT --test
@@ -158,24 +227,43 @@ Mỗi cặp có pattern storage riêng, accuracy tracking riêng.
 ./agentic-bot --config=config.yaml --symbol=BTCUSDT
 ```
 
-### 9.2 Các Thao Tác Quản Lý
+### 10.2 Các Thao Tác Quản Lý
 - **Dừng**: Ctrl+C hoặc SIGTERM → Graceful shutdown, save patterns
 - **Check status**: Log file hoặc API `/health`
 - **Reset breaker**: API POST hoặc command
 
 ---
 
-## 10. KPIs & Performance Targets
+## 11. State Machine JSONL Logging
+
+Mọi state transition được log với format JSONL:
+
+```json
+{
+  "timestamp": "2026-04-12T07:45:00Z",
+  "symbol": "BTCUSD1",
+  "from_state": "TRADING",
+  "to_state": "EXIT_ALL",
+  "event": "TREND_EXIT",
+  "reason": "adx_spike",
+  "adx_value": 28.5,
+  "bb_width_pct": 1.2
+}
+```
+
+## 12. KPIs & Performance Targets
 
 | Chỉ Số | Target | Đo Lường |
 |--------|--------|----------|
-| Decision Latency | < 500ms | Thời gian từ data → decision |
+| State Transition | < 10μs | Thời gian chuyển state |
+| Real-time Exit Latency | < 100ms | Từ detect ADX/BB → exit action |
 | Regime Detection | 30s | Khoảng cách giữa các lần detect |
-| Cold Start | < 5s | Thời gian warm-up 1000 candles |
-| Pattern Query | < 100ms | Thời gian tìm pattern phù hợp |
+| Micro Grid Placement | < 500ms | Thời gian đặt 10 lệnh |
+| Re-grid Wait Time | 30s-5m | Tùy điều kiện thị trường |
 | Uptime | > 99% | Thời gian hoạt động liên tục |
 
 ---
 
-*Document Version: 1.0*
-*Last Updated: 2026-04-10*
+*Document Version: 2.1*  
+*Last Updated: 2026-04-12*  
+*Aligns with: Core Flow Implementation (T001-T015)*

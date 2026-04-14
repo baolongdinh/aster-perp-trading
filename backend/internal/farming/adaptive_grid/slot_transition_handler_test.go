@@ -90,7 +90,7 @@ func TestSlotTransitionHandler_CanTransition(t *testing.T) {
 func TestSlotTransitionHandler_HandleTransition_DisabledSlot(t *testing.T) {
 	logger := zap.NewNop()
 	mockGrid := &mockGridManager{}
-	mockAdaptive := NewAdaptiveGridManager(nil, nil, nil, nil, logger)
+	mockAdaptive := NewAdaptiveGridManager(nil, nil, nil, nil, nil, logger)
 	// Initialize required maps
 	mockAdaptive.tradingPaused = make(map[string]bool)
 
@@ -132,7 +132,7 @@ func TestSlotTransitionHandler_HandleTransition_DisabledSlot(t *testing.T) {
 func TestSlotTransitionHandler_HandleTransition_EnabledSlot(t *testing.T) {
 	logger := zap.NewNop()
 	mockGrid := &mockGridManager{}
-	mockAdaptive := NewAdaptiveGridManager(nil, nil, nil, nil, logger)
+	mockAdaptive := NewAdaptiveGridManager(nil, nil, nil, nil, nil, logger)
 	// Initialize required maps
 	mockAdaptive.tradingPaused = make(map[string]bool)
 

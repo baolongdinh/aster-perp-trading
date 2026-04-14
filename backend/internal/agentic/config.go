@@ -117,7 +117,7 @@ func DefaultAgenticConfig() *AgenticConfig {
 		RegimeDetection: RegimeDetectionConfig{
 			UpdateInterval: 30 * time.Second,
 			ADXPeriod:      14,
-			BBPeriod:       20,
+			BBPeriod:       10, // Unified with execution layer (fast detection)
 			ATRPeriod:      14,
 			CandleInterval: "5m",
 			Thresholds: RegimeThresholdsConfig{
@@ -154,6 +154,7 @@ func DefaultAgenticConfig() *AgenticConfig {
 			},
 		},
 		WhitelistManagement: WhitelistConfig{
+			Enabled:            true,
 			MaxSymbols:         5,
 			MinScoreToAdd:      60,
 			ScoreToRemove:      35,

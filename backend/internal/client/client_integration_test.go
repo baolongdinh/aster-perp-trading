@@ -573,7 +573,7 @@ func TestOrderGet24hrTicker(t *testing.T) {
 	ti := setupIntegrationTest(t)
 	defer ti.log.Sync()
 
-	tickers, err := ti.futuresClient.Get24hrTicker()
+	tickers, err := ti.futuresClient.Get24hrTicker(context.Background())
 	require.NoError(t, err, "Get24hrTicker should succeed")
 	require.NotEmpty(t, tickers, "Should return ticker data")
 

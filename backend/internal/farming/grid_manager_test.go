@@ -2,6 +2,8 @@ package farming
 
 import (
 	"aster-bot/internal/client"
+	"aster-bot/internal/farming/adaptive_grid"
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -62,11 +64,12 @@ func TestGridManager_ResetStaleOrders(t *testing.T) {
 	}
 
 	grid := &SymbolGrid{
-		Symbol:       "BTCUSD1",
-		IsActive:     true,
-		CurrentPrice: 50000,
-		LastAttempt:  time.Now().Add(-35 * time.Second), // 35s ago
-		OrdersPlaced: true,
+		Symbol:        "BTCUSD1",
+		IsActive:      true,
+		CurrentPrice:  50000,
+		LastAttempt:   time.Now().Add(-35 * time.Second), // 35s ago
+		OrdersPlaced:  true,
+		MaxOrdersSide: 5,
 	}
 
 	gm.activeGrids["BTCUSD1"] = grid
@@ -441,7 +444,7 @@ func TestEnqueuePlacement_Backpressure(t *testing.T) {
 	gm := &GridManager{
 		logger:         logrus.NewEntry(logger),
 		activeGrids:    make(map[string]*SymbolGrid),
-		placementQueue: make(chan string, 2), // Small buffer for testing
+		placementQueue: make(chan string, 3), // Small buffer for testing without deadlock
 		stopCh:         make(chan struct{}),
 	}
 
@@ -472,4 +475,46 @@ func TestEnqueuePlacement_Backpressure(t *testing.T) {
 		t.Error("Expected some delay for blocking enqueue when queue near full")
 	}
 	t.Logf("Blocking enqueue took %v", elapsed)
+}
+
+func TestProcessPlacement_BlockedInWaitNewRange(t *testing.T) {
+	logger := logrus.New()
+	zapLogger, _ := zap.NewDevelopment()
+
+	gm := &GridManager{
+		logger:                logrus.NewEntry(logger),
+		activeGrids:           make(map[string]*SymbolGrid),
+		exchangeOrderCache:    make(map[string]*ExchangeOrderCacheEntry),
+		exchangeOrderCacheTTL: 1 * time.Second,
+		placementQueue:        make(chan string, 10),
+		gridPlacementCooldown: 1 * time.Second,
+		rateLimiter:           NewRateLimiter(10, 2, zapLogger),
+		stopCh:                make(chan struct{}),
+	}
+
+	sm := adaptive_grid.NewGridStateMachine(zap.NewNop())
+	sm.ForceState("BTCUSD1", adaptive_grid.GridStateWaitNewRange)
+	gm.stateMachine = sm
+	gm.activeGrids["BTCUSD1"] = &SymbolGrid{
+		Symbol:        "BTCUSD1",
+		CurrentPrice:  50000,
+		IsActive:      true,
+		PlacementBusy: false,
+		OrdersPlaced:  false,
+		MaxOrdersSide: 5,
+	}
+	gm.cacheExchangeOrders("BTCUSD1", []client.Order{})
+
+	gm.processPlacement(context.Background(), "BTCUSD1")
+
+	grid := gm.activeGrids["BTCUSD1"]
+	if grid.PlacementBusy {
+		t.Fatal("expected placement to be released when WAIT_NEW_RANGE blocks runtime placement")
+	}
+	if grid.OrdersPlaced {
+		t.Fatal("expected no orders to be marked placed while state machine is WAIT_NEW_RANGE")
+	}
+	if sm.GetState("BTCUSD1") != adaptive_grid.GridStateWaitNewRange {
+		t.Fatalf("expected state to remain WAIT_NEW_RANGE, got %s", sm.GetState("BTCUSD1"))
+	}
 }

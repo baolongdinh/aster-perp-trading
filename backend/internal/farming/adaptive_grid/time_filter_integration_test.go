@@ -141,7 +141,7 @@ func TestSlotTransitionHandlerWithTimeFilter(t *testing.T) {
 	mockGrid := &mockGridManager{}
 
 	// Create adaptive manager with initialized maps
-	adaptiveMgr := NewAdaptiveGridManager(nil, nil, nil, nil, logger)
+	adaptiveMgr := NewAdaptiveGridManager(nil, nil, nil, nil, nil, logger)
 
 	// Create transition handler
 	handler := NewSlotTransitionHandler(mockGrid, adaptiveMgr, logger)

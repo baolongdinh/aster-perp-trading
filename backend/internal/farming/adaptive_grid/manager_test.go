@@ -9,6 +9,64 @@ import (
 	"go.uber.org/zap"
 )
 
+func TestAdaptiveGridManager_RecordTradeResult_TriggersExitAllWithoutDeadlock(t *testing.T) {
+	manager := &AdaptiveGridManager{
+		logger:            zap.NewNop(),
+		riskConfig:        &RiskConfig{MaxConsecutiveLosses: 1, CooldownDuration: 30 * time.Second},
+		consecutiveLosses: make(map[string]int),
+		lastLossTime:      make(map[string]time.Time),
+		cooldownActive:    make(map[string]bool),
+		tradingPaused:     make(map[string]bool),
+		positions:         make(map[string]*SymbolPosition),
+		rangeDetectors:    make(map[string]*RangeDetector),
+	}
+	sm := NewGridStateMachine(zap.NewNop())
+	manager.stateMachine = sm
+
+	done := make(chan struct{})
+	go func() {
+		manager.RecordTradeResult("BTCUSD1", false)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecordTradeResult should not deadlock when loss threshold is reached")
+	}
+
+	assert.True(t, manager.cooldownActive["BTCUSD1"], "cooldown should be active after max losses")
+	assert.True(t, manager.tradingPaused["BTCUSD1"], "trading should be paused after EXIT_ALL")
+	assert.Equal(t, GridStateWaitNewRange, sm.GetState("BTCUSD1"), "state should end in WAIT_NEW_RANGE after EXIT_ALL completes")
+}
+
+func TestAdaptiveGridManager_TryResumeTrading_RequiresRangeDetector(t *testing.T) {
+	manager := &AdaptiveGridManager{
+		logger:         zap.NewNop(),
+		tradingPaused:  map[string]bool{"BTCUSD1": true},
+		rangeDetectors: make(map[string]*RangeDetector),
+	}
+
+	resumed := manager.TryResumeTrading("BTCUSD1")
+	assert.False(t, resumed, "resume should be blocked when no range detector exists")
+	assert.True(t, manager.tradingPaused["BTCUSD1"], "symbol should remain paused without range confirmation")
+}
+
+func TestAdaptiveGridManager_CanPlaceOrder_BlockedByCooldown(t *testing.T) {
+	manager := &AdaptiveGridManager{
+		logger:            zap.NewNop(),
+		riskConfig:        &RiskConfig{CooldownDuration: 30 * time.Second, MaxPositionUSDT: 1000},
+		cooldownActive:    map[string]bool{"BTCUSD1": true},
+		lastLossTime:      map[string]time.Time{"BTCUSD1": time.Now()},
+		consecutiveLosses: map[string]int{"BTCUSD1": 3},
+		tradingPaused:     make(map[string]bool),
+		positions:         make(map[string]*SymbolPosition),
+		rangeDetectors:    make(map[string]*RangeDetector),
+	}
+
+	assert.False(t, manager.CanPlaceOrder("BTCUSD1"), "active cooldown must block placement")
+}
+
 // TestCalculateLiquidationBuffer tests dynamic liquidation buffer calculation
 func TestCalculateLiquidationBuffer(t *testing.T) {
 	logger := zap.NewNop()
@@ -608,4 +666,74 @@ func TestInitializeRangeDetector_ThreadSafe(t *testing.T) {
 
 	assert.True(t, exists, "Range detector should exist after concurrent initialization")
 	assert.NotNil(t, detector, "Detector should not be nil")
+}
+
+func TestRangeDetector_ReentryRequiresMaterialShift(t *testing.T) {
+	logger := zap.NewNop()
+	config := DefaultRangeConfig()
+	config.StabilizationPeriod = 5 * time.Millisecond
+	config.ReentryConfirmations = 2
+	config.MaterialShiftPct = 0.003
+	config.WidthChangePct = 0.0015
+
+	detector := NewRangeDetector(config, logger)
+	detector.SetADXFilter(true, 20)
+
+	detector.state = RangeStateStabilizing
+	detector.stabilizationStart = time.Now().Add(-20 * time.Millisecond)
+	detector.currentADX = 12
+	detector.adxHistory = []float64{11, 12, 13}
+	detector.lastPrice = 100.15
+	detector.lastAcceptedRange = &RangeData{
+		UpperBound: 100.30,
+		LowerBound: 99.70,
+		MidPrice:   100.00,
+		WidthPct:   0.0060,
+	}
+	detector.currentRange = &RangeData{
+		UpperBound: 100.35,
+		LowerBound: 99.95,
+		MidPrice:   100.15,
+		WidthPct:   0.0068,
+	}
+
+	detector.checkStateTransition()
+	assert.Equal(t, RangeStateStabilizing, detector.GetState(), "minor range drift should not reactivate trading")
+
+	detector.currentRange = &RangeData{
+		UpperBound: 101.50,
+		LowerBound: 100.70,
+		MidPrice:   101.10,
+		WidthPct:   0.0079,
+	}
+	detector.lastPrice = 101.10
+
+	detector.checkStateTransition()
+	assert.Equal(t, RangeStateStabilizing, detector.GetState(), "first qualifying observation should not reactivate immediately")
+
+	detector.checkStateTransition()
+	assert.Equal(t, RangeStateActive, detector.GetState(), "materially shifted sideways range should reactivate after confirmations")
+}
+
+func TestRangeDetector_ShouldExitForTrendUsesADX(t *testing.T) {
+	logger := zap.NewNop()
+	config := DefaultRangeConfig()
+	detector := NewRangeDetector(config, logger)
+	detector.SetADXFilter(true, 20)
+
+	detector.state = RangeStateActive
+	detector.currentRange = &RangeData{
+		UpperBound: 101,
+		LowerBound: 99,
+		MidPrice:   100,
+		WidthPct:   0.02,
+	}
+
+	detector.currentADX = 18
+	detector.adxHistory = []float64{17, 18, 19}
+	assert.False(t, detector.ShouldExitForTrend(), "sideways ADX should not force trend exit")
+
+	detector.currentADX = 30
+	detector.adxHistory = []float64{28, 30, 32}
+	assert.True(t, detector.ShouldExitForTrend(), "elevated ADX should force trend exit from active range")
 }

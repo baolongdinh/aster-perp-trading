@@ -78,12 +78,12 @@ agentic:
   regime_detection:
     update_interval: 15s        # Tần suất cập nhật
     adx_period: 14            # 14 nến cho ADX (chuẩn)
-    bb_period: 20             # 20 nến cho Bollinger Bands
+    bb_period: 10             # 10 nến để đồng bộ với execution layer
     atr_period: 14            # 14 nến cho ATR
     candle_interval: 5m       # Khung thời gian phân tích
     
     thresholds:
-      sideways_adx_max: 25      # ADX < 25 = sideways ✓
+      sideways_adx_max: 20      # ADX < 20 = sideways ✓
       trending_adx_min: 25     # ADX > 25 = trending ✗
       volatile_atr_spike: 3.0   # ATR spike = volatile
   
@@ -139,7 +139,7 @@ agentic:
   # LƯU Ý: Hiện tại TẮT (enabled: false) để dùng whitelist cố định
   # Bật lên nếu muốn agentic tự động thay đổi symbol
   whitelist_management:
-    enabled: false              # TẮT - dùng VF whitelist
+    enabled: true               # BẬT - agentic chỉ orchestration whitelist
     max_symbols: 5              # Tối đa 5 symbol cùng lúc
     min_score_to_add: 45        # Điểm tối thiểu để thêm
     score_to_remove: 30         # Điểm dưới này thì xóa
@@ -277,7 +277,7 @@ volume_farming:
     futures_rest_base: "https://fapi.asterdex.com"
     futures_ws_base: "wss://fstream.asterdex.com"
     recv_window: 5000
-    requests_per_second: 5
+    requests_per_second: 0.5  # Ultra-conservative: 1 request per 2 seconds
 
   # FUNDING RATE
   # ============
@@ -474,7 +474,7 @@ optimization:
   #
   # KHUYẾN NGHỊ: Người mới để false
   dynamic_leverage:
-    enabled: false           # ⚠️ Chỉ bật khi hiểu rõ
+    enabled: true            # BẬT để dùng leverage theo BB/ADX runtime
     base_leverage: 50.0
     min_leverage: 10.0
     max_leverage: 100.0
@@ -498,7 +498,7 @@ optimization:
   #
   # KHUYẾN NGHỊ: Bật true cho production
   multi_layer_liquidation:
-    enabled: false           # ⚠️ Bật cho production
+    enabled: true            # BẬT cho production
     layer1_warn_pct: 0.50    # Tier 1: 50% distance
     layer2_reduce_pct: 0.30  # Tier 2: 30% distance
     layer3_close_pct: 0.15   # Tier 3: 15% distance
