@@ -153,25 +153,27 @@ func TestCircuitBreaker(t *testing.T) {
 
 	cb := NewCircuitBreaker(cfg, nil)
 
+	testSymbol := "BTCUSD1"
+
 	// Test that circuit breaker is not tripped initially
-	if cb.IsTripped() {
+	if cb.IsTripped(testSymbol) {
 		t.Error("Circuit breaker should not be tripped initially")
 	}
 
 	// Test recording consecutive losses
-	cb.RecordTradeOutcome(-10)
-	cb.RecordTradeOutcome(-20)
-	cb.RecordTradeOutcome(-5)
+	cb.RecordTradeOutcome(testSymbol, false) // loss
+	cb.RecordTradeOutcome(testSymbol, false) // loss
+	cb.RecordTradeOutcome(testSymbol, false) // loss
 
-	// After 3 losses, it should trip
-	if !cb.IsTripped() {
+	// Check if tripped after 3 losses
+	if !cb.IsTripped(testSymbol) {
 		t.Error("Circuit breaker should trip after 3 consecutive losses")
 	}
 
-	// Test reset
-	cb.Reset()
-	if cb.IsTripped() {
-		t.Error("Circuit breaker should not be tripped after reset")
+	// Test reset by recording a win
+	cb.RecordTradeOutcome(testSymbol, true) // win
+	if cb.IsTripped(testSymbol) {
+		t.Error("Circuit breaker should not be tripped after recording a win")
 	}
 }
 
@@ -218,4 +220,12 @@ func (m *mockVFController) UpdateWhitelist(symbols []string) error {
 
 func (m *mockVFController) GetActivePositions() ([]PositionStatus, error) {
 	return m.positions, nil
+}
+
+func (m *mockVFController) TriggerEmergencyExit(reason string) error {
+	return nil
+}
+
+func (m *mockVFController) TriggerForcePlacement() error {
+	return nil
 }

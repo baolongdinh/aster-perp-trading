@@ -27,6 +27,10 @@ type ModeManager struct {
 
 	// Callback when transitioning to COOLDOWN mode
 	onCooldownCallback func(reason string)
+
+	// Volatility tracking for dynamic cooldown
+	lastATR     float64
+	lastATRTime time.Time
 }
 
 // NewModeManager creates a new mode manager
@@ -200,6 +204,7 @@ func (m *ModeManager) shouldTransition(targetMode TradingMode) bool {
 }
 
 // getMinModeDuration returns minimum duration for a mode
+// For COOLDOWN mode, duration is dynamic based on volatility (ATR/BB width)
 func (m *ModeManager) getMinModeDuration(mode TradingMode) time.Duration {
 	switch mode {
 	case TradingModeMicro:
@@ -217,17 +222,34 @@ func (m *ModeManager) getMinModeDuration(mode TradingMode) time.Duration {
 	case TradingModeTrendAdapted:
 		sec := m.config.TrendAdaptedMode.MinModeDurationSec
 		if sec == 0 {
-			sec = 30
+			sec = 90
 		}
 		return time.Duration(sec) * time.Second
 	case TradingModeCooldown:
-		sec := m.config.CooldownMode.DurationSec
-		if sec == 0 {
-			sec = 10 // Reduced from 60s to 10s for faster re-entry
+		// DYNAMIC COOLDOWN based on volatility
+		// High volatility → longer cooldown (60-120s)
+		// Low volatility → shorter cooldown (10-30s)
+		baseSec := 30 // Base cooldown duration
+
+		// If we have recent ATR data, use it to adjust cooldown
+		if m.lastATR > 0 {
+			// ATR-based adjustment: higher ATR = longer cooldown
+			// ATR < 0.5% → 10-30s
+			// ATR 0.5-1.0% → 30-60s
+			// ATR > 1.0% → 60-120s
+			atrPct := m.lastATR * 100 // Convert to percentage
+			if atrPct < 0.5 {
+				baseSec = 15 // Low volatility
+			} else if atrPct < 1.0 {
+				baseSec = 45 // Medium volatility
+			} else {
+				baseSec = 90 // High volatility
+			}
 		}
-		return time.Duration(sec) * time.Second
+
+		return time.Duration(baseSec) * time.Second
 	default:
-		return 0
+		return 30 * time.Second
 	}
 }
 
@@ -340,4 +362,13 @@ func (m *ModeManager) GetCooldownRemaining() time.Duration {
 		return 0
 	}
 	return remaining
+}
+
+// UpdateATR updates the latest ATR value for dynamic cooldown calculation
+func (m *ModeManager) UpdateATR(atr float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.lastATR = atr
+	m.lastATRTime = time.Now()
 }

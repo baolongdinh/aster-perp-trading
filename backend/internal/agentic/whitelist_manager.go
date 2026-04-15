@@ -16,19 +16,21 @@ import (
 type VFWhitelistController interface {
 	UpdateWhitelist(symbols []string) error
 	GetActivePositions() ([]PositionStatus, error)
+	TriggerEmergencyExit(reason string) error
+	TriggerForcePlacement() error
 }
 
 // WhitelistManager manages the dynamic whitelist based on agentic decisions
 type WhitelistManager struct {
-	config            config.WhitelistConfig
-	vfController      VFWhitelistController
-	logger            *zap.Logger
+	config       config.WhitelistConfig
+	vfController VFWhitelistController
+	logger       *zap.Logger
 
-	mu                sync.RWMutex
-	currentScores     map[string]SymbolScore
-	activeWhitelist   []string
-	lastUpdate        time.Time
-	updateCount       int
+	mu              sync.RWMutex
+	currentScores   map[string]SymbolScore
+	activeWhitelist []string
+	lastUpdate      time.Time
+	updateCount     int
 }
 
 // NewWhitelistManager creates a new whitelist manager

@@ -2139,6 +2139,14 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 			isTrending := adx > 25.0   // Simple trend detection based on ADX
 			isVolatilitySpike := false // TODO: implement volatility spike detection
 
+			// Update ModeManager with latest ATR for dynamic cooldown calculation
+			atr := detector.GetATR()
+			if modeMgr, ok := a.modeManager.(interface {
+				UpdateATR(atr float64)
+			}); ok {
+				modeMgr.UpdateATR(atr)
+			}
+
 			// Type assertion to call EvaluateMode
 			if modeMgr, ok := a.modeManager.(interface {
 				EvaluateMode(

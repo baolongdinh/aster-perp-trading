@@ -114,8 +114,34 @@ func NewAgenticEngine(
 	engine.positionSizer = NewPositionSizer(cfg.PositionSizing)
 
 	// Initialize circuit breaker
-
 	engine.circuitBreaker = NewCircuitBreaker(cfg.CircuitBreakers, logger)
+	engine.circuitBreaker.Start() // Start evaluation worker
+
+	// Set callback to trigger emergency exit when circuit breaker trips for a symbol
+	if vfController != nil {
+		engine.circuitBreaker.SetOnTripCallback(func(symbol, reason string) {
+			engine.logger.Error("Circuit breaker tripped for symbol, triggering emergency exit",
+				zap.String("symbol", symbol),
+				zap.String("reason", reason))
+			if err := vfController.TriggerEmergencyExit(reason); err != nil {
+				engine.logger.Error("Failed to trigger emergency exit",
+					zap.String("symbol", symbol),
+					zap.String("reason", reason),
+					zap.Error(err))
+			}
+		})
+
+		// Set callback to trigger force placement when circuit breaker resets for a symbol
+		engine.circuitBreaker.SetOnResetCallback(func(symbol string) {
+			engine.logger.Info("Circuit breaker reset for symbol, triggering force placement",
+				zap.String("symbol", symbol))
+			if err := vfController.TriggerForcePlacement(); err != nil {
+				engine.logger.Error("Failed to trigger force placement",
+					zap.String("symbol", symbol),
+					zap.Error(err))
+			}
+		})
+	}
 
 	// Initialize detectors for each symbol in universe
 
@@ -224,6 +250,9 @@ func (ae *AgenticEngine) Stop() error {
 
 	ae.logger.Info("Stopping AgenticEngine")
 
+	// Stop circuit breaker evaluation worker
+	ae.circuitBreaker.Stop()
+
 	// Signal stop
 
 	close(ae.stopCh)
@@ -323,6 +352,13 @@ func (ae *AgenticEngine) runDetectionCycle(ctx context.Context) error {
 	// 2. Calculate scores
 
 	scores := ae.calculateScores(detectionResults)
+
+	// 2.5 Update circuit breaker with market conditions for dynamic reset
+	// For now, use default values - TODO: wire with actual detector data
+	for symbol := range detectionResults {
+		// Update with placeholder data - will be improved later
+		ae.circuitBreaker.UpdateMarketConditions(symbol, 0.01, 0.0, 0.0, 0.0)
+	}
 
 	// 3. Check circuit breaker
 
@@ -571,7 +607,12 @@ func (ae *AgenticEngine) GetCircuitBreaker() *CircuitBreaker {
 
 func (ae *AgenticEngine) GetCircuitBreakerStatus() map[string]interface{} {
 
-	return ae.circuitBreaker.GetStatus()
+	status := ae.circuitBreaker.GetStatus()
+	result := make(map[string]interface{})
+	for k, v := range status {
+		result[k] = v
+	}
+	return result
 
 }
 

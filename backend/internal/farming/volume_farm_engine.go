@@ -1007,3 +1007,126 @@ func (e *VolumeFarmEngine) GetActivePositions() ([]agentic.PositionStatus, error
 
 	return positions, nil
 }
+
+// TriggerEmergencyExit triggers fast exit for all active symbols when circuit breaker trips
+func (e *VolumeFarmEngine) TriggerEmergencyExit(reason string) error {
+	e.logger.Error("EMERGENCY EXIT TRIGGERED - Closing ALL positions immediately",
+		zap.String("reason", reason))
+
+	if e.exitExecutor == nil {
+		e.logger.Error("ExitExecutor not available, cannot trigger emergency exit")
+		return fmt.Errorf("exitExecutor not available")
+	}
+
+	if e.adaptiveGridManager == nil {
+		e.logger.Error("AdaptiveGridManager not available, cannot get active symbols")
+		return fmt.Errorf("adaptiveGridManager not available")
+	}
+
+	// Get all active symbols
+	tracked := e.adaptiveGridManager.GetAllPositions()
+	activeSymbols := make([]string, 0)
+	for symbol, pos := range tracked {
+		if pos != nil && pos.PositionAmt != 0 {
+			activeSymbols = append(activeSymbols, symbol)
+		}
+	}
+
+	if len(activeSymbols) == 0 {
+		e.logger.Info("No active positions to close")
+		return nil
+	}
+
+	e.logger.Warn("Triggering emergency exit for active symbols",
+		zap.Strings("symbols", activeSymbols),
+		zap.Int("count", len(activeSymbols)))
+
+	// Execute fast exit for each symbol in parallel
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errors := make([]error, 0)
+
+	for _, symbol := range activeSymbols {
+		wg.Add(1)
+		go func(sym string) {
+			defer wg.Done()
+			sequence := e.exitExecutor.ExecuteFastExit(ctx, sym)
+			if sequence.Error != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Errorf("%s: %w", sym, sequence.Error))
+				mu.Unlock()
+				e.logger.Error("Failed to execute fast exit",
+					zap.String("symbol", sym),
+					zap.Error(sequence.Error))
+			} else {
+				e.logger.Info("Fast exit executed successfully",
+					zap.String("symbol", sym),
+					zap.Duration("duration", sequence.Duration))
+			}
+		}(symbol)
+	}
+
+	wg.Wait()
+
+	if len(errors) > 0 {
+		return fmt.Errorf("emergency exit completed with %d errors: %v", len(errors), errors)
+	}
+
+	e.logger.Info("Emergency exit completed successfully",
+		zap.Int("symbols_closed", len(activeSymbols)))
+
+	return nil
+}
+
+// TriggerForcePlacement triggers force placement for all active symbols when circuit breaker resets
+func (e *VolumeFarmEngine) TriggerForcePlacement() error {
+	e.logger.Info("FORCE PLACEMENT TRIGGERED - Circuit breaker reset, resuming trading")
+
+	if e.adaptiveGridManager == nil {
+		e.logger.Error("AdaptiveGridManager not available, cannot trigger force placement")
+		return fmt.Errorf("adaptiveGridManager not available")
+	}
+
+	if e.modeManager == nil {
+		e.logger.Error("ModeManager not available, cannot trigger force placement")
+		return fmt.Errorf("modeManager not available")
+	}
+
+	// Check if still in cooldown
+	if e.modeManager.IsInCooldown() {
+		e.logger.Warn("Still in cooldown mode, skipping force placement")
+		return nil
+	}
+
+	// Get all tracked symbols from adaptive grid manager
+	tracked := e.adaptiveGridManager.GetAllPositions()
+	symbols := make([]string, 0)
+	for symbol := range tracked {
+		symbols = append(symbols, symbol)
+	}
+
+	if len(symbols) == 0 {
+		e.logger.Info("No tracked symbols to force placement")
+		return nil
+	}
+
+	e.logger.Info("Triggering force placement for tracked symbols",
+		zap.Strings("symbols", symbols),
+		zap.Int("count", len(symbols)))
+
+	// For each symbol, enqueue placement
+	for _, symbol := range symbols {
+		e.logger.Info("Enqueueing force placement",
+			zap.String("symbol", symbol))
+		// This will trigger the placement worker to place orders
+		if e.gridManager != nil {
+			e.gridManager.enqueuePlacement(symbol)
+		}
+	}
+
+	e.logger.Info("Force placement triggered successfully",
+		zap.Int("symbols", len(symbols)))
+
+	return nil
+}

@@ -5,33 +5,33 @@
 **Kiến trúc hệ thống v3.0:**
 
 ```mermaid
-flowchart TB
-    subgraph Data["Data Layer"]
-        WS1["WebSocket<br/>@kline_1m"]
-        WS2["User Data Stream<br/>ACCOUNT_UPDATE<br/>ORDER_TRADE_UPDATE"]
+graph TB
+    subgraph Data Data Layer
+        WS1 WebSocket kline 1m
+        WS2 User Data Stream ACCOUNT UPDATE ORDER TRADE UPDATE
     end
 
-    subgraph Core["Core Engine"]
-        RD["RangeDetector<br/>State: Unknown→Active"]
-        MM["ModeManager<br/>4 Trading Modes"]
-        FE["4-Factor Engine<br/>Scoring 0-100"]
-        GSM["GridStateMachine<br/>5 States"]
+    subgraph Core Core Engine
+        RD RangeDetector State Unknown to Active
+        MM ModeManager 4 Trading Modes
+        FE 4 Factor Engine Scoring 0 to 100
+        GSM GridStateMachine 5 States
     end
 
-    subgraph Execution["Execution Layer"]
-        AGM["AdaptiveGridManager<br/>CanPlaceOrder"]
-        GM["GridManager<br/>Order placement"]
-        EE["ExitExecutor<br/>Fast exit"]
-        SM["SyncManager<br/>3 Workers"]
+    subgraph Execution Execution Layer
+        AGM AdaptiveGridManager CanPlaceOrder
+        GM GridManager Order placement
+        EE ExitExecutor Fast exit
+        SM SyncManager 3 Workers
     end
 
-    subgraph Cache["Cache Layer"]
-        WC["WebSocket Cache<br/>Orders/Pos/Bal"]
+    subgraph Cache Cache Layer
+        WC WebSocket Cache Orders Pos Bal
     end
 
-    subgraph Exchange["Exchange"]
-        API["REST API<br/>Fallback"]
-        WSS["WebSocket Server"]
+    subgraph Exchange Exchange
+        API REST API Fallback
+        WSS WebSocket Server
     end
 
     WS1 --> RD
@@ -86,16 +86,13 @@ flowchart TB
 ### 2.1 Warm-up Flow (Khởi Động)
 
 ```mermaid
-flowchart LR
-    A["Start Bot"] --> B["REST API<br/>/klines"]
-    B --> C["1000 Candles<br/>Pre-load"]
-    C --> D["Indicator<br/>Calculate"]
-    D --> E["ADX/BB/ATR<br/>EMAs"]
-    E --> F["Regime<br/>Detect"]
-    F --> G["Ready to<br/>Trade"]
-
-    style A fill:#FFD700
-    style G fill:#90EE90
+graph LR
+    A Start Bot --> B REST API klines
+    B --> C 1000 Candles Pre load
+    C --> D Indicator Calculate
+    D --> E ADX BB ATR EMAs
+    E --> F Regime Detect
+    F --> G Ready to Trade
 ```
 
 **Mô tả:**
@@ -107,25 +104,22 @@ flowchart LR
 ### 2.2 Real-time Flow (Vận Hành)
 
 ```mermaid
-flowchart TB
-    WS["WebSocket<br/>@kline_1m"] --> NC["New Candle<br/>Arrival"]
-    NC --> SW["Slide Window<br/>1000 max"]
-    SW --> UI["Update<br/>Indicators"]
-    UI --> RC["Recalculate<br/>All"]
-    RC --> DR["Detect<br/>Regime"]
-    DR --> RC2["Regime<br/>Change?"]
-    RC2 --> FS["4 Factors<br/>Scoring"]
-    FS --> S0["Score 0-100"]
-    S0 --> PM["Pattern<br/>Matching"]
-    PM --> PS["Position<br/>Sizing"]
-    PS --> GA["Grid<br/>Adapter"]
-    GA --> GP["Grid Params<br/>Applied"]
-    GP --> EW["Execute/<br/>Wait"]
-    EW --> CB["Circuit<br/>Breakers?"]
-    CB --> DL["Decision<br/>Log"]
-
-    style WS fill:#E6E6FA
-    style DL fill:#90EE90
+graph TB
+    WS WebSocket kline 1m --> NC New Candle Arrival
+    NC --> SW Slide Window 1000 max
+    SW --> UI Update Indicators
+    UI --> RC Recalculate All
+    RC --> DR Detect Regime
+    DR --> RC2 Regime Change
+    RC2 --> FS 4 Factors Scoring
+    FS --> S0 Score 0 to 100
+    S0 --> PM Pattern Matching
+    PM --> PS Position Sizing
+    PS --> GA Grid Adapter
+    GA --> GP Grid Params Applied
+    GP --> EW Execute Wait
+    EW --> CB Circuit Breakers
+    CB --> DL Decision Log
 ```
 
 **Mô tả (V2 - Unified State Machine):**
@@ -141,29 +135,24 @@ flowchart TB
 ### 2.3 ModeManager Flow (Mới - Phase 2)
 
 ```mermaid
-flowchart TD
-    A["RangeDetector<br/>State + ADX + Breakout"] --> B{Range<br/>Active?}
-    B -->|Có| C{ADX < 25?}
-    B -->|Không| D{Has<br/>ATR Bands?}
-    C -->|Có| E["STANDARD<br/>Multiplier 1.0"]
-    C -->|Không| F["TREND_ADAPTED<br/>Multiplier 0.7"]
-    D -->|Có| G["MICRO<br/>ATR Bands<br/>Multiplier 1.0"]
-    D -->|Không| H{Consecutive<br/>Losses > 3?}
-    H -->|Có| I["COOLDOWN<br/>BLOCK<br/>Multiplier 0.0"]
-    H -->|Không| J["Wait for<br/>Data"]
+graph TD
+    A RangeDetector State ADX Breakout --> B Range Active
+    B -->|Co| C ADX less than 25
+    B -->|Khong| D Has ATR Bands
+    C -->|Co| E STANDARD Multiplier 1.0
+    C -->|Khong| F TREND ADAPTED Multiplier 0.7
+    D -->|Co| G MICRO ATR Bands Multiplier 1.0
+    D -->|Khong| H Consecutive Losses greater than 3
+    H -->|Co| I COOLDOWN BLOCK Multiplier 0.0
+    H -->|Khong| J Wait for Data
 
-    E --> K["Apply<br/>Parameters"]
+    E --> K Apply Parameters
     F --> K
     G --> K
-    I --> L["Block<br/>Placement"]
+    I --> L Block Placement
 
-    K --> M["CanPlaceOrder<br/>= true"]
-    L --> N["CanPlaceOrder<br/>= false"]
-
-    style E fill:#90EE90
-    style F fill:#FFD700
-    style G fill:#87CEEB
-    style I fill:#FF6347
+    K --> M CanPlaceOrder true
+    L --> N CanPlaceOrder false
 ```
 
 **Wiring:**
@@ -174,35 +163,30 @@ flowchart TD
 ### 2.4 Order Placement Flow
 
 ```mermaid
-flowchart TD
-    A["WebSocket<br/>Ticker Update"] --> B["processWebSocketTicker"]
-    B --> C{shouldSchedule<br/>Placement?}
-    C -->|Yes| D["enqueuePlacement"]
-    C -->|No| E["Skip"]
+graph TD
+    A WebSocket Ticker Update --> B processWebSocketTicker
+    B --> C shouldSchedule Placement
+    C -->|Yes| D enqueuePlacement
+    C -->|No| E Skip
 
-    D --> F{canPlaceFor<br/>Symbol?}
-    F -->|Yes| G{ModeManager<br/>CanPlaceOrder?}
-    F -->|No| H["Block<br/>Placement"]
+    D --> F canPlaceFor Symbol
+    F -->|Yes| G ModeManager CanPlaceOrder
+    F -->|No| H Block Placement
 
-    G -->|Yes| I{GridState<br/>Valid?}
-    G -->|No| J["COOLDOWN<br/>Block"]
+    G -->|Yes| I GridState Valid
+    G -->|No| J COOLDOWN Block
 
-    I -->|Yes| K["placeGridOrders"]
-    I -->|No| L["Wait for<br/>State Change"]
+    I -->|Yes| K placeGridOrders
+    I -->|No| L Wait for State Change
 
-    K --> M["Micro Grid<br/>0.05% spread<br/>10 orders"]
-    K --> N["BB Grid<br/>Fallback"]
+    K --> M Micro Grid 0.05 spread 10 orders
+    K --> N BB Grid Fallback
 
-    M --> O["Orders<br/>Placed"]
+    M --> O Orders Placed
     N --> O
 
-    O --> P["OnOrderUpdate<br/>WebSocket"]
-    P --> Q["Update<br/>Order Cache"]
-
-    style K fill:#90EE90
-    style H fill:#FF6347
-    style J fill:#FF6347
-    style O fill:#FFD700
+    O --> P OnOrderUpdate WebSocket
+    P --> Q Update Order Cache
 ```
 
 ---
@@ -210,35 +194,35 @@ flowchart TD
 ## 3. Luồng Phân Tích Chế Độ & State Machine (T001-T015)
 
 ```mermaid
-stateDiagram-v2
+stateDiagram
     [*] --> Unknown: Start
-    Unknown --> Establishing: Price data<br/>available
-    Establishing --> Active: BB tight<br/>ADX < 25
-    Active --> Breakout: Price outside<br/>BB bands
-    Active --> Stabilizing: Range shift<br/>detected
-    Breakout --> Stabilizing: Price returns<br/>to range
-    Stabilizing --> Active: New range<br/>confirmed
+    Unknown --> Establishing: Price data available
+    Establishing --> Active: BB tight ADX less than 25
+    Active --> Breakout: Price outside BB bands
+    Active --> Stabilizing: Range shift detected
+    Breakout --> Stabilizing: Price returns to range
+    Stabilizing --> Active: New range confirmed
 
-    note right of Active: Grid Trading<br/>Allowed
-    note right of Breakout: EXIT_ALL<br/>Triggered
-    note right of Stabilizing: Wait for<br/>New Range
+    note right of Active: Grid Trading Allowed
+    note right of Breakout: EXIT ALL Triggered
+    note right of Stabilizing: Wait for New Range
 ```
 
 **Grid State Machine:**
 
 ```mermaid
-stateDiagram-v2
+stateDiagram
     [*] --> IDLE: Start
-    IDLE --> ENTER_GRID: Range confirmed<br/>or MICRO mode
-    ENTER_GRID --> TRADING: Orders placed
-    TRADING --> EXIT_ALL: Breakout/Trend<br/>ADX > 25
+    IDLE --> ENTER GRID: Range confirmed or MICRO mode
+    ENTER GRID --> TRADING: Orders placed
+    TRADING --> EXIT ALL: Breakout Trend ADX greater than 25
     TRADING --> TRADING: Rebalancing
-    EXIT_ALL --> WAIT_NEW_RANGE: Positions closed
-    WAIT_NEW_RANGE --> ENTER_GRID: Re-grid<br/>conditions met
+    EXIT ALL --> WAIT NEW RANGE: Positions closed
+    WAIT NEW RANGE --> ENTER GRID: Re grid conditions met
 
-    note right of TRADING: Orders active<br/>Grid trading
-    note right of EXIT_ALL: Fast exit<br/>sequence
-    note right of WAIT_NEW_RANGE: 6 strict<br/>conditions
+    note right of TRADING: Orders active Grid trading
+    note right of EXIT ALL: Fast exit sequence
+    note right of WAIT NEW RANGE: 6 strict conditions
 ```
 
 **Classification Logic:**
@@ -252,29 +236,29 @@ stateDiagram-v2
 ## 4. Luồng Tính Toán Điểm Số (4 Factors Engine)
 
 ```mermaid
-flowchart TB
-    subgraph Inputs["Indicator Inputs"]
-        T["Trend<br/>30%"]
-        V["Volatility<br/>25%"]
-        Vo["Volume<br/>25%"]
-        S["Structure<br/>20%"]
+graph TB
+    subgraph Inputs Indicator Inputs
+        T Trend 30
+        V Volatility 25
+        Vo Volume 25
+        S Structure 20
     end
 
-    subgraph Metrics["Metrics"]
-        EMA["EMA Align<br/>ADX Strength"]
-        ATR["ATR Norm<br/>BB Expansion"]
-        VolMA["Vol/MA20<br/>Trend Dir"]
-        SR["Support/Res<br/>Range Detect"]
+    subgraph Metrics Metrics
+        EMA EMA Align ADX Strength
+        ATR ATR Norm BB Expansion
+        VolMA Vol MA20 Trend Dir
+        SR Support Res Range Detect
     end
 
-    subgraph Calc["Calculation"]
-        WS["Weighted Sum<br/>Score Calculation"]
-        RM["Regime Multiplier"]
-        FS["Final Score<br/>0-100"]
+    subgraph Calc Calculation
+        WS Weighted Sum Score Calculation
+        RM Regime Multiplier
+        FS Final Score 0 to 100
     end
 
-    subgraph Cache["Cache Layer"]
-        CL["5s TTL<br/>Cache Check"]
+    subgraph Cache Cache Layer
+        CL 5s TTL Cache Check
     end
 
     T --> EMA
@@ -291,11 +275,7 @@ flowchart TB
     RM --> FS
     FS --> CL
 
-    CL -->|Same indicators<br/>within 5s| WS
-
-    style Inputs fill:#E6E6FA
-    style Calc fill:#90EE90
-    style Cache fill:#FFD700
+    CL -->|Same indicators within 5s| WS
 ```
 
 **Cache Layer (5s TTL):**
@@ -309,35 +289,31 @@ flowchart TB
 ### 5.1 Real-time Exit Monitor (Goroutine riêng)
 
 ```mermaid
-flowchart TB
-    Ticker["100ms Ticker"] --> Check["Check All<br/>Symbols"]
-    Check --> Trigger["Trigger<br/>Exit?"]
+graph TB
+    Ticker 100ms Ticker --> Check Check All Symbols
+    Check --> Trigger Trigger Exit
 
-    Trigger --> ADX{ADX > 25?}
-    Trigger --> BB{BB Width<br/>> 1.5%?}
-    Trigger --> Loss{Consecutive<br/>Losses > 3?}
+    Trigger --> ADX ADX greater than 25
+    Trigger --> BB BB Width greater than 1.5
+    Trigger --> Loss Consecutive Losses greater than 3
 
-    ADX -->|Yes| TE["handleTrendExit"]
-    BB -->|Yes| BE["handleBreakout"]
+    ADX -->|Yes| TE handleTrendExit
+    BB -->|Yes| BE handleBreakout
     Loss -->|Yes| BE
 
-    TE --> TE1["Cancel orders"]
-    TE --> TE2["Close positions"]
-    TE --> TE3["Clear grid"]
-    TE --> TE4["pauseTrading"]
-    TE --> TE5["ForceRecalculate"]
-    TE --> TE6["Transition to<br/>EXIT_ALL"]
+    TE --> TE1 Cancel orders
+    TE --> TE2 Close positions
+    TE --> TE3 Clear grid
+    TE --> TE4 pauseTrading
+    TE --> TE5 ForceRecalculate
+    TE --> TE6 Transition to EXIT ALL
 
-    BE --> BE1["Cancel orders"]
-    BE --> BE2["Close positions"]
-    BE --> BE3["Clear grid"]
-    BE --> BE4["pauseTrading"]
-    BE --> BE5["ForceRecalc"]
-    BE --> BE6["Transition to<br/>EXIT_ALL"]
-
-    style Ticker fill:#E6E6FA
-    style TE fill:#FF6347
-    style BE fill:#FF6347
+    BE --> BE1 Cancel orders
+    BE --> BE2 Close positions
+    BE --> BE3 Clear grid
+    BE --> BE4 pauseTrading
+    BE --> BE5 ForceRecalc
+    BE --> BE6 Transition to EXIT ALL
 ```
 
 **T014 - Idempotent**: exitInProgress flag prevents duplicate exits
@@ -345,22 +321,17 @@ flowchart TB
 ### 5.2 Multi-Layer Liquidation Protection (T011)
 
 ```mermaid
-flowchart LR
-    PM["positionMonitor<br/>30s interval"] --> T1{Distance<br/>to liquidation}
-    T1 -->|50%| WARN["WARN<br/>Log only"]
-    T1 -->|30%| REDUCE["REDUCE 50%<br/>Position"]
-    T1 -->|15%| CLOSE["CLOSE<br/>ALL"]
-    T1 -->|10%| HEDGE["HEDGE +<br/>CLOSE"]
+graph LR
+    PM positionMonitor 30s interval --> T1 Distance to liquidation
+    T1 -->|50| WARN WARN Log only
+    T1 -->|30| REDUCE REDUCE 50 Position
+    T1 -->|15| CLOSE CLOSE ALL
+    T1 -->|10| HEDGE HEDGE CLOSE
 
     WARN --> PM
     REDUCE --> PM
     CLOSE --> PM
     HEDGE --> PM
-
-    style WARN fill:#FFD700
-    style REDUCE fill:#FFA500
-    style CLOSE fill:#FF6347
-    style HEDGE fill:#DC143C
 ```
 
 **T011**: Enabled by default, wired vào positionMonitor
@@ -370,24 +341,20 @@ flowchart LR
 ## 6. Luồng ExitExecutor - Fast Exit Sequence (Mới - Phase 4)
 
 ```mermaid
-flowchart TB
-    BD["Breakout<br/>Detected"] --> AE["AdaptiveGridManager<br/>handleBreakout"]
-    AE --> EE["ExitExecutor<br/>ExecuteFastExit"]
+graph TB
+    BD Breakout Detected --> AE AdaptiveGridManager handleBreakout
+    AE --> EE ExitExecutor ExecuteFastExit
 
-    EE --> T0["T+0ms<br/>Cancel ALL<br/>orders"]
-    T0 --> T1["T+100ms<br/>Wait<br/>cancellation"]
-    T1 --> T2["T+100ms<br/>Close positions<br/>market orders"]
-    T2 --> T3["T+800ms<br/>Wait for<br/>fills"]
-    T3 --> T4["T+5s<br/>Verify closure<br/>via cache"]
-    T4 --> T5{Position<br/>closed?}
-    T5 -->|No| Retry["Retry close<br/>orders"]
-    T5 -->|Yes| Transition["Transition to<br/>EXIT_ALL"]
+    EE --> T0 T0ms Cancel ALL orders
+    T0 --> T1 T100ms Wait cancellation
+    T1 --> T2 T100ms Close positions market orders
+    T2 --> T3 T800ms Wait for fills
+    T3 --> T4 T5s Verify closure via cache
+    T4 --> T5 Position closed
+    T5 -->|No| Retry Retry close orders
+    T5 -->|Yes| Transition Transition to EXIT ALL
 
     Retry --> T2
-
-    style BD fill:#FF6347
-    style EE fill:#FFD700
-    style Transition fill:#90EE90
 ```
 
 **Implementation:**
@@ -400,38 +367,33 @@ flowchart TB
 ## 7. Luồng SyncManager - Cache Sync Workers (Mới - Phase 7)
 
 ```mermaid
-flowchart TB
-    VFE["VolumeFarmEngine<br/>Start"] --> SM["SyncManager<br/>Start"]
+graph TB
+    VFE VolumeFarmEngine Start --> SM SyncManager Start
 
-    SM --> OSW["Order Sync<br/>Worker<br/>30s interval"]
-    SM --> PSW["Position Sync<br/>Worker<br/>30s interval"]
-    SM --> BSW["Balance Sync<br/>Worker<br/>30s interval"]
+    SM --> OSW Order Sync Worker 30s interval
+    SM --> PSW Position Sync Worker 30s interval
+    SM --> BSW Balance Sync Worker 30s interval
 
-    OSW --> OSW1["GetCachedOrders"]
-    OSW1 --> OSW2["GetOpenOrders<br/>REST API"]
-    OSW2 --> OSW3["Compare cache<br/>vs REST"]
-    OSW3 --> OSW4["Log mismatches"]
-    OSW4 --> OSW5["Update cache<br/>if stale"]
+    OSW --> OSW1 GetCachedOrders
+    OSW1 --> OSW2 GetOpenOrders REST API
+    OSW2 --> OSW3 Compare cache vs REST
+    OSW3 --> OSW4 Log mismatches
+    OSW4 --> OSW5 Update cache if stale
     OSW5 --> OSW
 
-    PSW --> PSW1["GetCachedPositions"]
-    PSW1 --> PSW2["GetPositions<br/>REST API"]
-    PSW2 --> PSW3["Compare cache<br/>vs REST"]
-    PSW3 --> PSW4["Log mismatches"]
-    PSW4 --> PSW5["Update cache<br/>if stale"]
+    PSW --> PSW1 GetCachedPositions
+    PSW1 --> PSW2 GetPositions REST API
+    PSW2 --> PSW3 Compare cache vs REST
+    PSW3 --> PSW4 Log mismatches
+    PSW4 --> PSW5 Update cache if stale
     PSW5 --> PSW
 
-    BSW --> BSW1["GetCachedBalance"]
-    BSW1 --> BSW2["GetAccountBalance<br/>REST API"]
-    BSW2 --> BSW3["Compare cache<br/>vs REST"]
-    BSW3 --> BSW4["Alert if<br/>balance low"]
-    BSW4 --> BSW5["Update cache<br/>if stale"]
+    BSW --> BSW1 GetCachedBalance
+    BSW1 --> BSW2 GetAccountBalance REST API
+    BSW2 --> BSW3 Compare cache vs REST
+    BSW3 --> BSW4 Alert if balance low
+    BSW4 --> BSW5 Update cache if stale
     BSW5 --> BSW
-
-    style SM fill:#FFD700
-    style OSW fill:#90EE90
-    style PSW fill:#87CEEB
-    style BSW fill:#FFA500
 ```
 
 **Implementation:**
@@ -444,37 +406,33 @@ flowchart TB
 ## 8. Luồng WebSocket Cache & Auto-Sync (Mới - Phase 6)
 
 ```mermaid
-flowchart TB
-    VFE["VolumeFarmEngine<br/>initUserStream"] --> LK["Create<br/>listenKey"]
-    LK --> WS["Subscribe to<br/>User Data Stream"]
+graph TB
+    VFE VolumeFarmEngine initUserStream --> LK Create listenKey
+    LK --> WS Subscribe to User Data Stream
 
-    WS --> AU["ACCOUNT_UPDATE<br/>Event"]
-    WS --> OU["ORDER_TRADE_UPDATE<br/>Event"]
+    WS --> AU ACCOUNT UPDATE Event
+    WS --> OU ORDER TRADE UPDATE Event
 
-    AU --> AH["OnAccountUpdate<br/>Handler"]
-    OU --> OH["OnOrderUpdate<br/>Handler"]
+    AU --> AH OnAccountUpdate Handler
+    OU --> OH OnOrderUpdate Handler
 
-    AH --> PC["Update<br/>Position Cache"]
-    AH --> BC["Update<br/>Balance Cache"]
+    AH --> PC Update Position Cache
+    AH --> BC Update Balance Cache
 
-    OH --> OC["Update/<br/>Remove<br/>Order Cache"]
+    OH --> OC Update Remove Order Cache
 
-    subgraph Cache["WebSocket Cache"]
-        OC2["Order Cache<br/>TTL: 60s"]
-        PC2["Position Cache<br/>TTL: 60s"]
-        BC2["Balance Cache<br/>TTL: 60s"]
+    subgraph Cache WebSocket Cache
+        OC2 Order Cache TTL 60s
+        PC2 Position Cache TTL 60s
+        BC2 Balance Cache TTL 60s
     end
 
     PC --> PC2
     BC --> BC2
     OC --> OC2
 
-    Cache --> Sync["Sync Workers<br/>30s Reconciliation"]
-    Sync --> REST["REST API<br/>Fallback"]
-
-    style WS fill:#87CEEB
-    style Cache fill:#90EE90
-    style REST fill:#FFD700
+    Cache --> Sync Sync Workers 30s Reconciliation
+    Sync --> REST REST API Fallback
 ```
 
 **Implementation:**
