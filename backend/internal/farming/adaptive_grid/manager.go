@@ -118,6 +118,15 @@ type AdaptiveGridManager struct {
 	// NEW: FundingRateMonitor for funding rate tracking
 	fundingMonitor *FundingRateMonitor
 
+	// NEW: WebSocket client for real-time data
+	wsClient *client.WebSocketClient
+
+	// NEW: ExitExecutor for fast exit on breakouts
+	exitExecutor interface{} // Use interface to avoid circular dependency
+
+	// NEW: ModeManager for trading mode evaluation
+	modeManager interface{} // Use interface to avoid circular dependency
+
 	// NEW: ATRCalculator for volatility calculation
 	atrCalc *ATRCalculator
 
@@ -413,6 +422,20 @@ func (a *AdaptiveGridManager) SetStateMachine(sm *GridStateMachine) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.stateMachine = sm
+}
+
+// SetExitExecutor wires the exit executor for fast exit on breakouts
+func (a *AdaptiveGridManager) SetExitExecutor(executor interface{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.exitExecutor = executor
+}
+
+// SetModeManager wires the mode manager for trading mode evaluation
+func (a *AdaptiveGridManager) SetModeManager(manager interface{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.modeManager = manager
 }
 
 // SetOptimizationConfig sets the optimization config from YAML files
@@ -2093,13 +2116,66 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		}
 	}
 
-	// CRITICAL: Check range state - STRICT: Chỉ trade khi BB range active
+	// NEW: Check ModeManager - block trading if in COOLDOWN mode
+	if a.modeManager != nil {
+		detector, exists := a.rangeDetectors[symbol]
+		if exists {
+			// Get current market conditions from detector
+			rangeState := detector.GetState()
+			adx := detector.GetCurrentADX()
+			isBreakout := detector.IsBreakout()
+			isTrending := adx > 25.0   // Simple trend detection based on ADX
+			isVolatilitySpike := false // TODO: implement volatility spike detection
+
+			// Type assertion to call EvaluateMode
+			if modeMgr, ok := a.modeManager.(interface {
+				EvaluateMode(
+					rangeState interface{},
+					adx float64,
+					isBreakout bool,
+					isTrending bool,
+					isVolatilitySpike bool,
+				) interface{}
+			}); ok {
+				mode := modeMgr.EvaluateMode(rangeState, adx, isBreakout, isTrending, isVolatilitySpike)
+				// Check if mode is COOLDOWN (string comparison for interface)
+				if modeStr, ok := mode.(string); ok && modeStr == "COOLDOWN" {
+					a.logger.Warn("CanPlaceOrder BLOCKED: ModeManager in COOLDOWN",
+						zap.String("symbol", symbol),
+						zap.String("mode", modeStr))
+					return false
+				}
+			}
+		}
+	}
+
+	// MODIFIED: Support MICRO mode - allow trading with ATR bands when BB not ready
 	if detector, exists := a.rangeDetectors[symbol]; exists {
-		if !detector.ShouldTrade() {
-			a.logger.Warn("CanPlaceOrder BLOCKED: BB range not active - waiting for range establishment",
-				zap.String("symbol", symbol),
-				zap.String("state", detector.GetStateString()))
-			return false // STRICT: Không có range = không trade
+		// Check if BB range is active (normal case)
+		bbActive := detector.ShouldTrade()
+
+		// If BB not active, check if we can use MICRO mode (ATR bands)
+		if !bbActive {
+			// Check if we have enough data for MICRO mode
+			if detector.HasEnoughDataForMICRO() {
+				// Allow trading in MICRO mode with ATR bands
+				_, _, valid := detector.GetATRBands(1.5) // 1.5x ATR multiplier
+				if valid {
+					a.logger.Debug("CanPlaceOrder: allowing MICRO mode with ATR bands",
+						zap.String("symbol", symbol),
+						zap.String("state", detector.GetStateString()))
+					// Continue to other checks (don't return false)
+				} else {
+					a.logger.Warn("CanPlaceOrder BLOCKED: invalid ATR bands",
+						zap.String("symbol", symbol))
+					return false
+				}
+			} else {
+				a.logger.Warn("CanPlaceOrder BLOCKED: BB range not active, insufficient data for MICRO mode",
+					zap.String("symbol", symbol),
+					zap.String("state", detector.GetStateString()))
+				return false // Not enough data for MICRO mode
+			}
 		}
 	}
 
@@ -2662,6 +2738,21 @@ func (a *AdaptiveGridManager) handleBreakout(ctx context.Context, symbol string,
 	a.logger.Error("BREAKOUT DETECTED - Closing ALL orders and positions immediately!",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice))
+
+	// NEW: Use ExitExecutor for fast exit if available
+	if a.exitExecutor != nil {
+		// Type assertion to call ExecuteFastExit
+		if executor, ok := a.exitExecutor.(interface {
+			ExecuteFastExit(ctx context.Context, symbol string) interface{}
+		}); ok {
+			_ = executor.ExecuteFastExit(ctx, symbol)
+			a.logger.Info("Fast exit executed via ExitExecutor",
+				zap.String("symbol", symbol))
+			return
+		}
+	}
+
+	// Fallback to standard ExitAll
 	a.ExitAll(ctx, symbol, EventEmergencyExit, "breakout")
 }
 

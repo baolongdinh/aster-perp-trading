@@ -569,15 +569,18 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 
 func (g *GridManager) canPlaceForSymbol(symbol string) bool {
 	if g.adaptiveMgr != nil {
-		rangeState := g.adaptiveMgr.GetRangeState(symbol)
-		if rangeState != adaptive_grid.RangeStateActive {
-			g.logger.WithFields(logrus.Fields{
-				"symbol":      symbol,
-				"range_state": rangeState,
-				"expected":    adaptive_grid.RangeStateActive,
-			}).Warn(">>> GATE BLOCKED: Range not active <<<")
-			return false
-		}
+		// REMOVED: Strict range check - let AdaptiveGridManager.CanPlaceOrder handle MICRO mode ATR bypass
+		// rangeState := g.adaptiveMgr.GetRangeState(symbol)
+		// if rangeState != adaptive_grid.RangeStateActive {
+		// 	g.logger.WithFields(logrus.Fields{
+		// 		"symbol":      symbol,
+		// 		"range_state": rangeState,
+		// 		"expected":    adaptive_grid.RangeStateActive,
+		// 	}).Warn(">>> GATE BLOCKED: Range not active <<<")
+		// 	return false
+		// }
+
+		// AdaptiveGridManager.CanPlaceOrder handles MICRO mode ATR bypass and all other checks
 		if !g.adaptiveMgr.CanPlaceOrder(symbol) {
 			g.logger.WithField("symbol", symbol).Warn(">>> GATE BLOCKED: Adaptive manager disallows order <<<")
 			return false
@@ -612,6 +615,15 @@ func (g *GridManager) shouldSchedulePlacement(grid *SymbolGrid, oldPrice float64
 
 	if !g.canPlaceForSymbol(grid.Symbol) {
 		return false
+	}
+
+	// NEW: Force initial placement when grid is first created (OrdersPlaced = false)
+	// This ensures bot places orders even if price is stable
+	if !grid.OrdersPlaced {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": grid.Symbol,
+		}).Info("Scheduling initial placement (first time)")
+		return true
 	}
 
 	// For price-based triggering, use tiny threshold for sensitive triggers

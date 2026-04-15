@@ -32,6 +32,14 @@ type WebSocketClient struct {
 
 	// Subscriptions
 	subscribedSymbols map[string]bool
+
+	// Cache for orders, positions, balance (WebSocket-only data)
+	orderCache      map[string]map[int64]Order // symbol -> orderID -> Order
+	positionCache   map[string]Position        // symbol -> Position
+	balanceCache    Balance                    // Account balance
+	lastOrderUpdate time.Time
+	lastPosUpdate   time.Time
+	lastBalUpdate   time.Time
 }
 
 // KlineMessage represents a kline/candlestick message from WebSocket
@@ -57,6 +65,8 @@ func NewWebSocketClient(baseURL string, logger *zap.Logger) *WebSocketClient {
 		tickerCh:          make(chan map[string]interface{}, 2000),
 		klineCh:           make(chan KlineMessage, 1000),
 		subscribedSymbols: make(map[string]bool),
+		orderCache:        make(map[string]map[int64]Order),
+		positionCache:     make(map[string]Position),
 	}
 }
 
@@ -379,6 +389,30 @@ func (ws *WebSocketClient) UnsubscribeFromKlines(symbols []string, interval stri
 	return nil
 }
 
+// SubscribeToUserData subscribes to user data stream for order/account updates
+func (ws *WebSocketClient) SubscribeToUserData(listenKey string) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if !ws.isRunning {
+		return fmt.Errorf("websocket not connected")
+	}
+
+	subscribeMsg := map[string]interface{}{
+		"method": "SUBSCRIBE",
+		"params": []string{listenKey},
+		"id":     4,
+	}
+
+	ws.logger.Info("Subscribing to user data stream", zap.String("listenKey", listenKey))
+
+	if err := ws.conn.WriteJSON(subscribeMsg); err != nil {
+		return fmt.Errorf("failed to send user data subscription: %w", err)
+	}
+
+	return nil
+}
+
 // processMessage handles incoming WebSocket messages from Aster API
 func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 	// Check if it's a kline stream message first
@@ -400,6 +434,19 @@ func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 		}
 	}
 
+	// Handle user data events (ACCOUNT_UPDATE, ORDER_TRADE_UPDATE)
+	if eventType, ok := msg["e"].(string); ok {
+		switch eventType {
+		case "ACCOUNT_UPDATE":
+			ws.processAccountUpdate(msg)
+		case "ORDER_TRADE_UPDATE":
+			ws.processOrderTradeUpdate(msg)
+		default:
+			ws.logger.Debug("Unknown user data event", zap.String("event", eventType))
+		}
+		return
+	}
+
 	// Handle subscription responses
 	if result, ok := msg["result"]; ok {
 		if result == nil {
@@ -410,6 +457,107 @@ func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 
 	// Log other messages for debugging
 	ws.logger.Debug("WebSocket message received", zap.Any("msg", msg))
+}
+
+// processAccountUpdate handles ACCOUNT_UPDATE events (positions & balance)
+func (ws *WebSocketClient) processAccountUpdate(msg map[string]interface{}) {
+	data, ok := msg["a"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	// Update balance
+	if balanceData, ok := data["B"].([]interface{}); ok && len(balanceData) > 0 {
+		if firstBalance, ok := balanceData[0].(map[string]interface{}); ok {
+			balance := Balance{
+				Asset:            getString(firstBalance, "a"),
+				WalletBalance:    getFloat64(firstBalance, "wb"),
+				AvailableBalance: getFloat64(firstBalance, "ab"),
+				MarginBalance:    getFloat64(firstBalance, "m"),
+			}
+			ws.UpdateBalanceCache(balance)
+			ws.logger.Debug("Balance updated from WebSocket", zap.String("asset", balance.Asset))
+		}
+	}
+
+	// Update positions
+	if positions, ok := data["P"].([]interface{}); ok {
+		for _, posData := range positions {
+			if pos, ok := posData.(map[string]interface{}); ok {
+				position := Position{
+					Symbol:           getString(pos, "s"),
+					PositionAmt:      getFloat64(pos, "pa"),
+					PositionSide:     getString(pos, "ps"),
+					EntryPrice:       getFloat64(pos, "ep"),
+					UnrealizedProfit: getFloat64(pos, "up"),
+				}
+				ws.UpdatePositionCache(position)
+				ws.logger.Debug("Position updated from WebSocket",
+					zap.String("symbol", position.Symbol),
+					zap.Float64("amt", position.PositionAmt))
+			}
+		}
+	}
+}
+
+// processOrderTradeUpdate handles ORDER_TRADE_UPDATE events
+func (ws *WebSocketClient) processOrderTradeUpdate(msg map[string]interface{}) {
+	data, ok := msg["o"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	order := Order{
+		OrderID:     getInt64(data, "i"),
+		Symbol:      getString(data, "s"),
+		Status:      getString(data, "X"), // Current status
+		Side:        getString(data, "S"),
+		Type:        getString(data, "o"),
+		Price:       getFloat64(data, "p"),
+		OrigQty:     getFloat64(data, "q"),
+		ExecutedQty: getFloat64(data, "z"),
+		UpdateTime:  getInt64(data, "T"),
+	}
+
+	// Update or remove from cache based on status
+	switch order.Status {
+	case "FILLED", "CANCELED", "EXPIRED", "REJECTED":
+		ws.RemoveOrderCache(order.Symbol, order.OrderID)
+		ws.logger.Debug("Order removed from cache", zap.Int64("order_id", order.OrderID), zap.String("status", order.Status))
+	default:
+		ws.UpdateOrderCache(order)
+		ws.logger.Debug("Order updated in cache", zap.Int64("order_id", order.OrderID), zap.String("status", order.Status))
+	}
+}
+
+// Helper functions for safe type conversion
+func getString(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getFloat64(m map[string]interface{}, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	if v, ok := m[key].(string); ok {
+		f, _ := strconv.ParseFloat(v, 64)
+		return f
+	}
+	return 0
+}
+
+func getInt64(m map[string]interface{}, key string) int64 {
+	if v, ok := m[key].(float64); ok {
+		return int64(v)
+	}
+	if v, ok := m[key].(string); ok {
+		i, _ := strconv.ParseInt(v, 10, 64)
+		return i
+	}
+	return 0
 }
 
 // processArrayMessage handles array format messages (e.g., !ticker@arr)
@@ -463,4 +611,101 @@ func (ws *WebSocketClient) IsRunning() bool {
 	ws.mu.RLock()
 	defer ws.mu.RUnlock()
 	return ws.isRunning
+}
+
+// GetCachedOrders returns cached orders for a symbol
+func (ws *WebSocketClient) GetCachedOrders(symbol string) []Order {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	symbolOrders, exists := ws.orderCache[symbol]
+	if !exists {
+		return []Order{}
+	}
+
+	orders := make([]Order, 0, len(symbolOrders))
+	for _, order := range symbolOrders {
+		orders = append(orders, order)
+	}
+	return orders
+}
+
+// GetCachedPositions returns cached positions
+func (ws *WebSocketClient) GetCachedPositions() map[string]Position {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	// Return a copy
+	positions := make(map[string]Position)
+	for symbol, pos := range ws.positionCache {
+		positions[symbol] = pos
+	}
+	return positions
+}
+
+// GetCachedBalance returns cached balance
+func (ws *WebSocketClient) GetCachedBalance() Balance {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.balanceCache
+}
+
+// UpdateOrderCache updates order in cache (called when WebSocket receives order update)
+func (ws *WebSocketClient) UpdateOrderCache(order Order) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if _, exists := ws.orderCache[order.Symbol]; !exists {
+		ws.orderCache[order.Symbol] = make(map[int64]Order)
+	}
+	ws.orderCache[order.Symbol][order.OrderID] = order
+	ws.lastOrderUpdate = time.Now()
+}
+
+// RemoveOrderCache removes order from cache
+func (ws *WebSocketClient) RemoveOrderCache(symbol string, orderID int64) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if symbolOrders, exists := ws.orderCache[symbol]; exists {
+		delete(symbolOrders, orderID)
+	}
+}
+
+// UpdatePositionCache updates position in cache
+func (ws *WebSocketClient) UpdatePositionCache(position Position) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	ws.positionCache[position.Symbol] = position
+	ws.lastPosUpdate = time.Now()
+}
+
+// UpdateBalanceCache updates balance in cache
+func (ws *WebSocketClient) UpdateBalanceCache(balance Balance) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	ws.balanceCache = balance
+	ws.lastBalUpdate = time.Now()
+}
+
+// IsCacheStale checks if cache data is stale (> 5 seconds old)
+func (ws *WebSocketClient) IsCacheStale(cacheType string) bool {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	threshold := 5 * time.Second
+	now := time.Now()
+
+	switch cacheType {
+	case "orders":
+		return now.Sub(ws.lastOrderUpdate) > threshold
+	case "positions":
+		return now.Sub(ws.lastPosUpdate) > threshold
+	case "balance":
+		return now.Sub(ws.lastBalUpdate) > threshold
+	default:
+		return true
+	}
 }

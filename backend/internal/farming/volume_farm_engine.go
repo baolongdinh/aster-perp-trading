@@ -15,6 +15,8 @@ import (
 	"aster-bot/internal/farming/adaptive_config"
 	"aster-bot/internal/farming/adaptive_grid"
 	"aster-bot/internal/farming/market_regime"
+	farmsync "aster-bot/internal/farming/sync"
+	"aster-bot/internal/farming/tradingmode"
 	"aster-bot/internal/risk"
 	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
@@ -61,8 +63,15 @@ type VolumeFarmEngine struct {
 	configManager       *adaptive_config.AdaptiveConfigManager
 	pointsTracker       *PointsTracker
 	userStream          *stream.UserStream
-	stopCh              chan struct{}
-	wg                  sync.WaitGroup
+
+	// NEW: Continuous Volume Farming components
+	modeManager  *tradingmode.ModeManager
+	exitExecutor *ExitExecutor
+	syncManager  *farmsync.SyncManager
+	wsClient     *client.WebSocketClient
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 // NewVolumeFarmEngine creates a new volume farming engine.
@@ -200,6 +209,42 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 
 	// NEW: Connect adaptive manager reference for optimization features
 	engine.gridManager.SetAdaptiveManager(adaptiveGridManager)
+
+	// NEW: Initialize Continuous Volume Farming components
+	// ModeManager - evaluates and switches trading modes based on market conditions
+	modeConfig := volumeConfig.TradingModes
+	if modeConfig == nil {
+		modeConfig = &config.TradingModesConfig{
+			MicroMode:        config.MicroModeConfig{Enabled: true},
+			StandardMode:     config.StandardModeConfig{Enabled: true},
+			TrendAdaptedMode: config.TrendAdaptedModeConfig{Enabled: true},
+		}
+	}
+	engine.modeManager = tradingmode.NewModeManager(modeConfig, logger)
+	logger.Info("ModeManager initialized",
+		zap.Bool("micro_enabled", modeConfig.MicroMode.Enabled),
+		zap.Bool("standard_enabled", modeConfig.StandardMode.Enabled),
+		zap.Bool("trend_enabled", modeConfig.TrendAdaptedMode.Enabled))
+
+	// ExitExecutor - handles fast exit on breakouts
+	engine.exitExecutor = NewExitExecutor(engine.futuresClient, sharedWSClient, 5*time.Second, logger)
+	logger.Info("ExitExecutor initialized", zap.Duration("timeout", 5*time.Second))
+
+	// NEW: Wire ExitExecutor into AdaptiveGridManager for breakout handling
+	adaptiveGridManager.SetExitExecutor(engine.exitExecutor)
+	logger.Info("ExitExecutor wired into AdaptiveGridManager")
+
+	// NEW: Wire ModeManager into AdaptiveGridManager for trading mode evaluation
+	adaptiveGridManager.SetModeManager(engine.modeManager)
+	logger.Info("ModeManager wired into AdaptiveGridManager")
+
+	// SyncManager - coordinates order/position/balance sync workers
+	engine.syncManager = farmsync.NewSyncManager(sharedWSClient, logger)
+	engine.syncManager.Initialize()
+	logger.Info("SyncManager initialized with all workers")
+
+	// Store WebSocket client reference
+	engine.wsClient = sharedWSClient
 
 	return engine, nil
 }
@@ -353,6 +398,12 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	// NEW: Initialize and start UserStream for real-time order updates
 	e.initUserStream(ctx)
 
+	// NEW: Start SyncManager for order/position/balance sync
+	if e.syncManager != nil {
+		e.syncManager.Start()
+		e.logger.Info("SyncManager started")
+	}
+
 	e.logger.Info("Volume Farming Engine started successfully")
 	return nil
 }
@@ -389,10 +440,36 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 				}
 			},
 			OnAccountUpdate: func(u stream.WsAccountUpdate) {
-				// Optional: Handle account/position updates
+				// Update WebSocket cache with positions and balances
 				e.logger.Debug("Account update received via WebSocket",
 					zap.Int("positions", len(u.Update.Positions)),
 					zap.Int("balances", len(u.Update.Balances)))
+
+				// Update position cache
+				for _, pos := range u.Update.Positions {
+					position := client.Position{
+						Symbol:           pos.Symbol,
+						PositionAmt:      pos.PositionAmt,
+						EntryPrice:       pos.EntryPrice,
+						MarkPrice:        pos.EntryPrice, // Use EntryPrice as fallback
+						UnrealizedProfit: pos.UnrealizedPnL,
+						PositionSide:     pos.PositionSide,
+					}
+					e.wsClient.UpdatePositionCache(position)
+				}
+
+				// Update balance cache
+				for _, bal := range u.Update.Balances {
+					if bal.Asset == "USDT" {
+						balance := client.Balance{
+							Asset:            bal.Asset,
+							AvailableBalance: bal.CrossWalletBalance, // Use CrossWalletBalance as available
+							WalletBalance:    bal.WalletBalance,
+							MarginBalance:    bal.WalletBalance, // Use WalletBalance as margin
+						}
+						e.wsClient.UpdateBalanceCache(balance)
+					}
+				}
 			},
 		},
 		e.logger,
@@ -618,6 +695,12 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 		if err := e.pointsTracker.Stop(ctx); err != nil {
 			e.logger.Warn("Points tracker stop error", zap.Error(err))
 		}
+	}
+
+	// NEW: Stop SyncManager
+	if e.syncManager != nil {
+		e.syncManager.Stop()
+		e.logger.Info("SyncManager stopped")
 	}
 
 	done := make(chan struct{})

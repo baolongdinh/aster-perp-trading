@@ -214,27 +214,80 @@ func validate(cfg *Config) error {
 
 // VolumeFarmConfig contains volume farming specific configuration
 type VolumeFarmConfig struct {
-	Enabled                  bool           `mapstructure:"enabled"`
-	MaxDailyLossUSDT         float64        `mapstructure:"max_daily_loss_usdt"`
-	MaxTotalDrawdownPct      float64        `mapstructure:"max_total_drawdown_pct"`
-	OrderSizeUSDT            float64        `mapstructure:"order_size_usdt"`
-	GridSpreadPct            float64        `mapstructure:"grid_spread_pct"`
-	MaxOrdersPerSide         int            `mapstructure:"max_orders_per_side"`
-	ReplaceImmediately       bool           `mapstructure:"replace_immediately"`
-	PositionTimeoutMinutes   int            `mapstructure:"position_timeout_minutes"`
-	TickerStream             string         `mapstructure:"ticker_stream"`
-	SymbolRefreshIntervalSec int            `mapstructure:"symbol_refresh_interval_seconds"`
-	GridPlacementCooldownSec int            `mapstructure:"grid_placement_cooldown_seconds"`
-	RateLimitCooldownSec     int            `mapstructure:"rate_limit_cooldown_seconds"`
-	RateLimiterCapacity      int            `mapstructure:"rate_limiter_capacity"`
-	RateLimiterRefillRate    float64        `mapstructure:"rate_limiter_refill_rate"`
-	SupportedQuoteCurrencies []string       `mapstructure:"supported_quote_currencies"`
-	MinVolume24h             float64        `mapstructure:"min_volume_24h"`
-	Bot                      BotConfig      `mapstructure:"bot"`
-	Symbols                  SymbolsConfig  `mapstructure:"symbols"`
-	Exchange                 ExchangeConfig `mapstructure:"exchange"`
-	Risk                     RiskConfig     `mapstructure:"risk"`
-	API                      APIConfig      `mapstructure:"api"`
+	Enabled                  bool                `mapstructure:"enabled"`
+	MaxDailyLossUSDT         float64             `mapstructure:"max_daily_loss_usdt"`
+	MaxTotalDrawdownPct      float64             `mapstructure:"max_total_drawdown_pct"`
+	OrderSizeUSDT            float64             `mapstructure:"order_size_usdt"`
+	GridSpreadPct            float64             `mapstructure:"grid_spread_pct"`
+	MaxOrdersPerSide         int                 `mapstructure:"max_orders_per_side"`
+	ReplaceImmediately       bool                `mapstructure:"replace_immediately"`
+	PositionTimeoutMinutes   int                 `mapstructure:"position_timeout_minutes"`
+	TickerStream             string              `mapstructure:"ticker_stream"`
+	SymbolRefreshIntervalSec int                 `mapstructure:"symbol_refresh_interval_seconds"`
+	GridPlacementCooldownSec int                 `mapstructure:"grid_placement_cooldown_seconds"`
+	RateLimitCooldownSec     int                 `mapstructure:"rate_limit_cooldown_seconds"`
+	RateLimiterCapacity      int                 `mapstructure:"rate_limiter_capacity"`
+	RateLimiterRefillRate    float64             `mapstructure:"rate_limiter_refill_rate"`
+	SupportedQuoteCurrencies []string            `mapstructure:"supported_quote_currencies"`
+	MinVolume24h             float64             `mapstructure:"min_volume_24h"`
+	Bot                      BotConfig           `mapstructure:"bot"`
+	Symbols                  SymbolsConfig       `mapstructure:"symbols"`
+	Exchange                 ExchangeConfig      `mapstructure:"exchange"`
+	Risk                     RiskConfig          `mapstructure:"risk"`
+	API                      APIConfig           `mapstructure:"api"`
+	TradingModes             *TradingModesConfig `mapstructure:"trading_modes,omitempty"`
+}
+
+// TradingModesConfig holds configuration for all trading modes
+type TradingModesConfig struct {
+	MicroMode        MicroModeConfig        `mapstructure:"micro_mode"`
+	StandardMode     StandardModeConfig     `mapstructure:"standard_mode"`
+	TrendAdaptedMode TrendAdaptedModeConfig `mapstructure:"trend_adapted_mode"`
+	CooldownMode     CooldownModeConfig     `mapstructure:"cooldown_mode"`
+	Transitions      ModeTransitionsConfig  `mapstructure:"transitions"`
+}
+
+// MicroModeConfig for MICRO trading mode (bypass range gate)
+type MicroModeConfig struct {
+	Enabled            bool    `mapstructure:"enabled"`
+	SizeMultiplier     float64 `mapstructure:"size_multiplier"`
+	LevelCount         int     `mapstructure:"level_count"`
+	SpreadMultiplier   float64 `mapstructure:"spread_multiplier"`
+	MinATRMultiplier   float64 `mapstructure:"min_atr_multiplier"`
+	MinModeDurationSec int     `mapstructure:"min_mode_duration_seconds"`
+}
+
+// StandardModeConfig for STANDARD trading mode (normal BB-based)
+type StandardModeConfig struct {
+	Enabled            bool    `mapstructure:"enabled"`
+	SizeMultiplier     float64 `mapstructure:"size_multiplier"`
+	LevelCount         int     `mapstructure:"level_count"`
+	SpreadMultiplier   float64 `mapstructure:"spread_multiplier"`
+	MinModeDurationSec int     `mapstructure:"min_mode_duration_seconds"`
+}
+
+// TrendAdaptedModeConfig for TREND_ADAPTED mode (reduced risk)
+type TrendAdaptedModeConfig struct {
+	Enabled            bool    `mapstructure:"enabled"`
+	SizeMultiplier     float64 `mapstructure:"size_multiplier"`
+	LevelCount         int     `mapstructure:"level_count"`
+	SpreadMultiplier   float64 `mapstructure:"spread_multiplier"`
+	TrendBiasEnabled   bool    `mapstructure:"trend_bias_enabled"`
+	TrendBiasRatio     float64 `mapstructure:"trend_bias_ratio"`
+	MinModeDurationSec int     `mapstructure:"min_mode_duration_seconds"`
+}
+
+// CooldownModeConfig for COOLDOWN mode (pause after exit)
+type CooldownModeConfig struct {
+	DurationSec int `mapstructure:"duration_seconds"`
+}
+
+// ModeTransitionsConfig holds thresholds for mode switching
+type ModeTransitionsConfig struct {
+	ADXThresholdSideways      float64 `mapstructure:"adx_threshold_sideways"`
+	ADXThresholdTrending      float64 `mapstructure:"adx_threshold_trending"`
+	VolatilitySpikeMultiplier float64 `mapstructure:"volatility_spike_multiplier"`
+	BreakoutConfirmations     int     `mapstructure:"breakout_confirmations"`
 }
 
 // SymbolsConfig contains symbol selection and management for volume farming

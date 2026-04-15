@@ -62,7 +62,7 @@ func FastRangeConfig() *EnhancedRangeConfig {
 			ATRMultiplier:            1.5,
 			BreakoutThreshold:        0.01,
 			StabilizationPeriod:      30 * time.Second,
-			MinRangeWidthPct:         0.003,
+			MinRangeWidthPct:         0.0001, // Giảm để dễ tạo range hơn
 			MaterialShiftPct:         0.005,
 			WidthChangePct:           0.0015,
 			ReentryConfirmations:     3,
@@ -87,7 +87,7 @@ func DefaultRangeConfig() *RangeConfig {
 		ATRMultiplier:            1.5,              // 1.5x ATR cho range
 		BreakoutThreshold:        0.01,             // 1% vượt range = breakout
 		StabilizationPeriod:      30 * time.Second, // Chờ 30s sau breakout để resume nhanh
-		MinRangeWidthPct:         0.001,            // Tối thiểu 0.1% range width (giảm từ 0.3%)
+		MinRangeWidthPct:         0.0001,           // Tối thiểu 0.01% range width (giảm để dễ tạo range hơn)
 		ADXPeriod:                14,
 		MaterialShiftPct:         0.005,
 		WidthChangePct:           0.0015,
@@ -528,6 +528,98 @@ func (r *RangeDetector) ShouldTrade() bool {
 // IsBreakout returns true if breakout detected
 func (r *RangeDetector) IsBreakout() bool {
 	return r.GetState() == RangeStateBreakout
+}
+
+// GetATR returns the current ATR value
+func (r *RangeDetector) GetATR() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.currentRange != nil {
+		return r.currentRange.ATR
+	}
+
+	// Calculate ATR from history if range not established
+	if len(r.prices) > 0 {
+		return r.calculateATRLocked()
+	}
+
+	return 0
+}
+
+// GetATRBands returns ATR-based bands for MICRO mode
+func (r *RangeDetector) GetATRBands(multiplier float64) (upper, lower float64, valid bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.prices) == 0 {
+		return 0, 0, false
+	}
+
+	currentPrice := r.lastPrice
+	if currentPrice == 0 && len(r.prices) > 0 {
+		currentPrice = r.prices[len(r.prices)-1]
+	}
+
+	// Use existing ATR or calculate from history
+	var atr float64
+	if r.currentRange != nil && r.currentRange.ATR > 0 {
+		atr = r.currentRange.ATR
+	} else {
+		atr = r.calculateATRLocked()
+	}
+
+	if atr == 0 || multiplier <= 0 {
+		return 0, 0, false
+	}
+
+	upper = currentPrice + atr*multiplier
+	lower = currentPrice - atr*multiplier
+	valid = upper > lower && upper > 0 && lower > 0
+
+	return upper, lower, valid
+}
+
+// calculateATRLocked calculates ATR (must be called with lock held)
+func (r *RangeDetector) calculateATRLocked() float64 {
+	if len(r.highs) < 2 || len(r.lows) < 2 {
+		return 0
+	}
+
+	period := r.config.Periods
+	if period > len(r.highs) {
+		period = len(r.highs)
+	}
+
+	sumTR := 0.0
+	for i := len(r.highs) - period; i < len(r.highs); i++ {
+		if i > 0 {
+			tr := r.highs[i] - r.lows[i]
+			if tr < 0 {
+				tr = -tr
+			}
+			sumTR += tr
+		}
+	}
+
+	if period > 0 {
+		return sumTR / float64(period)
+	}
+	return 0
+}
+
+// HasEnoughDataForMICRO checks if we have enough data for MICRO mode trading
+func (r *RangeDetector) HasEnoughDataForMICRO() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Need at least 3 candles for basic ATR calculation
+	minCandles := 3
+	if r.config.Periods < minCandles {
+		minCandles = r.config.Periods
+	}
+
+	return len(r.prices) >= minCandles && r.lastPrice > 0
 }
 
 // ForceRecalculate forces range recalculation
