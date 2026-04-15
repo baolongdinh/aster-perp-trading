@@ -32,9 +32,9 @@ func NewStateValidator(logger *zap.Logger) *StateValidator {
 var ValidTransitions = map[OrderState][]OrderState{
 	OrderStateNew:       {OrderStatePending, OrderStateFilled, OrderStateCancelled, OrderStateRejected},
 	OrderStatePending:   {OrderStateFilled, OrderStateCancelled, OrderStateRejected},
-	OrderStateFilled:    {}, // Terminal state
-	OrderStateCancelled: {}, // Terminal state
-	OrderStateRejected:  {}, // Terminal state
+	OrderStateFilled:    {},                 // Terminal state
+	OrderStateCancelled: {OrderStateFilled}, // Allow FILLED for edge case (filled after cancel request)
+	OrderStateRejected:  {},                 // Terminal state
 	OrderStateUnknown:   {OrderStatePending, OrderStateFilled, OrderStateCancelled},
 }
 

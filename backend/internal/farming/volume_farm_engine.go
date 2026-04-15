@@ -238,6 +238,51 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	adaptiveGridManager.SetModeManager(engine.modeManager)
 	logger.Info("ModeManager wired into AdaptiveGridManager")
 
+	// NEW: Register COOLDOWN callback to trigger exit sequence
+	engine.modeManager.SetOnCooldownCallback(func(reason string) {
+		logger.Warn("COOLDOWN mode triggered - initiating emergency exit for all symbols",
+			zap.String("reason", reason))
+
+		// Get all active symbols from adaptive grid manager
+		symbols := adaptiveGridManager.GetActiveSymbols()
+
+		// Trigger exit sequence for each symbol
+		for _, symbol := range symbols {
+			logger.Info("Triggering exit sequence for symbol due to COOLDOWN",
+				zap.String("symbol", symbol),
+				zap.String("reason", reason))
+
+			// Use ExitExecutor to cancel orders and close positions
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			sequence := engine.exitExecutor.ExecuteFastExit(ctx, symbol)
+			if sequence.Error != nil {
+				logger.Error("Failed to execute fast exit during COOLDOWN",
+					zap.String("symbol", symbol),
+					zap.Error(sequence.Error))
+			} else {
+				logger.Info("Fast exit completed during COOLDOWN",
+					zap.String("symbol", symbol),
+					zap.Int("orders_cancelled", sequence.OrdersCancelled),
+					zap.Int("positions_closed", sequence.PositionsClosed))
+			}
+		}
+
+		// Schedule force grid placement after cooldown expires (10s)
+		go func() {
+			time.Sleep(10 * time.Second)
+			logger.Info("COOLDOWN expired - forcing grid placement for all symbols")
+			symbols := adaptiveGridManager.GetActiveSymbols()
+			for _, symbol := range symbols {
+				logger.Info("Force triggering grid placement after COOLDOWN",
+					zap.String("symbol", symbol))
+				engine.gridManager.enqueuePlacement(symbol)
+			}
+		}()
+	})
+	logger.Info("COOLDOWN callback registered to trigger exit sequence and force placement after expiry")
+
 	// SyncManager - coordinates order/position/balance sync workers
 	engine.syncManager = farmsync.NewSyncManager(sharedWSClient, logger)
 	engine.syncManager.Initialize()

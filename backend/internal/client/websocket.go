@@ -466,17 +466,61 @@ func (ws *WebSocketClient) processAccountUpdate(msg map[string]interface{}) {
 		return
 	}
 
-	// Update balance
+	// Update balance - aggregate both USD1 and USDT for USD-M futures
 	if balanceData, ok := data["B"].([]interface{}); ok && len(balanceData) > 0 {
-		if firstBalance, ok := balanceData[0].(map[string]interface{}); ok {
+		// Aggregate balances for USD1 and USDT assets
+		totalWalletBalance := 0.0
+		totalAvailableBalance := 0.0
+		totalMarginBalance := 0.0
+		assets := []string{}
+
+		for _, bal := range balanceData {
+			if balanceItem, ok := bal.(map[string]interface{}); ok {
+				asset := getString(balanceItem, "a")
+				walletBalance := getFloat64(balanceItem, "wb")
+				availableBalance := getFloat64(balanceItem, "ab")
+				marginBalance := getFloat64(balanceItem, "m")
+
+				// Only aggregate USD1 and USDT for USD-M futures
+				if asset == "USD1" || asset == "USDT" {
+					totalWalletBalance += walletBalance
+					totalAvailableBalance += availableBalance
+					totalMarginBalance += marginBalance
+					assets = append(assets, asset)
+
+					ws.logger.Debug("Balance asset found",
+						zap.String("asset", asset),
+						zap.Float64("wallet", walletBalance),
+						zap.Float64("available", availableBalance))
+				}
+			}
+		}
+
+		if len(assets) > 0 {
 			balance := Balance{
-				Asset:            getString(firstBalance, "a"),
-				WalletBalance:    getFloat64(firstBalance, "wb"),
-				AvailableBalance: getFloat64(firstBalance, "ab"),
-				MarginBalance:    getFloat64(firstBalance, "m"),
+				Asset:            "USD1+USDT", // Combined asset name
+				WalletBalance:    totalWalletBalance,
+				AvailableBalance: totalAvailableBalance,
+				MarginBalance:    totalMarginBalance,
 			}
 			ws.UpdateBalanceCache(balance)
-			ws.logger.Debug("Balance updated from WebSocket", zap.String("asset", balance.Asset))
+			ws.logger.Info("Balance updated from WebSocket (aggregated)",
+				zap.Strings("assets", assets),
+				zap.Float64("total_available", totalAvailableBalance),
+				zap.Float64("total_wallet", totalWalletBalance))
+		} else {
+			// Fallback: use first balance if no USD1/USDT found
+			if firstBalance, ok := balanceData[0].(map[string]interface{}); ok {
+				balance := Balance{
+					Asset:            getString(firstBalance, "a"),
+					WalletBalance:    getFloat64(firstBalance, "wb"),
+					AvailableBalance: getFloat64(firstBalance, "ab"),
+					MarginBalance:    getFloat64(firstBalance, "m"),
+				}
+				ws.UpdateBalanceCache(balance)
+				ws.logger.Warn("No USD1/USDT balance found, using fallback asset",
+					zap.String("asset", balance.Asset))
+			}
 		}
 	}
 

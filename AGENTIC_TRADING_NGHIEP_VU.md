@@ -571,6 +571,552 @@ Mọi state transition được log với format JSONL:
 
 ---
 
-*Document Version: 3.0*  
+---
+
+## 16. Flow Nghiệp Vụ Chi Tiết - Vào Lệnh, Thoát Lệnh, Chờ
+
+### 16.1 Flow Khởi Động Bot (Cold Start)
+
+```mermaid
+flowchart TB
+    Start["Khởi Động Bot"] --> LoadConfig["Load Config YAML"]
+    LoadConfig --> InitComponents["Khởi Tạo Components"]
+    
+    InitComponents --> WS["WebSocket Client<br/>Ticker Stream"]
+    InitComponents --> UDS["User Data Stream<br/>Orders/Positions/Balance"]
+    InitComponents --> RD["RangeDetector<br/>State Machine"]
+    InitComponents --> MM["ModeManager<br/>4 Trading Modes"]
+    InitComponents --> GSM["GridStateMachine<br/>5 States"]
+    InitComponents --> AGM["AdaptiveGridManager<br/>Risk Control"]
+    InitComponents --> GM["GridManager<br/>Order Placement"]
+    InitComponents --> EE["ExitExecutor<br/>Fast Exit"]
+    InitComponents --> SM["SyncManager<br/>3 Workers"]
+    
+    WS --> Warmup["Warm-up Phase"]
+    UDS --> Warmup
+    RD --> Warmup
+    MM --> Warmup
+    GSM --> Warmup
+    
+    Warmup --> LoadHistory["Load 1000 Candles<br/>REST API"]
+    LoadHistory --> CalcIndicators["Tính Chỉ Báo<br/>ADX/BB/ATR/EMA"]
+    CalcIndicators --> DetectRegime["Phát Hiện Regime<br/>Sideways/Trending/Breakout"]
+    DetectRegime --> Ready["Sẵn Sàng Trade"]
+    
+    Ready --> StartLoop["Bắt Đầu Main Loop"]
+    
+    style Start fill:#FFD700
+    style Ready fill:#90EE90
+    style StartLoop fill:#87CEEB
+```
+
+**Giải thích:**
+1. Bot load config từ YAML
+2. Khởi tạo tất cả components (WebSocket, RangeDetector, ModeManager, etc.)
+3. Warm-up phase: Load 1000 nến lịch sử
+4. Tính chỉ báo kỹ thuật (ADX, Bollinger, ATR, EMA)
+5. Phát hiện regime hiện tại
+6. Sẵn sàng trade → Bắt đầu main loop
+
+---
+
+### 16.2 Flow Vào Lệnh (Entry Logic)
+
+```mermaid
+flowchart TD
+    A["WebSocket Ticker Update<br/>Price Change"] --> B["shouldSchedulePlacement?"]
+    
+    B -->|No| C["Skip<br/>Chờ price move"]
+    B -->|Yes| D["enqueuePlacement"]
+    
+    D --> E["canPlaceForSymbol?"]
+    E -->|No| F["BLOCK<br/>Log reason"]
+    E -->|Yes| G["ModeManager<br/>CanPlaceOrder?"]
+    
+    G -->|No| H["COOLDOWN BLOCK<br/>Log reason"]
+    G -->|Yes| I["GridStateMachine<br/>ShouldEnqueuePlacement?"]
+    
+    I -->|No| J["State BLOCK<br/>Chờ state change"]
+    I -->|Yes| K["Placement Queue<br/>Wait for worker"]
+    
+    K --> L["placementWorker<br/>Dequeue symbol"]
+    L --> M["canPlaceForSymbol?"]
+    M -->|No| N["BLOCK<br/>Runtime gate"]
+    M -->|Yes| O["ModeManager<br/>CanPlaceOrder?"]
+    
+    O -->|No| P["COOLDOWN BLOCK"]
+    O -->|Yes| Q["GridState<br/>ENTER_GRID/TRADING?"]
+    
+    Q -->|No| R["State BLOCK"]
+    Q -->|Yes| S["placeGridOrders"]
+    
+    S --> T{Micro Grid<br/>Enabled?}
+    T -->|Yes| U["placeMicroGridOrders<br/>0.05% spread<br/>5 orders/side"]
+    T -->|No| V["placeBBGridOrders<br/>BB bands geometry"]
+    
+    U --> W["Calculate Order Size<br/>Score × Volatility × Leverage"]
+    V --> W
+    
+    W --> X["Place Orders<br/>REST API"]
+    X --> Y["OnOrderUpdate<br/>WebSocket Event"]
+    Y --> Z["Update Order Cache"]
+    Z --> AA["Orders Active<br/>TRADING state"]
+    
+    style D fill:#FFD700
+    style S fill:#90EE90
+    style AA fill:#87CEEB
+    style F fill:#FF6347
+    style H fill:#FF6347
+    style J fill:#FF6347
+    style N fill:#FF6347
+    style P fill:#FF6347
+    style R fill:#FF6347
+```
+
+**Giải thích:**
+1. WebSocket ticker update → Check nên schedule placement
+2. Enqueue placement vào queue
+3. Worker dequeue → Check gates:
+   - canPlaceForSymbol (AdaptiveGridManager)
+   - ModeManager (MICRO/STANDARD/TREND_ADAPTED/COOLDOWN)
+   - GridStateMachine (ENTER_GRID/TRADING)
+4. Place orders:
+   - Micro grid (0.05% spread, 5 orders/side) - PRIMARY
+   - Fallback: BB grid geometry
+5. Calculate order size: Score × Volatility × Leverage
+6. Place orders via REST API
+7. WebSocket update order cache
+8. Orders active → TRADING state
+
+---
+
+### 16.3 Flow Trading (Rebalancing)
+
+```mermaid
+flowchart TD
+    A["TRADING State<br/>Orders Active"] --> B["Price Move"]
+    
+    B --> C{Order Filled?<br/>WebSocket Event}
+    C -->|No| D["Chờ fills"]
+    C -->|Yes| E["handleOrderFill"]
+    
+    E --> F["Dedup Check<br/>IsDuplicate?"]
+    F -->|Yes| G["LOG WARNING<br/>Vẫn trigger rebalance"]
+    F -->|No| H["Process Fill"]
+    
+    G --> I["Track Position<br/>InventoryManager"]
+    H --> I
+    
+    I --> J["canRebalance?"]
+    J -->|No| K["BLOCK<br/>Risk limits"]
+    J -->|Yes| L["enqueuePlacement<br/>Rebalance"]
+    
+    L --> M["placementWorker"]
+    M --> N["Cancel Filled Order<br/>Place New Order"]
+    
+    N --> O{Balance<br/>Sufficient?}
+    O -->|No| P["BLOCK<br/>Low balance"]
+    O -->|Yes| Q["Place New Order<br/>Grid rebalancing"]
+    
+    Q --> R["Update Order Cache"]
+    R --> S["Continue TRADING"]
+    
+    style E fill:#FFD700
+    style I fill:#90EE90
+    style L fill:#87CEEB
+    style S fill:#90EE90
+    style K fill:#FF6347
+    style P fill:#FF6347
+```
+
+**Giải thích:**
+1. Price move → Orders filled
+2. handleOrderFill called
+3. Dedup check (vẫn trigger rebalance dù duplicate)
+4. Track position trong InventoryManager
+5. Check canRebalance (risk limits)
+6. Enqueue placement để rebalance
+7. Cancel filled order, place new order
+8. Check balance sufficient
+9. Place new order
+10. Continue TRADING
+
+---
+
+### 16.4 Flow Thoát Lệnh (Exit Logic)
+
+```mermaid
+flowchart TD
+    A["TRADING State"] --> B{Exit Trigger?}
+    
+    B --> C["Breakout Detected<br/>Price outside BB"]
+    B --> D["ADX Spike<br/>ADX > 25"]
+    B --> E["Consecutive Losses<br/>> 3"]
+    B --> F["Volatility Spike<br/>Circuit Breaker"]
+    
+    C --> G["handleBreakout"]
+    D --> H["handleTrendExit"]
+    E --> I["handleLossExit"]
+    F --> J["handleVolatilityExit"]
+    
+    G --> K["ExitExecutor<br/>ExecuteFastExit"]
+    H --> K
+    I --> K
+    J --> K
+    
+    K --> L["T+0ms<br/>Cancel ALL orders"]
+    L --> M["T+100ms<br/>Wait cancellation"]
+    M --> N["T+100ms<br/>Close positions<br/>Market orders"]
+    N --> O["T+800ms<br/>Wait for fills"]
+    O --> P["T+5s<br/>Verify closure"]
+    
+    P --> Q{Position<br/>closed?}
+    Q -->|No| R["Retry close orders"]
+    Q -->|Yes| S["Transition to<br/>EXIT_ALL"]
+    
+    R --> N
+    
+    S --> T["Clear Grid"]
+    T --> U["Pause Trading"]
+    U --> V["Transition to<br/>WAIT_NEW_RANGE"]
+    
+    style K fill:#FFD700
+    style S fill:#90EE90
+    style V fill:#87CEEB
+    style C fill:#FF6347
+    style D fill:#FF6347
+    style E fill:#FF6347
+    style F fill:#FF6347
+```
+
+**Giải thích:**
+1. Exit triggers:
+   - Breakout (price outside BB)
+   - ADX spike (ADX > 25)
+   - Consecutive losses (> 3)
+   - Volatility spike (circuit breaker)
+2. Call ExitExecutor.ExecuteFastExit
+3. Fast exit sequence:
+   - T+0ms: Cancel ALL orders
+   - T+100ms: Wait cancellation complete
+   - T+100ms: Close positions (market orders)
+   - T+800ms: Wait for fills
+   - T+5s: Verify closure via cache
+4. If not closed → Retry
+5. Transition to EXIT_ALL → WAIT_NEW_RANGE
+
+---
+
+### 16.5 Flow Chờ Re-Grid (WAIT_NEW_RANGE)
+
+```mermaid
+flowchart TD
+    A["WAIT_NEW_RANGE State"] --> B{Re-grid<br/>Conditions?}
+    
+    B --> C["1. Zero open orders"]
+    B --> D["2. Zero position"]
+    B --> E["3. Range shift ≥ 0.5%"]
+    B --> F["4. BB width < 1.5x"]
+    B --> G["5. ADX < 20"]
+    
+    C --> H{All conditions<br/>met?}
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    
+    H -->|No| I["WAIT<br/>Check again in 30s"]
+    H -->|Yes| J["New Range Ready"]
+    
+    J --> K["Transition to<br/>ENTER_GRID"]
+    K --> L["placeGridOrders<br/>New grid geometry"]
+    L --> M["TRADING State<br/>Orders Active"]
+    
+    I --> B
+    
+    style A fill:#FFD700
+    style J fill:#90EE90
+    style M fill:#87CEEB
+    style I fill:#FFA500
+```
+
+**Giải thích:**
+1. WAIT_NEW_RANGE state
+2. Check 6 strict conditions:
+   - Zero open orders
+   - Zero position
+   - Range shift ≥ 0.5%
+   - BB width < 1.5x
+   - ADX < 20
+   - State = WAIT_NEW_RANGE
+3. Nếu không meet → Wait 30s, check lại
+4. Nếu meet → New range ready
+5. Transition to ENTER_GRID
+6. Place new grid orders
+7. TRADING state
+
+---
+
+### 16.6 Flow Trading Modes (ModeManager)
+
+```mermaid
+flowchart TD
+    A["ModeManager<br/>EvaluateMode"] --> B["Get Market Conditions"]
+    
+    B --> C["RangeDetector<br/>State + ADX + Breakout"]
+    C --> D{Range<br/>Active?}
+    
+    D -->|Yes| E{ADX < 25?}
+    D -->|No| F{Has ATR<br/>Bands?}
+    
+    E -->|Yes| G["STANDARD MODE<br/>Multiplier 1.0<br/>Grid trading trong BB range"]
+    E -->|No| H["TREND_ADAPTED MODE<br/>Multiplier 0.7<br/>Grid spacing rộng hơn"]
+    
+    F -->|Yes| I["MICRO MODE<br/>Multiplier 1.0<br/>Bypass range gate<br/>Dùng ATR bands"]
+    F -->|No| J{Volatility<br/>Spike?}
+    
+    J -->|Yes| K["COOLDOWN MODE<br/>Multiplier 0.0<br/>BLOCK trading<br/>10s duration"]
+    J -->|No| L{Breakout +<br/>Momentum?}
+    
+    L -->|Yes| K
+    L -->|No| I
+    
+    G --> M["Apply Parameters"]
+    H --> M
+    I --> M
+    K --> N["BLOCK Placement"]
+    
+    M --> O["CanPlaceOrder = true"]
+    N --> P["CanPlaceOrder = false"]
+    
+    O --> Q["Place Orders<br/>Theo mode"]
+    P --> R["Chờ mode change<br/>Sau 10s"]
+    
+    R --> A
+    
+    style G fill:#90EE90
+    style H fill:#FFD700
+    style I fill:#87CEEB
+    style K fill:#FF6347
+    style Q fill:#90EE90
+    style R fill:#FFA500
+```
+
+**Giải thích:**
+1. ModeManager.EvaluateMode called trước placement
+2. Get market conditions từ RangeDetector
+3. Determine mode:
+   - **STANDARD**: Range active + ADX < 25 → Grid trading trong BB range
+   - **TREND_ADAPTED**: Range active + ADX > 25 → Grid spacing rộng hơn
+   - **MICRO**: Range not active + Has ATR bands → Bypass range gate, dùng ATR bands
+   - **COOLDOWN**: Volatility spike hoặc Breakout + Momentum → BLOCK trading (10s)
+4. Apply parameters theo mode
+5. CanPlaceOrder = true/false
+6. Place orders hoặc chờ mode change
+
+---
+
+### 16.7 Flow COOLDOWN Mode (Emergency Exit + Re-entry)
+
+```mermaid
+sequenceDiagram
+    participant MM as ModeManager
+    participant CB as CircuitBreaker
+    participant EE as ExitExecutor
+    participant GM as GridManager
+    participant AGM as AdaptiveGridManager
+    
+    CB->>MM: volatility_spike detected
+    MM->>MM: EvaluateMode() → COOLDOWN
+    MM->>MM: transitionTo(COOLDOWN)
+    MM->>MM: Call onCooldownCallback()
+    
+    Note over MM: COOLDOWN Callback Triggered
+    MM->>AGM: GetActiveSymbols()
+    AGM-->>MM: [BTCUSD1, ETHUSD1, SOLUSD1]
+    
+    loop For each symbol
+        MM->>EE: ExecuteFastExit(symbol)
+        EE->>EE: Cancel ALL orders (T+0ms)
+        EE->>EE: Close positions (T+100ms)
+        EE->>EE: Verify closure (T+5s)
+        EE-->>MM: Exit sequence completed
+    end
+    
+    Note over MM: Schedule Force Placement (10s)
+    MM->>MM: time.Sleep(10s)
+    
+    Note over MM: COOLDOWN Expired
+    MM->>MM: transitionTo(MICRO, "cooldown_expired")
+    MM->>AGM: GetActiveSymbols()
+    AGM-->>MM: [BTCUSD1, ETHUSD1, SOLUSD1]
+    
+    loop For each symbol
+        MM->>GM: enqueuePlacement(symbol)
+        GM->>GM: Check gates
+        GM->>GM: placeGridOrders()
+        GM-->>MM: Orders placed
+    end
+    
+    Note over MM: Trading Resumed
+```
+
+**Giải thích:**
+1. Circuit breaker detect volatility_spike
+2. ModeManager → COOLDOWN (10s)
+3. COOLDOWN callback triggered:
+   - Get all active symbols
+   - ExecuteFastExit cho mỗi symbol
+   - Cancel orders + close positions
+4. Sau 10s → COOLDOWN expired
+5. Transition to MICRO mode
+6. Force grid placement cho tất cả symbols
+7. Trading resumed
+
+---
+
+### 16.8 Flow Balance Handling (USD1 + USDT)
+
+```mermaid
+flowchart TB
+    A["WebSocket<br/>ACCOUNT_UPDATE"] --> B["processAccountUpdate"]
+    
+    B --> C["Extract Balance Data"]
+    C --> D{Balance Data<br/>Available?}
+    
+    D -->|Yes| E["Loop through<br/>balance array"]
+    D -->|No| F["Log Warning<br/>No balance data"]
+    
+    E --> G{Asset =<br/>USD1 or USDT?}
+    G -->|Yes| H["Aggregate Balance"]
+    G -->|No| I["Skip asset"]
+    
+    H --> J["Total Wallet Balance"]
+    H --> K["Total Available Balance"]
+    H --> L["Total Margin Balance"]
+    
+    J --> M["Update Balance Cache"]
+    K --> M
+    L --> M
+    
+    M --> N["Log: Balance updated<br/>(aggregated)"]
+    N --> O["Balance Sync Worker<br/>30s interval"]
+    
+    O --> P{Balance <br/>Low?}
+    P -->|Yes| Q["Low Balance Alert<br/>available < 100"]
+    P -->|No| R["Normal"]
+    
+    Q --> S["Skip Placement<br/>Insufficient balance"]
+    R --> T["Allow Placement<br/>Balance sufficient"]
+    
+    style H fill:#90EE90
+    style M fill:#FFD700
+    style Q fill:#FF6347
+    style T fill:#87CEEB
+```
+
+**Giải thích:**
+1. WebSocket ACCOUNT_UPDATE event
+2. Extract balance data
+3. Loop through balance array
+4. Aggregate USD1 + USDT balances
+5. Update balance cache (aggregated)
+6. Balance sync worker reconcile với REST API (30s)
+7. If balance low (< 100) → Alert + Skip placement
+8. If balance sufficient → Allow placement
+
+---
+
+### 16.9 Flow Duplicate Fill Handling
+
+```mermaid
+flowchart TD
+    A["Order Fill Event<br/>WebSocket or Polling"] --> B["handleOrderFill"]
+    
+    B --> C["Validate State Transition"]
+    C --> D{Valid transition?}
+    
+    D -->|No| E["LOG WARNING<br/>Invalid transition"]
+    D -->|Yes| F["Dedup Check<br/>IsDuplicate?"]
+    
+    E --> G["SKIP<br/>Return"]
+    
+    F -->|Yes| H["LOG WARNING<br/>Duplicate detected<br/>Vẫn trigger rebalance"]
+    F -->|No| I["Process Fill"]
+    
+    H --> J["Track Position<br/>InventoryManager"]
+    I --> J
+    
+    J --> K["canRebalance?"]
+    K -->|No| L["BLOCK<br/>Risk limits"]
+    K -->|Yes| M["enqueuePlacement<br/>Trigger rebalance"]
+    
+    M --> N["Place New Order"]
+    N --> O["Continue Trading"]
+    
+    style H fill:#FFA500
+    style I fill:#90EE90
+    style M fill:#FFD700
+    style O fill:#87CEEB
+    style E fill:#FF6347
+    style L fill:#FF6347
+```
+
+**Giải thích:**
+1. Order fill event từ WebSocket hoặc Polling
+2. Validate state transition
+3. Dedup check:
+   - Nếu duplicate → LOG WARNING nhưng VẪ trigger rebalance
+   - Nếu không duplicate → Process fill
+4. Track position trong InventoryManager
+5. Check canRebalance
+6. Enqueue placement để rebalance
+7. Place new order
+8. Continue trading
+
+---
+
+### 16.10 Tóm Tắt Trading Flow
+
+```mermaid
+flowchart TB
+    Start["Start Bot"] --> Warmup["Warm-up<br/>Load 1000 candles"]
+    Warmup --> Ready["Ready to Trade"]
+    
+    Ready --> IDLE["IDLE State"]
+    IDLE --> ENTER_GRID["ENTER_GRID<br/>Range confirmed"]
+    
+    ENTER_GRID --> TRADING["TRADING State<br/>Orders Active"]
+    
+    TRADING --> Fill["Order Filled"]
+    Fill --> Rebalance["Rebalance<br/>Place new order"]
+    Rebalance --> TRADING
+    
+    TRADING --> Exit["Exit Trigger<br/>Breakout/ADX/Loss"]
+    Exit --> EXIT_ALL["EXIT_ALL<br/>Fast exit sequence"]
+    
+    EXIT_ALL --> WAIT["WAIT_NEW_RANGE<br/>Chờ stabilizing"]
+    WAIT --> Check{Re-grid<br/>conditions?}
+    
+    Check -->|No| WAIT
+    Check -->|Yes| ENTER_GRID
+    
+    TRADING --> COOLDOWN["COOLDOWN<br/>Volatility spike"]
+    COOLDOWN --> AutoExit["Auto Exit<br/>Cancel + Close"]
+    AutoExit --> Wait10s["Wait 10s"]
+    Wait10s --> MICRO["MICRO Mode<br/>Force placement"]
+    MICRO --> TRADING
+    
+    style Start fill:#FFD700
+    style TRADING fill:#90EE90
+    style EXIT_ALL fill:#FF6347
+    style WAIT fill:#FFA500
+    style COOLDOWN fill:#DC143C
+    style MICRO fill:#87CEEB
+```
+
+---
+
+*Document Version: 4.0*  
 *Last Updated: 2026-04-15*  
-*Aligns with: Core Flow Implementation (T001-T054) - Phase 1-9 Complete*
+*Aligns with: Core Flow Implementation (T001-T054) - Phase 1-9 Complete + Balance USD1+USDT + Duplicate Fill Handling*

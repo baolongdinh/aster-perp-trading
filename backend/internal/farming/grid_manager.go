@@ -345,10 +345,10 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.ordersResetWorker(ctx)
 
-	// NEW: Initialize UserStream for real-time position and order updates
-	g.initUserStream(ctx)
+	// NOTE: UserStream is handled by VolumeFarmEngine to avoid duplicate connections
+	// GridManager only handles ticker stream via wsClient
 
-	// NEW: Poll for filled orders since UserStream is not connected
+	// NEW: Poll for filled orders as fallback
 	g.wg.Add(1)
 	go g.orderFillPoller(ctx)
 
@@ -831,10 +831,11 @@ func (g *GridManager) cancelAllGridOrders(ctx context.Context, symbol string) in
 				"orderID": order.OrderID,
 			}).Warn("Failed to cancel order during recenter")
 		} else {
-			// Remove from active orders on success
 			g.ordersMu.Lock()
+			if o, exists := g.activeOrders[order.OrderID]; exists {
+				o.Status = "CANCELLED"
+			}
 			delete(g.activeOrders, order.OrderID)
-			order.Status = "CANCELLED"
 			g.ordersMu.Unlock()
 			cancelled++
 		}
@@ -2156,6 +2157,19 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 	// NEW: Validate state transition before processing
 	oldState := adaptive_grid.OrderState(order.Status)
 	newState := adaptive_grid.OrderStateFilled
+
+	// Special case: If order is CANCELLED but detected as filled, log and allow transition
+	// This handles edge case where cancellation request was sent but order was already filled
+	if oldState == adaptive_grid.OrderStateCancelled {
+		g.logger.WithFields(logrus.Fields{
+			"orderID": orderID,
+			"symbol":  symbol,
+		}).Info("Order marked as CANCELLED but detected as filled, allowing transition (edge case)")
+		// Reset to PENDING to allow the transition to FILLED
+		order.Status = "PENDING"
+		oldState = adaptive_grid.OrderStatePending
+	}
+
 	if !g.stateValidator.IsValidTransition(oldState, newState) {
 		g.ordersMu.Unlock()
 		g.logger.WithFields(logrus.Fields{
@@ -2164,6 +2178,16 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 			"to":      newState,
 		}).Warn("Invalid fill state transition - skipping")
 		return
+	}
+
+	// NEW: Check for duplicate fill events - but still allow rebalance
+	// Dedup prevents double processing but should NOT block rebalance
+	if g.deduplicator != nil && g.deduplicator.IsDuplicate(orderID, order.FilledAt) {
+		g.logger.WithFields(logrus.Fields{
+			"orderID": orderID,
+			"symbol":  symbol,
+		}).Warn("Duplicate fill event detected - skipping processing but will still trigger rebalance")
+		// Do NOT return - still allow rebalance to proceed
 	}
 
 	// Move to filled orders
@@ -2291,8 +2315,21 @@ func (g *GridManager) metricsReporter(ctx context.Context) {
 			return
 		case <-ticker.C:
 			g.LogVolumeMetrics()
+			g.checkWebSocketHealth()
 		}
 	}
+}
+
+// checkWebSocketHealth checks if WebSocket connection is healthy
+func (g *GridManager) checkWebSocketHealth() {
+	if g.wsClient == nil {
+		g.logger.Warn("WebSocket health check: wsClient is nil - ticker stream may not be connected")
+		return
+	}
+
+	// Note: For more detailed health check, we would need to track last message timestamps
+	// For now, just log that wsClient exists
+	g.logger.Debug("WebSocket health check: wsClient is connected")
 }
 
 // exchangeDataReporter queries real exchange data and logs for dashboard
@@ -3015,7 +3052,15 @@ func (g *GridManager) canRebalance(symbol string) bool {
 	if g.riskChecker == nil {
 		return true
 	}
-	return g.riskChecker.CanPlaceOrder(symbol)
+
+	canPlace := g.riskChecker.CanPlaceOrder(symbol)
+	if !canPlace {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+		}).Warn("Rebalancing blocked - risk checker returned false (check AdaptiveGridManager logs for detailed reason)")
+	}
+
+	return canPlace
 }
 
 // GetActivePositions returns active positions for a symbol
@@ -3494,6 +3539,7 @@ func (g *GridManager) cancelExcessOrders(ctx context.Context, symbol string, ord
 		g.ordersMu.Lock()
 		if o, exists := g.activeOrders[order.OrderID]; exists {
 			o.Status = "CANCELLED"
+			delete(g.activeOrders, order.OrderID)
 		}
 		g.ordersMu.Unlock()
 

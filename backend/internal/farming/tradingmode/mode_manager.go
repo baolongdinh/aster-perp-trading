@@ -24,6 +24,9 @@ type ModeManager struct {
 
 	// Cooldown tracking
 	cooldownEnd time.Time
+
+	// Callback when transitioning to COOLDOWN mode
+	onCooldownCallback func(reason string)
 }
 
 // NewModeManager creates a new mode manager
@@ -132,9 +135,23 @@ func (m *ModeManager) determineTargetMode(
 		trendingThreshold = 25.0
 	}
 
-	// Priority 1: Breakout or volatility spike -> Cooldown
-	if isBreakout || isVolatilitySpike {
+	// Priority 1: Volatility spike -> Cooldown (always)
+	if isVolatilitySpike {
 		return TradingModeCooldown
+	}
+
+	// Priority 1b: Breakout with momentum (high ADX or trending) -> Cooldown
+	// Breakout without momentum (sideways) -> Micro mode (continue trading)
+	if isBreakout {
+		if isTrending || adx > trendingThreshold {
+			// Strong breakout with trend momentum -> Cooldown
+			return TradingModeCooldown
+		}
+		// Weak breakout without momentum -> Micro mode (continue trading)
+		// This allows trading when price breaks out but doesn't have strong trend
+		if m.config.MicroMode.Enabled {
+			return TradingModeMicro
+		}
 	}
 
 	// Priority 2: Strong trend -> TrendAdapted
@@ -206,7 +223,7 @@ func (m *ModeManager) getMinModeDuration(mode TradingMode) time.Duration {
 	case TradingModeCooldown:
 		sec := m.config.CooldownMode.DurationSec
 		if sec == 0 {
-			sec = 60
+			sec = 10 // Reduced from 60s to 10s for faster re-entry
 		}
 		return time.Duration(sec) * time.Second
 	default:
@@ -245,6 +262,12 @@ func (m *ModeManager) transitionTo(newMode TradingMode, reason string) {
 		zap.String("reason", reason),
 		zap.Duration("duration_in_prev_mode", time.Since(m.modeSince)),
 	)
+
+	// Call callback if transitioning to COOLDOWN
+	if newMode == TradingModeCooldown && m.onCooldownCallback != nil {
+		m.logger.Info("Calling COOLDOWN callback to trigger exit sequence")
+		go m.onCooldownCallback(reason)
+	}
 }
 
 // buildTransitionReason builds a human-readable reason string
@@ -256,10 +279,13 @@ func (m *ModeManager) buildTransitionReason(
 	isVolatilitySpike bool,
 ) string {
 	switch {
-	case isBreakout:
-		return "breakout_detected"
 	case isVolatilitySpike:
 		return "volatility_spike"
+	case isBreakout:
+		if isTrending || adx > m.config.Transitions.ADXThresholdTrending {
+			return "breakout_with_momentum"
+		}
+		return "breakout_sideways"
 	case isTrending:
 		return "trend_detected"
 	case adx > m.config.Transitions.ADXThresholdTrending:
@@ -291,6 +317,13 @@ func (m *ModeManager) IsInCooldown() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.currentMode == TradingModeCooldown && time.Now().Before(m.cooldownEnd)
+}
+
+// SetOnCooldownCallback sets callback function to be called when transitioning to COOLDOWN
+func (m *ModeManager) SetOnCooldownCallback(callback func(reason string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onCooldownCallback = callback
 }
 
 // GetCooldownRemaining returns remaining cooldown duration

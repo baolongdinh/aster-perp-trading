@@ -431,7 +431,19 @@ func (a *AdaptiveGridManager) SetExitExecutor(executor interface{}) {
 	a.exitExecutor = executor
 }
 
-// SetModeManager wires the mode manager for trading mode evaluation
+// GetActiveSymbols returns all symbols with active range detectors
+func (a *AdaptiveGridManager) GetActiveSymbols() []string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	symbols := make([]string, 0, len(a.rangeDetectors))
+	for symbol := range a.rangeDetectors {
+		symbols = append(symbols, symbol)
+	}
+	return symbols
+}
+
+// SetModeManager sets the mode manager reference trading mode evaluation
 func (a *AdaptiveGridManager) SetModeManager(manager interface{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
