@@ -43,12 +43,12 @@ func (s GridState) String() string {
 type GridEvent int
 
 const (
-	EventRangeConfirmed GridEvent = iota  // WAIT_NEW_RANGE -> ENTER_GRID
-	EventEntryPlaced                       // ENTER_GRID -> TRADING
-	EventTrendExit                         // TRADING -> EXIT_ALL
-	EventEmergencyExit                     // TRADING -> EXIT_ALL (emergency)
-	EventPositionsClosed                     // EXIT_ALL -> WAIT_NEW_RANGE
-	EventNewRangeReady                     // WAIT_NEW_RANGE -> ENTER_GRID
+	EventRangeConfirmed  GridEvent = iota // WAIT_NEW_RANGE -> ENTER_GRID
+	EventEntryPlaced                      // ENTER_GRID -> TRADING
+	EventTrendExit                        // TRADING -> EXIT_ALL
+	EventEmergencyExit                    // TRADING -> EXIT_ALL (emergency)
+	EventPositionsClosed                  // EXIT_ALL -> WAIT_NEW_RANGE
+	EventNewRangeReady                    // WAIT_NEW_RANGE -> ENTER_GRID
 )
 
 // String returns the string representation of a GridEvent
@@ -73,11 +73,11 @@ func (e GridEvent) String() string {
 
 // SymbolState tracks the state for a specific symbol
 type SymbolState struct {
-	State           GridState
-	LastTransition  time.Time
-	EntryTime       time.Time
-	ExitTime        time.Time
-	ConsecutiveLosses int
+	State                GridState
+	LastTransition       time.Time
+	EntryTime            time.Time
+	ExitTime             time.Time
+	ConsecutiveLosses    int
 	RegridCooldownActive bool
 	RegridCooldownUntil  time.Time
 }
@@ -107,6 +107,18 @@ func (sm *GridStateMachine) GetState(symbol string) GridState {
 		return GridStateIdle
 	}
 	return state.State
+}
+
+// GetStateTime returns the timestamp of the last state transition for a symbol
+func (sm *GridStateMachine) GetStateTime(symbol string) time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	state, exists := sm.states[symbol]
+	if !exists {
+		return time.Time{}
+	}
+	return state.LastTransition
 }
 
 // GetSymbolState returns the full state info for a symbol

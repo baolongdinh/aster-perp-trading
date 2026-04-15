@@ -8,6 +8,12 @@ node_modules
 *.pid
 bin/
 
+# Go-specific patterns
+*.exe
+*.test
+*.out
+vendor/
+
 # Activity log data
 data/activity/
 *.db

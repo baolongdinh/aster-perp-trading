@@ -44,9 +44,9 @@ max_total_drawdown_pct: 50.0
 order_size_usdt: 20.5
 
 # grid_spread_pct: Spread giữa các lệnh
-# 0.6% = wider for high leverage (100x), reduces liquidation risk
-# Lãi ~0.4% sau phí (0.05% maker × 2)
-grid_spread_pct: 0.006
+# 0.15% = chặt hơn, fill nhanh hơn, nhiều volume hơn
+# Lãi ~0.05% sau phí (0.05% maker × 2)
+grid_spread_pct: 0.0015
 
 # max_orders_per_side: Số lệnh tối đa mỗi bên
 # TĂNG LÊN: 10 lệnh mỗi bên = 20 lệnh total
@@ -146,7 +146,7 @@ funding_rate:
 # ---------------------------------------------------------------------------
 dynamic_grid:
   enabled: true
-  base_spread_pct: 0.006    # 0.6% - spread cơ bản (wider for high leverage)
+  base_spread_pct: 0.0015    # 0.15% - spread cơ bản
   low_atr_threshold: 0.3       # ATR < 0.3% = low volatility
   normal_atr_threshold: 0.8  # ATR 0.3-0.8% = normal
   high_atr_threshold: 1.5    # ATR 0.8-1.5% = high
@@ -174,13 +174,13 @@ partial_close:
   enabled: true
   tp1:
     close_pct: 0.30             # Đóng 30% tại TP1
-    profit_pct: 0.008           # 0.8% lãi
+    profit_pct: 0.005           # 0.5% lãi
   tp2:
     close_pct: 0.40             # Đóng 40% tại TP2
-    profit_pct: 0.015           # 1.5% lãi
+    profit_pct: 0.01            # 1.0% lãi
   tp3:
     close_pct: 0.30             # Đóng 30% tại TP3
-    profit_pct: 0.02            # 2.0% lãi
+    profit_pct: 0.015            # 1.5% lãi
   trailing_after_tp2: true      # Bật trailing stop sau TP2
   trailing_distance: 0.005      # Trailing 0.5%
 
@@ -224,13 +224,13 @@ risk:
   # max_pending_per_side: Số lệnh pending tối đa mỗi bên
   max_pending_per_side: 10
 
-  # per_trade_stop_loss_pct: 1.0% (wider for high leverage safety)
-  # Với leverage cao, SL rộng hơn để tránh bị quét
-  per_trade_stop_loss_pct: 1.0
+  # per_trade_stop_loss_pct: 0.5% (cho 50x-100x leverage)
+  # Với leverage cao, SL rộng hơn một chút để tránh bị quét
+  per_trade_stop_loss_pct: 0.5
 
-  # per_trade_take_profit_pct: 0.6% (wider for realistic targets)
-  # Chốt lời rộng hơn = nhiều hit hơn = ít stuck positions
-  per_trade_take_profit_pct: 0.6
+  # per_trade_take_profit_pct: 0.3% (chặt cho high volume)
+  # Chốt lời nhanh = nhiều giao dịch hơn = nhiều volume hơn
+  per_trade_take_profit_pct: 0.3
 
   risk_per_trade_usdt: 1.5     # Rủi ro mỗi giao dịch tăng theo size
   atr_multiplier: 0.5             # Không dùng ATR cho vốn nhỏ

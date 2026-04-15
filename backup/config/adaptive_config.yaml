@@ -57,15 +57,15 @@ regimes:
   # ---------------------------------------------------------------------------
   trending:
     # order_size_usdt: GIẢM để an toàn khi trending
-    #   - $0.5-1: An toàn (KHUYẾN NGHĨ)
+    #   - $0.5-1: An toàn (KHUYẾN NGHỊ)
     #   - $2-3: Risk hơn nhưng nhiều profit
-    order_size_usdt: 0.8
+    order_size_usdt: 1.0
 
-    # grid_spread_pct: Tăng để phù hợp với high leverage
-    #   - 0.2%: Rộng, ít bị hit (KHUYẾN NGHĨ trending)
-    grid_spread_pct: 0.2
+    # grid_spread_pct: Tăng để tránh bị hit liên tục
+    #   - 0.1-0.2%: Rộng, ít bị hit (KHUYẾN NGHỊ trending)
+    grid_spread_pct: 0.15
 
-    max_orders_per_side: 5
+    max_orders_per_side: 2
     max_daily_loss_usdt: 1.0
     position_timeout_minutes: 5
 
@@ -75,13 +75,13 @@ regimes:
   # ---------------------------------------------------------------------------
   ranging:
     # order_size_usdt: TĂNG để farm nhiều khi ranging
-    #   - $2-3: Nhanh farm (KHUYẾN NGHĨ)
+    #   - $2-3: Nhanh farm (KHUYẾN NGHỊ)
     #   - $5+: Rất nhanh nhưng risk fakeout
     order_size_usdt: 2.0
 
-    # grid_spread_pct: Tăng để phù hợp với high leverage (100x)
-    #   - 0.06%: Wider, giảm liquidation risk (KHUYẾN NGHĨ)
-    grid_spread_pct: 0.06
+    # grid_spread_pct: Giảm để nhiều lệnh hơn
+    #   - 0.01-0.02%: Chặt, nhiều volume (KHUYẾN NGHỊ)
+    grid_spread_pct: 0.02
 
     max_orders_per_side: 10
     max_daily_loss_usdt: 2.0
@@ -96,9 +96,9 @@ regimes:
     #   - $1+: Risk liquidation
     order_size_usdt: 0.5
 
-    # grid_spread_pct: Tăng để phù hợp với high leverage
-    #   - 0.15%: Rộng, ít orders (KHUYẾN NGHĨ volatile)
-    grid_spread_pct: 0.15
+    # grid_spread_pct: Rộng để tránh bị hit liên tục
+    #   - 0.1%: Rộng, ít orders (KHUYẾN NGHỊ volatile)
+    grid_spread_pct: 0.1
 
     max_orders_per_side: 4
     max_daily_loss_usdt: 1.0

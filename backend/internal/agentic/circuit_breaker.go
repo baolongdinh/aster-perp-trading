@@ -376,10 +376,12 @@ func (cb *CircuitBreaker) tripSymbol(symbol string, state *SymbolDecisionState, 
 		zap.String("reason", reason),
 		zap.Time("time", state.tripTime))
 
-	// Call callback on first trip only (to trigger emergency exit)
-	if !wasAlreadyTripped && cb.onTripCallback != nil {
+	// Call callback on EVERY trip to trigger emergency exit
+	// This ensures positions are closed even after circuit breaker resets and trips again
+	if cb.onTripCallback != nil {
 		cb.logger.Info("Calling onTripCallback to trigger emergency exit",
-			zap.String("symbol", symbol))
+			zap.String("symbol", symbol),
+			zap.Bool("was_already_tripped", wasAlreadyTripped))
 		cb.onTripCallback(symbol, reason)
 	}
 }

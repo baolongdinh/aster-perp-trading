@@ -2203,16 +2203,6 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 		return
 	}
 
-	// NEW: Check for duplicate fill events - but still allow rebalance
-	// Dedup prevents double processing but should NOT block rebalance
-	if g.deduplicator != nil && g.deduplicator.IsDuplicate(orderID, order.FilledAt) {
-		g.logger.WithFields(logrus.Fields{
-			"orderID": orderID,
-			"symbol":  symbol,
-		}).Warn("Duplicate fill event detected - skipping processing but will still trigger rebalance")
-		// Do NOT return - still allow rebalance to proceed
-	}
-
 	// Move to filled orders
 	order.Status = "FILLED"
 	order.FilledAt = time.Now()

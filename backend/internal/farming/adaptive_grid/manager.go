@@ -1013,8 +1013,8 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 	ticker := time.NewTicker(a.riskConfig.PositionCheckInterval)
 	defer ticker.Stop()
 
-	// Additional ticker for checking resume conditions (less frequent)
-	resumeCheckTicker := time.NewTicker(10 * time.Second)
+	// Additional ticker for checking resume conditions (every 5 seconds)
+	resumeCheckTicker := time.NewTicker(5 * time.Second)
 	defer resumeCheckTicker.Stop()
 
 	// NEW: Funding rate check ticker (every 5 minutes)
@@ -1467,7 +1467,18 @@ func (a *AdaptiveGridManager) logBlockingChecksStatus() {
 			zap.Bool("exceeded_hard_cap", position.NotionalValue >= hardCap))
 	}
 
-	// 4. Trading paused status
+	// 4. State machine status
+	if a.stateMachine != nil {
+		for symbol := range a.tradingPaused {
+			state := a.stateMachine.GetState(symbol)
+			a.logger.Info("State Machine Status",
+				zap.String("symbol", symbol),
+				zap.String("state", state.String()),
+				zap.Bool("can_place_orders", a.stateMachine.CanPlaceOrders(symbol)))
+		}
+	}
+
+	// 5. Trading paused status
 	pausedSymbols := make([]string, 0)
 	for symbol, paused := range a.tradingPaused {
 		if paused {
@@ -1702,6 +1713,7 @@ func (a *AdaptiveGridManager) emergencyClosePosition(ctx context.Context, symbol
 
 	qty := fmt.Sprintf("%.6f", math.Abs(positionAmt))
 
+	// Try with ReduceOnly first
 	orderReq := client.PlaceOrderRequest{
 		Symbol:        symbol,
 		Side:          side,
@@ -1711,28 +1723,46 @@ func (a *AdaptiveGridManager) emergencyClosePosition(ctx context.Context, symbol
 		ClosePosition: true,
 	}
 
-	a.logger.Warn("EMERGENCY CLOSE - Placing market order",
+	a.logger.Warn("EMERGENCY CLOSE - Placing market order (with ReduceOnly)",
 		zap.String("symbol", symbol),
 		zap.String("side", side),
 		zap.String("qty", qty))
 
 	order, err := a.futuresClient.PlaceOrder(ctx, orderReq)
 	if err != nil {
-		a.logger.Error("Failed to emergency close position", zap.Error(err))
-		return
+		a.logger.Warn("Emergency close with ReduceOnly failed, retrying without ReduceOnly",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+
+		// Retry without ReduceOnly
+		orderReq.ReduceOnly = false
+		order, err = a.futuresClient.PlaceOrder(ctx, orderReq)
+		if err != nil {
+			a.logger.Error("Failed to emergency close position even without ReduceOnly - symbol may be stuck",
+				zap.String("symbol", symbol),
+				zap.Error(err))
+			// Don't return - allow the symbol to potentially resume trading despite the failure
+			// This prevents getting stuck forever in WAIT_NEW_RANGE
+		}
 	}
 
-	a.logger.Info("Position closed successfully",
-		zap.String("symbol", symbol),
-		zap.Int64("order_id", order.OrderID))
+	if err == nil {
+		a.logger.Info("Position closed successfully",
+			zap.String("symbol", symbol),
+			zap.Int64("order_id", order.OrderID))
 
-	// Clear position tracking
-	a.mu.Lock()
-	delete(a.positions, symbol)
-	delete(a.positionStopLoss, symbol)
-	delete(a.trailingStopPrice, symbol)
-	delete(a.positionTakeProfit, symbol)
-	a.mu.Unlock()
+		// Clear position tracking
+		a.mu.Lock()
+		delete(a.positions, symbol)
+		delete(a.positionStopLoss, symbol)
+		delete(a.trailingStopPrice, symbol)
+		delete(a.positionTakeProfit, symbol)
+		a.mu.Unlock()
+	} else {
+		a.logger.Error("Emergency close failed - position remains open, symbol may resume with existing position",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+	}
 
 	// Clear grid and transition to WAIT_NEW_RANGE. Re-entry must go through regrid readiness.
 	if a.gridManager != nil {
@@ -1746,7 +1776,6 @@ func (a *AdaptiveGridManager) emergencyClosePosition(ctx context.Context, symbol
 		}
 	}
 
-	a.pauseTrading(symbol)
 	a.markExitCompleted(symbol)
 	a.logger.Info("Trading moved to WAIT_NEW_RANGE after emergency close",
 		zap.String("symbol", symbol))
@@ -1881,21 +1910,58 @@ func (a *AdaptiveGridManager) TryResumeTrading(symbol string) bool {
 	}
 
 	// Require full regrid readiness while waiting for a new range.
+	// However, add a timeout to prevent getting stuck forever if emergency close failed
 	if stateMachine != nil && stateMachine.GetState(symbol) == GridStateWaitNewRange {
-		if !a.isReadyForRegrid(symbol) {
+		// Check how long we've been in WAIT_NEW_RANGE
+		stateTime := stateMachine.GetStateTime(symbol)
+		waitDuration := time.Since(stateTime)
+		maxWaitTime := 10 * time.Minute // Force resume after 10 minutes
+
+		if waitDuration > maxWaitTime {
+			a.logger.Warn("WAIT_NEW_RANGE timeout - forcing resume to prevent stuck state",
+				zap.String("symbol", symbol),
+				zap.Duration("waited", waitDuration),
+				zap.Duration("max_wait", maxWaitTime))
+			// Force resume despite not meeting all regrid conditions
+		} else if !a.isReadyForRegrid(symbol) {
+			a.logger.Debug("Waiting for regrid conditions",
+				zap.String("symbol", symbol),
+				zap.String("state", stateMachine.GetState(symbol).String()),
+				zap.Duration("waited", waitDuration),
+				zap.Duration("remaining", maxWaitTime-waitDuration))
 			return false
 		}
+
 		if stateMachine.CanTransition(symbol, EventNewRangeReady) {
 			stateMachine.Transition(symbol, EventNewRangeReady)
 		}
 		stateMachine.ClearRegridCooldown(symbol)
 	}
 
-	// Check if range is active and regrid conditions are satisfied.
-	if detector.ShouldTrade() && a.isReadyForRegrid(symbol) {
-		a.logger.Info("Price stabilized - Range is active, resuming trading",
+	// Check if range is active and trading is allowed
+	// For WAIT_NEW_RANGE state, we already checked isReadyForRegrid above
+	// For other states, just check if range detector allows trading
+	currentState := GridStateIdle
+	if stateMachine != nil {
+		currentState = stateMachine.GetState(symbol)
+	}
+
+	canResume := false
+	if currentState == GridStateWaitNewRange {
+		// Already checked isReadyForRegrid above, just need range to be active
+		canResume = detector.ShouldTrade()
+	} else {
+		// For other states, just check if range allows trading (don't require zero position)
+		canResume = detector.ShouldTrade()
+	}
+
+	if canResume {
+		currentRegime := a.GetCurrentRegime(symbol)
+		a.logger.Info("Resuming trading - Range is active",
 			zap.String("symbol", symbol),
-			zap.String("range_state", detector.GetStateString()))
+			zap.String("range_state", detector.GetStateString()),
+			zap.String("current_state", currentState.String()),
+			zap.String("regime", string(currentRegime)))
 		a.resumeTrading(symbol)
 		if a.gridManager != nil {
 			if err := a.gridManager.RebuildGrid(context.Background(), symbol); err != nil {
@@ -1983,6 +2049,25 @@ func (a *AdaptiveGridManager) OnRegimeChange(symbol string, oldRegime, newRegime
 		zap.String("from", string(oldRegime)),
 		zap.String("to", string(newRegime)),
 		zap.Time("timestamp", a.lastRegimeChange[symbol]))
+
+	// CRITICAL: Automatically trigger HandleRegimeTransition for parameter switching
+	// Run in goroutine to avoid blocking the price update loop
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := a.HandleRegimeTransition(ctx, symbol, oldRegime, newRegime); err != nil {
+			a.logger.Error("Failed to handle regime transition",
+				zap.String("symbol", symbol),
+				zap.String("from", string(oldRegime)),
+				zap.String("to", string(newRegime)),
+				zap.Error(err))
+		} else {
+			a.logger.Info("Regime transition completed successfully",
+				zap.String("symbol", symbol),
+				zap.String("regime", string(newRegime)))
+		}
+	}()
 }
 
 // IsInTransitionCooldown checks if symbol is in transition cooldown
@@ -2193,8 +2278,7 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 				zap.String("symbol", symbol),
 				zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
 				zap.Duration("remaining", cooldownDuration-time.Since(lastLoss)))
-			return false
-			// Volume farming: Vẫn cho phép nhưng log warning - không return false
+			// Volume farming: Vẫn cho phép rebalance - không block
 		} else {
 			// Cooldown expired - reset
 			a.cooldownActive[symbol] = false
@@ -2208,8 +2292,7 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 			a.logger.Debug("CanPlaceOrder: transition cooldown active but allowing for volume farming",
 				zap.String("symbol", symbol),
 				zap.Duration("elapsed", time.Since(cooldown)))
-			return false
-			// Volume farming: Không return false, vẫn cho phép
+			// Volume farming: Vẫn cho phép rebalance - không block
 		}
 	}
 
@@ -2244,9 +2327,8 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 			a.logger.Warn("CanPlaceOrder: max exposure reached but allowing rebalance for volume farming",
 				zap.Float64("utilization", utilization*100),
 				zap.Float64("max_exposure", maxExposure))
-			return false
-			// Volume farming: Vẫn cho phép rebalance, size sẽ được điều chỉnh tự động
-			// Không return false để không block việc thay thế lệnh đã fill
+			// Volume farming: Vẫn cho phép rebalance - không block
+			// Size sẽ được điều chỉnh tự động trong order placement logic
 		}
 	}
 
@@ -2613,6 +2695,21 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 	// This enables the "con rắn săn mồi" - patience mechanism + breakout protection
 	a.UpdatePriceForRange(symbol, high, low, close)
 	a.logger.Warn(">>> RANGE UPDATE DONE <<<")
+
+	// CRITICAL: Feed RegimeDetector for regime detection (ranging/trending/volatile)
+	// This enables automatic regime-based parameter switching
+	if a.regimeDetector != nil {
+		oldRegime := a.GetCurrentRegime(symbol)
+		newRegime := a.regimeDetector.DetectRegime(symbol, close)
+		if oldRegime != newRegime {
+			a.logger.Info("Regime change detected",
+				zap.String("symbol", symbol),
+				zap.String("from", string(oldRegime)),
+				zap.String("to", string(newRegime)))
+			a.OnRegimeChange(symbol, oldRegime, newRegime)
+		}
+	}
+	a.logger.Warn(">>> REGIME DETECTION DONE <<<")
 }
 
 // RecordTradeResult records trade result for loss tracking with cooldown
@@ -2846,7 +2943,7 @@ func (a *AdaptiveGridManager) handleStrongTrend(ctx context.Context, symbol stri
 	if a.trendDetector != nil {
 		trendScore = a.trendDetector.GetTrendScore()
 	}
-	a.logger.Error("STRONG TREND DETECTED - Closing ALL orders and positions!",
+	a.logger.Error("STRONG TREND DETECTED - Closing ALL orders and positions for this symbol",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
 		zap.String("trend_state", state.String()),
@@ -2855,9 +2952,9 @@ func (a *AdaptiveGridManager) handleStrongTrend(ctx context.Context, symbol stri
 }
 
 // handleBreakout handles breakout detection - STRICT risk management
-// Khi breakout: đóng TẤT CẢ lệnh và position, sau đó chờ BB tạo range mới
+// Khi breakout: đóng TẤT CẢ lệnh và position CỦA SYMBOL ĐÓ, sau đó chờ BB tạo range mới
 func (a *AdaptiveGridManager) handleBreakout(ctx context.Context, symbol string, currentPrice float64) {
-	a.logger.Error("BREAKOUT DETECTED - Closing ALL orders and positions immediately!",
+	a.logger.Error("BREAKOUT DETECTED - Closing ALL orders and positions for this symbol",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice))
 
@@ -2932,6 +3029,9 @@ func (a *AdaptiveGridManager) ExitAll(ctx context.Context, symbol string, event 
 		zap.String("reason", reason),
 		zap.String("event", event.String()))
 
+	// CRITICAL: Pause trading IMMEDIATELY to prevent grid manager from placing orders during exit
+	a.pauseTrading(symbol)
+
 	a.markExitAll(symbol, event)
 
 	if a.gridManager != nil {
@@ -2963,7 +3063,6 @@ func (a *AdaptiveGridManager) ExitAll(ctx context.Context, symbol string, event 
 					zap.Error(err))
 			}
 		}
-		a.pauseTrading(symbol)
 		a.markExitCompleted(symbol)
 	}
 
@@ -3713,12 +3812,13 @@ func (a *AdaptiveGridManager) GetLiquidationTierStatus(symbol string) map[string
 }
 
 // isReadyForRegrid checks if all conditions are met for re-gridding after exit
-// Strict conditions per spec:
-//  1. Zero open orders AND zero position
-//  2. Range shift ≥ 0.5% from last accepted range
-//  3. BB width contraction (< 1.5x average)
-//  4. ADX < 20 for ≥ 3 consecutive candles
-//  5. Current state is WAIT_NEW_RANGE
+// For volume farming: MODERATE conditions - wait for market stabilization
+//  1. Zero open orders AND zero position (REQUIRED)
+//  2. Current state is WAIT_NEW_RANGE (REQUIRED)
+//  3. No regrid cooldown (REQUIRED)
+//  4. ADX < 25 (relaxed from 20 for faster resume)
+//  5. BB width contraction (< 1.8x average, relaxed from 1.5x)
+//  6. Range shift ≥ 0.3% (relaxed from 0.5%)
 //
 // This function is called to determine if we can transition from WAIT_NEW_RANGE to ENTER_GRID
 func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
@@ -3727,16 +3827,34 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 
 	if a.stateMachine != nil {
 		if a.stateMachine.GetState(symbol) != GridStateWaitNewRange {
+			a.logger.Debug("Regrid check: not in WAIT_NEW_RANGE state",
+				zap.String("symbol", symbol),
+				zap.String("state", a.stateMachine.GetState(symbol).String()))
 			return false
 		}
 		if a.stateMachine.IsRegridCooldownActive(symbol) {
+			a.logger.Debug("Regrid check: cooldown active",
+				zap.String("symbol", symbol))
 			return false
 		}
 	}
 
-	// Must have zero tracked position before re-entry.
-	if position, exists := a.positions[symbol]; exists && position != nil && math.Abs(position.PositionAmt) > 0 {
-		return false
+	// Must have zero or negligible position before re-entry.
+	// For volume farming, allow tiny positions (< 10 USDT notional) to avoid blocking on dust
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		if math.Abs(position.PositionAmt) > 0 && position.NotionalValue >= 10.0 {
+			a.logger.Debug("Regrid check: position not zero",
+				zap.String("symbol", symbol),
+				zap.Float64("position_amt", position.PositionAmt),
+				zap.Float64("notional", position.NotionalValue))
+			return false
+		}
+		if math.Abs(position.PositionAmt) > 0 && position.NotionalValue < 10.0 {
+			a.logger.Info("Regrid check: ignoring dust position",
+				zap.String("symbol", symbol),
+				zap.Float64("position_amt", position.PositionAmt),
+				zap.Float64("notional", position.NotionalValue))
+		}
 	}
 
 	detector, exists := a.rangeDetectors[symbol]
@@ -3745,16 +3863,16 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 		return false
 	}
 
-	// Condition 4: ADX < 20 for sideways market
+	// Condition 4: ADX < 25 (relaxed from 20 for faster resume)
 	avgADX := detector.averageADXLocked()
-	if avgADX >= 20.0 {
+	if avgADX >= 25.0 {
 		a.logger.Debug("Regrid check: ADX too high",
 			zap.String("symbol", symbol),
 			zap.Float64("avg_adx", avgADX))
 		return false
 	}
 
-	// Condition 3: BB width contraction check
+	// Condition 3: BB width contraction check (relaxed to 1.8x from 1.5x)
 	currentRange := detector.currentRange
 	lastAccepted := detector.lastAcceptedRange
 	if currentRange == nil || lastAccepted == nil {
@@ -3765,29 +3883,33 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 		return false
 	}
 
-	// Check BB width contraction (current width < 1.5x last accepted)
+	// Check BB width contraction (current width < 1.8x last accepted)
 	widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
-	if widthRatio >= 1.5 {
-		a.logger.Debug("Regrid check: BB width not contracted",
+	if widthRatio >= 1.8 {
+		a.logger.Debug("Regrid check: BB width not contracted enough",
 			zap.String("symbol", symbol),
 			zap.Float64("width_ratio", widthRatio))
 		return false
 	}
 
-	// Condition 2: Range shift ≥ 0.5% from last accepted range center
+	// Condition 2: Range shift ≥ 0.3% (relaxed from 0.5% for faster resume)
 	centerShiftPct := math.Abs(currentRange.MidPrice-lastAccepted.MidPrice) / lastAccepted.MidPrice
-	if centerShiftPct < 0.005 { // 0.5% minimum shift
+	if centerShiftPct < 0.003 { // 0.3% minimum shift
 		a.logger.Debug("Regrid check: range shift too small",
 			zap.String("symbol", symbol),
 			zap.Float64("center_shift_pct", centerShiftPct))
 		return false
 	}
 
-	a.logger.Info("Regrid ready: all conditions met",
+	// Get current regime for context
+	currentRegime := a.GetCurrentRegime(symbol)
+
+	a.logger.Info("Regrid ready: market stabilization conditions met",
 		zap.String("symbol", symbol),
 		zap.Float64("avg_adx", avgADX),
 		zap.Float64("width_ratio", widthRatio),
-		zap.Float64("center_shift_pct", centerShiftPct))
+		zap.Float64("center_shift_pct", centerShiftPct),
+		zap.String("regime", string(currentRegime)))
 
 	return true
 }
