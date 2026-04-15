@@ -1,39 +1,83 @@
 # AGENTIC TRADING - Technical Flow & Architecture
 
-## 1. Tổng Quan Kiến Trúc (Unified State Machine)
+## 1. Tổng Quan Kiến Trúc (Unified State Machine - Updated)
 
+**Kiến trúc hệ thống v3.0:**
+
+```mermaid
+flowchart TB
+    subgraph Data["Data Layer"]
+        WS1["WebSocket<br/>@kline_1m"]
+        WS2["User Data Stream<br/>ACCOUNT_UPDATE<br/>ORDER_TRADE_UPDATE"]
+    end
+
+    subgraph Core["Core Engine"]
+        RD["RangeDetector<br/>State: Unknown→Active"]
+        MM["ModeManager<br/>4 Trading Modes"]
+        FE["4-Factor Engine<br/>Scoring 0-100"]
+        GSM["GridStateMachine<br/>5 States"]
+    end
+
+    subgraph Execution["Execution Layer"]
+        AGM["AdaptiveGridManager<br/>CanPlaceOrder"]
+        GM["GridManager<br/>Order placement"]
+        EE["ExitExecutor<br/>Fast exit"]
+        SM["SyncManager<br/>3 Workers"]
+    end
+
+    subgraph Cache["Cache Layer"]
+        WC["WebSocket Cache<br/>Orders/Pos/Bal"]
+    end
+
+    subgraph Exchange["Exchange"]
+        API["REST API<br/>Fallback"]
+        WSS["WebSocket Server"]
+    end
+
+    WS1 --> RD
+    WS2 --> WC
+
+    RD --> MM
+    FE --> MM
+    RD --> GSM
+    MM --> AGM
+
+    AGM --> GM
+    GSM --> GM
+
+    AGM --> EE
+    GSM --> EE
+
+    WC --> SM
+    SM --> WC
+
+    WC --> GM
+    WC --> EE
+
+    GM --> API
+    EE --> API
+    SM --> API
+
+    WS1 --> WSS
+    WS2 --> WSS
+
+    style Data fill:#E6E6FA
+    style Core fill:#90EE90
+    style Execution fill:#FFD700
+    style Cache fill:#87CEEB
+    style Exchange fill:#FF6347
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    UNIFIED AGENTIC TRADING SYSTEM                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │              UNIFIED STATE MACHINE (5 States)                    │   │
-│  │                                                                  │   │
-│  │   IDLE → ENTER_GRID → TRADING → EXIT_ALL → WAIT_NEW_RANGE       │   │
-│  │                     ↑___________________________________________│   │
-│  └──────────────────────────────────────────────────────────────────┘   │
-│                              │                                          │
-│         ┌────────────────────┼────────────────────┐                     │
-│         ↓                    ↓                    ↓                     │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
-│  │ Data Layer   │    │ Core Engine  │    │ Execution    │              │
-│  │ (Market Data)│    │ (Decision)   │    │ (Grid/Trade) │              │
-│  └──────────────┘    └──────────────┘    └──────────────┘              │
-│         │                   │                   │                        │
-│         ↓                   ↓                   ↓                        │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
-│  │ Real-time    │    │ 4 Factors    │    │ Real-time    │              │
-│  │ Exit Monitor │    │ Scoring      │    │ Exit Signals │              │
-│  │ (100ms tick) │    │ + State Mgmt │    │ (ADX/BB)     │              │
-│  └──────────────┘    └──────────────┘    └──────────────┘              │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
 
-State Machine Controls:
+**NEW COMPONENTS (Phase 2-8):**
+- ModeManager: MICRO/STANDARD/TREND_ADAPTED/COOLDOWN modes
+- ExitExecutor: Fast exit sequence (T+0ms cancel, T+100ms close)
+- SyncManager: Order/Position/Balance sync workers (30s interval)
+- WebSocket Cache: Real-time cache with auto-sync from user data stream
+
+**State Machine Controls:**
 - RangeDetector: Unknown → Establishing → Active → Breakout → Stabilizing
 - GridStateMachine: IDLE → ENTER_GRID → TRADING → EXIT_ALL → WAIT_NEW_RANGE
-```
+- ModeManager: Evaluate trading mode based on market conditions
 
 ---
 
@@ -41,17 +85,17 @@ State Machine Controls:
 
 ### 2.1 Warm-up Flow (Khởi Động)
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Start Bot  │────→│ REST API    │────→│ 1000 Candle │────→│ Indicator   │
-│             │     │ /klines     │     │ Pre-load    │     │ Calculate   │
-└─────────────┘     └─────────────┘     └─────────────┘     └──────┬──────┘
-                                                                    │
-                                                                    ↓
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Ready to   │←────│ Regime      │←────│ ADX/BB/ATR  │
-│  Trade      │     │ Detect      │     │ EMAs        │
-└─────────────┘     └─────────────┘     └─────────────┘
+```mermaid
+flowchart LR
+    A["Start Bot"] --> B["REST API<br/>/klines"]
+    B --> C["1000 Candles<br/>Pre-load"]
+    C --> D["Indicator<br/>Calculate"]
+    D --> E["ADX/BB/ATR<br/>EMAs"]
+    E --> F["Regime<br/>Detect"]
+    F --> G["Ready to<br/>Trade"]
+
+    style A fill:#FFD700
+    style G fill:#90EE90
 ```
 
 **Mô tả:**
@@ -62,29 +106,26 @@ State Machine Controls:
 
 ### 2.2 Real-time Flow (Vận Hành)
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ WebSocket   │────→│ New Candle  │────→│ Slide       │────→│ Update      │
-│ @kline_1m   │     │ Arrival     │     │ Window      │     │ Indicators  │
-└─────────────┘     └─────────────┘     │ (1000 max)  │     └──────┬──────┘
-                                        └─────────────┘            │
-                                                                   ↓
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ 4 Factors   │←────│ Regime      │←────│ Detect      │←────│ Recalculate │
-│ Scoring     │     │ Change?     │     │ Regime      │     │ All         │
-└──────┬──────┘     └─────────────┘     └─────────────┘     └─────────────┘
-       │
-       ↓
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Score 0-100 │────→│ Pattern     │────→│ Position    │────→│ Grid        │
-│             │     │ Matching    │     │ Sizing      │     │ Adapter     │
-└─────────────┘     └─────────────┘     └─────────────┘     └──────┬──────┘
-                                                                    │
-                                                                    ↓
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Decision    │←────│ Circuit     │←────│ Execute/    │←────│ Grid Params │
-│ Log         │     │ Breakers?   │     │ Wait        │     │ Applied     │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```mermaid
+flowchart TB
+    WS["WebSocket<br/>@kline_1m"] --> NC["New Candle<br/>Arrival"]
+    NC --> SW["Slide Window<br/>1000 max"]
+    SW --> UI["Update<br/>Indicators"]
+    UI --> RC["Recalculate<br/>All"]
+    RC --> DR["Detect<br/>Regime"]
+    DR --> RC2["Regime<br/>Change?"]
+    RC2 --> FS["4 Factors<br/>Scoring"]
+    FS --> S0["Score 0-100"]
+    S0 --> PM["Pattern<br/>Matching"]
+    PM --> PS["Position<br/>Sizing"]
+    PS --> GA["Grid<br/>Adapter"]
+    GA --> GP["Grid Params<br/>Applied"]
+    GP --> EW["Execute/<br/>Wait"]
+    EW --> CB["Circuit<br/>Breakers?"]
+    CB --> DL["Decision<br/>Log"]
+
+    style WS fill:#E6E6FA
+    style DL fill:#90EE90
 ```
 
 **Mô tả (V2 - Unified State Machine):**
@@ -97,53 +138,110 @@ State Machine Controls:
 - **T011**: Multi-layer liquidation protection (4-tier: warn→reduce50%→close→hedge)
 - State machine điều khiển placement gating, không chỉ là advisory
 
+### 2.3 ModeManager Flow (Mới - Phase 2)
+
+```mermaid
+flowchart TD
+    A["RangeDetector<br/>State + ADX + Breakout"] --> B{Range<br/>Active?}
+    B -->|Có| C{ADX < 25?}
+    B -->|Không| D{Has<br/>ATR Bands?}
+    C -->|Có| E["STANDARD<br/>Multiplier 1.0"]
+    C -->|Không| F["TREND_ADAPTED<br/>Multiplier 0.7"]
+    D -->|Có| G["MICRO<br/>ATR Bands<br/>Multiplier 1.0"]
+    D -->|Không| H{Consecutive<br/>Losses > 3?}
+    H -->|Có| I["COOLDOWN<br/>BLOCK<br/>Multiplier 0.0"]
+    H -->|Không| J["Wait for<br/>Data"]
+
+    E --> K["Apply<br/>Parameters"]
+    F --> K
+    G --> K
+    I --> L["Block<br/>Placement"]
+
+    K --> M["CanPlaceOrder<br/>= true"]
+    L --> N["CanPlaceOrder<br/>= false"]
+
+    style E fill:#90EE90
+    style F fill:#FFD700
+    style G fill:#87CEEB
+    style I fill:#FF6347
+```
+
+**Wiring:**
+- AdaptiveGridManager.CanPlaceOrder() → ModeManager.EvaluateMode()
+- GridManager.canPlaceForSymbol() → AdaptiveGridManager.CanPlaceOrder()
+- Type assertion để tránh circular dependency
+
+### 2.4 Order Placement Flow
+
+```mermaid
+flowchart TD
+    A["WebSocket<br/>Ticker Update"] --> B["processWebSocketTicker"]
+    B --> C{shouldSchedule<br/>Placement?}
+    C -->|Yes| D["enqueuePlacement"]
+    C -->|No| E["Skip"]
+
+    D --> F{canPlaceFor<br/>Symbol?}
+    F -->|Yes| G{ModeManager<br/>CanPlaceOrder?}
+    F -->|No| H["Block<br/>Placement"]
+
+    G -->|Yes| I{GridState<br/>Valid?}
+    G -->|No| J["COOLDOWN<br/>Block"]
+
+    I -->|Yes| K["placeGridOrders"]
+    I -->|No| L["Wait for<br/>State Change"]
+
+    K --> M["Micro Grid<br/>0.05% spread<br/>10 orders"]
+    K --> N["BB Grid<br/>Fallback"]
+
+    M --> O["Orders<br/>Placed"]
+    N --> O
+
+    O --> P["OnOrderUpdate<br/>WebSocket"]
+    P --> Q["Update<br/>Order Cache"]
+
+    style K fill:#90EE90
+    style H fill:#FF6347
+    style J fill:#FF6347
+    style O fill:#FFD700
+```
+
 ---
 
 ## 3. Luồng Phân Tích Chế Độ & State Machine (T001-T015)
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│              RANGE DETECTION + GRID STATE MACHINE                      │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│   ┌─────────────────────────────────────────────────────────────┐     │
-│   │  RANGE DETECTOR (Market Condition)                            │     │
-│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │     │
-│   │  │   ADX    │  │ BB Width │  │   ATR    │  │  EMAs    │  │     │
-│   │  │  Period  │  │  Period  │  │  Period  │  │9,21,50,  │  │     │
-│   │  │    14    │  │    10    │  │    14    │  │   200    │  │     │
-│   │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  │     │
-│   │       │             │             │             │         │     │
-│   │       └─────────────┴──────┬──────┴─────────────┘         │     │
-│   │                            │                              │     │
-│   │                            ↓                              │     │
-│   │  ┌──────────────────────────────────────────────────────┐│     │
-│   │  │  RangeState: Unknown → Establishing → Active        ││     │
-│   │  │                      ↓              ↓                ││     │
-│   │  │              Stabilizing ←── Breakout               ││     │
-│   │  └──────────────────────┬───────────────────────────────┘│     │
-│   └──────────────────────────┼────────────────────────────────┘     │
-│                              │                                      │
-│                              ↓ Triggers State Transition           │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │  GRID STATE MACHINE (Trading Lifecycle)                    │   │
-│   │                                                             │   │
-│   │   IDLE ──EventRangeConfirmed──→ ENTER_GRID                │   │
-│   │                                     │                       │   │
-│   │                            EventEntryPlaced               │   │
-│   │                                     ↓                       │   │
-│   │   WAIT_NEW_RANGE ←──EventNewRangeReady── TRADING           │   │
-│   │        ↑                              │                     │   │
-│   │        └──EventPositionsClosed── EXIT_ALL                   │   │
-│   │                              ↑                              │   │
-│   │                    EventTrendExit/Emergency                 │   │
-│   │                                                             │   │
-│   │  T001 Gate: Only ENTER_GRID/TRADING → Place Orders        │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Unknown: Start
+    Unknown --> Establishing: Price data<br/>available
+    Establishing --> Active: BB tight<br/>ADX < 25
+    Active --> Breakout: Price outside<br/>BB bands
+    Active --> Stabilizing: Range shift<br/>detected
+    Breakout --> Stabilizing: Price returns<br/>to range
+    Stabilizing --> Active: New range<br/>confirmed
 
-Classification Logic:
+    note right of Active: Grid Trading<br/>Allowed
+    note right of Breakout: EXIT_ALL<br/>Triggered
+    note right of Stabilizing: Wait for<br/>New Range
+```
+
+**Grid State Machine:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE: Start
+    IDLE --> ENTER_GRID: Range confirmed<br/>or MICRO mode
+    ENTER_GRID --> TRADING: Orders placed
+    TRADING --> EXIT_ALL: Breakout/Trend<br/>ADX > 25
+    TRADING --> TRADING: Rebalancing
+    EXIT_ALL --> WAIT_NEW_RANGE: Positions closed
+    WAIT_NEW_RANGE --> ENTER_GRID: Re-grid<br/>conditions met
+
+    note right of TRADING: Orders active<br/>Grid trading
+    note right of EXIT_ALL: Fast exit<br/>sequence
+    note right of WAIT_NEW_RANGE: 6 strict<br/>conditions
+```
+
+**Classification Logic:**
 - Sideways:  ADX < 25, BB width < 0.5%, RangeState = Active → Grid Trading
 - Trending:  ADX > 25 → EventTrendExit → EXIT_ALL
 - Breakout:  Price outside BB → EventEmergencyExit → EXIT_ALL
@@ -153,41 +251,56 @@ Classification Logic:
 
 ## 4. Luồng Tính Toán Điểm Số (4 Factors Engine)
 
+```mermaid
+flowchart TB
+    subgraph Inputs["Indicator Inputs"]
+        T["Trend<br/>30%"]
+        V["Volatility<br/>25%"]
+        Vo["Volume<br/>25%"]
+        S["Structure<br/>20%"]
+    end
+
+    subgraph Metrics["Metrics"]
+        EMA["EMA Align<br/>ADX Strength"]
+        ATR["ATR Norm<br/>BB Expansion"]
+        VolMA["Vol/MA20<br/>Trend Dir"]
+        SR["Support/Res<br/>Range Detect"]
+    end
+
+    subgraph Calc["Calculation"]
+        WS["Weighted Sum<br/>Score Calculation"]
+        RM["Regime Multiplier"]
+        FS["Final Score<br/>0-100"]
+    end
+
+    subgraph Cache["Cache Layer"]
+        CL["5s TTL<br/>Cache Check"]
+    end
+
+    T --> EMA
+    V --> ATR
+    Vo --> VolMA
+    S --> SR
+
+    EMA --> WS
+    ATR --> WS
+    VolMA --> WS
+    SR --> WS
+
+    WS --> RM
+    RM --> FS
+    FS --> CL
+
+    CL -->|Same indicators<br/>within 5s| WS
+
+    style Inputs fill:#E6E6FA
+    style Calc fill:#90EE90
+    style Cache fill:#FFD700
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                     MULTI-FACTOR SCORING FLOW                          │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│  │   TREND     │  │  VOLATILITY │  │   VOLUME    │  │  STRUCTURE  │   │
-│  │   30%       │  │    25%      │  │    25%      │  │    20%      │   │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘   │
-│         │                │                │                │          │
-│         ↓                ↓                ↓                ↓          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│  │EMA Align    │  │ATR Norm     │  │Vol/MA20    │  │Support/Res  │   │
-│  │ADX Strength │  │BB Expansion │  │Trend Dir   │  │Range Detect │   │
-│  │Direction    │  │Regime Mult  │  │            │  │             │   │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘   │
-│         │                │                │                │          │
-│         └────────────────┴────────────────┴────────────────┘          │
-│                                    │                                   │
-│                                    ↓                                   │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │           WEIGHTED SUM CALCULATION                             │  │
-│  │  Score = (Trend × 0.3 + Vol × 0.25 + Volume × 0.25 + Struct × 0.2) │  │
-│  │            × RegimeMultiplier                                    │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│                                    │                                   │
-│                                    ↓                                   │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │              CACHE LAYER (5s TTL)                              │  │
-│  │  Same indicators within 5s → Return cached score             │  │
-│  │  Reduces CPU usage for frequent detections                      │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
-```
+
+**Cache Layer (5s TTL):**
+- Same indicators within 5s → Return cached score
+- Reduces CPU usage for frequent detections
 
 ---
 
@@ -195,66 +308,183 @@ Classification Logic:
 
 ### 5.1 Real-time Exit Monitor (Goroutine riêng)
 
+```mermaid
+flowchart TB
+    Ticker["100ms Ticker"] --> Check["Check All<br/>Symbols"]
+    Check --> Trigger["Trigger<br/>Exit?"]
+
+    Trigger --> ADX{ADX > 25?}
+    Trigger --> BB{BB Width<br/>> 1.5%?}
+    Trigger --> Loss{Consecutive<br/>Losses > 3?}
+
+    ADX -->|Yes| TE["handleTrendExit"]
+    BB -->|Yes| BE["handleBreakout"]
+    Loss -->|Yes| BE
+
+    TE --> TE1["Cancel orders"]
+    TE --> TE2["Close positions"]
+    TE --> TE3["Clear grid"]
+    TE --> TE4["pauseTrading"]
+    TE --> TE5["ForceRecalculate"]
+    TE --> TE6["Transition to<br/>EXIT_ALL"]
+
+    BE --> BE1["Cancel orders"]
+    BE --> BE2["Close positions"]
+    BE --> BE3["Clear grid"]
+    BE --> BE4["pauseTrading"]
+    BE --> BE5["ForceRecalc"]
+    BE --> BE6["Transition to<br/>EXIT_ALL"]
+
+    style Ticker fill:#E6E6FA
+    style TE fill:#FF6347
+    style BE fill:#FF6347
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│              REAL-TIME EXIT MONITOR (100ms Tick)                      │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐             │
-│   │  100ms      │    │  Check All  │    │  Trigger    │             │
-│   │  Ticker     │───→│  Symbols    │───→│  Exit?      │             │
-│   └─────────────┘    └─────────────┘    └──────┬──────┘             │
-│                                                 │                     │
-│                      ┌──────────────────────────┼─────────────────┐  │
-│                      ↓                          ↓                 ↓  │
-│               ┌──────────┐              ┌──────────┐        ┌──────────┐│
-│               │ ADX > 25 │              │ BB Width │        │Consecutive││
-│               │          │              │ > 1.5%   │        │Losses > 3 ││
-│               └────┬─────┘              └────┬─────┘        └────┬─────┘│
-│                    │                         │                  │     │
-│                    └────────────┬──────────────┘                  │     │
-│                               ↓ YES                            ↓ YES│
-│                    ┌──────────────────────┐        ┌──────────────────┐ │
-│                    │ handleTrendExit()    │        │ handleBreakout() │ │
-│                    │                      │        │                  │ │
-│                    │ 1. Cancel orders     │        │ 1. Cancel orders │ │
-│                    │ 2. Close positions   │        │ 2. Close pos     │ │
-│                    │ 3. Clear grid        │        │ 3. Clear grid    │ │
-│                    │ 4. pauseTrading()    │        │ 4. pauseTrading()│ │
-│                    │ 5. ForceRecalculate()│        │ 5. ForceRecalc() │ │
-│                    │ 6. Transition to     │        │ 6. Transition    │ │
-│                    │    EXIT_ALL          │        │    EXIT_ALL      │ │
-│                    └──────────────────────┘        └──────────────────┘ │
-│                                                                        │
-│   **T014 - Idempotent**: exitInProgress flag prevents duplicate exits │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
-```
+
+**T014 - Idempotent**: exitInProgress flag prevents duplicate exits
 
 ### 5.2 Multi-Layer Liquidation Protection (T011)
 
+```mermaid
+flowchart LR
+    PM["positionMonitor<br/>30s interval"] --> T1{Distance<br/>to liquidation}
+    T1 -->|50%| WARN["WARN<br/>Log only"]
+    T1 -->|30%| REDUCE["REDUCE 50%<br/>Position"]
+    T1 -->|15%| CLOSE["CLOSE<br/>ALL"]
+    T1 -->|10%| HEDGE["HEDGE +<br/>CLOSE"]
+
+    WARN --> PM
+    REDUCE --> PM
+    CLOSE --> PM
+    HEDGE --> PM
+
+    style WARN fill:#FFD700
+    style REDUCE fill:#FFA500
+    style CLOSE fill:#FF6347
+    style HEDGE fill:#DC143C
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│              MULTI-LAYER LIQUIDATION (4-Tier System)                   │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│  Tier 1 (50% distance)    Tier 2 (30%)    Tier 3 (15%)   Tier 4 (10%)│
-│  ┌─────────────────┐     ┌─────────────┐   ┌──────────┐  ┌──────────┐│
-│  │     WARN        │     │ REDUCE 50%  │   │  CLOSE   │  │ HEDGE +  ││
-│  │   (Log only)    │────→│   Position  │──→│   ALL    │─→│  CLOSE   ││
-│  └─────────────────┘     └─────────────┘   └──────────┘  └──────────┘│
-│         ↑                                              │              │
-│         └──────────────────────────────────────────────┘              │
-│                    positionMonitor() kiểm tra mỗi 30s                   │
-│                                                                        │
-│   T011: Enabled by default, wired vào positionMonitor                 │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
-```
+
+**T011**: Enabled by default, wired vào positionMonitor
 
 ---
 
-## 6. Luồng Pattern Learning (Học Máy)
+## 6. Luồng ExitExecutor - Fast Exit Sequence (Mới - Phase 4)
+
+```mermaid
+flowchart TB
+    BD["Breakout<br/>Detected"] --> AE["AdaptiveGridManager<br/>handleBreakout"]
+    AE --> EE["ExitExecutor<br/>ExecuteFastExit"]
+
+    EE --> T0["T+0ms<br/>Cancel ALL<br/>orders"]
+    T0 --> T1["T+100ms<br/>Wait<br/>cancellation"]
+    T1 --> T2["T+100ms<br/>Close positions<br/>market orders"]
+    T2 --> T3["T+800ms<br/>Wait for<br/>fills"]
+    T3 --> T4["T+5s<br/>Verify closure<br/>via cache"]
+    T4 --> T5{Position<br/>closed?}
+    T5 -->|No| Retry["Retry close<br/>orders"]
+    T5 -->|Yes| Transition["Transition to<br/>EXIT_ALL"]
+
+    Retry --> T2
+
+    style BD fill:#FF6347
+    style EE fill:#FFD700
+    style Transition fill:#90EE90
+```
+
+**Implementation:**
+- File: `internal/farming/exit_executor.go`
+- Method: `ExecuteFastExit(ctx, symbol)`
+- Wiring: AdaptiveGridManager.handleBreakout() → ExitExecutor
+
+---
+
+## 7. Luồng SyncManager - Cache Sync Workers (Mới - Phase 7)
+
+```mermaid
+flowchart TB
+    VFE["VolumeFarmEngine<br/>Start"] --> SM["SyncManager<br/>Start"]
+
+    SM --> OSW["Order Sync<br/>Worker<br/>30s interval"]
+    SM --> PSW["Position Sync<br/>Worker<br/>30s interval"]
+    SM --> BSW["Balance Sync<br/>Worker<br/>30s interval"]
+
+    OSW --> OSW1["GetCachedOrders"]
+    OSW1 --> OSW2["GetOpenOrders<br/>REST API"]
+    OSW2 --> OSW3["Compare cache<br/>vs REST"]
+    OSW3 --> OSW4["Log mismatches"]
+    OSW4 --> OSW5["Update cache<br/>if stale"]
+    OSW5 --> OSW
+
+    PSW --> PSW1["GetCachedPositions"]
+    PSW1 --> PSW2["GetPositions<br/>REST API"]
+    PSW2 --> PSW3["Compare cache<br/>vs REST"]
+    PSW3 --> PSW4["Log mismatches"]
+    PSW4 --> PSW5["Update cache<br/>if stale"]
+    PSW5 --> PSW
+
+    BSW --> BSW1["GetCachedBalance"]
+    BSW1 --> BSW2["GetAccountBalance<br/>REST API"]
+    BSW2 --> BSW3["Compare cache<br/>vs REST"]
+    BSW3 --> BSW4["Alert if<br/>balance low"]
+    BSW4 --> BSW5["Update cache<br/>if stale"]
+    BSW5 --> BSW
+
+    style SM fill:#FFD700
+    style OSW fill:#90EE90
+    style PSW fill:#87CEEB
+    style BSW fill:#FFA500
+```
+
+**Implementation:**
+- Files: `internal/farming/sync/*.go`
+- Manager: `sync/manager.go`
+- Workers: `order_sync_worker.go`, `position_sync_worker.go`, `balance_sync_worker.go`
+
+---
+
+## 8. Luồng WebSocket Cache & Auto-Sync (Mới - Phase 6)
+
+```mermaid
+flowchart TB
+    VFE["VolumeFarmEngine<br/>initUserStream"] --> LK["Create<br/>listenKey"]
+    LK --> WS["Subscribe to<br/>User Data Stream"]
+
+    WS --> AU["ACCOUNT_UPDATE<br/>Event"]
+    WS --> OU["ORDER_TRADE_UPDATE<br/>Event"]
+
+    AU --> AH["OnAccountUpdate<br/>Handler"]
+    OU --> OH["OnOrderUpdate<br/>Handler"]
+
+    AH --> PC["Update<br/>Position Cache"]
+    AH --> BC["Update<br/>Balance Cache"]
+
+    OH --> OC["Update/<br/>Remove<br/>Order Cache"]
+
+    subgraph Cache["WebSocket Cache"]
+        OC2["Order Cache<br/>TTL: 60s"]
+        PC2["Position Cache<br/>TTL: 60s"]
+        BC2["Balance Cache<br/>TTL: 60s"]
+    end
+
+    PC --> PC2
+    BC --> BC2
+    OC --> OC2
+
+    Cache --> Sync["Sync Workers<br/>30s Reconciliation"]
+    Sync --> REST["REST API<br/>Fallback"]
+
+    style WS fill:#87CEEB
+    style Cache fill:#90EE90
+    style REST fill:#FFD700
+```
+
+**Implementation:**
+- File: `internal/client/websocket.go`
+- Methods: `SubscribeToUserData()`, `processAccountUpdate()`, `processOrderTradeUpdate()`
+- Cache: `orderCache`, `positionCache`, `balanceCache` with TTL 60s
+
+---
+
+## 13. Luồng Pattern Learning (Học Máy)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -309,7 +539,7 @@ Classification Logic:
 
 ---
 
-## 7. Luồng Multi-Pair Architecture
+## 15. Luồng Multi-Pair Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -343,9 +573,9 @@ Classification Logic:
 ```
 
 ---
-## 8. Luồng Position Sizing & Grid Configuration (T002, T003, T012)
+## 11. Luồng Position Sizing & Grid Configuration (T002, T003, T012)
 
-### 8.1 Dynamic Leverage Calculator (T002)
+### 11.1 Dynamic Leverage Calculator (T002)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -368,7 +598,7 @@ Classification Logic:
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 Micro Grid Priority Configuration (T003)
+### 11.2 Micro Grid Priority Configuration (T003)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -401,7 +631,7 @@ Classification Logic:
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 Position Sizing Pipeline
+### 11.3 Position Sizing Pipeline
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -428,9 +658,9 @@ Classification Logic:
 
 ---
 
-## 9. Luồng Logging & Decision Audit
+## 14. Luồng Logging & Decision Audit
 
-### 9.1 State Machine JSONL Logging (T015)
+### 14.1 State Machine JSONL Logging (T015)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -483,7 +713,7 @@ Classification Logic:
 
 ---
 
-## 10. Shutdown & Graceful Degradation
+## 16. Shutdown & Graceful Degradation
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -523,7 +753,7 @@ Classification Logic:
 
 ---
 
-## 12. Regrid Logic Implementation (T008)
+## 17. Re-grid Logic (Strict Conditions) (T008)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -556,7 +786,7 @@ Classification Logic:
 
 ---
 
-## 11. Component Interaction Summary (T001-T015)
+## 18. Component Interaction Summary (T001-T054)
 
 | Component | Input | Output | Triggers |
 |-----------|-------|--------|----------|
@@ -570,27 +800,27 @@ Classification Logic:
 | **GridManager** | StateMachine gates | Placement decision | RangeState==Active && GridState valid |
 | **DynamicLeverage** | BB width | Leverage 20x-100x | On range change |
 | **Logger** | Decision context | JSONL file | Every decision + state transition |
+| **ModeManager** (NEW) | RangeState, ADX, Breakout | Trading Mode | Every price update |
+| **ExitExecutor** (NEW) | Breakout signal | Fast exit sequence | handleBreakout() |
+| **SyncManager** (NEW) | Cache + REST API | Reconciled state | Every 30s |
+| **WebSocket Cache** (NEW) | User data stream | Real-time orders/pos/bal | ACCOUNT_UPDATE, ORDER_TRADE_UPDATE |
 
-### 11.1 Task Implementation Map
+### 18.1 Task Implementation Map
 
 | Task | File | Function | Status |
 |------|------|----------|--------|
-| T001 | grid_manager.go | shouldSchedulePlacement() | ✅ RangeState + GridState gates |
-| T002 | volume_farm_engine.go | setLeverageForSymbols() | ✅ GetOptimalLeverage() wired |
-| T003 | grid_manager.go | placeGridOrders() | ✅ Micro grid precedence |
-| T004-T006 | state_machine.go | GridStateMachine struct | ✅ 5 states + transitions |
-| T007 | risk_sizing.go | calculateDynamicLeverage() | ✅ Inverse BB width |
-| T008 | manager.go | isReadyForRegrid() | ✅ 6 strict conditions |
-| T009 | manager.go | realtimeExitMonitor() | ✅ 100ms goroutine |
-| T010 | manager.go | RecordTradeResult() | ✅ MaxConsecutiveLosses = 3, triggers ExitAll |
-| T011 | manager.go | checkMultiLayerLiquidation() | ✅ 4-tier enabled |
-| T012 | config.go | BBPeriod | ✅ Unified to 10 |
-| T013 | state_machine.go | RWMutex | ✅ Thread-safe |
-| T014 | manager.go | exitInProgress flag | ✅ Idempotent |
-| T015 | state_machine.go | Transition() | ✅ JSONL logging |
+| T001-T003 | grid_manager.go | shouldSchedulePlacement() | ✅ RangeState + GridState gates |
+| T004-T009 | tradingmode/ | ModeManager + TradingMode | ✅ 4 modes implemented |
+| T010-T018 | range_detector.go | MICRO mode ATR bypass | ✅ HasEnoughDataForMICRO, GetATRBands |
+| T019-T026 | exit_executor.go | Fast exit sequence | ✅ ExecuteFastExit with verify |
+| T027-T031 | manager.go | Regime adjustment | ✅ ADX-based mode switching |
+| T032-T036 | websocket.go | Cache + auto-sync | ✅ orderCache, positionCache, balanceCache |
+| T037-T042 | sync/*.go | Sync workers | ✅ Order/Position/Balance workers |
+| T043-T050 | metrics/trading_metrics.go | Trading metrics | ✅ fills, exits, mode transitions |
+| T051-T054 | volume_farm_engine.go | Integration | ✅ All components wired |
 
 ---
 
-*Document Version: 2.1*  
-*Last Updated: 2026-04-12*  
-*Aligns with: Core Flow Implementation (T001-T015)*
+*Document Version: 3.0*  
+*Last Updated: 2026-04-15*  
+*Aligns with: Core Flow Implementation (T001-T054) - Phase 1-9 Complete*
