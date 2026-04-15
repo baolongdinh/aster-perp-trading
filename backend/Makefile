@@ -1,4 +1,4 @@
-.PHONY: all build run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test
+.PHONY: all build run agentic-run agentic-test-run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test
 
 # The name of our output binary
 APP_NAME := aster-bot
@@ -21,6 +21,14 @@ build: deps
 # Run the bot directly
 run:
 	go run $(CMD_DIR)/main.go $(CONFIG_FILE)
+
+# Run agentic + volume farm bot directly
+agentic-run:
+	go run ./cmd/agentic/main.go -config ./config/agentic-vf-config.yaml
+
+# Run agentic bot in dry-run mode (test, no real trades)
+agentic-test-run:
+	go run ./cmd/agentic/main.go -config ./config/agentic-vf-config.yaml -dry-run
 
 # ============================================================================
 # Test Targets

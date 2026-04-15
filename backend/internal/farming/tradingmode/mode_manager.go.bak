@@ -11,20 +11,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// SymbolModeState holds mode state for a single symbol
-type SymbolModeState struct {
-	currentMode TradingMode
-	modeSince   time.Time
-	cooldownEnd time.Time
-	history     []ModeTransition
-}
-
 // ModeManager manages trading mode transitions and state
-//
-// DEPRECATED: This component is being merged into CircuitBreaker.
-// Use CircuitBreaker.GetSymbolDecision(symbol) instead for unified trading decisions.
-// The per-symbol mode management has been added to support migration,
-// but new code should use CircuitBreaker directly.
 type ModeManager struct {
 	mu          sync.RWMutex
 	currentMode TradingMode
@@ -44,9 +31,6 @@ type ModeManager struct {
 	// Volatility tracking for dynamic cooldown
 	lastATR     float64
 	lastATRTime time.Time
-
-	// Per-symbol mode state tracking
-	symbolModes map[string]*SymbolModeState
 }
 
 // NewModeManager creates a new mode manager
@@ -61,49 +45,11 @@ func NewModeManager(cfg *config.TradingModesConfig, logger *zap.Logger) *ModeMan
 		config:      cfg,
 		logger:      logger.With(zap.String("component", "mode_manager")),
 		modeHistory: make([]ModeTransition, 0),
-		symbolModes: make(map[string]*SymbolModeState),
 	}
 }
 
-// getOrCreateSymbolState gets or creates symbol state
-func (m *ModeManager) getOrCreateSymbolState(symbol string) *SymbolModeState {
-	state, exists := m.symbolModes[symbol]
-	if !exists {
-		state = &SymbolModeState{
-			currentMode: TradingModeUnknown,
-			modeSince:   time.Now(),
-			history:     make([]ModeTransition, 0),
-		}
-		m.symbolModes[symbol] = state
-	}
-	return state
-}
-
-// GetCurrentMode returns the current trading mode for a symbol
-func (m *ModeManager) GetCurrentMode(symbol string) TradingMode {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	state := m.getOrCreateSymbolState(symbol)
-
-	// Check if cooldown has expired
-	if state.currentMode == TradingModeCooldown && time.Now().After(state.cooldownEnd) {
-		m.mu.RUnlock()
-		m.mu.Lock()
-		state = m.getOrCreateSymbolState(symbol)
-		if state.currentMode == TradingModeCooldown && time.Now().After(state.cooldownEnd) {
-			m.transitionSymbolTo(symbol, TradingModeMicro, "cooldown_expired")
-		}
-		m.mu.Unlock()
-		m.mu.RLock()
-		state = m.getOrCreateSymbolState(symbol)
-	}
-
-	return state.currentMode
-}
-
-// GetCurrentModeGlobal returns the current global trading mode (backward compatibility)
-func (m *ModeManager) GetCurrentModeGlobal() TradingMode {
+// GetCurrentMode returns the current trading mode
+func (m *ModeManager) GetCurrentMode() TradingMode {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -135,7 +81,7 @@ func (m *ModeManager) GetModeDuration() time.Duration {
 	return time.Since(m.modeSince)
 }
 
-// GetModeHistory returns mode transition history (global)
+// GetModeHistory returns mode transition history
 func (m *ModeManager) GetModeHistory() []ModeTransition {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -145,18 +91,7 @@ func (m *ModeManager) GetModeHistory() []ModeTransition {
 	return history
 }
 
-// GetModeHistorySymbol returns mode transition history for a symbol
-func (m *ModeManager) GetModeHistorySymbol(symbol string) []ModeTransition {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	state := m.getOrCreateSymbolState(symbol)
-	history := make([]ModeTransition, len(state.history))
-	copy(history, state.history)
-	return history
-}
-
-// EvaluateMode evaluates market conditions and determines appropriate mode (global)
+// EvaluateMode evaluates market conditions and determines appropriate mode
 func (m *ModeManager) EvaluateMode(
 	rangeState adaptive_grid.RangeState,
 	adx float64,
@@ -184,39 +119,6 @@ func (m *ModeManager) EvaluateMode(
 	}
 
 	return m.currentMode
-}
-
-// EvaluateModeSymbol evaluates market conditions and determines appropriate mode for a symbol
-func (m *ModeManager) EvaluateModeSymbol(
-	symbol string,
-	rangeState adaptive_grid.RangeState,
-	adx float64,
-	isBreakout bool,
-	isTrending bool,
-	isVolatilitySpike bool,
-) TradingMode {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	state := m.getOrCreateSymbolState(symbol)
-
-	// Check cooldown first
-	if state.currentMode == TradingModeCooldown {
-		if time.Now().Before(state.cooldownEnd) {
-			return TradingModeCooldown
-		}
-		// Cooldown expired, will transition to Micro below
-	}
-
-	// Determine target mode based on conditions
-	targetMode := m.determineTargetMode(rangeState, adx, isBreakout, isTrending, isVolatilitySpike)
-
-	// Check if we should transition
-	if state.currentMode != targetMode {
-		m.transitionSymbolTo(symbol, targetMode, m.buildTransitionReason(rangeState, adx, isBreakout, isTrending, isVolatilitySpike))
-	}
-
-	return state.currentMode
 }
 
 // determineTargetMode determines what mode we should be in
@@ -390,48 +292,6 @@ func (m *ModeManager) transitionTo(newMode TradingMode, reason string) {
 	}
 }
 
-// transitionSymbolTo performs mode transition for a specific symbol
-func (m *ModeManager) transitionSymbolTo(symbol string, newMode TradingMode, reason string) {
-	state := m.getOrCreateSymbolState(symbol)
-	if state.currentMode == newMode {
-		return
-	}
-
-	oldMode := state.currentMode
-	state.currentMode = newMode
-	state.modeSince = time.Now()
-
-	// Record transition
-	transition := ModeTransition{
-		From:      oldMode,
-		To:        newMode,
-		Timestamp: time.Now(),
-		Reason:    reason,
-	}
-	state.history = append(state.history, transition)
-
-	// Limit history size
-	if len(state.history) > 100 {
-		state.history = state.history[len(state.history)-100:]
-	}
-
-	// Log the transition
-	m.logger.Info("Symbol mode transition",
-		zap.String("symbol", symbol),
-		zap.String("from", oldMode.String()),
-		zap.String("to", newMode.String()),
-		zap.String("reason", reason),
-		zap.Duration("duration_in_prev_mode", time.Since(state.modeSince)),
-	)
-
-	// Call callback if transitioning to COOLDOWN
-	if newMode == TradingModeCooldown && m.onCooldownCallback != nil {
-		m.logger.Info("Calling COOLDOWN callback to trigger exit sequence",
-			zap.String("symbol", symbol))
-		go m.onCooldownCallback(reason)
-	}
-}
-
 // buildTransitionReason builds a human-readable reason string
 func (m *ModeManager) buildTransitionReason(
 	rangeState adaptive_grid.RangeState,
@@ -461,7 +321,7 @@ func (m *ModeManager) buildTransitionReason(
 	}
 }
 
-// EnterCooldown manually enters cooldown mode (global)
+// EnterCooldown manually enters cooldown mode
 func (m *ModeManager) EnterCooldown(duration time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -474,35 +334,11 @@ func (m *ModeManager) EnterCooldown(duration time.Duration) {
 	m.transitionTo(TradingModeCooldown, "manual_cooldown")
 }
 
-// EnterCooldownSymbol manually enters cooldown mode for a symbol
-func (m *ModeManager) EnterCooldownSymbol(symbol string, duration time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	state := m.getOrCreateSymbolState(symbol)
-
-	if duration == 0 {
-		duration = m.getMinModeDuration(TradingModeCooldown)
-	}
-
-	state.cooldownEnd = time.Now().Add(duration)
-	m.transitionSymbolTo(symbol, TradingModeCooldown, "manual_cooldown")
-}
-
-// IsInCooldown returns true if currently in cooldown (global)
+// IsInCooldown returns true if currently in cooldown
 func (m *ModeManager) IsInCooldown() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.currentMode == TradingModeCooldown && time.Now().Before(m.cooldownEnd)
-}
-
-// IsInCooldownSymbol returns true if symbol is currently in cooldown
-func (m *ModeManager) IsInCooldownSymbol(symbol string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	state := m.getOrCreateSymbolState(symbol)
-	return state.currentMode == TradingModeCooldown && time.Now().Before(state.cooldownEnd)
 }
 
 // SetOnCooldownCallback sets callback function to be called when transitioning to COOLDOWN
@@ -512,7 +348,7 @@ func (m *ModeManager) SetOnCooldownCallback(callback func(reason string)) {
 	m.onCooldownCallback = callback
 }
 
-// GetCooldownRemaining returns remaining cooldown duration (global)
+// GetCooldownRemaining returns remaining cooldown duration
 func (m *ModeManager) GetCooldownRemaining() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -522,23 +358,6 @@ func (m *ModeManager) GetCooldownRemaining() time.Duration {
 	}
 
 	remaining := time.Until(m.cooldownEnd)
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
-}
-
-// GetCooldownRemainingSymbol returns remaining cooldown duration for a symbol
-func (m *ModeManager) GetCooldownRemainingSymbol(symbol string) time.Duration {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	state := m.getOrCreateSymbolState(symbol)
-	if state.currentMode != TradingModeCooldown {
-		return 0
-	}
-
-	remaining := time.Until(state.cooldownEnd)
 	if remaining < 0 {
 		return 0
 	}

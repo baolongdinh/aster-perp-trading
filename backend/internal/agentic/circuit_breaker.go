@@ -9,8 +9,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// SymbolBreakerState tracks circuit breaker state for a single symbol
-type SymbolBreakerState struct {
+// SymbolDecisionState holds circuit breaker and mode decision state for a single symbol
+type SymbolDecisionState struct {
 	isTripped         bool
 	tripTime          time.Time
 	reason            string
@@ -23,6 +23,10 @@ type SymbolBreakerState struct {
 	priceHistory   []float64
 	volumeHistory  []float64
 	adxHistory     []float64
+
+	// Trading mode decision (NEW - from ModeManager)
+	tradingMode string
+	modeSince   time.Time
 }
 
 // CircuitBreaker monitors market conditions and trading performance per-symbol
@@ -31,7 +35,7 @@ type CircuitBreaker struct {
 	logger *zap.Logger
 
 	mu                 sync.RWMutex
-	symbolStates       map[string]*SymbolBreakerState
+	symbolStates       map[string]*SymbolDecisionState
 	maxATRHistory      int
 	evaluationInterval time.Duration // How often to evaluate market conditions (default 3s)
 	stopCh             chan struct{}
@@ -43,6 +47,10 @@ type CircuitBreaker struct {
 	// Callback when circuit breaker resets for a symbol
 	// Used to trigger force placement in farming engine
 	onResetCallback func(symbol string)
+
+	// Callback when trading mode changes for a symbol
+	// Used to notify mode transitions
+	onModeChangeCallback func(symbol string, oldMode, newMode string)
 }
 
 // NewCircuitBreaker creates a new circuit breaker
@@ -50,7 +58,7 @@ func NewCircuitBreaker(cfg config.AgenticCircuitBreakerConfig, logger *zap.Logge
 	return &CircuitBreaker{
 		config:             cfg,
 		logger:             logger.With(zap.String("component", "circuit_breaker")),
-		symbolStates:       make(map[string]*SymbolBreakerState),
+		symbolStates:       make(map[string]*SymbolDecisionState),
 		maxATRHistory:      20,
 		evaluationInterval: 3 * time.Second,
 		stopCh:             make(chan struct{}),
@@ -114,7 +122,7 @@ func (cb *CircuitBreaker) evaluateAllSymbols() {
 }
 
 // shouldResetSymbol determines if a symbol's circuit breaker should be reset
-func (cb *CircuitBreaker) shouldResetSymbol(symbol string, state *SymbolBreakerState) bool {
+func (cb *CircuitBreaker) shouldResetSymbol(symbol string, state *SymbolDecisionState) bool {
 	// INTENTIONAL DESIGN: Trip at ADX > 25, reset when ADX < 20 (buffer zone 20-25)
 	// This prevents rapid mode switching during marginal volatility
 
@@ -258,7 +266,7 @@ func (cb *CircuitBreaker) averageATR(history []float64) float64 {
 }
 
 // resetSymbol resets circuit breaker for a specific symbol
-func (cb *CircuitBreaker) resetSymbol(symbol string, state *SymbolBreakerState) {
+func (cb *CircuitBreaker) resetSymbol(symbol string, state *SymbolDecisionState) {
 	state.isTripped = false
 	state.reason = ""
 	state.consecutiveLosses = 0
@@ -272,8 +280,10 @@ func (cb *CircuitBreaker) CheckSymbol(symbol string, score SymbolScore, currentA
 	// Get or create state for symbol
 	state, exists := cb.symbolStates[symbol]
 	if !exists {
-		state = &SymbolBreakerState{
-			atrHistory: make([]float64, 0, cb.maxATRHistory),
+		state = &SymbolDecisionState{
+			atrHistory:  make([]float64, 0, cb.maxATRHistory),
+			tradingMode: "MICRO",
+			modeSince:   time.Now(),
 		}
 		cb.symbolStates[symbol] = state
 	}
@@ -321,7 +331,7 @@ func (cb *CircuitBreaker) Check(scores map[string]SymbolScore) (bool, string) {
 }
 
 // updateATRHistory updates ATR history for a symbol
-func (cb *CircuitBreaker) updateATRHistory(state *SymbolBreakerState, atr float64) {
+func (cb *CircuitBreaker) updateATRHistory(state *SymbolDecisionState, atr float64) {
 	state.atrHistory = append(state.atrHistory, atr)
 	if len(state.atrHistory) > cb.maxATRHistory {
 		state.atrHistory = state.atrHistory[1:]
@@ -329,7 +339,7 @@ func (cb *CircuitBreaker) updateATRHistory(state *SymbolBreakerState, atr float6
 }
 
 // checkVolatilitySpikeForSymbol checks if volatility spike condition is met for a symbol
-func (cb *CircuitBreaker) checkVolatilitySpikeForSymbol(state *SymbolBreakerState, score SymbolScore) bool {
+func (cb *CircuitBreaker) checkVolatilitySpikeForSymbol(state *SymbolDecisionState, score SymbolScore) bool {
 	if len(state.atrHistory) < 5 {
 		return false
 	}
@@ -346,7 +356,7 @@ func (cb *CircuitBreaker) checkVolatilitySpikeForSymbol(state *SymbolBreakerStat
 }
 
 // checkConsecutiveLossesForSymbol checks if consecutive losses threshold is met for a symbol
-func (cb *CircuitBreaker) checkConsecutiveLossesForSymbol(state *SymbolBreakerState) bool {
+func (cb *CircuitBreaker) checkConsecutiveLossesForSymbol(state *SymbolDecisionState) bool {
 	threshold := cb.config.ConsecutiveLosses.Threshold
 	if threshold == 0 {
 		threshold = 3
@@ -355,7 +365,7 @@ func (cb *CircuitBreaker) checkConsecutiveLossesForSymbol(state *SymbolBreakerSt
 }
 
 // tripSymbol trips circuit breaker for a specific symbol
-func (cb *CircuitBreaker) tripSymbol(symbol string, state *SymbolBreakerState, reason string) {
+func (cb *CircuitBreaker) tripSymbol(symbol string, state *SymbolDecisionState, reason string) {
 	wasAlreadyTripped := state.isTripped
 	state.isTripped = true
 	state.tripTime = time.Now()
@@ -381,12 +391,14 @@ func (cb *CircuitBreaker) RecordTradeOutcome(symbol string, isWin bool) {
 
 	state, exists := cb.symbolStates[symbol]
 	if !exists {
-		state = &SymbolBreakerState{
+		state = &SymbolDecisionState{
 			atrHistory:     make([]float64, 0, cb.maxATRHistory),
 			bbWidthHistory: make([]float64, 0, cb.maxATRHistory),
 			priceHistory:   make([]float64, 0, cb.maxATRHistory),
 			volumeHistory:  make([]float64, 0, cb.maxATRHistory),
 			adxHistory:     make([]float64, 0, cb.maxATRHistory),
+			tradingMode:    "MICRO",
+			modeSince:      time.Now(),
 		}
 		cb.symbolStates[symbol] = state
 	}
@@ -407,12 +419,14 @@ func (cb *CircuitBreaker) UpdateMarketConditions(symbol string, bbWidth, price, 
 
 	state, exists := cb.symbolStates[symbol]
 	if !exists {
-		state = &SymbolBreakerState{
+		state = &SymbolDecisionState{
 			atrHistory:     make([]float64, 0, cb.maxATRHistory),
 			bbWidthHistory: make([]float64, 0, cb.maxATRHistory),
 			priceHistory:   make([]float64, 0, cb.maxATRHistory),
 			volumeHistory:  make([]float64, 0, cb.maxATRHistory),
 			adxHistory:     make([]float64, 0, cb.maxATRHistory),
+			tradingMode:    "MICRO",
+			modeSince:      time.Now(),
 		}
 		cb.symbolStates[symbol] = state
 	}
@@ -482,6 +496,101 @@ func (cb *CircuitBreaker) SetOnResetCallback(callback func(symbol string)) {
 	cb.onResetCallback = callback
 }
 
+// SetOnModeChangeCallback sets the callback function to be called when trading mode changes
+func (cb *CircuitBreaker) SetOnModeChangeCallback(callback func(symbol string, oldMode, newMode string)) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.onModeChangeCallback = callback
+}
+
+// determineTradingMode determines what trading mode we should be in based on market conditions
+// This logic is copied from ModeManager but adapted for CircuitBreaker
+func (cb *CircuitBreaker) determineTradingMode(
+	rangeState int, // adaptive_grid.RangeState as int
+	adx float64,
+	isBreakout bool,
+	isTrending bool,
+	isVolatilitySpike bool,
+) string {
+	// Hardcoded thresholds (matching ModeManager defaults)
+	sidewaysThreshold := 20.0
+	trendingThreshold := 25.0
+
+	// Priority 1: Volatility spike -> COOLDOWN (always)
+	if isVolatilitySpike {
+		return "COOLDOWN"
+	}
+
+	// Priority 1b: Breakout with momentum (high ADX or trending) -> COOLDOWN
+	// Breakout without momentum (sideways) -> MICRO mode (continue trading)
+	if isBreakout {
+		if isTrending || adx > trendingThreshold {
+			// Strong breakout with trend momentum -> COOLDOWN
+			return "COOLDOWN"
+		}
+		// Weak breakout without momentum -> MICRO mode (continue trading)
+		return "MICRO"
+	}
+
+	// Priority 2: Strong trend -> TREND_ADAPTED
+	if isTrending || adx > trendingThreshold {
+		return "TREND_ADAPTED"
+	}
+
+	// Priority 3: BB Range Active (state=2) + Low ADX -> STANDARD
+	if rangeState == 2 && adx < sidewaysThreshold {
+		return "STANDARD"
+	}
+
+	// Priority 4: Default to MICRO mode (always trade)
+	return "MICRO"
+}
+
+// evaluateSymbol evaluates both circuit breaker state and trading mode for a symbol
+// Returns (canTrade, tradingMode)
+func (cb *CircuitBreaker) evaluateSymbol(
+	symbol string,
+	state *SymbolDecisionState,
+	rangeState int,
+	adx float64,
+	isBreakout bool,
+	isTrending bool,
+	isVolatilitySpike bool,
+) (bool, string) {
+	// Determine trading mode based on market conditions
+	targetMode := cb.determineTradingMode(rangeState, adx, isBreakout, isTrending, isVolatilitySpike)
+
+	// Update trading mode if changed
+	if state.tradingMode != targetMode {
+		oldMode := state.tradingMode
+		state.tradingMode = targetMode
+		state.modeSince = time.Now()
+
+		cb.logger.Info("Trading mode changed",
+			zap.String("symbol", symbol),
+			zap.String("oldMode", oldMode),
+			zap.String("newMode", targetMode))
+
+		// Trigger callback if set
+		if cb.onModeChangeCallback != nil {
+			cb.onModeChangeCallback(symbol, oldMode, targetMode)
+		}
+	}
+
+	// If circuit breaker is tripped, cannot trade
+	if state.isTripped {
+		return false, state.tradingMode
+	}
+
+	// If in COOLDOWN mode, cannot trade
+	if state.tradingMode == "COOLDOWN" {
+		return false, state.tradingMode
+	}
+
+	// Can trade
+	return true, state.tradingMode
+}
+
 // GetStatus returns the current circuit breaker status for all symbols
 func (cb *CircuitBreaker) GetStatus() map[string]bool {
 	cb.mu.RLock()
@@ -492,4 +601,30 @@ func (cb *CircuitBreaker) GetStatus() map[string]bool {
 		status[symbol] = state.isTripped
 	}
 	return status
+}
+
+// GetSymbolDecision returns the trading decision for a symbol
+// Returns (canTrade, tradingMode)
+func (cb *CircuitBreaker) GetSymbolDecision(symbol string) (bool, string) {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	state, exists := cb.symbolStates[symbol]
+	if !exists {
+		// New symbol - can trade with default MICRO mode
+		return true, "MICRO"
+	}
+
+	// If circuit breaker is tripped, cannot trade
+	if state.isTripped {
+		return false, state.tradingMode
+	}
+
+	// If in COOLDOWN mode, cannot trade
+	if state.tradingMode == "COOLDOWN" {
+		return false, state.tradingMode
+	}
+
+	// Can trade
+	return true, state.tradingMode
 }

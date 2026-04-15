@@ -65,10 +65,11 @@ type VolumeFarmEngine struct {
 	userStream          *stream.UserStream
 
 	// NEW: Continuous Volume Farming components
-	modeManager  *tradingmode.ModeManager
-	exitExecutor *ExitExecutor
-	syncManager  *farmsync.SyncManager
-	wsClient     *client.WebSocketClient
+	modeManager    *tradingmode.ModeManager
+	circuitBreaker *agentic.CircuitBreaker // NEW: Unified trading decision brain
+	exitExecutor   *ExitExecutor
+	syncManager    *farmsync.SyncManager
+	wsClient       *client.WebSocketClient
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -226,6 +227,46 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		zap.Bool("standard_enabled", modeConfig.StandardMode.Enabled),
 		zap.Bool("trend_enabled", modeConfig.TrendAdaptedMode.Enabled))
 
+	// NEW: Initialize CircuitBreaker - unified trading decision brain
+	cbConfig := cfg.Agentic.CircuitBreakers
+	engine.circuitBreaker = agentic.NewCircuitBreaker(cbConfig, logger)
+	logger.Info("CircuitBreaker initialized as unified trading brain")
+
+	// NEW: Wire CircuitBreaker into AdaptiveGridManager for unified decisions
+	adaptiveGridManager.SetCircuitBreaker(engine.circuitBreaker)
+	logger.Info("CircuitBreaker wired into AdaptiveGridManager")
+
+	// NEW: Wire CircuitBreaker callbacks for automatic actions
+	engine.circuitBreaker.SetOnTripCallback(func(symbol, reason string) {
+		logger.Warn("CircuitBreaker TRIPPED - Triggering emergency exit",
+			zap.String("symbol", symbol),
+			zap.String("reason", reason))
+		// Trigger emergency exit for this symbol via state machine
+		adaptiveGridManager.ExitAll(context.Background(), symbol, adaptive_grid.EventEmergencyExit, reason)
+	})
+
+	engine.circuitBreaker.SetOnResetCallback(func(symbol string) {
+		logger.Info("CircuitBreaker RESET - Rebuilding grid",
+			zap.String("symbol", symbol))
+		// Rebuild grid when circuit breaker resets
+		if engine.gridManager != nil {
+			if err := engine.gridManager.RebuildGrid(context.Background(), symbol); err != nil {
+				logger.Warn("Failed to rebuild grid after circuit breaker reset",
+					zap.String("symbol", symbol),
+					zap.Error(err))
+			}
+		}
+	})
+
+	engine.circuitBreaker.SetOnModeChangeCallback(func(symbol string, oldMode, newMode string) {
+		logger.Info("Trading mode changed",
+			zap.String("symbol", symbol),
+			zap.String("old_mode", oldMode),
+			zap.String("new_mode", newMode))
+		// Could trigger grid rebuild or parameter adjustment based on mode change
+	})
+	logger.Info("CircuitBreaker callbacks wired")
+
 	// ExitExecutor - handles fast exit on breakouts
 	engine.exitExecutor = NewExitExecutor(engine.futuresClient, sharedWSClient, 5*time.Second, logger)
 	logger.Info("ExitExecutor initialized", zap.Duration("timeout", 5*time.Second))
@@ -233,6 +274,13 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	// NEW: Wire ExitExecutor into AdaptiveGridManager for breakout handling
 	adaptiveGridManager.SetExitExecutor(engine.exitExecutor)
 	logger.Info("ExitExecutor wired into AdaptiveGridManager")
+
+	// NEW: Wire onOrderPlaced callback to update SyncManager
+	engine.gridManager.SetOnOrderPlacedCallback(func(symbol string, order client.Order) {
+		if engine.syncManager != nil {
+			engine.syncManager.UpdateOrder(symbol, order)
+		}
+	})
 
 	// NEW: Wire ModeManager into AdaptiveGridManager for trading mode evaluation
 	adaptiveGridManager.SetModeManager(engine.modeManager)
@@ -286,6 +334,20 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	// SyncManager - coordinates order/position/balance sync workers
 	engine.syncManager = farmsync.NewSyncManager(sharedWSClient, logger)
 	engine.syncManager.Initialize()
+
+	// Wire up order missing callback to trigger GridManager handleOrderFill
+	engine.syncManager.SetOnOrderMissingCallback(func(symbol string, orderID int64) {
+		logger.Info("Sync worker detected missing order, triggering fill handler",
+			zap.String("symbol", symbol),
+			zap.Int64("order_id", orderID))
+
+		// Trigger GridManager's handleOrderFill to process the fill and rebalance
+		if engine.gridManager != nil {
+			orderIDStr := strconv.FormatInt(orderID, 10)
+			engine.gridManager.handleOrderFill(orderIDStr, symbol)
+		}
+	})
+
 	logger.Info("SyncManager initialized with all workers")
 
 	// Store WebSocket client reference
@@ -468,21 +530,19 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 			OnOrderUpdate: func(u stream.WsOrderUpdate) {
 				// Convert WsOrderUpdate to local OrderUpdate
 				orderUpdate := &OrderUpdate{
-					Symbol:      u.Order.Symbol,
-					OrderID:     strconv.FormatInt(u.Order.OrderID, 10),
-					ClientID:    u.Order.ClientOrderID,
-					Side:        u.Order.Side,
-					Type:        u.Order.OrderType,
-					Status:      u.Order.OrderStatus,
-					Price:       u.Order.AvgPrice,
-					Quantity:    u.Order.FilledQty,
-					ExecutedQty: u.Order.CumFilledQty,
-					Timestamp:   u.EventTime,
+					Symbol:    u.Order.Symbol,
+					OrderID:   strconv.FormatInt(u.Order.OrderID, 10),
+					ClientID:  u.Order.ClientOrderID,
+					Side:      u.Order.Side,
+					Type:      u.Order.OrderType,
+					Price:     u.Order.Price,
+					Quantity:  u.Order.FilledQty,
+					Status:    u.Order.OrderStatus,
+					Fee:       0, // Fee not available in WsOrderUpdate
+					Timestamp: u.EventTime,
 				}
-				// Only process FILLED orders
-				if orderUpdate.Status == "FILLED" {
-					e.gridManager.OnOrderUpdate(orderUpdate)
-				}
+				// Process all order status updates for proper sync
+				e.gridManager.OnOrderUpdate(orderUpdate)
 			},
 			OnAccountUpdate: func(u stream.WsAccountUpdate) {
 				// Update WebSocket cache with positions and balances
@@ -490,7 +550,12 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 					zap.Int("positions", len(u.Update.Positions)),
 					zap.Int("balances", len(u.Update.Balances)))
 
-				// Update position cache
+				// Update GridManager's position cache directly to keep it in sync
+				if e.gridManager != nil {
+					e.gridManager.OnAccountUpdate(u)
+				}
+
+				// Also update wsClient cache for other consumers
 				for _, pos := range u.Update.Positions {
 					position := client.Position{
 						Symbol:           pos.Symbol,
@@ -505,7 +570,7 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 
 				// Update balance cache
 				for _, bal := range u.Update.Balances {
-					if bal.Asset == "USDT" {
+					if bal.Asset == "USDT" || bal.Asset == "USD1" {
 						balance := client.Balance{
 							Asset:            bal.Asset,
 							AvailableBalance: bal.CrossWalletBalance, // Use CrossWalletBalance as available

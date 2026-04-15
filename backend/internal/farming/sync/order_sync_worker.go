@@ -19,6 +19,7 @@ type OrderSyncWorker struct {
 	mismatchThreshold time.Duration
 	logger            *zap.Logger
 	onMismatch        func(symbol string, mismatches []OrderMismatch)
+	onOrderMissing    func(symbol string, orderID int64) // Callback when order is missing (filled/cancelled)
 }
 
 // OrderMismatch represents an order state mismatch
@@ -52,6 +53,11 @@ func NewOrderSyncWorker(
 // SetOnMismatchCallback sets callback for mismatch handling
 func (w *OrderSyncWorker) SetOnMismatchCallback(fn func(symbol string, mismatches []OrderMismatch)) {
 	w.onMismatch = fn
+}
+
+// SetOnOrderMissingCallback sets callback when order is missing (filled/cancelled)
+func (w *OrderSyncWorker) SetOnOrderMissingCallback(fn func(symbol string, orderID int64)) {
+	w.onOrderMissing = fn
 }
 
 // UpdateInternalOrder updates internal order state
@@ -145,6 +151,11 @@ func (w *OrderSyncWorker) syncSymbol(symbol string) []OrderMismatch {
 			w.logger.Info("Order missing on exchange, assuming filled/cancelled",
 				zap.String("symbol", symbol),
 				zap.Int64("order_id", id))
+
+			// Notify GridManager to handle order fill
+			if w.onOrderMissing != nil {
+				w.onOrderMissing(symbol, id)
+			}
 
 			// Remove from internal state
 			w.RemoveInternalOrder(symbol, id)

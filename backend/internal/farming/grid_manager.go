@@ -132,6 +132,9 @@ type GridManager struct {
 	warmupOnce   sync.Once
 	warmupStopCh chan struct{}
 	warmupWg     sync.WaitGroup
+
+	// NEW: Callback when order is placed (for sync worker integration)
+	onOrderPlaced func(symbol string, order client.Order)
 }
 
 // ExchangeOrderCacheEntry stores cached exchange orders with timestamp
@@ -143,6 +146,11 @@ type ExchangeOrderCacheEntry struct {
 // SetActivityLogger sets the activity logger for the grid manager.
 func (g *GridManager) SetActivityLogger(al *activitylog.ActivityLogger) {
 	g.activityLog = al
+}
+
+// SetOnOrderPlacedCallback sets callback when order is placed (for sync worker integration)
+func (g *GridManager) SetOnOrderPlacedCallback(fn func(symbol string, order client.Order)) {
+	g.onOrderPlaced = fn
 }
 
 // SetWebSocketClient sets an external WebSocket client to share connection
@@ -2094,6 +2102,21 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	g.activeOrders[order.OrderID] = order
 	g.ordersMu.Unlock()
 
+	// Notify sync worker about the placed order
+	if g.onOrderPlaced != nil {
+		// Parse OrderID from string to int64
+		orderIDInt, _ := strconv.ParseInt(order.OrderID, 10, 64)
+		g.onOrderPlaced(order.Symbol, client.Order{
+			OrderID: orderIDInt,
+			Symbol:  order.Symbol,
+			Side:    order.Side,
+			Type:    order.OrderType,
+			Price:   order.Price,
+			OrigQty: order.Size,
+			Status:  "NEW",
+		})
+	}
+
 	// Log order placement
 	if g.activityLog != nil {
 		g.activityLog.Log(context.Background(), activitylog.EventOrderPlaced, activitylog.SeverityInfo,
@@ -3143,13 +3166,8 @@ func (g *GridManager) RebuildGrid(ctx context.Context, symbol string) error {
 }
 
 // OnOrderUpdate handles real-time order updates from UserStream WebSocket
-// This is the WebSocket alternative to polling for fills
+// This is the WebSocket alternative to polling for fills and syncs order state
 func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
-	// Only process FILLED orders via WebSocket
-	if orderUpdate.Status != "FILLED" {
-		return
-	}
-
 	g.logger.WithFields(logrus.Fields{
 		"order_id":  orderUpdate.OrderID,
 		"symbol":    orderUpdate.Symbol,
@@ -3158,10 +3176,59 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 		"quantity":  orderUpdate.Quantity,
 		"price":     orderUpdate.Price,
 		"websocket": true,
-	}).Info("WebSocket order fill detected - processing immediately")
+	}).Debug("WebSocket order update received")
 
-	// Call handleOrderFill to process the fill event
-	g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
+	switch orderUpdate.Status {
+	case "FILLED":
+		g.logger.WithFields(logrus.Fields{
+			"order_id": orderUpdate.OrderID,
+			"symbol":   orderUpdate.Symbol,
+		}).Info("WebSocket order fill detected - processing immediately")
+		// Call handleOrderFill to process the fill event
+		g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
+
+	case "CANCELED":
+		g.logger.WithFields(logrus.Fields{
+			"order_id": orderUpdate.OrderID,
+			"symbol":   orderUpdate.Symbol,
+		}).Info("WebSocket order cancellation detected - removing from active orders")
+		// Remove from active orders
+		g.ordersMu.Lock()
+		delete(g.activeOrders, orderUpdate.OrderID)
+		g.ordersMu.Unlock()
+
+	case "EXPIRED", "REJECTED":
+		g.logger.WithFields(logrus.Fields{
+			"order_id": orderUpdate.OrderID,
+			"symbol":   orderUpdate.Symbol,
+			"status":   orderUpdate.Status,
+		}).Warn("WebSocket order expired/rejected - removing from active orders")
+		// Remove from active orders
+		g.ordersMu.Lock()
+		delete(g.activeOrders, orderUpdate.OrderID)
+		g.ordersMu.Unlock()
+
+	case "NEW":
+		g.logger.WithFields(logrus.Fields{
+			"order_id": orderUpdate.OrderID,
+			"symbol":   orderUpdate.Symbol,
+		}).Debug("WebSocket new order detected - should be tracked in activeOrders")
+
+	case "PARTIALLY_FILLED":
+		g.logger.WithFields(logrus.Fields{
+			"order_id": orderUpdate.OrderID,
+			"symbol":   orderUpdate.Symbol,
+			"quantity": orderUpdate.Quantity,
+		}).Debug("WebSocket partial fill detected - order still active")
+		// Order still active, no action needed
+
+	default:
+		g.logger.WithFields(logrus.Fields{
+			"order_id": orderUpdate.OrderID,
+			"symbol":   orderUpdate.Symbol,
+			"status":   orderUpdate.Status,
+		}).Warn("WebSocket order update with unknown status")
+	}
 }
 
 // OnAccountUpdate handles real-time position updates from UserStream WebSocket

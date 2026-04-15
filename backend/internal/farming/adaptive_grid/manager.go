@@ -124,8 +124,11 @@ type AdaptiveGridManager struct {
 	// NEW: ExitExecutor for fast exit on breakouts
 	exitExecutor interface{} // Use interface to avoid circular dependency
 
-	// NEW: ModeManager for trading mode evaluation
+	// NEW: ModeManager for trading mode evaluation (DEPRECATED - being replaced by CircuitBreaker)
 	modeManager interface{} // Use interface to avoid circular dependency
+
+	// NEW: Agentic CircuitBreaker for unified trading decisions (replaces ModeManager)
+	circuitBreaker interface{} // Use interface to avoid circular dependency
 
 	// NEW: ATRCalculator for volatility calculation
 	atrCalc *ATRCalculator
@@ -151,6 +154,9 @@ type AdaptiveGridManager struct {
 	// NEW: Partial close tracking for TP levels
 	partialCloseConfig *PartialCloseConfig
 	positionSlices     map[string]*PositionSlice // symbol -> position slice tracking
+
+	// NEW: Position reduction tracking for gradual size reduction
+	positionReductionTime map[string]time.Time // symbol -> last reduction timestamp
 
 	// Control channels
 	stopCh chan struct{}
@@ -372,35 +378,36 @@ func NewAdaptiveGridManager(
 	logger *zap.Logger,
 ) *AdaptiveGridManager {
 	return &AdaptiveGridManager{
-		gridManager:        baseGrid,
-		configManager:      configManager,
-		regimeDetector:     regimeDetector,
-		futuresClient:      futuresClient,
-		positionProvider:   positionProvider, // NEW: WebSocket position provider
-		logger:             logger,
-		currentRegime:      make(map[string]market_regime.MarketRegime),
-		lastRegimeChange:   make(map[string]time.Time),
-		transitionCooldown: make(map[string]time.Time),
-		circuitBreakers:    make(map[string]*CircuitBreaker),
-		trendingStrength:   make(map[string]float64),
-		tradingPaused:      make(map[string]bool),
-		maxPositionSize:    make(map[string]float64),
-		unhedgedExposure:   make(map[string]float64),
-		trailingStopPrice:  make(map[string]float64),
-		positions:          make(map[string]*SymbolPosition),
-		positionStopLoss:   make(map[string]float64),
-		positionTakeProfit: make(map[string]float64),
-		maxUnrealizedLoss:  make(map[string]float64),
-		riskConfig:         DefaultRiskConfig(),
-		rangeDetectors:     make(map[string]*RangeDetector), // NEW: Range detectors
-		volumeScalers:      make(map[string]*VolumeScaler),  // NEW: Volume scalers
-		timeFilter:         nil,                             // NEW: Time filter (init later)
-		consecutiveLosses:  make(map[string]int),            // NEW: Track consecutive losses
-		lastLossTime:       make(map[string]time.Time),      // NEW: Track last loss time
-		cooldownActive:     make(map[string]bool),           // NEW: Track cooldown state
-		microGridCalc:      NewMicroGridCalculator(nil),     // NEW: Micro grid calculator (disabled by default)
-		stopCh:             make(chan struct{}),
-		mu:                 sync.RWMutex{},
+		gridManager:           baseGrid,
+		configManager:         configManager,
+		regimeDetector:        regimeDetector,
+		futuresClient:         futuresClient,
+		positionProvider:      positionProvider, // NEW: WebSocket position provider
+		logger:                logger,
+		currentRegime:         make(map[string]market_regime.MarketRegime),
+		lastRegimeChange:      make(map[string]time.Time),
+		transitionCooldown:    make(map[string]time.Time),
+		circuitBreakers:       make(map[string]*CircuitBreaker),
+		trendingStrength:      make(map[string]float64),
+		tradingPaused:         make(map[string]bool),
+		maxPositionSize:       make(map[string]float64),
+		unhedgedExposure:      make(map[string]float64),
+		trailingStopPrice:     make(map[string]float64),
+		positions:             make(map[string]*SymbolPosition),
+		positionStopLoss:      make(map[string]float64),
+		positionTakeProfit:    make(map[string]float64),
+		maxUnrealizedLoss:     make(map[string]float64),
+		riskConfig:            DefaultRiskConfig(),
+		rangeDetectors:        make(map[string]*RangeDetector), // NEW: Range detectors
+		volumeScalers:         make(map[string]*VolumeScaler),  // NEW: Volume scalers
+		timeFilter:            nil,                             // NEW: Time filter (init later)
+		consecutiveLosses:     make(map[string]int),            // NEW: Track consecutive losses
+		lastLossTime:          make(map[string]time.Time),      // NEW: Track last loss time
+		cooldownActive:        make(map[string]bool),           // NEW: Track cooldown state
+		positionReductionTime: make(map[string]time.Time),      // NEW: Track last position reduction time
+		microGridCalc:         NewMicroGridCalculator(nil),     // NEW: Micro grid calculator (disabled by default)
+		stopCh:                make(chan struct{}),
+		mu:                    sync.RWMutex{},
 	}
 }
 
@@ -448,6 +455,13 @@ func (a *AdaptiveGridManager) SetModeManager(manager interface{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.modeManager = manager
+}
+
+// SetCircuitBreaker sets the agentic circuit breaker for unified trading decisions
+func (a *AdaptiveGridManager) SetCircuitBreaker(cb interface{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.circuitBreaker = cb
 }
 
 // SetOptimizationConfig sets the optimization config from YAML files
@@ -1007,6 +1021,10 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 	fundingCheckTicker := time.NewTicker(5 * time.Minute)
 	defer fundingCheckTicker.Stop()
 
+	// DEBUG: Blocking checks status ticker (every 30 seconds)
+	debugCheckTicker := time.NewTicker(30 * time.Second)
+	defer debugCheckTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1018,6 +1036,9 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 		case <-resumeCheckTicker.C:
 			// Check if any paused symbols can resume trading
 			a.CheckAndResumeAll()
+		case <-debugCheckTicker.C:
+			// DEBUG: Log all blocking checks status
+			a.logBlockingChecksStatus()
 		case <-fundingCheckTicker.C:
 			// NEW: Check and apply funding rate bias
 			a.CheckFundingAndApplyBias()
@@ -1311,14 +1332,50 @@ func (a *AdaptiveGridManager) evaluateRiskAndAct(ctx context.Context, symbol str
 		return
 	}
 
-	// 4. Check max position size
+	// 4. Check max position size - Use gradual reduction instead of pause
+	hardCap := a.riskConfig.MaxPositionUSDT * 1.2
 	if notional > a.riskConfig.MaxPositionUSDT {
-		a.logger.Warn("MAX POSITION SIZE EXCEEDED - Pausing new orders",
-			zap.String("symbol", symbol),
-			zap.Float64("notional", notional),
-			zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT))
-		a.pauseTrading(symbol)
+		if notional >= hardCap {
+			// CRITICAL: Hard cap exceeded - emergency close
+			a.logger.Error("HARD POSITION CAP EXCEEDED - Emergency closing position",
+				zap.String("symbol", symbol),
+				zap.Float64("notional", notional),
+				zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT),
+				zap.Float64("hard_cap", hardCap))
+			a.emergencyClosePosition(ctx, symbol, pos.PositionAmt)
+			return
+		}
+
+		// Position exceeded max but below hard cap - reduce gradually
+		// Check if we recently reduced position (avoid repeated reductions)
+		lastReductionTime, exists := a.positionReductionTime[symbol]
+		if !exists || time.Since(lastReductionTime) > 30*time.Second {
+			a.logger.Warn("MAX POSITION SIZE EXCEEDED - Reducing position by 50% gradually",
+				zap.String("symbol", symbol),
+				zap.Float64("notional", notional),
+				zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT),
+				zap.Float64("hard_cap", hardCap))
+
+			// Reduce position by 50%
+			a.reducePositionByPct(ctx, symbol, pos.PositionAmt, 0.5)
+
+			// Track last reduction time
+			a.mu.Lock()
+			a.positionReductionTime[symbol] = time.Now()
+			a.mu.Unlock()
+		} else {
+			a.logger.Debug("Position reduction recently executed, waiting for cooldown",
+				zap.String("symbol", symbol),
+				zap.Duration("time_since_last_reduction", time.Since(lastReductionTime)))
+		}
 		return
+	}
+
+	// 4.1. Clear reduction time when position size decreased below max
+	if notional <= a.riskConfig.MaxPositionUSDT {
+		a.mu.Lock()
+		delete(a.positionReductionTime, symbol)
+		a.mu.Unlock()
 	}
 
 	// 5. Check multi-layer liquidation protection (4-tier system)
@@ -1369,6 +1426,71 @@ func (a *AdaptiveGridManager) isStopLossHit(symbol string, markPrice, positionAm
 	}
 
 	return false
+}
+
+// logBlockingChecksStatus logs the status of all blocking checks for debugging
+func (a *AdaptiveGridManager) logBlockingChecksStatus() {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	a.logger.Info("=== BLOCKING CHECKS STATUS ===")
+
+	// 1. CircuitBreaker status
+	if a.circuitBreaker != nil {
+		if cb, ok := a.circuitBreaker.(interface {
+			GetTrippedSymbols() []string
+		}); ok {
+			trippedSymbols := cb.GetTrippedSymbols()
+			a.logger.Info("CircuitBreaker Status",
+				zap.Strings("tripped_symbols", trippedSymbols),
+				zap.Int("count", len(trippedSymbols)))
+		}
+	}
+
+	// 2. RiskMonitor exposure
+	if a.riskMonitor != nil {
+		totalExposure, maxExposure, utilization := a.riskMonitor.GetExposureStats()
+		a.logger.Info("RiskMonitor Exposure",
+			zap.Float64("total_exposure", totalExposure),
+			zap.Float64("max_exposure", maxExposure),
+			zap.Float64("utilization_pct", utilization*100))
+	}
+
+	// 3. Position limits
+	for symbol, position := range a.positions {
+		hardCap := a.riskConfig.MaxPositionUSDT * 1.2
+		a.logger.Info("Position Status",
+			zap.String("symbol", symbol),
+			zap.Float64("notional", position.NotionalValue),
+			zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT),
+			zap.Float64("hard_cap", hardCap),
+			zap.Bool("exceeded_hard_cap", position.NotionalValue >= hardCap))
+	}
+
+	// 4. Trading paused status
+	pausedSymbols := make([]string, 0)
+	for symbol, paused := range a.tradingPaused {
+		if paused {
+			pausedSymbols = append(pausedSymbols, symbol)
+		}
+	}
+	a.logger.Info("Trading Paused Status",
+		zap.Strings("paused_symbols", pausedSymbols),
+		zap.Int("count", len(pausedSymbols)))
+
+	// 5. Cooldown status
+	cooldownSymbols := make([]string, 0)
+	for symbol, active := range a.cooldownActive {
+		if active {
+			cooldownSymbols = append(cooldownSymbols, symbol)
+		}
+	}
+	a.logger.Info("Cooldown Status",
+		zap.Strings("cooldown_symbols", cooldownSymbols),
+		zap.Int("count", len(cooldownSymbols)))
+
+	// Note: Balance and GridManager active orders are logged separately in other components
+	a.logger.Info("=== END BLOCKING CHECKS STATUS ===")
 }
 
 // isTakeProfitHit checks if take profit is hit
@@ -2128,44 +2250,24 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		}
 	}
 
-	// NEW: Check ModeManager - block trading if in COOLDOWN mode
-	if a.modeManager != nil {
-		detector, exists := a.rangeDetectors[symbol]
-		if exists {
-			// Get current market conditions from detector
-			rangeState := detector.GetState()
-			adx := detector.GetCurrentADX()
-			isBreakout := detector.IsBreakout()
-			isTrending := adx > 25.0   // Simple trend detection based on ADX
-			isVolatilitySpike := false // TODO: implement volatility spike detection
-
-			// Update ModeManager with latest ATR for dynamic cooldown calculation
-			atr := detector.GetATR()
-			if modeMgr, ok := a.modeManager.(interface {
-				UpdateATR(atr float64)
-			}); ok {
-				modeMgr.UpdateATR(atr)
+	// NEW: Check CircuitBreaker - unified trading decision (breaker state + mode)
+	if a.circuitBreaker != nil {
+		// Type assertion to call GetSymbolDecision
+		if cb, ok := a.circuitBreaker.(interface {
+			GetSymbolDecision(symbol string) (canTrade bool, tradingMode string)
+		}); ok {
+			canTrade, tradingMode := cb.GetSymbolDecision(symbol)
+			if !canTrade {
+				a.logger.Warn("CanPlaceOrder BLOCKED: CircuitBreaker decision",
+					zap.String("symbol", symbol),
+					zap.Bool("canTrade", canTrade),
+					zap.String("tradingMode", tradingMode),
+					zap.String("reason", "circuit breaker tripped or in COOLDOWN mode"))
+				return false
 			}
-
-			// Type assertion to call EvaluateMode
-			if modeMgr, ok := a.modeManager.(interface {
-				EvaluateMode(
-					rangeState interface{},
-					adx float64,
-					isBreakout bool,
-					isTrending bool,
-					isVolatilitySpike bool,
-				) interface{}
-			}); ok {
-				mode := modeMgr.EvaluateMode(rangeState, adx, isBreakout, isTrending, isVolatilitySpike)
-				// Check if mode is COOLDOWN (string comparison for interface)
-				if modeStr, ok := mode.(string); ok && modeStr == "COOLDOWN" {
-					a.logger.Warn("CanPlaceOrder BLOCKED: ModeManager in COOLDOWN",
-						zap.String("symbol", symbol),
-						zap.String("mode", modeStr))
-					return false
-				}
-			}
+			a.logger.Debug("CanPlaceOrder: CircuitBreaker allows trading",
+				zap.String("symbol", symbol),
+				zap.String("tradingMode", tradingMode))
 		}
 	}
 

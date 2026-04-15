@@ -400,46 +400,88 @@ func TestCalculateSmartSize_KellyCriterion(t *testing.T) {
 	assert.InDelta(t, 8.33, size, 0.5, "With 80% win rate, should be higher")
 }
 
-// TestTradeTracker_GetConsecutiveLosses tests consecutive loss counting
+// TestTradeTracker_GetConsecutiveLosses tests consecutive loss counting (per-symbol)
 func TestTradeTracker_GetConsecutiveLosses(t *testing.T) {
 	tracker := NewTradeTracker(24)
 
-	// No trades yet
-	assert.Equal(t, 0, tracker.GetConsecutiveLosses(), "Should be 0 with no trades")
+	// No trades yet for BTC
+	assert.Equal(t, 0, tracker.GetConsecutiveLosses("BTC"), "Should be 0 with no trades")
 
-	// Add wins
+	// Add wins for BTC
 	tracker.RecordTrade("BTC", 1.0)
-	tracker.RecordTrade("ETH", 2.0)
-	assert.Equal(t, 0, tracker.GetConsecutiveLosses(), "Should be 0 after wins")
+	tracker.RecordTrade("BTC", 2.0)
+	assert.Equal(t, 0, tracker.GetConsecutiveLosses("BTC"), "Should be 0 after wins")
 
-	// Add losses
+	// Add losses for BTC
 	tracker.RecordTrade("BTC", -1.0)
-	tracker.RecordTrade("ETH", -2.0)
-	assert.Equal(t, 2, tracker.GetConsecutiveLosses(), "Should count consecutive losses")
+	tracker.RecordTrade("BTC", -2.0)
+	assert.Equal(t, 2, tracker.GetConsecutiveLosses("BTC"), "Should count consecutive losses")
 
 	// Add another loss
 	tracker.RecordTrade("BTC", -0.5)
-	assert.Equal(t, 3, tracker.GetConsecutiveLosses(), "Should count 3 consecutive losses")
+	assert.Equal(t, 3, tracker.GetConsecutiveLosses("BTC"), "Should count 3 consecutive losses")
 
 	// Add a win - resets counter
 	tracker.RecordTrade("BTC", 1.0)
-	assert.Equal(t, 0, tracker.GetConsecutiveLosses(), "Should reset after win")
+	assert.Equal(t, 0, tracker.GetConsecutiveLosses("BTC"), "Should reset after win")
 }
 
-// TestTradeTracker_GetWinRate tests win rate calculation
+// TestTradeTracker_GetWinRate tests win rate calculation (per-symbol)
 func TestTradeTracker_GetWinRate(t *testing.T) {
 	tracker := NewTradeTracker(24)
 
-	// Default when no trades
-	assert.Equal(t, 0.5, tracker.GetWinRate(), "Should return 0.5 default with no trades")
+	// Default when no trades for BTC
+	assert.Equal(t, 0.5, tracker.GetWinRate("BTC"), "Should return 0.5 default with no trades")
 
-	// 3 wins, 1 loss = 75% win rate
+	// 3 wins, 1 loss = 75% win rate for BTC
 	tracker.RecordTrade("BTC", 1.0)
 	tracker.RecordTrade("BTC", 1.0)
 	tracker.RecordTrade("BTC", -1.0)
 	tracker.RecordTrade("BTC", 1.0)
 
-	assert.InDelta(t, 0.75, tracker.GetWinRate(), 0.01, "Win rate should be 75%")
+	assert.InDelta(t, 0.75, tracker.GetWinRate("BTC"), 0.01, "Win rate should be 75%")
+}
+
+// TestTradeTracker_PerSymbolIsolation tests that symbols are isolated
+func TestTradeTracker_PerSymbolIsolation(t *testing.T) {
+	tracker := NewTradeTracker(24)
+
+	// BTC has 3 losses
+	tracker.RecordTrade("BTC", -1.0)
+	tracker.RecordTrade("BTC", -1.0)
+	tracker.RecordTrade("BTC", -1.0)
+
+	// ETH has 0 losses (has wins)
+	tracker.RecordTrade("ETH", 1.0)
+	tracker.RecordTrade("ETH", 1.0)
+
+	// Verify isolation
+	assert.Equal(t, 3, tracker.GetConsecutiveLosses("BTC"), "BTC should have 3 consecutive losses")
+	assert.Equal(t, 0, tracker.GetConsecutiveLosses("ETH"), "ETH should have 0 consecutive losses")
+
+	assert.Equal(t, 0.0, tracker.GetWinRate("BTC"), "BTC should have 0% win rate")
+	assert.Equal(t, 1.0, tracker.GetWinRate("ETH"), "ETH should have 100% win rate")
+}
+
+// TestExposureManager_PerSymbolIsolation tests that cooldowns are isolated per-symbol
+func TestExposureManager_PerSymbolIsolation(t *testing.T) {
+	logger := zap.NewNop()
+	manager := NewExposureManager(1.0, logger)
+
+	// BTC hits 3 losses
+	manager.RecordLoss("BTC")
+	manager.RecordLoss("BTC")
+	manager.RecordLoss("BTC")
+
+	// ETH has 0 losses
+	// (no RecordLoss calls for ETH)
+
+	// Verify isolation
+	assert.True(t, manager.IsCooldownActive("BTC"), "BTC should be in cooldown")
+	assert.False(t, manager.IsCooldownActive("ETH"), "ETH should not be in cooldown")
+
+	assert.Equal(t, 3, manager.GetConsecutiveLosses("BTC"), "BTC should have 3 consecutive losses")
+	assert.Equal(t, 0, manager.GetConsecutiveLosses("ETH"), "ETH should have 0 consecutive losses")
 }
 
 // =============================================================================

@@ -20,6 +20,17 @@ type FuturesClient struct {
 	rateLimiter *rate.Limiter
 }
 
+// getMaxLeverageForSymbol returns the maximum leverage allowed for a symbol
+// BTC: 149x, Other symbols: 99x
+func getMaxLeverageForSymbol(symbol string) int {
+	// Check if symbol is BTC (case-insensitive)
+	symbolUpper := strings.ToUpper(symbol)
+	if strings.HasPrefix(symbolUpper, "BTC") {
+		return 149
+	}
+	return 99
+}
+
 // NewFuturesClient creates a new FuturesClient.
 func NewFuturesClient(h *HTTPClient, dryRun bool, log *zap.Logger, requestsPerSecond int) *FuturesClient {
 	// Create rate limiter - very conservative to avoid bans
@@ -41,7 +52,10 @@ func (f *FuturesClient) GetHTTPClient() *HTTPClient {
 }
 
 // PlaceOrder places a new futures order. Returns the placed Order or a dry-run stub.
-// If leverage exceeds maximum (error -2027), it automatically adjusts to x99 and retries.
+// If leverage exceeds maximum (error -2027), it automatically adjusts with per-symbol max leverage:
+// - BTC: max 149x
+// - Other symbols: max 99x
+// Fallback tries safe leverage first (20, 50) then max leverage for the symbol.
 func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*Order, error) {
 	// Wait for rate limiter
 	if err := f.rateLimiter.Wait(ctx); err != nil {
@@ -77,12 +91,28 @@ func (f *FuturesClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 				zap.Int("error_code", apiErr.Code),
 				zap.String("error_msg", apiErr.Message))
 
+			// Get per-symbol max leverage
+			maxLeverage := getMaxLeverageForSymbol(req.Symbol)
+			f.log.Info("Using per-symbol max leverage",
+				zap.String("symbol", req.Symbol),
+				zap.Int("max_leverage", maxLeverage))
+
 			// Try multiple fallback leverage levels
-			fallbacks := []int{149, 99, 50, 20, 10, 5}
+			// Start with safe leverage (20), then 50, then max leverage
+			// Filter to only include values <= max leverage for the symbol
+			allFallbacks := []int{20, 50, 99, 149}
+			var fallbacks []int
+			for _, lev := range allFallbacks {
+				if lev <= maxLeverage {
+					fallbacks = append(fallbacks, lev)
+				}
+			}
+
 			for _, leverage := range fallbacks {
 				f.log.Info("Attempting to set leverage",
 					zap.String("symbol", req.Symbol),
-					zap.Int("leverage", leverage))
+					zap.Int("leverage", leverage),
+					zap.Int("max_allowed", maxLeverage))
 
 				if leverageErr := f.SetLeverage(ctx, SetLeverageRequest{
 					Symbol:   req.Symbol,
