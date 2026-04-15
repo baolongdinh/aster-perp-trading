@@ -5,18 +5,17 @@ import (
 	"time"
 
 	"aster-bot/internal/client"
+
 	"go.uber.org/zap"
 )
 
 // BalanceSyncWorker syncs balance state between internal and exchange
 type BalanceSyncWorker struct {
-	wsClient           *client.WebSocketClient
-	internalBalance    client.Balance
-	mu                 sync.RWMutex
-	interval           time.Duration
-	logger             *zap.Logger
-	onLowBalance       func(available float64, required float64)
-	lowBalanceThreshold float64
+	wsClient        *client.WebSocketClient
+	internalBalance client.Balance
+	mu              sync.RWMutex
+	interval        time.Duration
+	logger          *zap.Logger
 }
 
 // NewBalanceSyncWorker creates a new balance sync worker
@@ -30,21 +29,10 @@ func NewBalanceSyncWorker(
 	}
 
 	return &BalanceSyncWorker{
-		wsClient:            wsClient,
-		interval:            interval,
-		logger:              logger.With(zap.String("worker", "balance_sync")),
-		lowBalanceThreshold: 100.0, // $100 USDT default threshold
+		wsClient: wsClient,
+		interval: interval,
+		logger:   logger.With(zap.String("worker", "balance_sync")),
 	}
-}
-
-// SetOnLowBalanceCallback sets callback for low balance alert
-func (w *BalanceSyncWorker) SetOnLowBalanceCallback(fn func(available float64, required float64)) {
-	w.onLowBalance = fn
-}
-
-// SetLowBalanceThreshold sets the threshold for low balance alerts
-func (w *BalanceSyncWorker) SetLowBalanceThreshold(threshold float64) {
-	w.lowBalanceThreshold = threshold
 }
 
 // UpdateInternalBalance updates internal balance state
@@ -105,21 +93,4 @@ func (w *BalanceSyncWorker) sync() {
 			zap.Float64("previous", prevBalance.AvailableBalance),
 			zap.Float64("change", diff))
 	}
-
-	// Check for low balance
-	if exchangeBalance.AvailableBalance < w.lowBalanceThreshold {
-		w.logger.Warn("Low balance alert",
-			zap.Float64("available", exchangeBalance.AvailableBalance),
-			zap.Float64("threshold", w.lowBalanceThreshold))
-
-		if w.onLowBalance != nil {
-			w.onLowBalance(exchangeBalance.AvailableBalance, w.lowBalanceThreshold)
-		}
-	}
-}
-
-// CheckMarginSufficient checks if available margin is sufficient for required amount
-func (w *BalanceSyncWorker) CheckMarginSufficient(required float64) bool {
-	available := w.GetAvailableBalance()
-	return available >= required
 }

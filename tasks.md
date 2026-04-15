@@ -210,3 +210,180 @@ T001, T002 (Critical) → T003, T004, T005, T006 (High) → T007-T012 (Medium) �
 - ✅ Real-time exit goroutine runs independently of WebSocket flow
 - ✅ 4-tier liquidation protection active
 - ✅ BB period 10 used consistently across all layers
+
+---
+
+# TradingDecisionWorker Integration
+
+## Status: 🔄 IN PROGRESS
+
+**Created**: April 15, 2026
+
+## Overview
+
+Integrate TradingDecisionWorker as the single source of truth for trading decisions, centralizing all decision logic while keeping existing checks.
+
+## Phase 1: Integration Tasks
+
+### T016: Create TradingDecisionWorker Instance in VolumeFarmEngine
+- **File**: `backend/internal/farming/volume_farm_engine.go`
+- **Location**: `NewVolumeFarmEngine()` function (~line 150)
+- **Action**:
+  1. Add field `tradingDecisionWorker *TradingDecisionWorker` to VolumeFarmEngine struct
+  2. Create instance after adaptiveGridManager initialization:
+     ```go
+     engine.tradingDecisionWorker = farming.NewTradingDecisionWorker(adaptiveGridManager, logger)
+     ```
+  3. Set symbols: `engine.tradingDecisionWorker.SetSymbols([]string{"BTCUSD1", "ETHUSD1", "SOLUSD1"})`
+
+### T017: Set TradingDecisionWorker to GridManager
+- **File**: `backend/internal/farming/volume_farm_engine.go`
+- **Location**: After gridManager initialization (~line 200)
+- **Action**:
+  1. Call `engine.gridManager.SetTradingDecisionWorker(engine.tradingDecisionWorker)`
+  2. Log confirmation: "TradingDecisionWorker set to GridManager"
+
+### T018: Start TradingDecisionWorker
+- **File**: `backend/internal/farming/volume_farm_engine.go`
+- **Location**: `Start()` method (~line 300)
+- **Action**:
+  1. Add goroutine: `go engine.tradingDecisionWorker.Run(ctx)`
+  2. Ensure it starts after adaptiveGridManager starts
+  3. Add error handling for worker startup
+
+### T019: Stop TradingDecisionWorker on Shutdown
+- **File**: `backend/internal/farming/volume_farm_engine.go`
+- **Location**: `Stop()` method (~line 800)
+- **Action**:
+  1. Call `engine.tradingDecisionWorker.Stop()` before stopping other components
+  2. Add logging for shutdown confirmation
+  3. Ensure graceful shutdown with timeout
+
+### T020: Add CircuitBreaker Event Handlers
+- **File**: `backend/internal/farming/volume_farm_engine.go`
+- **Location**: CircuitBreaker callback setup (~line 225)
+- **Action**:
+  1. In SetOnTripCallback: Call `engine.tradingDecisionWorker.ForceUpdate(symbol, false, "circuit breaker trip: "+reason)`
+  2. In SetOnResetCallback: Call `engine.tradingDecisionWorker.ForceUpdate(symbol, true, "circuit breaker reset")`
+  3. Ensure ForceUpdate happens before exit/rebuild actions
+
+### T021: Add RangeDetector Event Handlers
+- **File**: `backend/internal/farming/adaptive_grid/manager.go`
+- **Location**: Range breakout handling (~line 3070)
+- **Action**:
+  1. Add field `tradingDecisionWorker *TradingDecisionWorker` to AdaptiveGridManager
+  2. Add setter method: `SetTradingDecisionWorker(worker *TradingDecisionWorker)`
+  3. In `handleBreakout()`: Call `tradingDecisionWorker.ForceUpdate(symbol, false, "range breakout")`
+  4. In ready-to-reenter: Call `tradingDecisionWorker.evaluateSymbol(symbol)` for immediate update
+
+### T022: Create Trading State API Endpoint
+- **File**: `backend/internal/api/trading_state_api.go` (NEW)
+- **Action**:
+  1. Create handler: `func GetTradingState(w http.ResponseWriter, r *http.Request)`
+  2. Query TradingDecisionWorker: `worker.GetAllTradingStates()`
+  3. Return JSON response with all symbol states
+  4. Add route: `GET /api/trading-state`
+  5. Add query param: `?symbol=BTCUSD1` for single symbol
+
+### T023: Wire API to HTTP Server
+- **File**: `backend/cmd/agentic/main.go` or equivalent
+- **Location**: HTTP server setup
+- **Action**:
+  1. Import trading state API package
+  2. Add route: `router.HandleFunc("/api/trading-state", api.GetTradingState)`
+  3. Ensure it's registered before server starts
+
+## Phase 2: Testing & Validation
+
+### T024: Test TradingDecisionWorker Evaluation
+- **File**: `backend/internal/farming/trading_decision_worker_test.go` (NEW)
+- **Action**:
+  1. Create unit test for `evaluateSymbol()`
+  2. Mock AdaptiveGridManager.CanPlaceOrder() responses
+  3. Verify state updates correctly
+  4. Test ForceUpdate() functionality
+
+### T025: Test Integration with GridManager
+- **File**: `backend/internal/farming/grid_manager_test.go`
+- **Action**:
+  1. Test `canPlaceForSymbol()` with TradingDecisionWorker set
+  2. Verify it reads from worker state
+  3. Test fallback when worker state not available
+  4. Verify logging outputs
+
+### T026: Test API Endpoint
+- **File**: `backend/internal/api/trading_state_api_test.go` (NEW)
+- **Action**:
+  1. Test GET /api/trading-state returns all states
+  2. Test GET /api/trading-state?symbol=BTCUSD1 returns single state
+  3. Verify JSON format matches expected schema
+  4. Test error handling for invalid symbol
+
+### T027: Manual Integration Test
+- **File**: Test plan document
+- **Action**:
+  1. Start bot with TradingDecisionWorker integrated
+  2. Monitor logs for "Trading decision updated" messages
+  3. Trigger CircuitBreaker trip - verify ForceUpdate called
+  4. Query /api/trading-state - verify state reflects decision
+  5. Verify canPlaceForSymbol respects worker decision
+
+## Phase 3: Monitoring & Polish
+
+### T028: Add Metrics for Trading Decisions
+- **File**: `backend/internal/farming/trading_decision_worker.go`
+- **Action**:
+  1. Add counter for total evaluations
+  2. Add counter for state changes
+  3. Add gauge for current canTrade count
+  4. Export metrics for Prometheus scraping
+
+### T029: Add Health Check
+- **File**: `backend/internal/farming/volume_farm_engine.go`
+- **Location**: Health check endpoint
+- **Action**:
+  1. Add TradingDecisionWorker status to health check
+  2. Report last evaluation time
+  3. Report number of symbols being evaluated
+  4. Alert if worker not running
+
+### T030: Documentation Update
+- **File**: `backend/REFACTOR_TRADING_DECISION.md`
+- **Action**:
+  1. Update with actual implementation details
+  2. Add API endpoint documentation
+  3. Add troubleshooting section
+  4. Add example API responses
+
+## Execution Order
+
+**Immediate (Critical)**:
+1. T016 - Create instance
+2. T017 - Set to GridManager
+3. T018 - Start worker
+4. T019 - Stop worker
+
+**Short-term (High)**:
+5. T020 - CircuitBreaker handlers
+6. T021 - RangeDetector handlers
+7. T022 - API endpoint
+8. T023 - Wire API
+
+**Medium-term**:
+9. T024 - T026 - Tests
+10. T027 - Manual test
+
+**Long-term**:
+11. T028 - T030 - Polish
+
+## Success Criteria
+
+- ✅ TradingDecisionWorker starts and evaluates symbols every 5s
+- ✅ GridManager.canPlaceForSymbol reads from worker state
+- ✅ CircuitBreaker trip triggers ForceUpdate
+- ✅ Range breakout triggers ForceUpdate
+- ✅ API endpoint returns trading state
+- ✅ All tests pass
+- ✅ Manual integration test successful
+- ✅ Metrics exported correctly
+- ✅ Health check includes worker status

@@ -18,6 +18,7 @@ Bot giao dịch tự động trên Aster Finance Futures API - Grid Trading + Vo
 Bot tự động đặt lệnh mua (BUY) và bán (SELL) xung quanh giá hiện tại để:
 - **Grid Trading**: Kiếm lãi từ biên độ dao động giá (mua thấp - bán cao)
 - **Volume Farming**: Tạo volume giao dịch liên tục để tích lũy điểm thưởng
+- **Micro Profit**: Chốt lời ngắn (take profit) ngay sau khi grid order khớp, sau đó đặt grid mới
 
 ### Cơ Chế Đơn Giản
 ```
@@ -66,6 +67,17 @@ risk_management:
   max_position_usdt: 300    # Tối đa $300/symbol
   daily_drawdown_pct: 20    # Dừng nếu lỗ 20%
 ```
+
+**Cấu hình Micro Profit (Tùy chọn):**
+```yaml
+micro_profit:
+  enabled: false               # Mặc định tắt
+  spread_pct: 0.005           # 0.5% spread cho take profit
+  timeout_seconds: 30         # 30 giây timeout
+  min_profit_usdt: 0.01       # Lợi nhuận tối thiểu $0.01
+```
+
+> 📖 Xem [`.specify/features/feature/001-micro-profit-volume/quickstart.md`](.specify/features/feature/001-micro-profit-volume/quickstart.md) để biết cách cấu hình micro profit chi tiết.
 
 ### 3. Chạy Bot
 

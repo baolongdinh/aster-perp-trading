@@ -1,0 +1,212 @@
+# Micro Profit Configuration Contract
+
+## Schema Definition
+
+```yaml
+micro_profit:
+  enabled: boolean
+  spread_pct: float  # Range: 0.001 - 0.01
+  timeout_seconds: integer  # Range: 10 - 300
+  min_profit_usdt: float  # Range: 0.001 - 1.0
+```
+
+## Default Configuration
+
+```yaml
+micro_profit:
+  enabled: false
+  spread_pct: 0.005
+  timeout_seconds: 30
+  min_profit_usdt: 0.01
+```
+
+## Validation Rules
+
+### enabled
+- Type: boolean
+- Required: yes
+- Default: false
+- Description: Enable or disable micro profit feature
+
+### spread_pct
+- Type: float
+- Required: yes
+- Default: 0.005
+- Range: 0.001 to 0.01 (0.001% to 0.01%)
+- Description: Spread percentage for take profit orders
+- Validation: Must be > 0 and <= 0.01
+- Error message: "spread_pct must be between 0.001 and 0.01"
+
+### timeout_seconds
+- Type: integer
+- Required: yes
+- Default: 30
+- Range: 10 to 300 (10 seconds to 5 minutes)
+- Description: Timeout duration for take profit orders
+- Validation: Must be >= 10 and <= 300
+- Error message: "timeout_seconds must be between 10 and 300"
+
+### min_profit_usdt
+- Type: float
+- Required: yes
+- Default: 0.01
+- Range: 0.001 to 1.0 ($0.001 to $1)
+- Description: Minimum profit threshold to place take profit order
+- Validation: Must be > 0 and <= 1.0
+- Error message: "min_profit_usdt must be between 0.001 and 1.0"
+
+## Hot-Reload Mechanism
+
+### File Watch
+- Watch `config/micro_profit.yaml` for changes
+- Use file system watcher (fsnotify) to detect modifications
+- Debounce changes by 1 second to avoid reload storms
+
+### Reload Process
+1. Detect file change
+2. Wait 1 second (debounce)
+3. Read new configuration
+4. Validate new configuration
+5. If valid:
+   - Update MicroProfitConfig in memory
+   - Log configuration change
+   - Apply new settings to new take profit orders
+   - Existing take profit orders continue with old settings
+6. If invalid:
+   - Log validation error
+   - Keep old configuration
+   - Alert user via dashboard
+
+### Configuration Change Events
+- Log all configuration changes with timestamp
+- Include old and new values
+- Include source of change (file reload vs API)
+
+## Per-Symbol Configuration
+
+### Global Configuration
+- Default configuration applies to all symbols
+- Defined in `config/micro_profit.yaml`
+
+### Symbol-Specific Overrides
+- Optional: Allow symbol-specific configuration overrides
+- Structure:
+  ```yaml
+  micro_profit:
+    enabled: false
+    spread_pct: 0.005
+    timeout_seconds: 30
+    min_profit_usdt: 0.01
+    symbols:
+      BTCUSD1:
+        enabled: true
+        spread_pct: 0.006
+      ETHUSD1:
+        enabled: false
+  ```
+
+### Override Resolution
+- Symbol-specific overrides take precedence over global config
+- Missing symbol-level fields fall back to global config
+- Validation applies to both global and symbol-specific values
+
+## API Configuration (Optional)
+
+### REST API Endpoints
+```
+GET  /api/config/micro-profit
+PUT  /api/config/micro-profit
+GET  /api/config/micro-profit/:symbol
+PUT  /api/config/micro-profit/:symbol
+```
+
+### API Response Format
+```json
+{
+  "enabled": true,
+  "spread_pct": 0.005,
+  "timeout_seconds": 30,
+  "min_profit_usdt": 0.01,
+  "symbols": {
+    "BTCUSD1": {
+      "enabled": true,
+      "spread_pct": 0.006
+    }
+  }
+}
+```
+
+## Configuration Examples
+
+### Example 1: Conservative Settings
+```yaml
+micro_profit:
+  enabled: true
+  spread_pct: 0.008  # 0.008% spread
+  timeout_seconds: 60  # 1 minute timeout
+  min_profit_usdt: 0.02  # $0.02 minimum profit
+```
+
+### Example 2: Aggressive Settings
+```yaml
+micro_profit:
+  enabled: true
+  spread_pct: 0.003  # 0.003% spread (tighter)
+  timeout_seconds: 15  # 15 second timeout (faster)
+  min_profit_usdt: 0.005  # $0.005 minimum profit (lower)
+```
+
+### Example 3: Disabled
+```yaml
+micro_profit:
+  enabled: false
+```
+
+### Example 4: Symbol-Specific
+```yaml
+micro_profit:
+  enabled: true
+  spread_pct: 0.005
+  timeout_seconds: 30
+  min_profit_usdt: 0.01
+  symbols:
+    BTCUSD1:
+      enabled: true
+      spread_pct: 0.006
+      timeout_seconds: 45
+    ETHUSD1:
+      enabled: false
+    SOLUSD1:
+      enabled: true
+      spread_pct: 0.004
+```
+
+## Error Handling
+
+### File Not Found
+- If config file doesn't exist, use default values
+- Log warning about missing config file
+- Create default config file for user reference
+
+### Invalid Configuration
+- If config is invalid, log error
+- Use last known valid configuration
+- Alert user via dashboard
+- Do not crash the system
+
+### Partial Configuration
+- If some fields are missing, use defaults for missing fields
+- Log warning about missing fields
+- Continue with partial configuration
+
+## Migration Path
+
+### From Version 1.0 to 2.0
+- Add new field `symbols` for per-symbol configuration
+- Backward compatible: old config without `symbols` still works
+- Migration: Load old config, add empty `symbols` map
+
+### From Version 2.0 to 3.0
+- Add new field `dynamic_spread` (future feature)
+- Backward compatible: if not present, use fixed spread_pct
+- Migration: Load old config, set `dynamic_spread: false`

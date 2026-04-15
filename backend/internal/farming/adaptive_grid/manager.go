@@ -1017,9 +1017,25 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 	resumeCheckTicker := time.NewTicker(5 * time.Second)
 	defer resumeCheckTicker.Stop()
 
+	// NEW: Auto-recovery ticker (every 30 seconds)
+	autoRecoveryTicker := time.NewTicker(30 * time.Second)
+	defer autoRecoveryTicker.Stop()
+
+	// IMMEDIATE: Run initial blocking checks status on startup
+	a.logBlockingChecksStatus()
+
 	// NEW: Funding rate check ticker (every 5 minutes)
 	fundingCheckTicker := time.NewTicker(5 * time.Minute)
 	defer fundingCheckTicker.Stop()
+
+	// NEW: Partial close check ticker (every 2 seconds)
+	partialCloseTicker := time.NewTicker(2 * time.Second)
+	defer partialCloseTicker.Stop()
+
+	// NEW: Cluster stop loss check ticker (every 30 seconds)
+	// This handles both cluster stop loss and time-based stop loss internally
+	clusterStopLossTicker := time.NewTicker(30 * time.Second)
+	defer clusterStopLossTicker.Stop()
 
 	// DEBUG: Blocking checks status ticker (every 30 seconds)
 	debugCheckTicker := time.NewTicker(30 * time.Second)
@@ -1036,12 +1052,21 @@ func (a *AdaptiveGridManager) positionMonitor(ctx context.Context) {
 		case <-resumeCheckTicker.C:
 			// Check if any paused symbols can resume trading
 			a.CheckAndResumeAll()
+		case <-autoRecoveryTicker.C:
+			// Run auto-recovery to unblock stuck symbols
+			a.AutoRecovery()
 		case <-debugCheckTicker.C:
 			// DEBUG: Log all blocking checks status
 			a.logBlockingChecksStatus()
 		case <-fundingCheckTicker.C:
-			// NEW: Check and apply funding rate bias
-			a.CheckFundingAndApplyBias()
+			// Run periodic checks including auto-recovery, funding bias, and blocking status
+			a.RunPeriodicChecks()
+		case <-partialCloseTicker.C:
+			// NEW: Check partial take-profit levels for all symbols
+			a.checkPartialTakeProfits(ctx)
+		case <-clusterStopLossTicker.C:
+			// NEW: Check cluster stop loss for all symbols (includes time-based stop loss internally)
+			a.checkClusterStopLoss(ctx)
 		}
 	}
 }
@@ -1160,6 +1185,68 @@ func (a *AdaptiveGridManager) checkAndManageRisk(ctx context.Context) {
 
 		// Check risk limits for this position
 		a.evaluateRiskAndAct(ctx, symbol, &pos)
+	}
+}
+
+// checkPartialTakeProfits checks partial take-profit levels for all active symbols
+func (a *AdaptiveGridManager) checkPartialTakeProfits(ctx context.Context) {
+	a.mu.RLock()
+	symbols := make([]string, 0, len(a.positions))
+	for symbol := range a.positions {
+		symbols = append(symbols, symbol)
+	}
+	a.mu.RUnlock()
+
+	for _, symbol := range symbols {
+		a.mu.RLock()
+		markPrice := a.positions[symbol].MarkPrice
+		a.mu.RUnlock()
+
+		if markPrice > 0 {
+			closed, err := a.CheckPartialTakeProfits(ctx, symbol, markPrice)
+			if err != nil {
+				a.logger.Error("Failed to check partial take profits",
+					zap.String("symbol", symbol),
+					zap.Error(err))
+			}
+			if closed {
+				a.logger.Info("Partial take profit executed",
+					zap.String("symbol", symbol),
+					zap.Float64("price", markPrice))
+			}
+		}
+	}
+}
+
+// checkClusterStopLoss checks cluster stop loss for all active symbols
+func (a *AdaptiveGridManager) checkClusterStopLoss(ctx context.Context) {
+	a.mu.RLock()
+	symbols := make([]string, 0, len(a.positions))
+	for symbol := range a.positions {
+		symbols = append(symbols, symbol)
+	}
+	a.mu.RUnlock()
+
+	for _, symbol := range symbols {
+		a.mu.RLock()
+		markPrice := a.positions[symbol].MarkPrice
+		a.mu.RUnlock()
+
+		if markPrice > 0 {
+			clusters, err := a.CheckClusterStopLoss(symbol, markPrice)
+			if err != nil {
+				a.logger.Error("Failed to check cluster stop loss",
+					zap.String("symbol", symbol),
+					zap.Error(err))
+			}
+			if len(clusters) > 0 {
+				a.logger.Info("Cluster stop loss triggered",
+					zap.String("symbol", symbol),
+					zap.Int("clusters", len(clusters)))
+				// Trigger exit for symbol
+				a.ExitAll(ctx, symbol, EventEmergencyExit, "Cluster stop loss triggered")
+			}
+		}
 	}
 }
 
@@ -1428,12 +1515,112 @@ func (a *AdaptiveGridManager) isStopLossHit(symbol string, markPrice, positionAm
 	return false
 }
 
+// AutoRecovery attempts to unblock symbols that are stuck in various states
+func (a *AdaptiveGridManager) AutoRecovery() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.logger.Info("=== AUTO-RECOVERY START ===")
+
+	for symbol := range a.rangeDetectors {
+		a.logger.Info("Checking symbol for auto-recovery", zap.String("symbol", symbol))
+
+		// 1. Check RangeDetector state
+		if detector, exists := a.rangeDetectors[symbol]; exists {
+			rangeInfo := detector.GetRangeInfo()
+			state := rangeInfo["state"]
+			if state == "Unknown" || state == "Initializing" {
+				a.logger.Warn("Auto-recovery: Force initializing RangeDetector stuck in Unknown/Initializing",
+					zap.String("symbol", symbol),
+					zap.Any("state", state))
+				config := DefaultRangeConfig()
+				config.StabilizationPeriod = 30 * time.Second // Shorter for auto-recovery
+				a.InitializeRangeDetector(symbol, config)
+			}
+		}
+
+		// 2. Check State Machine
+		if a.stateMachine != nil {
+			state := a.stateMachine.GetState(symbol)
+			stateTime := a.stateMachine.GetStateTime(symbol)
+			timeInState := time.Since(stateTime)
+
+			// Force transition from EXIT_ALL if stuck > 2 minutes
+			if state == GridStateExitAll && timeInState > 2*time.Minute {
+				a.logger.Warn("Auto-recovery: Force transition from EXIT_ALL to WAIT_NEW_RANGE",
+					zap.String("symbol", symbol),
+					zap.Duration("time_in_state", timeInState))
+				a.markExitCompleted(symbol)
+			}
+
+			// Force transition from WAIT_NEW_RANGE if stuck > 5 minutes
+			if state == GridStateWaitNewRange && timeInState > 5*time.Minute {
+				a.logger.Warn("Auto-recovery: Force transition from WAIT_NEW_RANGE to IDLE",
+					zap.String("symbol", symbol),
+					zap.Duration("time_in_state", timeInState))
+				a.stateMachine.ForceState(symbol, GridStateIdle)
+			}
+
+			// Force transition from IDLE if stuck > 10 minutes and range is ready
+			if state == GridStateIdle && timeInState > 10*time.Minute {
+				if detector, exists := a.rangeDetectors[symbol]; exists && detector.ShouldTrade() {
+					a.logger.Warn("Auto-recovery: Force transition from IDLE to ENTER_GRID (range ready)",
+						zap.String("symbol", symbol),
+						zap.Duration("time_in_state", timeInState))
+					a.stateMachine.Transition(symbol, EventRangeConfirmed)
+				}
+			}
+		}
+
+		// 3. Check tradingPaused
+		if a.tradingPaused[symbol] {
+			state := a.stateMachine.GetState(symbol)
+			if state == GridStateIdle || state == GridStateWaitNewRange {
+				a.logger.Warn("Auto-recovery: Auto-resuming paused symbol in IDLE/WAIT_NEW_RANGE",
+					zap.String("symbol", symbol),
+					zap.String("state", state.String()))
+				a.resumeTrading(symbol)
+			}
+		}
+	}
+
+	a.logger.Info("=== AUTO-RECOVERY END ===")
+}
+
 // logBlockingChecksStatus logs the status of all blocking checks for debugging
 func (a *AdaptiveGridManager) logBlockingChecksStatus() {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
 	a.logger.Info("=== BLOCKING CHECKS STATUS ===")
+
+	// 0. RangeDetector status (BEFORE other checks)
+	a.logger.Info("RangeDetector Status")
+	for symbol, detector := range a.rangeDetectors {
+		rangeInfo := detector.GetRangeInfo()
+		state := rangeInfo["state"]
+		a.logger.Info("RangeDetector Details",
+			zap.String("symbol", symbol),
+			zap.Any("state", state),
+			zap.Bool("should_trade", detector.ShouldTrade()),
+			zap.Any("has_range", rangeInfo["has_range"]),
+			zap.Any("range_lower", rangeInfo["range_lower"]),
+			zap.Any("range_upper", rangeInfo["range_upper"]),
+			zap.Any("adx_filter_enabled", rangeInfo["adx_filter_enabled"]),
+			zap.Any("is_sideways", rangeInfo["is_sideways"]),
+			zap.Any("data_points", rangeInfo["data_points"]))
+
+		// Force initialize if stuck in Unknown state for too long
+		if state == "Unknown" || state == "Initializing" {
+			a.logger.Warn("RangeDetector stuck in Unknown/Initializing state, forcing initialization IMMEDIATELY",
+				zap.String("symbol", symbol),
+				zap.Any("current_state", state))
+			// Force re-initialization with default config
+			config := DefaultRangeConfig()
+			config.StabilizationPeriod = 10 * time.Second // Ultra-short for immediate recovery
+			a.InitializeRangeDetector(symbol, config)
+		}
+	}
 
 	// 1. CircuitBreaker status
 	if a.circuitBreaker != nil {
@@ -1469,12 +1656,47 @@ func (a *AdaptiveGridManager) logBlockingChecksStatus() {
 
 	// 4. State machine status
 	if a.stateMachine != nil {
-		for symbol := range a.tradingPaused {
+		for symbol := range a.rangeDetectors {
 			state := a.stateMachine.GetState(symbol)
+			canPlace := a.stateMachine.CanPlaceOrders(symbol)
+			stateTime := a.stateMachine.GetStateTime(symbol)
+			timeInState := time.Since(stateTime)
+
 			a.logger.Info("State Machine Status",
 				zap.String("symbol", symbol),
 				zap.String("state", state.String()),
-				zap.Bool("can_place_orders", a.stateMachine.CanPlaceOrders(symbol)))
+				zap.Bool("can_place_orders", canPlace),
+				zap.Duration("time_in_state", timeInState))
+
+			if !canPlace {
+				a.logger.Warn("State Machine Blocking Orders for symbol", zap.String("symbol", symbol), zap.String("reason", state.String()))
+
+				// Force transition if stuck in EXIT_ALL (immediate - no wait)
+				if state == GridStateExitAll {
+					a.logger.Warn("Symbol in EXIT_ALL state, forcing transition to WAIT_NEW_RANGE IMMEDIATELY",
+						zap.String("symbol", symbol),
+						zap.Duration("time_in_state", timeInState))
+					a.markExitCompleted(symbol)
+				}
+
+				// Force transition from IDLE if range is ready (immediate - no wait)
+				if state == GridStateIdle {
+					if detector, exists := a.rangeDetectors[symbol]; exists && detector.ShouldTrade() {
+						a.logger.Warn("Symbol in IDLE state with ready range, forcing transition to ENTER_GRID IMMEDIATELY",
+							zap.String("symbol", symbol),
+							zap.Duration("time_in_state", timeInState))
+						a.stateMachine.Transition(symbol, EventRangeConfirmed)
+					}
+				}
+
+				// Force transition if stuck in WAIT_NEW_RANGE for more than 5 minutes
+				if state == GridStateWaitNewRange && timeInState > 5*time.Minute {
+					a.logger.Warn("Symbol stuck in WAIT_NEW_RANGE for too long, forcing transition to IDLE",
+						zap.String("symbol", symbol),
+						zap.Duration("time_in_state", timeInState))
+					a.stateMachine.ForceState(symbol, GridStateIdle)
+				}
+			}
 		}
 	}
 
@@ -1483,13 +1705,24 @@ func (a *AdaptiveGridManager) logBlockingChecksStatus() {
 	for symbol, paused := range a.tradingPaused {
 		if paused {
 			pausedSymbols = append(pausedSymbols, symbol)
+			// Check if symbol is stuck in paused state
+			state := a.stateMachine.GetState(symbol)
+			if state == GridStateIdle || state == GridStateWaitNewRange {
+				// If paused but in IDLE or WAIT_NEW_RANGE, auto-resume
+				a.logger.Warn("Auto-resuming trading for paused symbol in IDLE/WAIT_NEW_RANGE",
+					zap.String("symbol", symbol),
+					zap.String("state", state.String()))
+				a.resumeTrading(symbol)
+			}
 		}
 	}
-	a.logger.Info("Trading Paused Status",
-		zap.Strings("paused_symbols", pausedSymbols),
-		zap.Int("count", len(pausedSymbols)))
+	if len(pausedSymbols) > 0 {
+		a.logger.Warn("Trading PAUSED for symbols", zap.Strings("symbols", pausedSymbols))
+	} else {
+		a.logger.Info("Trading NOT paused for any symbol")
+	}
 
-	// 5. Cooldown status
+	// 6. Cooldown status
 	cooldownSymbols := make([]string, 0)
 	for symbol, active := range a.cooldownActive {
 		if active {
@@ -1864,7 +2097,7 @@ func (a *AdaptiveGridManager) emergencyCloseAll(ctx context.Context, positions [
 	for symbol := range symbolsMap {
 		// Initialize or reset range detector to wait for new stable range
 		config := DefaultRangeConfig()
-		config.StabilizationPeriod = 5 * time.Minute // Wait 5 minutes for stabilization
+		config.StabilizationPeriod = 1 * time.Minute // Wait 1 minute for stabilization (reduced from 5min)
 		a.InitializeRangeDetector(symbol, config)
 		a.logger.Info("Range detector initialized - waiting for price stabilization",
 			zap.String("symbol", symbol),
@@ -1874,11 +2107,30 @@ func (a *AdaptiveGridManager) emergencyCloseAll(ctx context.Context, positions [
 	a.logger.Error("EMERGENCY CLOSE ALL COMPLETE - All positions closed, trading paused, waiting for stabilization")
 }
 
-// pauseTrading pauses trading for a symbol
+// pauseTrading pauses trading for a symbol with auto-resume timer
 func (a *AdaptiveGridManager) pauseTrading(symbol string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.tradingPaused[symbol] = true
+
+	// Set auto-resume timer (default 1 minute - reduced from 5min)
+	stabilizationPeriod := 1 * time.Minute
+
+	a.logger.Info("Trading paused with auto-resume timer",
+		zap.String("symbol", symbol),
+		zap.Duration("auto_resume_after", stabilizationPeriod))
+
+	// Schedule auto-resume
+	go func() {
+		time.Sleep(stabilizationPeriod)
+		a.mu.Lock()
+		if paused, exists := a.tradingPaused[symbol]; exists && paused {
+			delete(a.tradingPaused, symbol)
+			a.logger.Info("Auto-resuming trading after stabilization period",
+				zap.String("symbol", symbol))
+		}
+		a.mu.Unlock()
+	}()
 }
 
 // resumeTrading resumes trading for a symbol
@@ -2256,190 +2508,97 @@ func (a *AdaptiveGridManager) Stop(ctx context.Context) error {
 }
 
 // CanPlaceOrder checks if new orders can be placed for a symbol
-// For volume farming: luôn cho phép rebalance ngay sau khi fill để duy trì số lệnh grid
+// Simplified: CircuitBreaker is the single source of truth for trading decisions
 func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	// Check if trading is paused
+	a.logger.Info("=== CanPlaceOrder START ===", zap.String("symbol", symbol))
+
+	// Check 1: Manual pause
 	if a.tradingPaused[symbol] {
+		a.logger.Warn("CanPlaceOrder BLOCKED: trading paused",
+			zap.String("symbol", symbol))
 		return false
 	}
+	a.logger.Debug("Check 1 PASS: trading not paused", zap.String("symbol", symbol))
 
-	// NEW: Check consecutive loss cooldown - GIẢM thời gian cho volume farming
-	if a.cooldownActive[symbol] {
-		lastLoss := a.lastLossTime[symbol]
-		cooldownDuration := a.riskConfig.CooldownDuration
-		if cooldownDuration <= 0 {
-			cooldownDuration = 30 * time.Second // GIẢM: 30s thay vì 5 phút cho volume farming
-		}
-		if time.Since(lastLoss) < cooldownDuration {
-			a.logger.Warn("CanPlaceOrder: cooldown active but allowing rebalance for volume farming",
-				zap.String("symbol", symbol),
-				zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
-				zap.Duration("remaining", cooldownDuration-time.Since(lastLoss)))
-			// Volume farming: Vẫn cho phép rebalance - không block
-		} else {
-			// Cooldown expired - reset
-			a.cooldownActive[symbol] = false
-			a.consecutiveLosses[symbol] = 0
-		}
-	}
-
-	// Check if in cooldown - GIẢM thời gian cho volume farming
-	if cooldown, exists := a.transitionCooldown[symbol]; exists {
-		if time.Since(cooldown) < 5*time.Second { // GIẢM từ 30s xuống 5s
-			a.logger.Debug("CanPlaceOrder: transition cooldown active but allowing for volume farming",
-				zap.String("symbol", symbol),
-				zap.Duration("elapsed", time.Since(cooldown)))
-			// Volume farming: Vẫn cho phép rebalance - không block
-		}
-	}
-
-	// Check position limit - STRICT: Block if already at or above max position
+	// Check 2: Position limit (1.2x hard cap)
 	if position, exists := a.positions[symbol]; exists {
-		if position.NotionalValue >= a.riskConfig.MaxPositionUSDT {
-			// HARD CAP: Không cho phép vượt quá 1.2x max position để tránh runaway positions
-			hardCap := a.riskConfig.MaxPositionUSDT * 1.2
-			if position.NotionalValue >= hardCap {
-				a.logger.Error("CanPlaceOrder BLOCKED: hard position cap (1.2x) exceeded",
-					zap.String("symbol", symbol),
-					zap.Float64("notional", position.NotionalValue),
-					zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT),
-					zap.Float64("hard_cap", hardCap))
-				return false // HARD BLOCK: Không cho phép vượt quá hard cap
-			}
-			// If position is between max and 1.2x, only allow reducing position (hedge orders)
-			a.logger.Warn("CanPlaceOrder: max position reached - only allowing hedge orders",
+		if position.NotionalValue >= a.riskConfig.MaxPositionUSDT*1.2 {
+			a.logger.Error("CanPlaceOrder BLOCKED: hard position cap exceeded",
 				zap.String("symbol", symbol),
 				zap.Float64("notional", position.NotionalValue),
-				zap.Float64("max", a.riskConfig.MaxPositionUSDT),
-				zap.Float64("hard_cap", hardCap))
-			// Note: Actual order side check happens in buildGridOrders
-			// We don't return false here to allow hedge orders, but size will be limited
+				zap.Float64("max_allowed", a.riskConfig.MaxPositionUSDT*1.2))
+			return false
 		}
+		a.logger.Debug("Check 2 PASS: position within hard cap",
+			zap.String("symbol", symbol),
+			zap.Float64("notional", position.NotionalValue))
+	} else {
+		a.logger.Debug("Check 2 PASS: no position", zap.String("symbol", symbol))
 	}
 
-	// NEW: Check RiskMonitor exposure limits - Cho phép rebalance với size nhỏ hơn
-	if a.riskMonitor != nil {
-		_, maxExposure, utilization := a.riskMonitor.GetExposureStats()
-		if utilization >= 1.0 {
-			a.logger.Warn("CanPlaceOrder: max exposure reached but allowing rebalance for volume farming",
-				zap.Float64("utilization", utilization*100),
-				zap.Float64("max_exposure", maxExposure))
-			// Volume farming: Vẫn cho phép rebalance - không block
-			// Size sẽ được điều chỉnh tự động trong order placement logic
-		}
-	}
-
-	// NEW: Check CircuitBreaker - unified trading decision (breaker state + mode)
+	// Check 3: CircuitBreaker (single source of truth)
 	if a.circuitBreaker != nil {
-		// Type assertion to call GetSymbolDecision
 		if cb, ok := a.circuitBreaker.(interface {
 			GetSymbolDecision(symbol string) (canTrade bool, tradingMode string)
 		}); ok {
-			canTrade, tradingMode := cb.GetSymbolDecision(symbol)
+			canTrade, mode := cb.GetSymbolDecision(symbol)
+			a.logger.Info("Check 3: CircuitBreaker decision",
+				zap.String("symbol", symbol),
+				zap.Bool("can_trade", canTrade),
+				zap.String("mode", mode))
 			if !canTrade {
-				a.logger.Warn("CanPlaceOrder BLOCKED: CircuitBreaker decision",
+				a.logger.Warn("CanPlaceOrder BLOCKED: CircuitBreaker",
 					zap.String("symbol", symbol),
-					zap.Bool("canTrade", canTrade),
-					zap.String("tradingMode", tradingMode),
-					zap.String("reason", "circuit breaker tripped or in COOLDOWN mode"))
+					zap.String("mode", mode))
 				return false
 			}
-			a.logger.Debug("CanPlaceOrder: CircuitBreaker allows trading",
-				zap.String("symbol", symbol),
-				zap.String("tradingMode", tradingMode))
-		}
-	}
-
-	// MODIFIED: Support MICRO mode - allow trading with ATR bands when BB not ready
-	if detector, exists := a.rangeDetectors[symbol]; exists {
-		// Check if BB range is active (normal case)
-		bbActive := detector.ShouldTrade()
-
-		// If BB not active, check if we can use MICRO mode (ATR bands)
-		if !bbActive {
-			// Check if we have enough data for MICRO mode
-			if detector.HasEnoughDataForMICRO() {
-				// Allow trading in MICRO mode with ATR bands
-				_, _, valid := detector.GetATRBands(1.5) // 1.5x ATR multiplier
-				if valid {
-					a.logger.Debug("CanPlaceOrder: allowing MICRO mode with ATR bands",
-						zap.String("symbol", symbol),
-						zap.String("state", detector.GetStateString()))
-					// Continue to other checks (don't return false)
-				} else {
-					a.logger.Warn("CanPlaceOrder BLOCKED: invalid ATR bands",
-						zap.String("symbol", symbol))
-					return false
-				}
-			} else {
-				a.logger.Warn("CanPlaceOrder BLOCKED: BB range not active, insufficient data for MICRO mode",
-					zap.String("symbol", symbol),
-					zap.String("state", detector.GetStateString()))
-				return false // Not enough data for MICRO mode
-			}
-		}
-	}
-
-	// NEW: Check TimeFilter - only trade during allowed hours
-	if a.timeFilter != nil {
-		if !a.timeFilter.CanTrade() {
-			a.logger.Debug("CanPlaceOrder blocked: outside trading hours",
+		} else {
+			a.logger.Warn("CircuitBreaker exists but GetSymbolDecision not available",
 				zap.String("symbol", symbol))
-			return false
 		}
+	} else {
+		a.logger.Warn("CircuitBreaker is nil",
+			zap.String("symbol", symbol))
 	}
+	a.logger.Debug("Check 3 PASS: CircuitBreaker allows trading", zap.String("symbol", symbol))
 
-	// NEW: Check SpreadProtection - log warning nhưng không block cho volume farming
-	if a.spreadProtection != nil {
-		if a.spreadProtection.ShouldPauseTrading() {
-			a.logger.Warn("CanPlaceOrder: spread too wide but allowing for volume farming",
-				zap.String("symbol", symbol),
-				zap.Float64("spread_pct", a.spreadProtection.GetSpreadPct()*100))
-			// Volume farming: Không block, vẫn cho phép đặt lệnh với spread rộng
-		}
-	}
+	// Check 4: TimeFilter - DISABLED for volume farming (trade 24/7)
+	// if a.timeFilter != nil {
+	// 	canTrade := a.timeFilter.CanTrade()
+	// 	a.logger.Info("Check 4: TimeFilter",
+	// 		zap.String("symbol", symbol),
+	// 		zap.Bool("can_trade", canTrade))
+	// 	if !canTrade {
+	// 		a.logger.Warn("CanPlaceOrder BLOCKED: outside trading hours",
+	// 			zap.String("symbol", symbol))
+	// 		return false
+	// 	}
+	// } else {
+	// 	a.logger.Debug("Check 4 SKIP: TimeFilter is nil", zap.String("symbol", symbol))
+	// }
+	a.logger.Debug("Check 4 SKIP: TimeFilter disabled for volume farming", zap.String("symbol", symbol))
 
-	// NEW: Check InventoryManager - Volume farming: không pause side dù skew cao
-	if a.inventoryMgr != nil {
-		// Không kiểm tra ShouldPauseSide nữa - luôn cho phép cả 2 sides
-		// Size sẽ được điều chỉnh trong GetInventoryAdjustedSize
-		skewRatio := a.inventoryMgr.CalculateSkewRatio(symbol)
-		if skewRatio > 0.8 {
-			a.logger.Info("CanPlaceOrder: inventory skew detected but allowing for volume farming",
-				zap.String("symbol", symbol),
-				zap.Float64("skew_ratio", skewRatio))
-		}
-	}
-
-	// NEW: Check TrendDetector - Volume farming: log warning nhưng không block
-	if a.trendDetector != nil {
-		state := a.trendDetector.GetTrendState()
-		score := a.trendDetector.GetTrendScore()
-
-		// Strong trend - log warning nhưng không block
-		if score >= 4 {
-			a.logger.Info("CanPlaceOrder: strong trend detected but allowing for volume farming",
-				zap.String("symbol", symbol),
-				zap.String("trend_state", state.String()),
-				zap.Int("trend_score", score))
-			// Volume farming: Không return false, vẫn cho phép đặt lệnh
-			// Grid sẽ tự động điều chỉnh spread và size
-		}
-	}
-
-	// NEW: Check FundingRate - skip opening if funding too high
+	// Check 5: FundingRate
 	if a.fundingMonitor != nil {
-		if biasSide, _, shouldSkip := a.fundingMonitor.GetFundingBias(symbol); shouldSkip {
+		biasSide, _, shouldSkip := a.fundingMonitor.GetFundingBias(symbol)
+		a.logger.Info("Check 5: FundingRate",
+			zap.String("symbol", symbol),
+			zap.String("bias_side", biasSide),
+			zap.Bool("should_skip", shouldSkip))
+		if shouldSkip {
 			a.logger.Warn("CanPlaceOrder BLOCKED: extreme funding rate",
 				zap.String("symbol", symbol),
 				zap.String("bias_side", biasSide))
 			return false
 		}
+	} else {
+		a.logger.Debug("Check 5 SKIP: FundingMonitor is nil", zap.String("symbol", symbol))
 	}
 
+	a.logger.Info("=== CanPlaceOrder ALL CHECKS PASSED ===", zap.String("symbol", symbol))
 	return true
 }
 
@@ -2479,8 +2638,8 @@ func (a *AdaptiveGridManager) CheckFundingAndApplyBias() {
 	}
 
 	a.mu.RLock()
-	symbols := make([]string, 0, len(a.positions))
-	for symbol := range a.positions {
+	symbols := make([]string, 0, len(a.rangeDetectors))
+	for symbol := range a.rangeDetectors {
 		symbols = append(symbols, symbol)
 	}
 	a.mu.RUnlock()
@@ -2488,6 +2647,18 @@ func (a *AdaptiveGridManager) CheckFundingAndApplyBias() {
 	for _, symbol := range symbols {
 		a.ApplyFundingBias(symbol)
 	}
+}
+
+// RunPeriodicChecks runs all periodic checks including auto-recovery
+func (a *AdaptiveGridManager) RunPeriodicChecks() {
+	// Run auto-recovery every 30 seconds to unblock stuck symbols
+	a.AutoRecovery()
+
+	// Check funding bias
+	a.CheckFundingAndApplyBias()
+
+	// Log blocking status for debugging
+	a.logBlockingChecksStatus()
 }
 
 // CalculateDynamicSpread calculates dynamic grid spread for a symbol based on ATR
@@ -2528,16 +2699,10 @@ func (a *AdaptiveGridManager) GetCurrentSlot() *TimeSlotConfig {
 	return a.timeFilter.GetCurrentSlot()
 }
 
-// CanTrade returns true if trading is allowed at current time
+// CanTrade checks if trading is allowed based on time filter - DISABLED for volume farming (trade 24/7)
 func (a *AdaptiveGridManager) CanTrade() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	if a.timeFilter == nil {
-		return true // Default allow if no time filter
-	}
-
-	return a.timeFilter.CanTrade()
+	// DISABLED: Always return true for volume farming
+	return true
 }
 
 // InitializeTimeFilter creates or reinitializes the time filter with config
@@ -2619,6 +2784,17 @@ func (a *AdaptiveGridManager) GetCurrentTimeSlot() map[string]interface{} {
 
 // GetOrderSize returns dynamically calculated order size with time-based adjustment
 func (a *AdaptiveGridManager) GetOrderSize(symbol string, currentPrice float64, isLong bool) (float64, error) {
+	// NEW: Check if micro grid mode is enabled
+	if a.IsMicroGridEnabled() {
+		microGridSize := a.GetMicroGridOrderSize(currentPrice)
+		if microGridSize > 0 {
+			a.logger.Info("Using micro grid order size",
+				zap.String("symbol", symbol),
+				zap.Float64("micro_grid_size", microGridSize))
+			return microGridSize, nil
+		}
+	}
+
 	if a.riskMonitor == nil {
 		return 0, fmt.Errorf("risk monitor not initialized")
 	}
@@ -2638,7 +2814,25 @@ func (a *AdaptiveGridManager) GetOrderSize(symbol string, currentPrice float64, 
 			zap.Float64("base_size", size),
 			zap.Float64("multiplier", sizeMultiplier),
 			zap.Float64("adjusted_size", adjustedSize))
-		return adjustedSize, nil
+		size = adjustedSize
+	}
+
+	// NEW: Apply dynamic leverage adjustment
+	optimalLeverage := a.GetOptimalLeverage()
+	defaultLeverage := 50.0 // Default leverage for reference
+	if optimalLeverage != defaultLeverage {
+		// Adjust size inversely to leverage change
+		// Higher leverage = smaller size, Lower leverage = larger size
+		leverageRatio := defaultLeverage / optimalLeverage
+		adjustedSize := size * leverageRatio
+		a.logger.Info("Order size adjusted by dynamic leverage",
+			zap.String("symbol", symbol),
+			zap.Float64("base_size", size),
+			zap.Float64("optimal_leverage", optimalLeverage),
+			zap.Float64("default_leverage", defaultLeverage),
+			zap.Float64("leverage_ratio", leverageRatio),
+			zap.Float64("adjusted_size", adjustedSize))
+		size = adjustedSize
 	}
 
 	return size, nil
@@ -2710,6 +2904,21 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 		}
 	}
 	a.logger.Warn(">>> REGIME DETECTION DONE <<<")
+
+	// NEW: Check breakeven exit on price updates
+	clusters, err := a.CheckClusterStopLoss(symbol, close)
+	if err != nil {
+		a.logger.Error("Failed to check breakeven exit",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+	}
+	if len(clusters) > 0 {
+		a.logger.Info("Breakeven exit triggered",
+			zap.String("symbol", symbol),
+			zap.Int("clusters", len(clusters)))
+		// Trigger exit for symbol
+		a.ExitAll(context.Background(), symbol, EventEmergencyExit, "Breakeven exit triggered")
+	}
 }
 
 // RecordTradeResult records trade result for loss tracking with cooldown
@@ -2764,18 +2973,18 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 			zap.Int("consecutive_losses", a.consecutiveLosses[symbol]),
 			zap.Int("total_losses_today", a.totalLossesToday))
 
-		// Check if max consecutive losses reached
-		if a.consecutiveLosses[symbol] >= maxConsecutiveLosses {
-			a.cooldownActive[symbol] = true
-			if a.stateMachine != nil {
-				a.stateMachine.RecordConsecutiveLoss(symbol)
-			}
-			maxLossesReached = true
-			a.logger.Error("MAX CONSECUTIVE LOSSES REACHED - Entering cooldown",
-				zap.String("symbol", symbol),
-				zap.Int("losses", a.consecutiveLosses[symbol]),
-				zap.Duration("cooldown", cooldownDuration))
-		}
+		// DISABLED: Check if max consecutive losses reached - don't activate cooldown for volume farming
+		// if a.consecutiveLosses[symbol] >= maxConsecutiveLosses {
+		// 	a.cooldownActive[symbol] = true
+		// 	if a.stateMachine != nil {
+		// 		a.stateMachine.RecordConsecutiveLoss(symbol)
+		// 	}
+		// 	maxLossesReached = true
+		// 	a.logger.Error("MAX CONSECUTIVE LOSSES REACHED - Entering cooldown",
+		// 		zap.String("symbol", symbol),
+		// 		zap.Int("losses", a.consecutiveLosses[symbol]),
+		// 		zap.Duration("cooldown", cooldownDuration))
+		// }
 	}
 
 	a.mu.Unlock()
@@ -2884,6 +3093,46 @@ func (a *AdaptiveGridManager) InitializeRangeDetector(symbol string, config *Ran
 		zap.String("symbol", symbol),
 		zap.String("method", config.Method),
 		zap.Bool("adx_filter_enabled", a.optConfig != nil && a.optConfig.ADXFilter != nil && a.optConfig.ADXFilter.Enabled))
+
+	// IMMEDIATE: Fetch historical kline data to establish range immediately
+	// Instead of waiting for WebSocket warm-up
+	// Fetch MORE data (50 periods) for better range detection since we're using API
+	a.logger.Info("About to fetch historical klines", zap.String("symbol", symbol))
+	a.fetchHistoricalKlinesAndFeedDetector(symbol, detector, 50)
+	a.logger.Info("Historical klines fetch completed", zap.String("symbol", symbol))
+}
+
+// fetchHistoricalKlinesAndFeedDetector fetches historical kline data and feeds to detector
+func (a *AdaptiveGridManager) fetchHistoricalKlinesAndFeedDetector(symbol string, detector *RangeDetector, periods int) {
+	a.logger.Info("Fetching historical klines for immediate range establishment",
+		zap.String("symbol", symbol),
+		zap.Int("periods", periods))
+
+	// Create HTTPClient for API calls (no auth needed for public endpoints)
+	httpClient := client.NewHTTPClient("", nil, a.logger, 30)
+	marketClient := client.NewMarketClient(httpClient)
+
+	// Fetch historical klines from API
+	klines, err := marketClient.Klines(context.Background(), symbol, "1m", periods)
+	if err != nil {
+		a.logger.Error("Failed to fetch historical klines",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+		return
+	}
+
+	a.logger.Info("Historical klines fetched successfully",
+		zap.String("symbol", symbol),
+		zap.Int("count", len(klines)))
+
+	// Feed klines to detector
+	for _, kline := range klines {
+		detector.AddPrice(kline.High, kline.Low, kline.Close)
+	}
+
+	a.logger.Info("Historical klines fed to detector",
+		zap.String("symbol", symbol),
+		zap.Int("klines_fed", len(klines)))
 }
 
 // UpdatePriceForRange updates price data for range detection.
@@ -2908,16 +3157,41 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 		a.UpdateDynamicLeverageMetrics(currentRange.ATR, detector.GetCurrentADX(), currentRange.WidthPct)
 	}
 
-	if stateMachine != nil && detector.ShouldTrade() {
-		switch stateMachine.GetState(symbol) {
+	if stateMachine != nil {
+		currentState := stateMachine.GetState(symbol)
+		a.logger.Info("State machine transition check",
+			zap.String("symbol", symbol),
+			zap.String("current_state", currentState.String()))
+
+		// REMOVED detector.ShouldTrade() check to allow auto-reentry after breakout
+		// CircuitBreaker is the single source of truth for trading decisions
+		switch currentState {
 		case GridStateIdle:
-			if stateMachine.CanTransition(symbol, EventRangeConfirmed) {
-				stateMachine.Transition(symbol, EventRangeConfirmed)
+			readyForRegrid := a.isReadyForRegrid(symbol)
+			canTransition := stateMachine.CanTransition(symbol, EventRangeConfirmed)
+			a.logger.Info("IDLE -> ENTER_GRID transition check",
+				zap.String("symbol", symbol),
+				zap.Bool("ready_for_regrid", readyForRegrid),
+				zap.Bool("can_transition", canTransition))
+			if readyForRegrid && canTransition {
+				ok := stateMachine.Transition(symbol, EventRangeConfirmed)
+				a.logger.Info("IDLE -> ENTER_GRID transition result",
+					zap.String("symbol", symbol),
+					zap.Bool("success", ok))
 			}
 		case GridStateWaitNewRange:
-			if a.isReadyForRegrid(symbol) && stateMachine.CanTransition(symbol, EventNewRangeReady) {
-				stateMachine.Transition(symbol, EventNewRangeReady)
+			readyForRegrid := a.isReadyForRegrid(symbol)
+			canTransition := stateMachine.CanTransition(symbol, EventNewRangeReady)
+			a.logger.Info("WAIT_NEW_RANGE -> ENTER_GRID transition check",
+				zap.String("symbol", symbol),
+				zap.Bool("ready_for_regrid", readyForRegrid),
+				zap.Bool("can_transition", canTransition))
+			if readyForRegrid && canTransition {
+				ok := stateMachine.Transition(symbol, EventNewRangeReady)
 				stateMachine.ClearRegridCooldown(symbol)
+				a.logger.Info("WAIT_NEW_RANGE -> ENTER_GRID transition result",
+					zap.String("symbol", symbol),
+					zap.Bool("success", ok))
 			}
 		}
 	}
@@ -3043,17 +3317,47 @@ func (a *AdaptiveGridManager) ExitAll(ctx context.Context, symbol string, event 
 		}
 	}
 
-	a.mu.RLock()
-	position, hasPosition := a.positions[symbol]
-	detector, hasDetector := a.rangeDetectors[symbol]
-	a.mu.RUnlock()
+	// CRITICAL: Fetch position directly from exchange to ensure we don't miss any open positions
+	// This is necessary because cache might not be synced during breakout
+	var positionAmt float64
+	if a.futuresClient != nil {
+		positions, err := a.futuresClient.GetPositions(ctx)
+		if err != nil {
+			a.logger.Error("Failed to fetch positions from exchange during EXIT_ALL",
+				zap.String("symbol", symbol),
+				zap.Error(err))
+		} else {
+			for _, pos := range positions {
+				if pos.Symbol == symbol && pos.PositionAmt != 0 {
+					positionAmt = pos.PositionAmt
+					a.logger.Warn("Found position on exchange during EXIT_ALL",
+						zap.String("symbol", symbol),
+						zap.Float64("position_amt", positionAmt))
+					break
+				}
+			}
+		}
+	}
 
-	if hasPosition && position != nil && position.PositionAmt != 0 {
+	// Also check cache as fallback
+	if positionAmt == 0 {
+		a.mu.RLock()
+		position, hasPosition := a.positions[symbol]
+		a.mu.RUnlock()
+		if hasPosition && position != nil && position.PositionAmt != 0 {
+			positionAmt = position.PositionAmt
+			a.logger.Warn("Found position in cache during EXIT_ALL",
+				zap.String("symbol", symbol),
+				zap.Float64("position_amt", positionAmt))
+		}
+	}
+
+	if positionAmt != 0 {
 		a.logger.Warn("Closing position during EXIT_ALL",
 			zap.String("symbol", symbol),
 			zap.String("reason", reason),
-			zap.Float64("position_amt", position.PositionAmt))
-		a.emergencyClosePosition(ctx, symbol, position.PositionAmt)
+			zap.Float64("position_amt", positionAmt))
+		a.emergencyClosePosition(ctx, symbol, positionAmt)
 	} else {
 		if a.gridManager != nil {
 			if err := a.gridManager.ClearGrid(ctx, symbol); err != nil {
@@ -3065,6 +3369,10 @@ func (a *AdaptiveGridManager) ExitAll(ctx context.Context, symbol string, event 
 		}
 		a.markExitCompleted(symbol)
 	}
+
+	a.mu.RLock()
+	detector, hasDetector := a.rangeDetectors[symbol]
+	a.mu.RUnlock()
 
 	if hasDetector {
 		detector.ForceRecalculate()
@@ -3812,24 +4120,27 @@ func (a *AdaptiveGridManager) GetLiquidationTierStatus(symbol string) map[string
 }
 
 // isReadyForRegrid checks if all conditions are met for re-gridding after exit
-// For volume farming: MODERATE conditions - wait for market stabilization
-//  1. Zero open orders AND zero position (REQUIRED)
-//  2. Current state is WAIT_NEW_RANGE (REQUIRED)
-//  3. No regrid cooldown (REQUIRED)
-//  4. ADX < 25 (relaxed from 20 for faster resume)
-//  5. BB width contraction (< 1.8x average, relaxed from 1.5x)
-//  6. Range shift ≥ 0.3% (relaxed from 0.5%)
+// For volume farming: VERY RELAXED conditions - provides context for CircuitBreaker to decide trade mode
+//  1. Current state is IDLE or WAIT_NEW_RANGE (REQUIRED)
+//  2. No regrid cooldown (REQUIRED)
+//  3. Position ≈ 0 (REQUIRED, dust < 10 USDT allowed)
+//  4. ADX < 50 (very relaxed, provides volatility context)
+//  5. BB width < 5x (very relaxed, provides volatility context)
+//  6. Range shift ≥ 0.05% (very relaxed, provides trend context)
 //
-// This function is called to determine if we can transition from WAIT_NEW_RANGE to ENTER_GRID
+// This function is called to determine if we can transition from IDLE or WAIT_NEW_RANGE to ENTER_GRID
+// CircuitBreaker uses these conditions to decide trade mode (MICRO/SMALL/MEDIUM/LARGE)
 func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
+	// Check state machine (IDLE or WAIT_NEW_RANGE)
 	if a.stateMachine != nil {
-		if a.stateMachine.GetState(symbol) != GridStateWaitNewRange {
-			a.logger.Debug("Regrid check: not in WAIT_NEW_RANGE state",
+		state := a.stateMachine.GetState(symbol)
+		if state != GridStateIdle && state != GridStateWaitNewRange {
+			a.logger.Debug("Regrid check: not in IDLE or WAIT_NEW_RANGE state",
 				zap.String("symbol", symbol),
-				zap.String("state", a.stateMachine.GetState(symbol).String()))
+				zap.String("state", state.String()))
 			return false
 		}
 		if a.stateMachine.IsRegridCooldownActive(symbol) {
@@ -3863,16 +4174,16 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 		return false
 	}
 
-	// Condition 4: ADX < 25 (relaxed from 20 for faster resume)
+	// Condition 4: ADX < 50 (very relaxed, provides volatility context for CircuitBreaker)
 	avgADX := detector.averageADXLocked()
-	if avgADX >= 25.0 {
+	if avgADX >= 50.0 {
 		a.logger.Debug("Regrid check: ADX too high",
 			zap.String("symbol", symbol),
 			zap.Float64("avg_adx", avgADX))
 		return false
 	}
 
-	// Condition 3: BB width contraction check (relaxed to 1.8x from 1.5x)
+	// Condition 5: BB width contraction check (very relaxed to 5x)
 	currentRange := detector.currentRange
 	lastAccepted := detector.lastAcceptedRange
 	if currentRange == nil || lastAccepted == nil {
@@ -3883,18 +4194,18 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 		return false
 	}
 
-	// Check BB width contraction (current width < 1.8x last accepted)
+	// Check BB width contraction (current width < 5x last accepted) - very relaxed
 	widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
-	if widthRatio >= 1.8 {
+	if widthRatio >= 5.0 {
 		a.logger.Debug("Regrid check: BB width not contracted enough",
 			zap.String("symbol", symbol),
 			zap.Float64("width_ratio", widthRatio))
 		return false
 	}
 
-	// Condition 2: Range shift ≥ 0.3% (relaxed from 0.5% for faster resume)
+	// Condition 6: Range shift ≥ 0.05% (very relaxed, provides trend context)
 	centerShiftPct := math.Abs(currentRange.MidPrice-lastAccepted.MidPrice) / lastAccepted.MidPrice
-	if centerShiftPct < 0.003 { // 0.3% minimum shift
+	if centerShiftPct < 0.0005 { // 0.05% minimum shift
 		a.logger.Debug("Regrid check: range shift too small",
 			zap.String("symbol", symbol),
 			zap.Float64("center_shift_pct", centerShiftPct))
@@ -3904,7 +4215,7 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 	// Get current regime for context
 	currentRegime := a.GetCurrentRegime(symbol)
 
-	a.logger.Info("Regrid ready: market stabilization conditions met",
+	a.logger.Info("Regrid ready: market conditions met (very relaxed)",
 		zap.String("symbol", symbol),
 		zap.Float64("avg_adx", avgADX),
 		zap.Float64("width_ratio", widthRatio),

@@ -236,6 +236,7 @@ type VolumeFarmConfig struct {
 	Risk                     RiskConfig          `mapstructure:"risk"`
 	API                      APIConfig           `mapstructure:"api"`
 	TradingModes             *TradingModesConfig `mapstructure:"trading_modes,omitempty"`
+	PartialClose             *PartialCloseConfig `mapstructure:"partial_close,omitempty"`
 }
 
 // TradingModesConfig holds configuration for all trading modes
@@ -280,6 +281,16 @@ type TrendAdaptedModeConfig struct {
 // CooldownModeConfig for COOLDOWN mode (pause after exit)
 type CooldownModeConfig struct {
 	DurationSec int `mapstructure:"duration_seconds"`
+}
+
+// PartialCloseConfig holds configuration for partial take-profit strategy
+type PartialCloseConfig struct {
+	Enabled          bool          `mapstructure:"enabled"`
+	TP1              TPLevelConfig `mapstructure:"tp1"`
+	TP2              TPLevelConfig `mapstructure:"tp2"`
+	TP3              TPLevelConfig `mapstructure:"tp3"`
+	TrailingAfterTP2 bool          `mapstructure:"trailing_after_tp2"`
+	TrailingDistance float64       `mapstructure:"trailing_distance"`
 }
 
 // ModeTransitionsConfig holds thresholds for mode switching
@@ -794,6 +805,7 @@ type MultiLayerLiquidationConfig struct {
 type TPLevelConfig struct {
 	TargetPct float64 `yaml:"target_pct" mapstructure:"target_pct"`
 	ClosePct  float64 `yaml:"close_pct" mapstructure:"close_pct"`
+	ProfitPct float64 `yaml:"profit_pct" mapstructure:"profit_pct"`
 }
 
 // MicroPartialCloseConfig mirrors adaptive_grid partial close with micro TP levels

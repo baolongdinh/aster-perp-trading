@@ -56,11 +56,6 @@ func (m *SyncManager) Initialize() {
 
 	// Create balance sync worker
 	m.balanceWorker = NewBalanceSyncWorker(m.wsClient, 0, m.logger)
-	m.balanceWorker.SetOnLowBalanceCallback(func(available, threshold float64) {
-		m.logger.Warn("Low balance alert",
-			zap.Float64("available", available),
-			zap.Float64("threshold", threshold))
-	})
 }
 
 // SetOnOrderMissingCallback sets callback when order is missing (filled/cancelled)

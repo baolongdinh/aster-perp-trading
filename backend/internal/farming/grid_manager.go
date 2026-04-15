@@ -2,7 +2,6 @@ package farming
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -110,6 +109,9 @@ type GridManager struct {
 	// NEW: Reference to AdaptiveGridManager for optimization features
 	adaptiveMgr *adaptive_grid.AdaptiveGridManager
 
+	// NEW: Take profit manager for micro profit feature
+	takeProfitMgr *adaptive_grid.TakeProfitManager
+
 	// NEW: Trading lifecycle state machine for strict state transitions
 	stateMachine *adaptive_grid.GridStateMachine
 
@@ -177,20 +179,47 @@ type SymbolGrid struct {
 
 // GridOrder represents an order in the grid.
 type GridOrder struct {
-	Symbol       string    `json:"symbol"`
-	OrderID      string    `json:"order_id"`
-	Side         string    `json:"side"`
-	Size         float64   `json:"size"`
-	Price        float64   `json:"price"`
-	OrderType    string    `json:"order_type"`
-	Status       string    `json:"status"`
-	CreatedAt    time.Time `json:"created_at"`
-	FilledAt     time.Time `json:"filled_at,omitempty"`
-	FeePaid      float64   `json:"fee_paid"`
-	PointsEarned int64     `json:"points_earned"`
-	GridLevel    int       `json:"grid_level"`
-	ReduceOnly   bool      `json:"reduce_only"`  // For position rebalancing orders
-	IsRebalance  bool      `json:"is_rebalance"` // True if this is a rebalancing order
+	Symbol            string    `json:"symbol"`
+	OrderID           string    `json:"order_id"`
+	Side              string    `json:"side"`
+	Size              float64   `json:"size"`
+	Price             float64   `json:"price"`
+	OrderType         string    `json:"order_type"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+	FilledAt          time.Time `json:"filled_at,omitempty"`
+	FeePaid           float64   `json:"fee_paid"`
+	PointsEarned      int64     `json:"points_earned"`
+	GridLevel         int       `json:"grid_level"`
+	ReduceOnly        bool      `json:"reduce_only"`                    // For position rebalancing orders
+	IsRebalance       bool      `json:"is_rebalance"`                   // True if this is a rebalancing order
+	TakeProfitOrderID *string   `json:"take_profit_order_id,omitempty"` // ID of associated take profit order
+}
+
+// initTakeProfitManager initializes the take profit manager with configuration
+func initTakeProfitManager(logger *zap.Logger) *adaptive_grid.TakeProfitManager {
+	// Load micro profit config from file
+	config, err := adaptive_grid.LoadFromFile("backend/config/micro_profit.yaml")
+	if err != nil {
+		logger.Warn("Failed to load micro profit config, using defaults",
+			zap.Error(err))
+		config = adaptive_grid.DefaultConfig()
+	}
+
+	// Create take profit manager
+	tpMgr := adaptive_grid.NewTakeProfitManager(logger, config)
+	logger.Info("Take profit manager initialized",
+		zap.Bool("enabled", config.Enabled),
+		zap.Float64("spread_pct", config.SpreadPct),
+		zap.Int("timeout_seconds", config.TimeoutSeconds))
+
+	// Start config watcher for hot-reload
+	if err := tpMgr.StartConfigWatcher("backend/config/micro_profit.yaml"); err != nil {
+		logger.Warn("Failed to start config watcher for take profit manager",
+			zap.Error(err))
+	}
+
+	return tpMgr
 }
 
 // NewGridManager creates a new grid manager with volume farm config.
@@ -253,6 +282,8 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		orderLockMgr:          adaptive_grid.NewOrderLockManager(zapLogger),
 		deduplicator:          adaptive_grid.NewFillEventDeduplicator(zapLogger),
 		stateValidator:        adaptive_grid.NewStateValidator(zapLogger),
+		// Initialize take profit manager with micro profit config
+		takeProfitMgr: initTakeProfitManager(zapLogger),
 		// Position rebalancer defaults - OPTIMIZED for faster response
 		rebalanceThresholdPct:   0.75,            // Start earlier at 75% of max
 		rebalanceAggressiveness: 0.50,            // Reduce by 50% of excess (faster)
@@ -363,6 +394,13 @@ func (g *GridManager) Start(ctx context.Context) error {
 	// NEW: Log real exchange data for accurate dashboard display
 	g.wg.Add(1)
 	go g.exchangeDataReporter(ctx)
+
+	// NEW: Start take profit timeout checker
+	if g.takeProfitMgr != nil {
+		g.takeProfitMgr.SetGridManager(g)
+		g.takeProfitMgr.StartTimeoutChecker(ctx)
+		g.logger.Info("Take profit timeout checker started")
+	}
 
 	// NEW: Start position rebalancer to manage oversized positions
 	g.wg.Add(1)
@@ -576,35 +614,38 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 }
 
 func (g *GridManager) canPlaceForSymbol(symbol string) bool {
-	if g.adaptiveMgr != nil {
-		// REMOVED: Strict range check - let AdaptiveGridManager.CanPlaceOrder handle MICRO mode ATR bypass
-		// rangeState := g.adaptiveMgr.GetRangeState(symbol)
-		// if rangeState != adaptive_grid.RangeStateActive {
-		// 	g.logger.WithFields(logrus.Fields{
-		// 		"symbol":      symbol,
-		// 		"range_state": rangeState,
-		// 		"expected":    adaptive_grid.RangeStateActive,
-		// 	}).Warn(">>> GATE BLOCKED: Range not active <<<")
-		// 	return false
-		// }
+	g.logger.WithField("symbol", symbol).Info("=== CHECKING canPlaceForSymbol ===")
 
-		// AdaptiveGridManager.CanPlaceOrder handles MICRO mode ATR bypass and all other checks
-		if !g.adaptiveMgr.CanPlaceOrder(symbol) {
+	if g.adaptiveMgr != nil {
+		g.logger.WithField("symbol", symbol).Info("Checking AdaptiveGridManager.CanPlaceOrder")
+		// AdaptiveGridManager.CanPlaceOrder handles all trading decision checks
+		// CircuitBreaker is the single source of truth for trading decisions
+		canPlace := g.adaptiveMgr.CanPlaceOrder(symbol)
+		g.logger.WithFields(logrus.Fields{
+			"symbol":    symbol,
+			"can_place": canPlace,
+		}).Info("AdaptiveGridManager.CanPlaceOrder result")
+		if !canPlace {
 			g.logger.WithField("symbol", symbol).Warn(">>> GATE BLOCKED: Adaptive manager disallows order <<<")
-			return false
-		}
-		if g.adaptiveMgr.IsInCooldown(symbol) {
-			g.logger.WithField("symbol", symbol).Warn(">>> GATE BLOCKED: Symbol in cooldown <<<")
 			return false
 		}
 	}
 
-	if g.stateMachine != nil && !g.stateMachine.ShouldEnqueuePlacement(symbol) {
+	if g.stateMachine != nil {
+		shouldEnqueue := g.stateMachine.ShouldEnqueuePlacement(symbol)
+		gridState := g.stateMachine.GetState(symbol)
 		g.logger.WithFields(logrus.Fields{
-			"symbol":     symbol,
-			"grid_state": g.stateMachine.GetState(symbol),
-		}).Warn(">>> GATE BLOCKED: Grid state machine not in placement state <<<")
-		return false
+			"symbol":         symbol,
+			"should_enqueue": shouldEnqueue,
+			"grid_state":     gridState,
+		}).Info("StateMachine.ShouldEnqueuePlacement result")
+		if !shouldEnqueue {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":     symbol,
+				"grid_state": gridState,
+			}).Warn(">>> GATE BLOCKED: Grid state machine not in placement state <<<")
+			return false
+		}
 	}
 
 	g.logger.WithField("symbol", symbol).Info(">>> ALL GATES PASSED - CAN PLACE <<<")
@@ -1101,21 +1142,34 @@ func (g *GridManager) warmupCompletionChecker(symbol string) {
 
 			// Check range state
 			rangeState := g.adaptiveMgr.GetRangeState(symbol)
+			g.logger.WithFields(logrus.Fields{
+				"symbol":      symbol,
+				"range_state": rangeState,
+				"expected":    adaptive_grid.RangeStateActive,
+			}).Info("Warm-up checking range state")
+
+			// VOLUME FARMING: Skip warm-up requirement - allow immediate trading
+			// AdaptiveGridManager.CanPlaceOrder will handle MICRO mode with ATR bands
 			if rangeState == adaptive_grid.RangeStateActive {
 				g.logger.WithFields(logrus.Fields{
 					"symbol":      symbol,
 					"range_state": rangeState,
 				}).Info("✅ Warm-up COMPLETE - RangeDetector ready")
-
-				// Mark warm-up complete
-				g.warmupMu.Lock()
-				delete(g.warmupActive, symbol)
-				g.warmupMu.Unlock()
-
-				// Finalize and trigger placement
-				g.finalizeWarmup(symbol)
-				return
+			} else {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":      symbol,
+					"range_state": rangeState,
+				}).Warn("⚡ Warm-up SKIPPED - Allowing immediate trading (MICRO mode with ATR bands)")
 			}
+
+			// Mark warm-up complete regardless of range state
+			g.warmupMu.Lock()
+			delete(g.warmupActive, symbol)
+			g.warmupMu.Unlock()
+
+			// Finalize and trigger placement
+			g.finalizeWarmup(symbol)
+			return
 		}
 	}
 }
@@ -1969,15 +2023,34 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	notional := order.Size * order.Price
 	shouldCheckNotional := !(order.ReduceOnly && order.IsRebalance)
 	if shouldCheckNotional && notional > g.maxNotionalUSD {
+		// Instead of rejecting, reduce order size to fit within max notional
+		reducedSize := (g.maxNotionalUSD / order.Price) * 0.95 // 5% buffer
+		if reducedSize < 0.001 {                               // Minimum order size
+			g.logger.WithFields(logrus.Fields{
+				"symbol":       order.Symbol,
+				"side":         order.Side,
+				"order_size":   order.Size,
+				"notional":     notional,
+				"max_notional": g.maxNotionalUSD,
+				"reduced_size": reducedSize,
+			}).Warn("ORDER SKIPPED: Reduced size below minimum for max notional limit")
+			return fmt.Errorf("reduced size %.6f below minimum for max notional", reducedSize)
+		}
+
+		// Update order with reduced size
+		oldSize := order.Size
+		order.Size = reducedSize
+		newNotional := order.Size * order.Price
+
 		g.logger.WithFields(logrus.Fields{
 			"symbol":       order.Symbol,
 			"side":         order.Side,
-			"order_size":   order.Size,
-			"price":        order.Price,
-			"notional":     notional,
+			"old_size":     oldSize,
+			"new_size":     order.Size,
+			"old_notional": notional,
+			"new_notional": newNotional,
 			"max_notional": g.maxNotionalUSD,
-		}).Error("ORDER REJECTED: Exceeds max notional limit")
-		return fmt.Errorf("order rejected: notional %.2f exceeds max %.2f", notional, g.maxNotionalUSD)
+		}).Info("ORDER SIZE REDUCED to fit max notional limit")
 	}
 
 	// CRITICAL: Check total position exposure before adding new order
@@ -1988,26 +2061,58 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		newTotalExposure := currentExposure + notional
 		exposureLimit := g.maxNotionalUSD * 1.2 // STRICT: Only allow 1.2x max position
 		if newTotalExposure > exposureLimit {
+			// Instead of rejecting, reduce order size to fit within limit
+			maxAllowedNotional := exposureLimit - currentExposure
+			if maxAllowedNotional <= 0 {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":           order.Symbol,
+					"current_exposure": currentExposure,
+					"exposure_limit":   exposureLimit,
+					"max_config":       g.maxNotionalUSD,
+				}).Warn("ORDER SKIPPED: Exposure already at limit, cannot place any order")
+				return fmt.Errorf("exposure at limit %.2f, cannot place order", currentExposure)
+			}
+
+			// Calculate reduced order size
+			reducedSize := (maxAllowedNotional / order.Price) * 0.95 // 5% buffer
+			if reducedSize < 0.001 {                                 // Minimum order size
+				g.logger.WithFields(logrus.Fields{
+					"symbol":           order.Symbol,
+					"current_exposure": currentExposure,
+					"exposure_limit":   exposureLimit,
+					"max_allowed":      maxAllowedNotional,
+					"reduced_size":     reducedSize,
+				}).Warn("ORDER SKIPPED: Reduced size below minimum")
+				return fmt.Errorf("reduced size %.6f below minimum", reducedSize)
+			}
+
+			// Update order with reduced size
+			oldSize := order.Size
+			order.Size = reducedSize
+			newNotional := order.Size * order.Price
+
 			g.logger.WithFields(logrus.Fields{
-				"symbol":           order.Symbol,
-				"current_exposure": currentExposure,
-				"new_order":        notional,
-				"total_exposure":   newTotalExposure,
-				"max_exposure":     exposureLimit,
-				"max_config":       g.maxNotionalUSD,
-			}).Error("ORDER REJECTED: Total exposure would exceed 1.2x limit - position too large!")
-			return fmt.Errorf("order rejected: total exposure %.2f would exceed max %.2f", newTotalExposure, exposureLimit)
+				"symbol":             order.Symbol,
+				"side":               order.Side,
+				"old_size":           oldSize,
+				"new_size":           order.Size,
+				"old_notional":       notional,
+				"new_notional":       newNotional,
+				"current_exposure":   currentExposure,
+				"new_total_exposure": currentExposure + newNotional,
+				"exposure_limit":     exposureLimit,
+			}).Info("ORDER SIZE REDUCED to fit exposure limit")
 		}
 	}
 
-	// NEW: Check if trading is allowed by time filter
-	if g.adaptiveMgr != nil && !g.adaptiveMgr.CanTrade() {
-		g.logger.WithFields(logrus.Fields{
-			"symbol": order.Symbol,
-			"side":   order.Side,
-		}).Warn("Order placement blocked - outside trading hours")
-		return fmt.Errorf("trading not allowed: outside configured trading hours")
-	}
+	// NEW: Check if trading is allowed by time filter - DISABLED for volume farming (trade 24/7)
+	// if g.adaptiveMgr != nil && !g.adaptiveMgr.CanTrade() {
+	// 	g.logger.WithFields(logrus.Fields{
+	// 		"symbol": order.Symbol,
+	// 		"side":   order.Side,
+	// 	}).Warn("Order placement blocked - outside trading hours")
+	// 	return fmt.Errorf("trading not allowed: outside configured trading hours")
+	// }
 
 	// NEW: Check state transition validity (only for existing orders)
 	if order.OrderID != "" {
@@ -2266,24 +2371,46 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 			"size":       order.Size,
 			"grid_level": order.GridLevel,
 		}).Info("Position tracked in inventory and cluster managers")
+
+		// NEW: Initialize partial close tracking for this position
+		g.adaptiveMgr.InitializePartialClose(symbol, order.Size, order.Price)
+		g.logger.WithFields(logrus.Fields{
+			"symbol":      symbol,
+			"side":        order.Side,
+			"size":        order.Size,
+			"entry_price": order.Price,
+		}).Info("Partial close tracking initialized for filled position")
 	}
 
-	// Check if rebalancing is allowed (risk limits not exceeded)
-	canRebalance := g.canRebalance(symbol)
-	g.logger.WithFields(logrus.Fields{
-		"symbol":        symbol,
-		"can_rebalance": canRebalance,
-		"order_id":      orderID,
-		"side":          order.Side,
-	}).Info("Order filled - checking rebalance status")
-
-	if !canRebalance {
-		g.logger.WithField("symbol", symbol).Warn("Rebalancing blocked due to risk limits - SKIPPING REBALANCE")
-		return
+	// NEW: Place take profit order for micro profit feature
+	if g.takeProfitMgr != nil {
+		tpOrderID, err := g.takeProfitMgr.PlaceTakeProfitOrder(context.Background(), symbol, order.Side, order.Price, order.Size, orderID)
+		if err != nil {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":   symbol,
+				"order_id": orderID,
+				"error":    err,
+			}).Warn("Failed to place take profit order, continuing without it")
+		} else if tpOrderID != "" {
+			g.ordersMu.Lock()
+			order.TakeProfitOrderID = &tpOrderID
+			g.ordersMu.Unlock()
+			g.logger.WithFields(logrus.Fields{
+				"symbol":               symbol,
+				"order_id":             orderID,
+				"take_profit_order_id": tpOrderID,
+			}).Info("Take profit order placed successfully")
+		}
 	}
 
 	// Trigger immediate rebalancing for this symbol
-	g.logger.WithField("symbol", symbol).Info("Triggering rebalance enqueue for filled order")
+	// Risk is already controlled by AdaptiveGridManager.CanPlaceOrder and StateMachine gates
+	// No need for additional canRebalance check - it's redundant and causes deadlock
+	g.logger.WithFields(logrus.Fields{
+		"symbol":   symbol,
+		"order_id": orderID,
+		"side":     order.Side,
+	}).Info("Order filled - triggering rebalance")
 	go g.enqueuePlacement(symbol)
 }
 
@@ -2854,6 +2981,16 @@ func minInt(a, b int) int {
 	return b
 }
 
+// GetTakeProfitMetrics returns micro profit metrics if take profit manager is available
+func (g *GridManager) GetTakeProfitMetrics() map[string]interface{} {
+	if g.takeProfitMgr == nil {
+		return map[string]interface{}{
+			"enabled": false,
+		}
+	}
+	return g.takeProfitMgr.GetMicroProfitMetrics()
+}
+
 // Stop stops the grid manager.
 func (g *GridManager) Stop(ctx context.Context) error {
 	g.isRunningMu.Lock()
@@ -2872,6 +3009,12 @@ func (g *GridManager) Stop(ctx context.Context) error {
 		// already closed
 	default:
 		close(g.stopCh)
+	}
+
+	// Shutdown take profit manager
+	if g.takeProfitMgr != nil {
+		g.takeProfitMgr.Shutdown(ctx)
+		g.logger.Info("Take profit manager shutdown complete")
 	}
 
 	// Cleanup safeguard components
@@ -3058,24 +3201,6 @@ func (g *GridManager) SetStateMachine(sm *adaptive_grid.GridStateMachine) {
 	g.logger.Info("Grid state machine set")
 }
 
-// canRebalance checks if rebalancing is allowed for a symbol
-func (g *GridManager) canRebalance(symbol string) bool {
-	g.riskCheckerMu.RLock()
-	defer g.riskCheckerMu.RUnlock()
-	if g.riskChecker == nil {
-		return true
-	}
-
-	canPlace := g.riskChecker.CanPlaceOrder(symbol)
-	if !canPlace {
-		g.logger.WithFields(logrus.Fields{
-			"symbol": symbol,
-		}).Warn("Rebalancing blocked - risk checker returned false (check AdaptiveGridManager logs for detailed reason)")
-	}
-
-	return canPlace
-}
-
 // GetActivePositions returns active positions for a symbol
 func (g *GridManager) GetActivePositions(symbol string) ([]interface{}, error) {
 	g.ordersMu.RLock()
@@ -3174,8 +3299,25 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 			"order_id": orderUpdate.OrderID,
 			"symbol":   orderUpdate.Symbol,
 		}).Info("WebSocket order fill detected - processing immediately")
-		// Call handleOrderFill to process the fill event
-		g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
+
+		// Check if this is a take profit order fill
+		if g.takeProfitMgr != nil && len(orderUpdate.OrderID) > 3 && orderUpdate.OrderID[:3] == "TP-" {
+			g.logger.WithFields(logrus.Fields{
+				"order_id": orderUpdate.OrderID,
+				"symbol":   orderUpdate.Symbol,
+			}).Info("Take profit order fill detected - processing")
+			err := g.takeProfitMgr.HandleTakeProfitFill(orderUpdate.OrderID, orderUpdate.Price)
+			if err != nil {
+				g.logger.WithFields(logrus.Fields{
+					"order_id": orderUpdate.OrderID,
+					"symbol":   orderUpdate.Symbol,
+					"error":    err,
+				}).Error("Failed to handle take profit fill")
+			}
+		} else {
+			// Call handleOrderFill to process the fill event
+			g.handleOrderFill(orderUpdate.OrderID, orderUpdate.Symbol)
+		}
 
 	case "CANCELED":
 		g.logger.WithFields(logrus.Fields{
@@ -3227,6 +3369,11 @@ func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
 	g.cachedPositionsMu.Lock()
 	defer g.cachedPositionsMu.Unlock()
 
+	g.logger.WithFields(logrus.Fields{
+		"positions_count": len(accountUpdate.Update.Positions),
+		"balances_count":  len(accountUpdate.Update.Balances),
+	}).Info("WebSocket account update received")
+
 	// Update cached positions from WebSocket data
 	for _, pos := range accountUpdate.Update.Positions {
 		if pos.PositionAmt != 0 {
@@ -3248,13 +3395,20 @@ func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
 				"entry_price":    pos.EntryPrice,
 				"unrealized_pnl": pos.UnrealizedPnL,
 				"websocket":      true,
-			}).Debug("Position updated from WebSocket")
+			}).Info("Position updated from WebSocket")
 		} else {
 			// Remove zero positions from cache
 			delete(g.cachedPositions, pos.Symbol)
+			g.logger.WithFields(logrus.Fields{
+				"symbol": pos.Symbol,
+			}).Info("Position removed from cache (zero position)")
 		}
 	}
 	g.lastPositionUpdate = time.Now()
+	g.logger.WithFields(logrus.Fields{
+		"cache_size":  len(g.cachedPositions),
+		"last_update": g.lastPositionUpdate,
+	}).Info("Position cache updated from WebSocket")
 }
 
 // GetCachedPositions returns cached positions from WebSocket data
@@ -3265,7 +3419,12 @@ func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position
 
 	// If cache is empty or stale, fallback to API call
 	if len(g.cachedPositions) == 0 || time.Since(g.lastPositionUpdate) > 30*time.Second {
-		g.logger.Warn("Position cache empty or stale, falling back to API call")
+		g.logger.Info("Position cache empty or stale, falling back to API call",
+			logrus.Fields{
+				"cache_size":    len(g.cachedPositions),
+				"last_update":   g.lastPositionUpdate,
+				"stale_seconds": time.Since(g.lastPositionUpdate).Seconds(),
+			})
 		return g.futuresClient.GetPositions(ctx)
 	}
 
@@ -3276,49 +3435,6 @@ func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position
 	}
 
 	return positions, nil
-}
-
-// initUserStream initializes and starts the user data stream WebSocket
-// This provides real-time position and order updates, eliminating API polling
-func (g *GridManager) initUserStream(ctx context.Context) {
-	wsBase := "wss://fstream.asterdex.com"
-
-	// Create zap logger for UserStream (it expects zap.Logger, not logrus)
-	zapLogger, _ := zap.NewDevelopment()
-
-	userStream := stream.NewUserStream(
-		wsBase,
-		g.futuresClient.StartListenKey,
-		g.futuresClient.KeepaliveListenKey,
-		stream.UserStreamHandlers{
-			OnOrderUpdate: func(u stream.WsOrderUpdate) {
-				// Convert WsOrderUpdate to local OrderUpdate
-				orderUpdate := &OrderUpdate{
-					OrderID:  fmt.Sprintf("%d", u.Order.OrderID),
-					Symbol:   u.Order.Symbol,
-					Side:     u.Order.Side,
-					Status:   u.Order.OrderStatus,
-					Quantity: u.Order.FilledQty,
-					Price:    u.Order.AvgPrice,
-				}
-				g.OnOrderUpdate(orderUpdate)
-			},
-			OnAccountUpdate: g.OnAccountUpdate,
-			OnMarginCall: func(msg json.RawMessage) {
-				g.logger.Warn("Margin call received", string(msg))
-			},
-		},
-		zapLogger,
-	)
-
-	// Start user stream in background
-	g.wg.Add(1)
-	go func() {
-		defer g.wg.Done()
-		g.logger.Info("Starting UserStream for real-time position and order updates")
-		userStream.Run(ctx)
-		g.logger.Info("UserStream stopped")
-	}()
 }
 
 // positionRebalancerWorker monitors position sizes and places reduce-only orders when needed

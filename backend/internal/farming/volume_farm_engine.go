@@ -66,7 +66,7 @@ type VolumeFarmEngine struct {
 
 	// NEW: Continuous Volume Farming components
 	modeManager    *tradingmode.ModeManager
-	circuitBreaker *agentic.CircuitBreaker // NEW: Unified trading decision brain
+	circuitBreaker *agentic.CircuitBreaker // Unified trading decision brain (single source of truth)
 	exitExecutor   *ExitExecutor
 	syncManager    *farmsync.SyncManager
 	wsClient       *client.WebSocketClient
@@ -141,7 +141,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	volumeConfig := engine.extractVolumeFarmConfig(cfg)
 	engine.volumeConfig = volumeConfig
 	engine.futuresClient = client.NewFuturesClient(httpClient, volumeConfig.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
-	engine.riskManager = risk.NewManager(volumeConfig.Risk, logger)
+	engine.riskManager = risk.NewManager(volumeConfig.Risk, logger, engine.futuresClient)
 
 	// NEW: Initialize and inject CorrelationTracker for correlation-based risk checks
 	corrThreshold := volumeConfig.Risk.CorrelationThreshold
@@ -232,6 +232,10 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	engine.circuitBreaker = agentic.NewCircuitBreaker(cbConfig, logger)
 	logger.Info("CircuitBreaker initialized as unified trading brain")
 
+	// CRITICAL: Start CircuitBreaker evaluation loop
+	engine.circuitBreaker.Start()
+	logger.Info("CircuitBreaker evaluation loop started")
+
 	// NEW: Wire CircuitBreaker into AdaptiveGridManager for unified decisions
 	adaptiveGridManager.SetCircuitBreaker(engine.circuitBreaker)
 	logger.Info("CircuitBreaker wired into AdaptiveGridManager")
@@ -266,6 +270,32 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		// Could trigger grid rebuild or parameter adjustment based on mode change
 	})
 	logger.Info("CircuitBreaker callbacks wired")
+
+	// NEW: Load and set partial close configuration
+	if volumeConfig.PartialClose != nil && volumeConfig.PartialClose.Enabled {
+		partialCloseConfig := &adaptive_grid.PartialCloseConfig{
+			Enabled:          volumeConfig.PartialClose.Enabled,
+			TP1_ClosePct:     volumeConfig.PartialClose.TP1.ClosePct,
+			TP1_ProfitPct:    volumeConfig.PartialClose.TP1.ProfitPct,
+			TP2_ClosePct:     volumeConfig.PartialClose.TP2.ClosePct,
+			TP2_ProfitPct:    volumeConfig.PartialClose.TP2.ProfitPct,
+			TP3_ClosePct:     volumeConfig.PartialClose.TP3.ClosePct,
+			TP3_ProfitPct:    volumeConfig.PartialClose.TP3.ProfitPct,
+			TrailingAfterTP2: volumeConfig.PartialClose.TrailingAfterTP2,
+			TrailingDistance: volumeConfig.PartialClose.TrailingDistance,
+		}
+		adaptiveGridManager.SetPartialCloseConfig(partialCloseConfig)
+		logger.Info("Partial close configuration loaded and set",
+			zap.Bool("enabled", partialCloseConfig.Enabled),
+			zap.Float64("tp1_close_pct", partialCloseConfig.TP1_ClosePct),
+			zap.Float64("tp1_profit_pct", partialCloseConfig.TP1_ProfitPct),
+			zap.Float64("tp2_close_pct", partialCloseConfig.TP2_ClosePct),
+			zap.Float64("tp2_profit_pct", partialCloseConfig.TP2_ProfitPct),
+			zap.Float64("tp3_close_pct", partialCloseConfig.TP3_ClosePct),
+			zap.Float64("tp3_profit_pct", partialCloseConfig.TP3_ProfitPct))
+	} else {
+		logger.Info("Partial close configuration not enabled or not provided")
+	}
 
 	// ExitExecutor - handles fast exit on breakouts
 	engine.exitExecutor = NewExitExecutor(engine.futuresClient, sharedWSClient, 5*time.Second, logger)
@@ -427,6 +457,8 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
+		e.logger.Info("Adaptive grid manager goroutine STARTED")
+		e.logger.Info("=== ADAPTIVE GRID MANAGER INITIALIZATION START ===")
 
 		// CRITICAL: Load optimization config BEFORE Initialize
 		// Priority 1: Use unified config if available (from agentic-vf-config.yaml)
@@ -466,6 +498,7 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		e.adaptiveGridManager.InitializeDynamicLeverage(nil)
 
 		// Initialize adaptive grid manager
+		e.logger.Info("Calling adaptiveGridManager.Initialize()...")
 		if err := e.adaptiveGridManager.Initialize(ctx); err != nil {
 			e.logger.Error("Adaptive grid manager initialization error", zap.Error(err))
 			return
@@ -503,7 +536,9 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	}()
 
 	// NEW: Initialize and start UserStream for real-time order updates
+	e.logger.Info("About to call initUserStream")
 	e.initUserStream(ctx)
+	e.logger.Info("initUserStream call completed")
 
 	// NEW: Start SyncManager for order/position/balance sync
 	if e.syncManager != nil {
@@ -517,9 +552,20 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 // initUserStream initializes and starts the user data stream WebSocket
 func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
+	e.logger.Info("=== initUserStream CALLED ===")
+
 	wsBase := e.config.Exchange.FuturesWSBase
 	if wsBase == "" {
 		wsBase = "wss://fstream.asterdex.com"
+	}
+
+	e.logger.Info("Initializing UserStream",
+		zap.String("ws_base", wsBase),
+		zap.Bool("futures_client_nil", e.futuresClient == nil))
+
+	if e.futuresClient == nil {
+		e.logger.Error("FuturesClient is nil, cannot initialize UserStream")
+		return
 	}
 
 	userStream := stream.NewUserStream(
@@ -546,7 +592,7 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 			},
 			OnAccountUpdate: func(u stream.WsAccountUpdate) {
 				// Update WebSocket cache with positions and balances
-				e.logger.Debug("Account update received via WebSocket",
+				e.logger.Info("Account update received via WebSocket",
 					zap.Int("positions", len(u.Update.Positions)),
 					zap.Int("balances", len(u.Update.Balances)))
 
@@ -596,26 +642,30 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 	}()
 }
 func (e *VolumeFarmEngine) syncGridSymbols() {
-	e.logger.Info("Syncing grid symbols")
+	e.logger.Info("=== SYNC GRID SYMBOLS START ===")
 
 	activeSymbols := e.symbolSelector.GetActiveSymbols()
+	e.logger.Info("Active symbols from selector",
+		zap.Int("count", len(activeSymbols)),
+		zap.Strings("symbols", func() []string {
+			syms := make([]string, len(activeSymbols))
+			for i, s := range activeSymbols {
+				syms[i] = s.Symbol
+			}
+			return syms
+		}()))
 
 	// Get whitelist from symbol selector (updated by Agentic layer)
 	whitelist := e.symbolSelector.GetWhitelist()
+	e.logger.Info("Whitelist from selector",
+		zap.Int("count", len(whitelist)),
+		zap.Strings("whitelist", whitelist))
 
 	// FALLBACK: If agentic whitelist is empty, use config whitelist
 	if len(whitelist) == 0 && len(e.volumeConfig.Symbols.Whitelist) > 0 {
 		whitelist = e.volumeConfig.Symbols.Whitelist
 		e.logger.Info("Using config whitelist (agentic whitelist empty)", zap.Strings("whitelist", whitelist))
 	}
-
-	e.logger.Info("Active symbols from selector", zap.Int("count", len(activeSymbols)), zap.Strings("symbols", func() []string {
-		syms := make([]string, len(activeSymbols))
-		for i, s := range activeSymbols {
-			syms[i] = s.Symbol
-		}
-		return syms
-	}()), zap.Strings("whitelist_from_selector", whitelist))
 
 	// Always include whitelist symbols
 	if len(whitelist) > 0 {
@@ -657,6 +707,16 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 		activeSymbols = append(activeSymbols, whitelistOnly...)
 	}
 
+	e.logger.Info("Final active symbols before UpdateSymbols",
+		zap.Int("count", len(activeSymbols)),
+		zap.Strings("symbols", func() []string {
+			syms := make([]string, len(activeSymbols))
+			for i, s := range activeSymbols {
+				syms[i] = s.Symbol
+			}
+			return syms
+		}()))
+
 	// NEW: Set correct leverage for each symbol from exchange info
 	e.setLeverageForSymbols(activeSymbols)
 
@@ -668,6 +728,8 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 		return syms
 	}()))
 	e.gridManager.UpdateSymbols(activeSymbols)
+
+	e.logger.Info("=== SYNC GRID SYMBOLS END ===")
 }
 
 // setLeverageForSymbols sets the correct leverage for each symbol based on exchange info
@@ -813,6 +875,12 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 		e.logger.Info("SyncManager stopped")
 	}
 
+	// NEW: Stop CircuitBreaker evaluation loop
+	if e.circuitBreaker != nil {
+		e.circuitBreaker.Stop()
+		e.logger.Info("CircuitBreaker evaluation loop stopped")
+	}
+
 	done := make(chan struct{})
 	go func() {
 		e.wg.Wait()
@@ -838,7 +906,7 @@ func (e *VolumeFarmEngine) IsRunning() bool {
 
 // GetStatus returns the current status.
 func (e *VolumeFarmEngine) GetStatus() *VolumeFarmStatus {
-	return &VolumeFarmStatus{
+	status := &VolumeFarmStatus{
 		IsRunning:     e.IsRunning(),
 		ActiveSymbols: e.symbolSelector.GetActiveSymbolCount(),
 		ActiveGrids:   0,
@@ -853,6 +921,13 @@ func (e *VolumeFarmEngine) GetStatus() *VolumeFarmStatus {
 		}(),
 		LastUpdate: time.Now(),
 	}
+
+	// Add micro profit metrics if grid manager has take profit manager
+	if e.gridManager != nil {
+		status.MicroProfitMetrics = e.gridManager.GetTakeProfitMetrics()
+	}
+
+	return status
 }
 
 // monitorRegimeChanges monitors and handles regime changes for all symbols
@@ -875,6 +950,15 @@ func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
 		case <-ticker.C:
 			dailyPnL := e.riskManager.DailyPnL()
 			isPaused := e.riskManager.IsPaused()
+			availableBalance := e.riskManager.GetAvailableBalance()
+			dailyStartingEquity := e.riskManager.GetDailyStartingEquity()
+
+			e.logger.Info("Risk Monitor Status",
+				zap.Float64("daily_pnl", dailyPnL),
+				zap.Bool("is_paused", isPaused),
+				zap.Float64("available_balance", availableBalance),
+				zap.Float64("daily_starting_equity", dailyStartingEquity),
+				zap.Float64("daily_loss_limit", e.volumeConfig.Risk.DailyLossLimitUSDT))
 
 			if dailyPnL < -e.volumeConfig.Risk.DailyLossLimitUSDT {
 				e.logger.Warn("Daily loss limit reached, stopping farming",
@@ -884,6 +968,11 @@ func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
 
 			if isPaused {
 				e.logger.Warn("Risk manager paused, stopping farming")
+			}
+
+			if availableBalance <= 0 {
+				e.logger.Warn("Available balance is 0, cannot place new orders",
+					zap.Float64("available_balance", availableBalance))
 			}
 		}
 	}
@@ -1017,14 +1106,15 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 
 // VolumeFarmStatus represents the current status.
 type VolumeFarmStatus struct {
-	IsRunning     bool      `json:"is_running"`
-	ActiveSymbols int       `json:"active_symbols"`
-	ActiveGrids   int       `json:"active_grids"`
-	CurrentPoints int64     `json:"current_points"`
-	CurrentVolume float64   `json:"current_volume"`
-	DailyLoss     float64   `json:"daily_loss"`
-	RiskStatus    string    `json:"risk_status"`
-	LastUpdate    time.Time `json:"last_update"`
+	IsRunning          bool                   `json:"is_running"`
+	ActiveSymbols      int                    `json:"active_symbols"`
+	ActiveGrids        int                    `json:"active_grids"`
+	CurrentPoints      int64                  `json:"current_points"`
+	CurrentVolume      float64                `json:"current_volume"`
+	DailyLoss          float64                `json:"daily_loss"`
+	RiskStatus         string                 `json:"risk_status"`
+	LastUpdate         time.Time              `json:"last_update"`
+	MicroProfitMetrics map[string]interface{} `json:"micro_profit_metrics,omitempty"`
 }
 
 // UpdateWhitelist updates the whitelist for symbol selection (called by Agentic layer)

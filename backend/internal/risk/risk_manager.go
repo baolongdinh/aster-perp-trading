@@ -2,6 +2,7 @@
 package risk
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -18,8 +19,9 @@ import (
 
 // Manager enforces trading risk rules.
 type Manager struct {
-	cfg config.RiskConfig
-	log *zap.Logger
+	cfg            config.RiskConfig
+	log            *zap.Logger
+	exchangeClient *client.FuturesClient // For fetching real-time balance from exchange
 
 	mu                  sync.Mutex
 	dailyPnL            float64            // running daily P&L (realized)
@@ -55,16 +57,17 @@ type PersistentState struct {
 }
 
 // NewManager creates a new risk manager.
-func NewManager(cfg config.RiskConfig, log *zap.Logger) *Manager {
+func NewManager(cfg config.RiskConfig, log *zap.Logger, exchangeClient *client.FuturesClient) *Manager {
 	return &Manager{
 		cfg:               cfg,
 		log:               log,
-		dailyPnLReset:     todayUTC(),
+		exchangeClient:    exchangeClient,
+		dailyPnLReset:     time.Now(),
+		symUnrealizedPnL:  make(map[string]float64),
 		symPositions:      make(map[string]int),
 		symNotional:       make(map[string]float64),
-		symUnrealizedPnL:  make(map[string]float64),
-		pendingOrders:     make(map[string]float64),
 		lastCumulativePnL: make(map[string]float64),
+		pendingOrders:     make(map[string]float64),
 	}
 }
 
@@ -446,6 +449,68 @@ func (m *Manager) OpenPositions() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.openPositions
+}
+
+// GetConfig returns the current risk configuration.
+func (m *Manager) GetConfig() config.RiskConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg
+}
+
+// GetDailyStartingEquity returns the equity at the start of the day.
+func (m *Manager) GetDailyStartingEquity() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dailyStartingEquity
+}
+
+// GetAvailableBalance returns the current available USDT balance by fetching directly from exchange.
+func (m *Manager) GetAvailableBalance() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Fetch directly from exchange instead of using cached value
+	if m.exchangeClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		account, err := m.exchangeClient.GetAccountInfo(ctx)
+		if err != nil {
+			m.log.Error("Failed to fetch available balance from exchange",
+				zap.Error(err))
+			// Return cached value as fallback
+			return m.availableBalance
+		}
+
+		// Update cache
+		m.availableBalance = account.AvailableBalance
+		m.log.Debug("Fetched available balance from exchange",
+			zap.Float64("available_balance", account.AvailableBalance))
+
+		return account.AvailableBalance
+	}
+
+	// Fallback to cached value if exchange client not available
+	return m.availableBalance
+}
+
+// GetPendingMargin returns the total pending margin from open orders.
+func (m *Manager) GetPendingMargin() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pendingMargin
+}
+
+// GetSymNotional returns the notional values per symbol and total.
+func (m *Manager) GetSymNotional() (map[string]float64, float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	total := 0.0
+	for _, notional := range m.symNotional {
+		total += notional
+	}
+	return m.symNotional, total
 }
 
 // SetOpenPositions sets the open positions count (e.g. after reconcile).

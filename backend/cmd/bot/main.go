@@ -102,7 +102,7 @@ func main() {
 	)
 
 	// --- Risk manager ---
-	riskMgr := risk.NewManager(cfg.Risk, log)
+	riskMgr := risk.NewManager(cfg.Risk, log, futuresClient)
 	riskMgr.LoadState()
 
 	// --- Order manager ---

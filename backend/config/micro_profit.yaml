@@ -1,0 +1,26 @@
+# Micro Profit Configuration
+# Feature: Automatic take profit order placement for grid trading
+
+micro_profit:
+  # Enable or disable micro profit feature
+  enabled: false
+  
+  # Spread percentage for take profit orders (0.001% to 0.01%)
+  # Default: 0.005% (0.005)
+  spread_pct: 0.005
+  
+  # Timeout duration for take profit orders in seconds (10 to 300)
+  # Default: 30 seconds
+  timeout_seconds: 30
+  
+  # Minimum profit threshold in USDT to place take profit order (0.001 to 1.0)
+  # Default: $0.01
+  min_profit_usdt: 0.01
+  
+  # Symbol-specific configuration overrides (optional)
+  symbols:
+    # Example:
+    # BTCUSD1:
+    #   enabled: true
+    #   spread_pct: 0.006
+    #   timeout_seconds: 45

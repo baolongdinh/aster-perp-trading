@@ -52,28 +52,28 @@ type EnhancedRangeConfig struct {
 	CurrentADX      float64 `yaml:"-" mapstructure:"-"`                                 // Current ADX value (runtime)
 }
 
-// FastRangeConfig returns optimized config for fast range detection (10 periods)
+// FastRangeConfig returns optimized config for fast range detection (5 periods)
 func FastRangeConfig() *EnhancedRangeConfig {
 	return &EnhancedRangeConfig{
 		RangeConfig: RangeConfig{
 			Method:                   "combined",
-			Periods:                  10, // Fast: 10 periods instead of 20
+			Periods:                  5, // Ultra-fast: 5 periods instead of 10
 			BBMultiplier:             2.0,
 			ATRMultiplier:            1.5,
 			BreakoutThreshold:        0.01,
-			StabilizationPeriod:      30 * time.Second,
-			MinRangeWidthPct:         0.0001, // Giảm để dễ tạo range hơn
+			StabilizationPeriod:      10 * time.Second, // Ultra-fast: 10s instead of 30s
+			MinRangeWidthPct:         0.0001,           // Giảm để dễ tạo range hơn
 			MaterialShiftPct:         0.005,
 			WidthChangePct:           0.0015,
-			ReentryConfirmations:     3,
+			ReentryConfirmations:     2, // Giảm từ 3 xuống 2
 			EntryConfirmations:       1,
 			OutsideBandConfirmations: 2,
 			BBExpansionFactor:        1.5,
 		},
-		BBPeriod:         10,
-		ADXPeriod:        14,
+		BBPeriod:         5, // Giảm từ 10 xuống 5
+		ADXPeriod:        7, // Giảm từ 14 xuống 7
 		SidewaysADXMax:   20.0,
-		StabilizationMin: 3,
+		StabilizationMin: 2,     // Giảm từ 3 xuống 2
 		EnableADXFilter:  false, // Disabled by default
 	}
 }
@@ -82,17 +82,17 @@ func FastRangeConfig() *EnhancedRangeConfig {
 func DefaultRangeConfig() *RangeConfig {
 	return &RangeConfig{
 		Method:                   "combined",       // Dùng cả BB và ATR
-		Periods:                  10,               // 10 periods (optimized for faster detection)
+		Periods:                  20,               // 20 periods (better range detection with historical data)
 		BBMultiplier:             2.0,              // 2 sigma cho BB
 		ATRMultiplier:            1.5,              // 1.5x ATR cho range
 		BreakoutThreshold:        0.01,             // 1% vượt range = breakout
-		StabilizationPeriod:      30 * time.Second, // Chờ 30s sau breakout để resume nhanh
+		StabilizationPeriod:      10 * time.Second, // Chờ 10s sau breakout để resume siêu nhanh
 		MinRangeWidthPct:         0.0001,           // Tối thiểu 0.01% range width (giảm để dễ tạo range hơn)
 		ADXPeriod:                14,
 		MaterialShiftPct:         0.005,
 		WidthChangePct:           0.0015,
-		ReentryConfirmations:     3,
-		EntryConfirmations:       1,
+		ReentryConfirmations:     2, // Giảm từ 3 xuống 2
+		EntryConfirmations:       1, // Giữ nguyên
 		OutsideBandConfirmations: 2,
 		BBExpansionFactor:        1.5,
 	}

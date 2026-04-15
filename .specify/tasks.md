@@ -211,18 +211,18 @@ Parallel Opportunities: 12
 - Gradual profit taking working
 
 **Tasks:**
-- [ ] T080 [AGENTIC-1] Locate partial_close config section in backend/config/volume-farm-config.yaml
-- [ ] T081 [AGENTIC-1] Verify partial_close config has enabled: true, tp1_profit_pct, tp2_profit_pct, tp3_profit_pct
-- [ ] T082 [AGENTIC-1] Find VolumeFarmEngine initialization in backend/internal/farming/volume_farm_engine.go
-- [ ] T083 [AGENTIC-1] Add config loading for partial_close section in VolumeFarmEngine.Initialize()
-- [ ] T084 [AGENTIC-1] Call adaptiveMgr.SetPartialCloseConfig(config) with loaded config
-- [ ] T085 [AGENTIC-1] Find position opening logic in backend/internal/farming/grid_manager.go (OnOrderFilled or similar)
-- [ ] T086 [AGENTIC-1] Add call to adaptiveMgr.InitializePartialClose(symbol, positionAmt, entryPrice) after position opens
-- [ ] T087 [AGENTIC-1] Find positionMonitor function in backend/internal/farming/adaptive_grid/manager.go (around line 1010)
-- [ ] T088 [AGENTIC-1] Add CheckPartialTakeProfits call inside positionMonitor ticker loop
-- [ ] T089 [AGENTIC-1] Add currentPrice parameter to CheckPartialTakeProfits call (from price update)
-- [ ] T090 [AGENTIC-1] Add error handling for CheckPartialTakeProfits return values
-- [ ] T091 [AGENTIC-1] Add partial close trigger logging (which TP level triggered, qty closed)
+- [X] T080 [AGENTIC-1] Locate partial_close config section in backend/config/volume-farm-config.yaml
+- [X] T081 [AGENTIC-1] Verify partial_close config has enabled: true, tp1_profit_pct, tp2_profit_pct, tp3_profit_pct
+- [X] T082 [AGENTIC-1] Find VolumeFarmEngine initialization in backend/internal/farming/volume_farm_engine.go
+- [X] T083 [AGENTIC-1] Add config loading for partial_close section in VolumeFarmEngine.Initialize()
+- [X] T084 [AGENTIC-1] Call adaptiveMgr.SetPartialCloseConfig(config) with loaded config
+- [X] T085 [AGENTIC-1] Find position opening logic in backend/internal/farming/grid_manager.go (OnOrderFilled or similar)
+- [X] T086 [AGENTIC-1] Add call to adaptiveMgr.InitializePartialClose(symbol, positionAmt, entryPrice) after position opens
+- [X] T087 [AGENTIC-1] Find positionMonitor function in backend/internal/farming/adaptive_grid/manager.go (around line 1010)
+- [X] T088 [AGENTIC-1] Add CheckPartialTakeProfits call inside positionMonitor ticker loop
+- [X] T089 [AGENTIC-1] Add currentPrice parameter to CheckPartialTakeProfits call (from price update)
+- [X] T090 [AGENTIC-1] Add error handling for CheckPartialTakeProfits return values
+- [X] T091 [AGENTIC-1] Add partial close trigger logging (which TP level triggered, qty closed)
 - [ ] T092 [AGENTIC-1] Test partial close with dry-run mode and simulated position
 - [ ] T093 [AGENTIC-1] Validate TP1 (30%) trigger closes correct quantity
 - [ ] T094 [AGENTIC-1] Validate TP2 (50%) trigger closes correct quantity
@@ -241,21 +241,21 @@ Parallel Opportunities: 12
 - Automatic cluster exits working
 
 **Tasks:**
-- [ ] T098 [AGENTIC-2] Find positionMonitor function in backend/internal/farming/adaptive_grid/manager.go (around line 1010)
-- [ ] T099 [AGENTIC-2] Add separate ticker for cluster stop loss checks (every 30 seconds)
-- [ ] T100 [AGENTIC-2] Add CheckClusterStopLoss call in cluster stop loss ticker loop
-- [ ] T101 [AGENTIC-2] Pass currentPrice to CheckClusterStopLoss from price cache
-- [ ] T102 [AGENTIC-2] Handle returned clusters from CheckClusterStopLoss (if any, trigger exit)
-- [ ] T103 [AGENTIC-2] Add separate ticker for time-based stop loss (every 5 minutes)
-- [ ] T104 [AGENTIC-2] Add CheckTimeBasedStopLoss call in time-based ticker loop
-- [ ] T105 [AGENTIC-2] Pass currentPrice to CheckTimeBasedStopLoss from price cache
-- [ ] T106 [AGENTIC-2] Handle returned clusters from CheckTimeBasedStopLoss (if any, trigger exit)
-- [ ] T107 [AGENTIC-2] Find UpdatePriceData function in backend/internal/farming/adaptive_grid/manager.go (around line 2650)
-- [ ] T108 [AGENTIC-2] Add CheckBreakevenExit call after price update
-- [ ] T109 [AGENTIC-2] Pass currentPrice to CheckBreakevenExit
-- [ ] T110 [AGENTIC-2] Handle returned clusters from CheckBreakevenExit (if any, trigger exit)
-- [ ] T111 [AGENTIC-2] Add cluster exit logging (cluster level, reason, qty closed)
-- [ ] T112 [AGENTIC-2] Add cluster exit to grid_manager for actual position closing
+- [X] T098 [AGENTIC-2] Find positionMonitor function in backend/internal/farming/adaptive_grid/manager.go (around line 1010)
+- [X] T099 [AGENTIC-2] Add separate ticker for cluster stop loss checks (every 30 seconds)
+- [X] T100 [AGENTIC-2] Add CheckClusterStopLoss call in cluster stop loss ticker loop
+- [X] T101 [AGENTIC-2] Pass currentPrice to CheckClusterStopLoss from price cache
+- [X] T102 [AGENTIC-2] Handle returned clusters from CheckClusterStopLoss (if any, trigger exit)
+- [X] T103 [AGENTIC-2] Add separate ticker for time-based stop loss (every 5 minutes)
+- [X] T104 [AGENTIC-2] Add CheckTimeBasedStopLoss call in time-based ticker loop
+- [X] T105 [AGENTIC-2] Pass currentPrice to CheckTimeBasedStopLoss from price cache
+- [X] T106 [AGENTIC-2] Handle returned clusters from CheckTimeBasedStopLoss (if any, trigger exit)
+- [X] T107 [AGENTIC-2] Find UpdatePriceData function in backend/internal/farming/adaptive_grid/manager.go (around line 2650)
+- [X] T108 [AGENTIC-2] Add CheckBreakevenExit call after price update
+- [X] T109 [AGENTIC-2] Pass currentPrice to CheckBreakevenExit
+- [X] T110 [AGENTIC-2] Handle returned clusters from CheckBreakevenExit (if any, trigger exit)
+- [X] T111 [AGENTIC-2] Add cluster exit logging (cluster level, reason, qty closed)
+- [X] T112 [AGENTIC-2] Add cluster exit to grid_manager for actual position closing
 - [ ] T113 [AGENTIC-2] Test cluster stop loss with dry-run mode and simulated clusters
 - [ ] T114 [AGENTIC-2] Validate time-based exit after 2 hours (monitor level)
 - [ ] T115 [AGENTIC-2] Validate time-based exit after 4 hours (emergency level)
@@ -274,17 +274,17 @@ Parallel Opportunities: 12
 - Position sizes recalculated with new leverage
 
 **Tasks:**
-- [ ] T119 [AGENTIC-3] Find VolumeFarmEngine initialization in backend/internal/farming/volume_farm_engine.go
-- [ ] T120 [AGENTIC-3] Check if optConfig has DynamicLeverage section
-- [ ] T121 [AGENTIC-3] Call adaptiveMgr.InitializeDynamicLeverage(optConfig.DynamicLeverage) in VolumeFarmEngine
-- [ ] T122 [AGENTIC-3] Verify InitializeDynamicLeverage creates dynamicLeverageCalc global variable
-- [ ] T123 [AGENTIC-3] Find GetOrderSize function in backend/internal/farming/adaptive_grid/manager.go
-- [ ] T124 [AGENTIC-3] Check if GetOrderSize currently uses static leverage
-- [ ] T125 [AGENTIC-3] Add call to dynamicLeverageCalc.CalculateOptimalLeverage() in GetOrderSize
-- [ ] T126 [AGENTIC-3] Store calculated leverage in local variable
-- [ ] T127 [AGENTIC-3] Apply calculated leverage to order size calculation (size = base / leverage)
-- [ ] T128 [AGENTIC-3] Add fallback to default leverage if calculator not initialized
-- [ ] T129 [AGENTIC-3] Add leverage adjustment logging (old leverage, new leverage, reason)
+- [X] T119 [AGENTIC-3] Find VolumeFarmEngine initialization in backend/internal/farming/volume_farm_engine.go
+- [X] T120 [AGENTIC-3] Check if optConfig has DynamicLeverage section
+- [X] T121 [AGENTIC-3] Call adaptiveMgr.InitializeDynamicLeverage(optConfig.DynamicLeverage) in VolumeFarmEngine
+- [X] T122 [AGENTIC-3] Verify InitializeDynamicLeverage creates dynamicLeverageCalc global variable
+- [X] T123 [AGENTIC-3] Find GetOrderSize function in backend/internal/farming/adaptive_grid/manager.go
+- [X] T124 [AGENTIC-3] Check if GetOrderSize currently uses static leverage
+- [X] T125 [AGENTIC-3] Add call to dynamicLeverageCalc.CalculateOptimalLeverage() in GetOrderSize
+- [X] T126 [AGENTIC-3] Store calculated leverage in local variable
+- [X] T127 [AGENTIC-3] Apply calculated leverage to order size calculation (size = base / leverage)
+- [X] T128 [AGENTIC-3] Add fallback to default leverage if calculator not initialized
+- [X] T129 [AGENTIC-3] Add leverage adjustment logging (old leverage, new leverage, reason)
 - [ ] T130 [AGENTIC-3] Test leverage adjustment with low volatility simulation (should get 100x)
 - [ ] T131 [AGENTIC-3] Test leverage adjustment with normal volatility simulation (should get 50x)
 - [ ] T132 [AGENTIC-3] Test leverage adjustment with high volatility simulation (should get 20x)
@@ -340,21 +340,21 @@ Parallel Opportunities: 12
 - Micro grid mode toggleable in config
 
 **Tasks:**
-- [ ] T161 [AGENTIC-5] Find micro_grid config section in backend/config/volume-farm-config.yaml
-- [ ] T162 [AGENTIC-5] Verify micro_grid config has enabled, spread_pct, order_size_usdt
-- [ ] T163 [AGENTIC-5] Find VolumeFarmEngine initialization in backend/internal/farming/volume_farm_engine.go
-- [ ] T164 [AGENTIC-5] Add call to adaptiveMgr.SetMicroGridMode(config.Enabled, config) in VolumeFarmEngine
-- [ ] T165 [AGENTIC-5] Verify SetMicroGridMode creates microGridCalc in adaptive grid manager
-- [ ] T166 [AGENTIC-5] Find grid order placement in backend/internal/farming/grid_manager.go (PlaceGridOrder or similar)
-- [ ] T167 [AGENTIC-5] Add IsMicroGridEnabled check before normal grid calculation
-- [ ] T168 [AGENTIC-5] If micro grid enabled, call GetMicroGridPrices(currentPrice)
-- [ ] T169 [AGENTIC-5] Use micro grid prices instead of normal grid prices when enabled
-- [ ] T170 [AGENTIC-5] Find order sizing in backend/internal/farming/adaptive_grid/manager.go (GetOrderSize)
-- [ ] T171 [AGENTIC-5] Add IsMicroGridEnabled check in GetOrderSize
-- [ ] T172 [AGENTIC-5] If micro grid enabled, call GetMicroGridOrderSize(price)
-- [ ] T173 [AGENTIC-5] Use micro grid order size instead of normal size when enabled
-- [ ] T174 [AGENTIC-5] Add micro grid activation logging (enabled, spread, size)
-- [ ] T175 [AGENTIC-5] Add micro grid deactivation logging (reason, timestamp)
+- [X] T161 [AGENTIC-5] Find micro_grid config section in backend/config/volume-farm-config.yaml
+- [X] T162 [AGENTIC-5] Verify micro_grid config has enabled, spread_pct, order_size_usdt
+- [X] T163 [AGENTIC-5] Find VolumeFarmEngine initialization in backend/internal/farming/volume_farm_engine.go
+- [X] T164 [AGENTIC-5] Add call to adaptiveMgr.SetMicroGridMode(config.Enabled, config) in VolumeFarmEngine
+- [X] T165 [AGENTIC-5] Verify SetMicroGridMode creates microGridCalc in adaptive grid manager
+- [X] T166 [AGENTIC-5] Find grid order placement in backend/internal/farming/grid_manager.go (PlaceGridOrder or similar)
+- [X] T167 [AGENTIC-5] Add IsMicroGridEnabled check before normal grid calculation
+- [X] T168 [AGENTIC-5] If micro grid enabled, call GetMicroGridPrices(currentPrice)
+- [X] T169 [AGENTIC-5] Use micro grid prices instead of normal grid prices when enabled
+- [X] T170 [AGENTIC-5] Find order sizing in backend/internal/farming/adaptive_grid/manager.go (GetOrderSize)
+- [X] T171 [AGENTIC-5] Add IsMicroGridEnabled check in GetOrderSize
+- [X] T172 [AGENTIC-5] If micro grid enabled, call GetMicroGridOrderSize(price)
+- [X] T173 [AGENTIC-5] Use micro grid order size instead of normal size when enabled
+- [X] T174 [AGENTIC-5] Add micro grid activation logging (enabled, spread, size)
+- [X] T175 [AGENTIC-5] Add micro grid deactivation logging (reason, timestamp)
 - [ ] T176 [AGENTIC-5] Test micro grid with dry-run mode and low volatility simulation
 - [ ] T177 [AGENTIC-5] Validate micro grid spread is 0.05% (ultra-tight)
 - [ ] T178 [AGENTIC-5] Validate micro grid order size is smaller (default $0.5)
