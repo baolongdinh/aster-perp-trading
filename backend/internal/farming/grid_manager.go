@@ -3907,12 +3907,30 @@ func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
 				"unrealized_pnl": pos.UnrealizedPnL,
 				"websocket":      true,
 			}).Info("Position updated from WebSocket")
+
+			// CRITICAL: Also update AdaptiveGridManager's position tracking
+			// This ensures state machine transitions (e.g., EXIT_ALL → WAIT_NEW_RANGE) work correctly
+			if g.adaptiveMgr != nil {
+				g.adaptiveMgr.UpdatePositionTracking(pos.Symbol, cachedPos)
+			}
 		} else {
 			// Remove zero positions from cache
 			delete(g.cachedPositions, pos.Symbol)
 			g.logger.WithFields(logrus.Fields{
 				"symbol": pos.Symbol,
 			}).Info("Position removed from cache (zero position)")
+
+			// CRITICAL: Also update AdaptiveGridManager's position tracking to zero
+			// This ensures state machine can detect position is closed
+			if g.adaptiveMgr != nil {
+				zeroPos := &client.Position{
+					Symbol:      pos.Symbol,
+					PositionAmt: 0,
+					EntryPrice:  0,
+					MarkPrice:   0,
+				}
+				g.adaptiveMgr.UpdatePositionTracking(pos.Symbol, zeroPos)
+			}
 		}
 	}
 	g.lastPositionUpdate = time.Now()

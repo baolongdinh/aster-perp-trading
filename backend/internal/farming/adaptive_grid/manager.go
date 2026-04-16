@@ -1325,7 +1325,7 @@ func (a *AdaptiveGridManager) checkAndManageRisk(ctx context.Context) {
 		symbol := pos.Symbol
 
 		// Update position tracking
-		a.updatePositionTracking(symbol, &pos)
+		a.UpdatePositionTracking(symbol, &pos)
 
 		// Check risk limits for this position
 		a.evaluateRiskAndAct(ctx, symbol, &pos)
@@ -1394,8 +1394,8 @@ func (a *AdaptiveGridManager) checkClusterStopLoss(ctx context.Context) {
 	}
 }
 
-// updatePositionTracking updates internal position state
-func (a *AdaptiveGridManager) updatePositionTracking(symbol string, pos *client.Position) {
+// UpdatePositionTracking updates internal position state (exported for cross-package calls)
+func (a *AdaptiveGridManager) UpdatePositionTracking(symbol string, pos *client.Position) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -3368,9 +3368,16 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 				}
 			}
 		case GridStateExitAll:
+			// FAIL-SAFE TIMEOUT: Force transition after 15s regardless of position status
+			// This ensures bot never gets stuck in EXIT_ALL state
+			stateTime := stateMachine.GetStateTime(symbol)
+			timeInState := time.Since(stateTime)
+			timeout := 15 * time.Second
+
 			// Check if positions are zero to auto-transition to WAIT_NEW_RANGE
 			position, hasPosition := a.positions[symbol]
 			positionZero := !hasPosition || position == nil || math.Abs(position.PositionAmt) == 0
+
 			if positionZero {
 				canTransition := stateMachine.CanTransition(symbol, EventPositionsClosed)
 				a.logger.Info("EXIT_ALL -> WAIT_NEW_RANGE transition check",
@@ -3383,14 +3390,39 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 						zap.String("symbol", symbol),
 						zap.Bool("success", ok))
 				}
+			} else if timeInState > timeout {
+				// FAIL-SAFE: Force transition even if position not zero
+				// This prevents bot from getting stuck indefinitely
+				a.logger.Error("EXIT_ALL FAIL-SAFE: Timeout exceeded, forcing transition to WAIT_NEW_RANGE",
+					zap.String("symbol", symbol),
+					zap.Duration("time_in_state", timeInState),
+					zap.Duration("timeout", timeout),
+					zap.Float64("position_amt", position.PositionAmt),
+					zap.String("reason", "Prevent indefinite blocking"))
+
+				canTransition := stateMachine.CanTransition(symbol, EventPositionsClosed)
+				if canTransition {
+					ok := stateMachine.Transition(symbol, EventPositionsClosed)
+					a.logger.Info("EXIT_ALL FAIL-SAFE: Forced transition result",
+						zap.String("symbol", symbol),
+						zap.Bool("success", ok))
+					if ok {
+						// Update position cache to zero to match state
+						a.UpdatePositionTracking(symbol, &client.Position{
+							Symbol:      symbol,
+							PositionAmt: 0,
+							EntryPrice:  0,
+							MarkPrice:   0,
+						})
+					}
+				}
 			} else {
-				// Check if stuck in EXIT_ALL for too long (> 30s) with positions
-				stateTime := stateMachine.GetStateTime(symbol)
-				timeInState := time.Since(stateTime)
-				if timeInState > 30*time.Second {
-					a.logger.Warn("EXIT_ALL stuck for > 30s with positions, forcing close",
+				// Check if stuck in EXIT_ALL for too long (> 10s) with positions
+				if timeInState > 10*time.Second {
+					a.logger.Warn("EXIT_ALL approaching timeout, forcing close",
 						zap.String("symbol", symbol),
 						zap.Duration("time_in_state", timeInState),
+						zap.Duration("timeout", timeout),
 						zap.Float64("position_amt", position.PositionAmt))
 					// Force close position
 					a.emergencyClosePosition(context.Background(), symbol, position.PositionAmt)
@@ -3399,6 +3431,110 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 						zap.String("symbol", symbol),
 						zap.Float64("position_amt", position.PositionAmt),
 						zap.Duration("time_in_state", timeInState))
+				}
+			}
+		case GridStateOverSize:
+			// Auto-transition to TRADING when position size normalizes
+			position, hasPosition := a.positions[symbol]
+			if hasPosition && position != nil {
+				// Use hardcoded thresholds: 80% to enter, 60% to exit
+				recoveryLevel := a.riskConfig.MaxPositionUSDT * 0.6
+				currentNotional := position.NotionalValue
+
+				if currentNotional <= recoveryLevel {
+					canTransition := stateMachine.CanTransition(symbol, EventSizeNormalized)
+					a.logger.Info("OVER_SIZE -> TRADING transition check",
+						zap.String("symbol", symbol),
+						zap.Float64("current_notional", currentNotional),
+						zap.Float64("recovery_level", recoveryLevel),
+						zap.Bool("can_transition", canTransition))
+					if canTransition {
+						ok := stateMachine.Transition(symbol, EventSizeNormalized)
+						a.logger.Info("OVER_SIZE -> TRADING transition result",
+							zap.String("symbol", symbol),
+							zap.Bool("success", ok))
+					}
+				}
+			}
+		case GridStateDefensive:
+			// Auto-transition to TRADING when volatility normalizes
+			// Check if BB width and ADX have normalized
+			if detector != nil {
+				currentRange := detector.GetCurrentRange()
+				if currentRange != nil {
+					// Volatility normalized if BB width < 5% and ADX < 50
+					volatilityNormalized := currentRange.WidthPct < 0.05
+					adxNormalized := detector.GetCurrentADX() < 50.0
+
+					if volatilityNormalized && adxNormalized {
+						canTransition := stateMachine.CanTransition(symbol, EventVolatilityNormalized)
+						a.logger.Info("DEFENSIVE -> TRADING transition check",
+							zap.String("symbol", symbol),
+							zap.Float64("bb_width", currentRange.WidthPct),
+							zap.Float64("bb_threshold", 0.05),
+							zap.Float64("adx", detector.GetCurrentADX()),
+							zap.Bool("volatility_normalized", volatilityNormalized),
+							zap.Bool("adx_normalized", adxNormalized),
+							zap.Bool("can_transition", canTransition))
+						if canTransition {
+							ok := stateMachine.Transition(symbol, EventVolatilityNormalized)
+							a.logger.Info("DEFENSIVE -> TRADING transition result",
+								zap.String("symbol", symbol),
+								zap.Bool("success", ok))
+						}
+					}
+				}
+			}
+		case GridStateRecovery:
+			// Auto-transition to TRADING when recovery conditions met
+			position, hasPosition := a.positions[symbol]
+			if hasPosition && position != nil {
+				// Recovery complete if PnL >= 0 (break even) and stable for 30 minutes
+				pnlRecovery := position.UnrealizedPnL >= 0
+				stateTime := stateMachine.GetStateTime(symbol)
+				stableDuration := time.Since(stateTime)
+				stableEnough := stableDuration >= 30*time.Minute
+
+				if pnlRecovery && stableEnough {
+					canTransition := stateMachine.CanTransition(symbol, EventRecoveryComplete)
+					a.logger.Info("RECOVERY -> TRADING transition check",
+						zap.String("symbol", symbol),
+						zap.Float64("unrealized_pnl", position.UnrealizedPnL),
+						zap.Float64("recovery_threshold", 0),
+						zap.Duration("stable_duration", stableDuration),
+						zap.Int("min_stable_minutes", 30),
+						zap.Bool("pnl_recovery", pnlRecovery),
+						zap.Bool("stable_enough", stableEnough),
+						zap.Bool("can_transition", canTransition))
+					if canTransition {
+						ok := stateMachine.Transition(symbol, EventRecoveryComplete)
+						a.logger.Info("RECOVERY -> TRADING transition result",
+							zap.String("symbol", symbol),
+							zap.Bool("success", ok))
+					}
+				}
+			}
+		case GridStateExitHalf:
+			// Auto-transition to TRADING when recovery conditions met
+			position, hasPosition := a.positions[symbol]
+			if hasPosition && position != nil {
+				// Recovery if PnL >= 0 (break even)
+				pnlRecovery := position.UnrealizedPnL >= 0
+
+				if pnlRecovery {
+					canTransition := stateMachine.CanTransition(symbol, EventRecovery)
+					a.logger.Info("EXIT_HALF -> TRADING transition check",
+						zap.String("symbol", symbol),
+						zap.Float64("unrealized_pnl", position.UnrealizedPnL),
+						zap.Float64("recovery_threshold", 0),
+						zap.Bool("pnl_recovery", pnlRecovery),
+						zap.Bool("can_transition", canTransition))
+					if canTransition {
+						ok := stateMachine.Transition(symbol, EventRecovery)
+						a.logger.Info("EXIT_HALF -> TRADING transition result",
+							zap.String("symbol", symbol),
+							zap.Bool("success", ok))
+					}
 				}
 			}
 		}

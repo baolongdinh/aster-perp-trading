@@ -221,4 +221,21 @@ func mergeRiskConfig(cfg *config.Config, volumeCfg *config.VolumeFarmConfig) {
 	if volumeCfg.Risk.PerTradeTakeProfitPct > 0 {
 		cfg.Risk.PerTradeTakeProfitPct = volumeCfg.Risk.PerTradeTakeProfitPct
 	}
+
+	// Merge adaptive state machine configs
+	if volumeCfg.Risk.MarketConditionEvaluator != nil {
+		cfg.Risk.MarketConditionEvaluator = volumeCfg.Risk.MarketConditionEvaluator
+	}
+	if volumeCfg.Risk.OverSize != nil {
+		cfg.Risk.OverSize = volumeCfg.Risk.OverSize
+	}
+	if volumeCfg.Risk.DefensiveState != nil {
+		cfg.Risk.DefensiveState = volumeCfg.Risk.DefensiveState
+	}
+	if volumeCfg.Risk.RecoveryState != nil {
+		cfg.Risk.RecoveryState = volumeCfg.Risk.RecoveryState
+	}
+	if volumeCfg.Risk.PnLRiskControl != nil {
+		cfg.Risk.PnLRiskControl = volumeCfg.Risk.PnLRiskControl
+	}
 }
