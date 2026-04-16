@@ -1215,10 +1215,18 @@ func (e *VolumeFarmEngine) syncGridSymbols() {
 	e.logger.Info("=== SYNC GRID SYMBOLS END ===")
 }
 
-// setLeverageForSymbols sets the correct leverage for each symbol based on exchange info
+// setLeverageForSymbols sets the correct leverage for each symbol
+// Uses symbol-specific config if enabled, otherwise falls back to exchange info
 func (e *VolumeFarmEngine) setLeverageForSymbols(symbols []*SymbolData) {
+	// Check if symbol-specific leverage is enabled
+	if e.volumeConfig.SymbolLeverage != nil && e.volumeConfig.SymbolLeverage.Enabled {
+		e.logger.Info("Using symbol-specific leverage configuration")
+		e.setSymbolSpecificLeverage(symbols)
+		return
+	}
+
+	// FALLBACK: Use exchange info based leverage (original behavior)
 	// CRITICAL: Ensure exchange info is loaded before checking leverage
-	// This may be called before grid manager Start() completes
 	if e.gridManager.precisionMgr.GetMaxLeverage("BTCUSD1") == 0 {
 		e.logger.Info("Exchange info not loaded yet, fetching directly for leverage setup")
 		marketClient := client.NewMarketClient(e.futuresClient.GetHTTPClient())
@@ -1274,6 +1282,51 @@ func (e *VolumeFarmEngine) setLeverageForSymbols(symbols []*SymbolData) {
 		} else {
 			e.logger.Warn("Max leverage unknown for symbol, skipping leverage set",
 				zap.String("symbol", sym.Symbol))
+		}
+	}
+}
+
+// setSymbolSpecificLeverage sets leverage based on symbol-specific config
+// BTC gets 149x, other symbols get 99x (or configured values)
+func (e *VolumeFarmEngine) setSymbolSpecificLeverage(symbols []*SymbolData) {
+	cfg := e.volumeConfig.SymbolLeverage
+	defaultLeverage := cfg.DefaultMaxLeverage
+	if defaultLeverage <= 0 {
+		defaultLeverage = 99 // Default for non-BTC symbols
+	}
+
+	for _, sym := range symbols {
+		// Get symbol-specific leverage or use default
+		targetLeverage, ok := cfg.SymbolMaxLeverage[sym.Symbol]
+		if !ok {
+			targetLeverage = defaultLeverage
+		}
+
+		// Safety clamp: ensure leverage is reasonable (1-200)
+		if targetLeverage > 200 {
+			targetLeverage = 200
+		}
+		if targetLeverage < 1 {
+			targetLeverage = 1
+		}
+
+		e.logger.Info("Setting symbol-specific max leverage",
+			zap.String("symbol", sym.Symbol),
+			zap.Int("target_leverage", targetLeverage),
+			zap.Bool("is_configured", ok))
+
+		if err := e.futuresClient.SetLeverage(context.Background(), client.SetLeverageRequest{
+			Symbol:   sym.Symbol,
+			Leverage: targetLeverage,
+		}); err != nil {
+			e.logger.Warn("Failed to set symbol-specific leverage",
+				zap.String("symbol", sym.Symbol),
+				zap.Int("target_leverage", targetLeverage),
+				zap.Error(err))
+		} else {
+			e.logger.Info("Symbol-specific leverage set successfully",
+				zap.String("symbol", sym.Symbol),
+				zap.Int("leverage", targetLeverage))
 		}
 	}
 }
@@ -1825,4 +1878,184 @@ func (e *VolumeFarmEngine) periodicMetricsBroadcast() {
 // GetPostOnlyHandler returns the post-only handler for order placement
 func (e *VolumeFarmEngine) GetPostOnlyHandler() interface{} {
 	return e.postOnlyHandler
+}
+
+// GetCurrentPrice returns the current price for a symbol
+func (e *VolumeFarmEngine) GetCurrentPrice(symbol string) float64 {
+	// For now return 0 - price will be fetched by grid manager itself
+	// In future: can add price cache from websocket
+	e.logger.Debug("GetCurrentPrice called", zap.String("symbol", symbol))
+	return 0
+}
+
+// GetStateEventBus returns the state event bus for agentic integration
+func (e *VolumeFarmEngine) GetStateEventBus() *agentic.StateEventBus {
+	return nil // Will be set via setter
+}
+
+// SetStateEventBus sets the state event bus for agentic integration
+func (e *VolumeFarmEngine) SetStateEventBus(bus *agentic.StateEventBus) {
+	// Store for later use
+	e.logger.Info("StateEventBus set for hybrid integration")
+}
+
+// ExecuteGridEntry enables grid trading for a symbol based on Agentic decision
+func (e *VolumeFarmEngine) ExecuteGridEntry(ctx context.Context, symbol string, params agentic.ExecutionParams) error {
+	e.logger.Info("Executing grid entry from Agentic",
+		zap.String("symbol", symbol),
+		zap.Float64("range_low", params.RangeLow),
+		zap.Float64("range_high", params.RangeHigh),
+		zap.Int("grid_levels", params.GridLevels),
+	)
+
+	// Use the existing UpdateWhitelist method to add symbol
+	whitelist := e.symbolSelector.GetWhitelist()
+	found := false
+	for _, s := range whitelist {
+		if s == symbol {
+			found = true
+			break
+		}
+	}
+	if !found {
+		newWhitelist := append(whitelist, symbol)
+		if err := e.UpdateWhitelist(newWhitelist); err != nil {
+			return fmt.Errorf("failed to add symbol to whitelist: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ExecuteGridExit disables grid trading for a symbol
+func (e *VolumeFarmEngine) ExecuteGridExit(ctx context.Context, symbol string, reason string) error {
+	e.logger.Info("Executing grid exit from Agentic",
+		zap.String("symbol", symbol),
+		zap.String("reason", reason),
+	)
+
+	// Remove symbol from whitelist using existing UpdateWhitelist method
+	whitelist := e.symbolSelector.GetWhitelist()
+	newWhitelist := make([]string, 0, len(whitelist))
+	for _, s := range whitelist {
+		if s != symbol {
+			newWhitelist = append(newWhitelist, s)
+		}
+	}
+
+	if len(newWhitelist) < len(whitelist) {
+		if err := e.UpdateWhitelist(newWhitelist); err != nil {
+			return fmt.Errorf("failed to remove symbol from whitelist: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ExecuteTrendEntry prepares for trend following mode (exits grid, sets up trend params)
+func (e *VolumeFarmEngine) ExecuteTrendEntry(ctx context.Context, symbol string, params agentic.ExecutionParams) error {
+	e.logger.Info("Executing trend entry from Agentic",
+		zap.String("symbol", symbol),
+		zap.String("direction", params.TrendDirection),
+	)
+
+	// First exit grid mode by removing from whitelist
+	if err := e.ExecuteGridExit(ctx, symbol, "switch_to_trend"); err != nil {
+		e.logger.Warn("Failed to exit grid for trend entry", zap.Error(err))
+	}
+
+	// Log trend parameters - VF decides how to implement trend following
+	e.logger.Info("Trend mode parameters set",
+		zap.String("symbol", symbol),
+		zap.String("direction", params.TrendDirection),
+		zap.Float64("stop_loss", params.StopLoss),
+		zap.Bool("trailing", params.TrailingStop),
+	)
+
+	return nil
+}
+
+// ExecuteTrendExit exits trend following mode
+func (e *VolumeFarmEngine) ExecuteTrendExit(ctx context.Context, symbol string, reason string) error {
+	e.logger.Info("Executing trend exit from Agentic",
+		zap.String("symbol", symbol),
+		zap.String("reason", reason),
+	)
+
+	// Exit all positions for this symbol
+	return e.ExecuteDefensive(ctx, symbol, 1.0, reason)
+}
+
+// ExecuteDefensive executes defensive actions (reduce/exit positions)
+func (e *VolumeFarmEngine) ExecuteDefensive(ctx context.Context, symbol string, exitPct float64, reason string) error {
+	e.logger.Info("Executing defensive from Agentic",
+		zap.String("symbol", symbol),
+		zap.Float64("exit_pct", exitPct),
+		zap.String("reason", reason),
+	)
+
+	// Remove from whitelist to stop new orders
+	if err := e.ExecuteGridExit(ctx, symbol, reason); err != nil {
+		e.logger.Warn("Failed to remove from whitelist in defensive", zap.Error(err))
+	}
+
+	// Cancel orders
+	if e.gridManager != nil {
+		if err := e.gridManager.CancelAllOrders(ctx, symbol); err != nil {
+			e.logger.Error("Failed to cancel orders in defensive", zap.Error(err))
+		}
+	}
+
+	// If full exit, trigger emergency exit
+	if exitPct >= 1.0 {
+		return e.TriggerEmergencyExit(reason)
+	}
+
+	return nil
+}
+
+// ExecuteAccumulation executes accumulation strategy (gradual position building)
+func (e *VolumeFarmEngine) ExecuteAccumulation(ctx context.Context, symbol string, params agentic.ExecutionParams) error {
+	e.logger.Info("Executing accumulation from Agentic",
+		zap.String("symbol", symbol),
+		zap.Float64("target_position", params.TargetPosition),
+	)
+
+	// Enter grid mode with reduced size for gradual building
+	accParams := params
+	accParams.PositionSizeMultiplier = 0.3 // 30% of normal size for gradual building
+
+	return e.ExecuteGridEntry(ctx, symbol, accParams)
+}
+
+// ExecuteRecovery executes recovery after losses (reduced size, wait for opportunities)
+func (e *VolumeFarmEngine) ExecuteRecovery(ctx context.Context, symbol string, params agentic.ExecutionParams) error {
+	e.logger.Info("Executing recovery from Agentic",
+		zap.String("symbol", symbol),
+	)
+
+	// Ensure we're in a safe state
+	if err := e.ExecuteDefensive(ctx, symbol, 0.5, "recovery_init"); err != nil {
+		e.logger.Warn("Recovery: partial exit failed", zap.Error(err))
+	}
+
+	// Wait for cooldown (handled by recovery state handler)
+	return nil
+}
+
+// ExecuteIdle stops all trading for a symbol
+func (e *VolumeFarmEngine) ExecuteIdle(ctx context.Context, symbol string) error {
+	e.logger.Info("Executing idle from Agentic",
+		zap.String("symbol", symbol),
+	)
+
+	// Full exit
+	return e.ExecuteDefensive(ctx, symbol, 1.0, "enter_idle")
+}
+
+// PublishExecutionResult publishes execution result back to Agentic
+func (e *VolumeFarmEngine) PublishExecutionResult(ctx context.Context, bus *agentic.StateEventBus, result agentic.ExecutionResult) {
+	if bus != nil {
+		bus.PublishResult(ctx, result)
+	}
 }

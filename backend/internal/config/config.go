@@ -384,7 +384,27 @@ func validate(cfg *Config) error {
 		cfg.Risk.ATRMultiplier = 2.0 // Stop loss = 2 * ATR
 	}
 	cfg.Risk.MakerPriority = true // Default to true
-	_ = time.Now()                // suppress import
+
+	// Score Engine defaults for adaptive state management
+	if cfg.Agentic != nil {
+		if cfg.Agentic.ScoreEngine.GridThreshold <= 0 {
+			cfg.Agentic.ScoreEngine.GridThreshold = 0.6
+		}
+		if cfg.Agentic.ScoreEngine.TrendThreshold <= 0 {
+			cfg.Agentic.ScoreEngine.TrendThreshold = 0.75
+		}
+		if cfg.Agentic.ScoreEngine.HysteresisBuffer <= 0 {
+			cfg.Agentic.ScoreEngine.HysteresisBuffer = 0.1
+		}
+		if cfg.Agentic.ScoreEngine.RegimeWeight <= 0 {
+			cfg.Agentic.ScoreEngine.RegimeWeight = 0.4
+		}
+		if cfg.Agentic.ScoreEngine.SignalWeight <= 0 {
+			cfg.Agentic.ScoreEngine.SignalWeight = 0.6
+		}
+	}
+
+	_ = time.Now() // suppress import
 	return nil
 }
 
@@ -414,6 +434,7 @@ type VolumeFarmConfig struct {
 	TradingModes             *TradingModesConfig       `mapstructure:"trading_modes,omitempty"`
 	PartialClose             *PartialCloseConfig       `mapstructure:"partial_close,omitempty"`
 	VolumeOptimization       *VolumeOptimizationConfig `mapstructure:"volume_optimization,omitempty"`
+	SymbolLeverage           *SymbolLeverageConfig     `mapstructure:"symbol_leverage,omitempty"`
 }
 
 // TradingModesConfig holds configuration for all trading modes
@@ -496,6 +517,17 @@ type SymbolsConfig struct {
 	AllowMixedQuotes          bool      `mapstructure:"allow_mixed_quotes"`
 	Whitelist                 []string  `mapstructure:"whitelist"`
 	Blacklist                 []string  `mapstructure:"blacklist"`
+}
+
+// SymbolLeverageConfig holds max leverage settings per symbol
+// Allows setting fixed max leverage per symbol instead of using exchange info
+type SymbolLeverageConfig struct {
+	// Enabled turns on symbol-specific leverage setting
+	Enabled bool `mapstructure:"enabled"`
+	// DefaultMaxLeverage is used for symbols not in SymbolMaxLeverage map
+	DefaultMaxLeverage int `mapstructure:"default_max_leverage"`
+	// SymbolMaxLeverage maps symbol name to max leverage (e.g., BTCUSD1: 149)
+	SymbolMaxLeverage map[string]int `mapstructure:"symbol_max_leverage"`
 }
 
 // LoadVolumeFarming loads volume farming configuration from file
@@ -1063,6 +1095,7 @@ type AgenticConfig struct {
 	PositionSizing      PositionSizingConfig        `mapstructure:"position_sizing" yaml:"position_sizing"`
 	WhitelistManagement WhitelistConfig             `mapstructure:"whitelist_management" yaml:"whitelist_management"`
 	CircuitBreakers     AgenticCircuitBreakerConfig `mapstructure:"circuit_breakers" yaml:"circuit_breakers"`
+	ScoreEngine         ScoreEngineConfig           `mapstructure:"score_engine" yaml:"score_engine"` // NEW: Adaptive state scoring
 }
 
 // UniverseConfig defines the symbol universe for monitoring
@@ -1145,4 +1178,23 @@ type ConsecutiveLossBreakerConfig struct {
 	Enabled       bool    `mapstructure:"enabled" yaml:"enabled"`
 	Threshold     int     `mapstructure:"threshold" yaml:"threshold"`
 	SizeReduction float64 `mapstructure:"size_reduction" yaml:"size_reduction"`
+}
+
+// ScoreEngineConfig configures the adaptive state scoring engine
+// This enables score-based transitions between GRID, TREND, ACCUMULATION modes
+type ScoreEngineConfig struct {
+	Enabled          bool    `mapstructure:"enabled" yaml:"enabled"`
+	GridThreshold    float64 `mapstructure:"grid_threshold" yaml:"grid_threshold"`       // Min score for GRID (default 0.6)
+	TrendThreshold   float64 `mapstructure:"trend_threshold" yaml:"trend_threshold"`     // Min score for TREND (default 0.75)
+	HysteresisBuffer float64 `mapstructure:"hysteresis_buffer" yaml:"hysteresis_buffer"` // Buffer to prevent flip-flop (default 0.1)
+	RegimeWeight     float64 `mapstructure:"regime_weight" yaml:"regime_weight"`         // Weight for regime component (default 0.4)
+	SignalWeight     float64 `mapstructure:"signal_weight" yaml:"signal_weight"`         // Weight for signal component (default 0.6)
+}
+
+// DecisionEngineConfig configures the centralized decision engine
+type DecisionEngineConfig struct {
+	Enabled             bool          `mapstructure:"enabled" yaml:"enabled"`
+	TransitionTimeout   time.Duration `mapstructure:"transition_timeout" yaml:"transition_timeout"`
+	SmoothingDuration   time.Duration `mapstructure:"smoothing_duration" yaml:"smoothing_duration"`
+	MaxFlipFlopsPerHour int           `mapstructure:"max_flip_flops_per_hour" yaml:"max_flip_flops_per_hour"`
 }

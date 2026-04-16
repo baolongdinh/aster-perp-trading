@@ -43,6 +43,24 @@ type AgenticEngine struct {
 
 	alertManager AlertManager
 
+	// NEW: Adaptive State Management Components (Phase 2-10)
+	scoreEngine         *ScoreCalculationEngine
+	decisionEngine      *DecisionEngine
+	idleHandler         *IdleStateHandler
+	waitRangeHandler    *WaitRangeStateHandler
+	enterGridHandler    *EnterGridStateHandler
+	tradingGridHandler  *TradingGridStateHandler
+	trendingHandler     *TrendingStateHandler
+	accumulationHandler *AccumulationStateHandler
+	defensiveHandler    *DefensiveStateHandler
+	overSizeHandler     *OverSizeStateHandler
+	recoveryHandler     *RecoveryStateHandler
+	eventPublisher      *EventPublisher
+
+	// NEW: Hybrid integration - Event-driven communication with VF
+	stateEventBus *StateEventBus
+	vfBridge      *AgenticVFBridge
+
 	// State
 
 	currentScores map[string]SymbolScore
@@ -116,6 +134,50 @@ func NewAgenticEngine(
 	// Initialize circuit breaker
 	engine.circuitBreaker = NewCircuitBreaker(cfg.CircuitBreakers, logger)
 	engine.circuitBreaker.Start() // Start evaluation worker
+
+	// NEW: Initialize adaptive state management components (Phase 2-10)
+	if cfg.ScoreEngine.Enabled {
+		engine.scoreEngine = NewScoreCalculationEngine(&cfg.ScoreEngine, logger)
+		engine.decisionEngine = NewDecisionEngine(nil, engine.scoreEngine, logger)
+		engine.idleHandler = NewIdleStateHandler(engine.scoreEngine, logger)
+		engine.waitRangeHandler = NewWaitRangeStateHandler(engine.scoreEngine, logger)
+		engine.enterGridHandler = NewEnterGridStateHandler(engine.scoreEngine, logger)
+		engine.tradingGridHandler = NewTradingGridStateHandler(engine.scoreEngine, logger)
+		engine.trendingHandler = NewTrendingStateHandler(engine.scoreEngine, logger)
+		engine.accumulationHandler = NewAccumulationStateHandler(engine.scoreEngine, logger)
+		engine.defensiveHandler = NewDefensiveStateHandler(engine.scoreEngine, logger)
+		engine.overSizeHandler = NewOverSizeStateHandler(engine.scoreEngine, logger)
+		engine.recoveryHandler = NewRecoveryStateHandler(engine.scoreEngine, logger)
+		engine.eventPublisher = NewEventPublisher(logger)
+
+		// Wire event publisher to decision engine
+		eventCh := make(chan StateTransition, 100)
+		engine.eventPublisher.Subscribe(eventCh)
+		engine.decisionEngine.SubscribeToTransitions(eventCh)
+
+		// NEW: Initialize hybrid event-driven integration (Option 3)
+		engine.stateEventBus = NewStateEventBus(logger)
+		engine.vfBridge = NewAgenticVFBridge(engine.stateEventBus, logger)
+
+		// VF handler will be subscribed externally when VFEngine is available
+		logger.Info("Hybrid state-execution integration initialized",
+			zap.Bool("state_event_bus", engine.stateEventBus != nil),
+			zap.Bool("vf_bridge", engine.vfBridge != nil),
+		)
+
+		logger.Info("Adaptive state management initialized",
+			zap.Bool("score_engine", cfg.ScoreEngine.Enabled),
+			zap.Bool("idle_handler", engine.idleHandler != nil),
+			zap.Bool("wait_range_handler", engine.waitRangeHandler != nil),
+			zap.Bool("enter_grid_handler", engine.enterGridHandler != nil),
+			zap.Bool("trading_grid_handler", engine.tradingGridHandler != nil),
+			zap.Bool("trending_handler", engine.trendingHandler != nil),
+			zap.Bool("accumulation_handler", engine.accumulationHandler != nil),
+			zap.Bool("defensive_handler", engine.defensiveHandler != nil),
+			zap.Bool("over_size_handler", engine.overSizeHandler != nil),
+			zap.Bool("recovery_handler", engine.recoveryHandler != nil),
+		)
+	}
 
 	// Set callback to trigger emergency exit when circuit breaker trips for a symbol
 	if vfController != nil {
@@ -352,6 +414,11 @@ func (ae *AgenticEngine) runDetectionCycle(ctx context.Context) error {
 	// 2. Calculate scores
 
 	scores := ae.calculateScores(detectionResults)
+
+	// NEW: 2.5 Run adaptive state management (Phase 2+3)
+	if ae.idleHandler != nil {
+		ae.runStateManagement(ctx, detectionResults)
+	}
 
 	// 2.5 Update circuit breaker with market conditions for dynamic reset
 	// For now, use default values - TODO: wire with actual detector data
@@ -650,4 +717,309 @@ func (ae *AgenticEngine) GetDetectionCount() int {
 
 	return ae.detectionCount
 
+}
+
+// GetStateEventBus returns the state event bus for hybrid integration
+func (ae *AgenticEngine) GetStateEventBus() *StateEventBus {
+	return ae.stateEventBus
+}
+
+// runStateManagement executes adaptive state management for all symbols
+// This is the core integration point for state-based trading
+func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[string]RegimeSnapshot) {
+	for symbol, regime := range detections {
+		// Only process if we have a decision engine and idle handler
+		if ae.decisionEngine == nil || ae.idleHandler == nil {
+			continue
+		}
+
+		// Get current state for this symbol
+		currentState, ok := ae.decisionEngine.GetSymbolState(symbol)
+		if !ok {
+			// New symbol, start in IDLE
+			currentState = &SymbolTradingState{
+				Symbol:      symbol,
+				CurrentMode: TradingModeIdle,
+				ModeScores:  make(map[TradingMode]*TradingModeScore),
+			}
+		}
+
+		// Execute state-specific logic
+		switch currentState.CurrentMode {
+		case TradingModeIdle:
+			// Handle IDLE state
+			transition, err := ae.idleHandler.HandleState(ctx, symbol, regime)
+			if err != nil {
+				ae.logger.Error("IDLE state handler failed",
+					zap.String("symbol", symbol),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			if transition != nil {
+				// Execute the transition through decision engine
+				_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+					Symbol:         symbol,
+					RegimeSnapshot: regime,
+				})
+				if err != nil {
+					ae.logger.Error("State transition failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+				} else {
+					ae.logger.Info("State transition executed",
+						zap.String("symbol", symbol),
+						zap.String("from", string(transition.FromState)),
+						zap.String("to", string(transition.ToState)),
+						zap.Float64("score", transition.Score),
+					)
+
+					// NEW: Request execution via VF Bridge (Hybrid Integration)
+					if ae.vfBridge != nil {
+						if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
+							transition.FromState, transition.ToState,
+							transition.Trigger, transition.Score, regime); err != nil {
+							ae.logger.Error("Failed to request VF execution",
+								zap.String("symbol", symbol),
+								zap.Error(err),
+							)
+						}
+					}
+				}
+			}
+
+		case TradingModeWaitNewRange:
+			// Handle WAIT_NEW_RANGE state
+			if ae.waitRangeHandler != nil {
+				// Get current price (would need price feed, using placeholder)
+				currentPrice := 0.0 // TODO: Wire with actual price feed
+
+				transition, err := ae.waitRangeHandler.HandleState(ctx, symbol, regime, currentPrice)
+				if err != nil {
+					ae.logger.Error("WAIT_NEW_RANGE state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		case TradingModeGrid:
+			// Handle active GRID trading state (Phase 6)
+			if ae.tradingGridHandler != nil {
+				// TODO: Get actual price, position size, and blended signals
+				currentPrice := 0.0
+				positionSize := 0.0
+				signals := &SignalBundle{OverallStrength: 0.5}
+
+				transition, err := ae.tradingGridHandler.HandleState(
+					ctx, symbol, regime, currentPrice, positionSize, signals,
+				)
+				if err != nil {
+					ae.logger.Error("TRADING_GRID state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		case TradingModeTrending:
+			// Handle TRENDING state (Phase 7)
+			if ae.trendingHandler != nil {
+				// TODO: Get actual price, breakout level, and FVG zones
+				currentPrice := 0.0
+				breakoutLevel := 0.0
+				fvgZones := []FVGZone{}
+
+				transition, err := ae.trendingHandler.HandleState(
+					ctx, symbol, regime, currentPrice, breakoutLevel, fvgZones,
+				)
+				if err != nil {
+					ae.logger.Error("TRENDING state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		case TradingModeAccumulation:
+			// Handle ACCUMULATION state (Phase 8)
+			if ae.accumulationHandler != nil {
+				// TODO: Get actual price and volume
+				currentPrice := 0.0
+				volume24h := regime.Volume24h
+
+				transition, err := ae.accumulationHandler.HandleState(
+					ctx, symbol, regime, currentPrice, volume24h,
+				)
+				if err != nil {
+					ae.logger.Error("ACCUMULATION state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		case TradingModeDefensive:
+			// Handle DEFENSIVE state (Phase 9)
+			if ae.defensiveHandler != nil {
+				// TODO: Get actual price, position size, and unrealized PnL
+				currentPrice := 0.0
+				positionSize := 0.0
+				unrealizedPnL := 0.0
+
+				transition, err := ae.defensiveHandler.HandleState(
+					ctx, symbol, regime, currentPrice, positionSize, unrealizedPnL,
+				)
+				if err != nil {
+					ae.logger.Error("DEFENSIVE state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		case TradingModeOverSize:
+			// Handle OVER_SIZE state (Phase 10)
+			if ae.overSizeHandler != nil {
+				// TODO: Get actual price and position size
+				currentPrice := 0.0
+				positionSize := 0.0
+
+				transition, err := ae.overSizeHandler.HandleState(
+					ctx, symbol, regime, currentPrice, positionSize,
+				)
+				if err != nil {
+					ae.logger.Error("OVER_SIZE state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		case TradingModeRecovery:
+			// Handle RECOVERY state (Phase 10)
+			if ae.recoveryHandler != nil {
+				// TODO: Get actual exit PnL and reason
+				exitPnL := 0.0
+				exitReason := ""
+				consecutiveLosses := 0
+
+				transition, err := ae.recoveryHandler.HandleState(
+					ctx, symbol, regime, exitPnL, exitReason, consecutiveLosses,
+				)
+				if err != nil {
+					ae.logger.Error("RECOVERY state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				if transition != nil {
+					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
+						Symbol:         symbol,
+						RegimeSnapshot: regime,
+					})
+					if err != nil {
+						ae.logger.Error("State transition failed",
+							zap.String("symbol", symbol),
+							zap.Error(err),
+						)
+					}
+				}
+			}
+
+		default:
+			ae.logger.Debug("State not handled yet",
+				zap.String("symbol", symbol),
+				zap.String("state", string(currentState.CurrentMode)),
+			)
+		}
+	}
 }

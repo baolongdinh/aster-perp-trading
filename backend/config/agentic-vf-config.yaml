@@ -159,6 +159,49 @@ agentic:
       threshold: 3              # 3 lỗi liên tiếp
       size_reduction: 0.5       # Giảm 50% size sau đó
 
+  # SCORE ENGINE - Adaptive State Management (Phase 2-10)
+  # =======================================================
+  # Bật tính năng quản lý state thông minh (IDLE → GRID → TRENDING → EXIT)
+  # 
+  # TÍNH NĂNG:
+  # - 10 trading states với transitions có điều kiện
+  # - Score-based decision engine
+  # - Lock-free state transitions
+  # - Smoothing & hysteresis
+  #
+  # ⚠️ CẦN BẬT để sử dụng adaptive state management
+  score_engine:
+    enabled: true              # BẬT state management mới
+    
+    # Grid Scoring Parameters
+    grid:
+      regime_weight: 0.35       # Trọng số regime (0-1)
+      signal_weight: 0.35       # Trọng số mean reversion signals
+      volume_weight: 0.20       # Trọng số volume
+      momentum_weight: 0.10     # Trọng số momentum
+      threshold: 0.60           # Ngưỡng vào GRID (0.6 = 60%)
+    
+    # Trend Scoring Parameters  
+    trend:
+      adx_weight: 0.40          # Trọng số ADX
+      momentum_weight: 0.30     # Trọng số momentum
+      breakout_weight: 0.30     # Trọng số breakout
+      threshold: 0.75           # Ngưỡng vào TRENDING (0.75 = 75%)
+    
+    # Hybrid Score Parameters
+    hybrid:
+      breakout_weight: 0.35     # Trọng số breakout
+      momentum_weight: 0.35     # Trọng số momentum
+      confirmation_weight: 0.30 # Trọng số confirmation
+      agreement_bonus: 0.10     # Bonus khi breakout + momentum agree
+    
+    # Smoothing Parameters
+    smoothing:
+      duration: 5s              # Thời gian smooth transitions
+      min_stable_count: 3       # Số lần score ổn định trước transition
+      flip_flop_window: 60s     # Cửa sổ phát hiện flip-flop
+      max_flip_flops: 2        # Max flip-flops trước khi lock
+
 # =============================================================================
 # VOLUME FARMING EXECUTION LAYER - Thực hiện grid trading
 # =============================================================================
@@ -1009,7 +1052,7 @@ optimization:
   #
   # KHUYẾN NGHỊ: Người mới để false
   dynamic_leverage:
-    enabled: true            # BẬT để dùng leverage theo BB/ADX runtime
+    enabled: false           # TẮT - dùng symbol_leverage thay thế
     base_leverage: 50.0
     min_leverage: 10.0
     max_leverage: 100.0
@@ -1017,6 +1060,34 @@ optimization:
     atr_threshold_low: 0.8
     adx_threshold_trending: 30.0
     bb_width_threshold_tight: 0.005
+
+  # ===========================================================================
+  # SYMBOL LEVERAGE - Đòn bẩy cố định theo symbol (ƯU TIÊN)
+  # ===========================================================================
+  # Set leverage max cố định cho từng symbol, KHÔNG dựa vào exchange info
+  #
+  # LOGIC:
+  #   - BTCUSD1: 149x (max cho BTC)
+  #   - Các symbol khác: 99x (default)
+  #   - Luôn set max, không dùng 80% hay dynamic calculation
+  #
+  # ƯU ĐIỂM:
+  #   - Kiểm soát chính xác leverage từng symbol
+  #   - Không phụ thuộc vào exchange info có thể thay đổi
+  #   - Nhanh hơn (không cần fetch exchange info trước khi set)
+  #
+  # LƯU Ý:
+  #   - Nếu enabled: true, symbol_leverage sẽ OVERRIDE dynamic_leverage
+  #   - Exchange vẫn có thể reject nếu leverage vượt quá giới hạn thực tế
+  #
+  # KHUYẾN NGHỊ: Bật true để có kiểm soát leverage chính xác
+  symbol_leverage:
+    enabled: true              # BẬT để dùng symbol-specific leverage
+    default_max_leverage: 99    # Default cho symbols không được specify
+    symbol_max_leverage:        # Map symbol → leverage
+      BTCUSD1: 149              # BTC: max 149x
+      ETHUSD1: 99               # ETH: 99x
+      SOLUSD1: 99               # SOL: 99x
 
   # ===========================================================================
   # MULTI-LAYER LIQUIDATION - Bảo vệ 4 lớp trước liquidation

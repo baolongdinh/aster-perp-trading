@@ -121,6 +121,20 @@ func main() {
 			logger.Fatal("Failed to initialize Agentic Engine", zap.Error(err))
 		}
 
+		// NEW: Hybrid Integration - Wire VF Event Handler to Agentic Event Bus
+		// This enables event-driven state transitions between Agentic (decision) and VF (execution)
+		logger.Info("🔗 Setting up hybrid integration (Agentic ↔ VF)...")
+		vfEventHandler := farming.NewAgenticEventHandler(vfEngine, logger)
+
+		// Subscribe VF handler to Agentic's event bus
+		if bus := agenticEngine.GetStateEventBus(); bus != nil {
+			bus.GetPublisher().Subscribe(vfEventHandler)
+			vfEngine.SetStateEventBus(bus)
+			logger.Info("✅ Hybrid integration active - Agentic decisions → VF execution")
+		} else {
+			logger.Warn("⚠️ StateEventBus not available - hybrid integration disabled")
+		}
+
 		// Start Agentic Engine
 		go func() {
 			logger.Info("▶️ Starting Agentic Engine")

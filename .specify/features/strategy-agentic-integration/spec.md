@@ -41,13 +41,47 @@ Integrate the existing Strategy ecosystem (12+ battle-tested trading strategies)
 - Maintains smaller position sizes
 - Switches to time-based entry after timeout (60s)
 
-### Scenario 4: Regime-Strategy Alignment
-**Given** Market transitions from ranging to trending (ADX crosses 30)  
-**When** Agentic RegimeDetector updates regime to TRENDING  
+### Scenario 4: Score-Based GRID vs TREND Decision (NEW)
+**Given** BTCUSD1 shows both grid opportunity (sideways, FVG 0.6) AND trending opportunity (breakout signal 0.7, momentum 0.65)  
+**When** DecisionEngine calculates scores for both modes  
 **Then** the bot:
-- Switches active strategy set (bb_bounce→ema_cross, etc.)
-- Maintains existing positions with trend-following bias
-- Adjusts geometry for trend mode (wider spacing, fewer orders)
+- GRID score = 0.62 (sideways regime + FVG signal)
+- TREND score = 0.78 (breakout 0.7 + momentum 0.65 + volume spike)
+- Chooses TREND mode (higher score)
+- Gracefully exits/hedges existing grid positions
+- Switches to hybrid trend-following strategy
+
+### Scenario 4.1: Flexible State Transitions (NEW)
+**Given** Bot is in WAIT_NEW_RANGE state for BTCUSD1  
+**When** Multiple market conditions detected simultaneously  
+**Then** the bot can transition to:
+- **ENTER_GRID**: Nếu sideways regime + mean reversion signals mạnh (score > 0.6)
+- **TRENDING**: Nếu breakout signal > 0.7 + momentum confirming (score > 0.75)
+- **ACCUMULATION**: Nếu compression detected (preparing for breakout)
+- **DEFENSIVE**: Nếu high volatility + no clear direction (score < 0.4 cho cả 2)
+- **WAIT_NEW_RANGE vẫn tiếp tục**: Nếu chưa đủ tín hiệu (scores < threshold)
+
+### Scenario 4.2: Single Decision Engine Coordination (NEW)
+**Given** GRID worker detects FVG signal 0.8, TREND worker detects breakout 0.75  
+**When** Cả 2 workers đều muốn đổi state cùng lúc  
+**Then** the bot:
+- Single DecisionEngine tổng hợp tất cả tín hiệu từ mọi workers
+- Calculates final scores với weighting phù hợp
+- Đưa ra quyết định duy nhất, không xung đột
+- Publishes state change event cho tất cả workers
+- Workers phối hợp graceful transition
+
+### Scenario 4.3: Hybrid Trend Following Strategy (NEW)
+**Given** Bot chuyển sang TRENDING mode cho BTCUSD1  
+**When** Market shows breakout khỏi range với momentum mạnh  
+**Then** the bot:
+- Breakout signal (0.75): Giá vượt resistance + volume tăng
+- Momentum signal (0.70): ROC + volume velocity mạnh
+- Enters long position nếu cả 2 signals agree (hybrid score 0.8)
+- Places stop-loss dưới breakout level (range low - buffer)
+- Uses trailing stop để ride trend (ATR-based)
+- Micro-profit taking tại các FVG zones trên đường đi
+- Continuously monitors để detect trend exhaustion
 
 ### Scenario 5: Continuous Strategy Blending
 **Given** BTCUSD1 has FVG signal (strength 0.7) + BB Bounce signal (strength 0.5) simultaneously  
@@ -166,6 +200,45 @@ Integrate the existing Strategy ecosystem (12+ battle-tested trading strategies)
 - Each micro-state maps to specific flow parameters
 - Validated with historical data for accuracy > 70%
 
+### FR11: Adaptive State Management (NEW)
+**Acceptance Criteria:**
+- State machine supports flexible transitions (không chỉ linear)
+- Từ WAIT_NEW_RANGE có thể đi: ENTER_GRID, TRENDING, ACCUMULATION, DEFENSIVE
+- State transitions dựa trên score-based decision (không hard-coded rules)
+- Transition smoothing: state weights blend trong 5-10s (không jump)
+- Support re-entry: TRENDING → GRID khi trend kết thúc
+- Deadlock detection: xung đột state requests được giải quyết
+
+### FR12: Trading Mode Score Calculation (NEW)
+**Acceptance Criteria:**
+- GRID mode score = sideways_regime_score * 0.4 + mean_reversion_signals * 0.6
+- TREND mode score = trending_regime_score * 0.3 + (breakout_signal + momentum_signal) * 0.35
+- Normalized về 0-1 range
+- Threshold configurable (default: GRID 0.6, TREND 0.75)
+- Hysteresis để tránh flip-flop (+/- 0.1 buffer)
+- Historical performance weighting (thành công trước đây tăng weight)
+
+### FR13: Single Decision Engine (NEW)
+**Acceptance Criteria:**
+- Một centralized engine duy nhất có quyền quyết định đổi state
+- Collects signals từ tất cả workers (GRID, TREND, RISK)
+- Calculates final scores với conflict resolution
+- Publishes state change events qua channel
+- Workers subscribe và react accordingly
+- Lock-free coordination (state version + CAS)
+- Decision latency < 100ms
+
+### FR14: Hybrid Trend Strategy (NEW)
+**Acceptance Criteria:**
+- Breakout detection: giá vượt range high/low + volume confirmation
+- Momentum detection: ROC + velocity + volume profile
+- Hybrid score = max(breakout, momentum) * 0.6 + min(breakout, momentum) * 0.4
+- Entry chỉ khi hybrid score > 0.7
+- Stop-loss: dưới breakout level (ATR-based buffer)
+- Trailing stop: ATR multiplier (2-3x) để ride trend
+- Micro-profit: FVG zones trên đường trend
+- Trend exhaustion detection: momentum divergence + volume decrease
+
 ## Success Criteria
 
 ### Quantitative Metrics
@@ -184,6 +257,14 @@ Integrate the existing Strategy ecosystem (12+ battle-tested trading strategies)
 11. **Micro-Regime Accuracy**: Micro-state detection validated >70% on historical data
 12. **Continuous Parameters**: All outputs are continuous gradients (no binary on/off)
 
+### Adaptive State Management Metrics (NEW)
+13. **State Transition Latency**: < 100ms từ signal đến state change
+14. **State Conflict Resolution**: 100% conflicts resolved without deadlock
+15. **Score Calculation Accuracy**: GRID vs TREND scores correlate with actual performance (R² > 0.6)
+16. **Transition Smoothness**: State weights blend trong 5-10s (no discrete jumps)
+17. **Mode Switch Efficiency**: Số lần switch giữa GRID/TREND < 3/hour (tránh over-trading)
+18. **Decision Engine Availability**: 99.9% uptime cho decision engine
+
 ### Qualitative Indicators
 1. Bot demonstrates awareness of key structural levels
 2. Grid spreads visibly adjust to setup type in logs
@@ -197,6 +278,9 @@ Integrate the existing Strategy ecosystem (12+ battle-tested trading strategies)
 8. **Predictive Adjustments**: Flow changes BEFORE signal peaks (lead compensation)
 9. **Graceful Degradation**: Signals fade smoothly, not suddenly cut
 10. **Micro-Adaptation**: Bot distinguishes between Accumulation/Compression within Sideways
+11. **Intelligent Mode Switching**: Logs show GRID → TREND → GRID transitions based on scores
+12. **Conflict-Free Coordination**: No worker deadlock logs, smooth state consensus
+13. **Hybrid Trend Riding**: Logs show breakout entry + trailing stop + micro-profit taking
 
 ## Key Entities
 
@@ -265,6 +349,48 @@ Fine-grained market states:
 - `Impulse`: Strong trend momentum
 - `Pullback`: Trend continuation setup
 - `Consolidation`: Flag/pennant patterns
+
+### TradingMode (NEW)
+Trading modes bot can operate in:
+- `GRID`: Volume farming trong sideways market
+- `TRENDING`: Trend following khi có breakout + momentum
+- `ACCUMULATION`: Preparing for breakout (compression phase)
+- `DEFENSIVE`: Reduced exposure khi high uncertainty
+- `RECOVERY`: Recovering từ drawdown
+
+### TradingModeScore (NEW)
+Score calculation cho mỗi trading mode:
+- `Mode`: TradingMode type
+- `Score`: 0-1 confidence score
+- `Components`: Breakdown of score contributors
+- `Threshold`: Min score để activate mode
+- `Timestamp`: When calculated
+
+### StateTransition (NEW)
+State transition request:
+- `FromState`: Current state
+- `ToState`: Target state
+- `Trigger`: What caused transition (signal, timeout, risk)
+- `Score`: Decision confidence
+- `SmoothingDuration`: Time to complete transition
+
+### AdaptiveStateManager (NEW)
+Centralized state management:
+- `CurrentMode`: Active TradingMode
+- `CurrentMicroState`: Active MicroState
+- `ModeScores`: Map of all mode scores
+- `DecisionEngine`: Calculates final decisions
+- `TransitionHistory`: Log of recent transitions
+- `ConflictResolver`: Xử lý xung đột giữa workers
+
+### HybridTrendStrategy (NEW)
+Trend following với breakout + momentum:
+- `BreakoutDetector`: Detect range breakouts
+- `MomentumCalculator`: Tính ROC + velocity
+- `HybridScorer`: Blend breakout + momentum
+- `EntryExecutor`: Place trend entries
+- `TrailingStopManager`: Manage trailing stops
+- `TrendExhaustionDetector`: Detect khi trend kết thúc
 
 ### Enhanced Flow Parameters
 Extension of FluidFlowEngine output:
