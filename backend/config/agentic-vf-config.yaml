@@ -417,6 +417,33 @@ volume_farming:
       recovery_threshold_usdt: 0.0         # Recovery threshold để về TRADING (0 = break even)
       partial_close_pct: 0.5               # Tỷ lệ cắt khi partial loss (0.5 = 50%)
 
+    # Market Condition Evaluator - Đánh giá điều kiện thị trường để chọn state phù hợp
+    market_condition_evaluator:
+      enabled: true                        # Bật/tắt market condition evaluator (true = enable adaptive states)
+      evaluation_interval_sec: 1          # Đánh giá mỗi kline (1 giây)
+      min_confidence_threshold: 0.7       # Confidence tối thiểu để switch state (0.7 = 70%)
+      state_stability_duration: 30         # Thời gian tối thiểu ở state trước khi consider switch (giây)
+
+    # OVER_SIZE State - Khi position size vượt quá giới hạn
+    over_size:
+      threshold_pct: 0.8                  # Ngưỡng kích hoạt OVER_SIZE (80% MaxPositionUSDT)
+      recovery_pct: 0.6                   # Ngưỡng thoát OVER_SIZE (60% MaxPositionUSDT)
+
+    # DEFENSIVE State - Khi volatility quá cao
+    defensive_state:
+      atr_multiplier_threshold: 3.0       # ATR multiplier để kích hoạt DEFENSIVE
+      bb_width_threshold: 0.05            # BB width % để kích hoạt DEFENSIVE (5%)
+      spread_multiplier: 2.0               # Nhân spread trong DEFENSIVE (2x)
+      sl_multiplier: 0.8                  # Nhân SL trong DEFENSIVE (0.8x = chặt hơn)
+      allow_new_positions: false           # Cho phép mở position mới trong DEFENSIVE
+
+    # RECOVERY State - Recovery sau khi cắt lỗ
+    recovery_state:
+      recovery_threshold_usdt: 0.0         # Ngưỡng PnL để vào RECOVERY (0 = break even)
+      size_multiplier: 0.5                # Nhân size trong RECOVERY (0.5x)
+      spread_multiplier: 1.5               # Nhân spread trong RECOVERY (1.5x)
+      stable_duration_min: 30              # Thời gian PnL ổn định tối thiểu (phút)
+
 # =============================================================================
 # API & LOGGING
 # =============================================================================

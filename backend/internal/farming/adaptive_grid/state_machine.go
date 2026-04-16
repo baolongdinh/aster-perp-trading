@@ -20,6 +20,9 @@ const (
 	GridStateExitHalf // Partial exit - cut 50% position
 	GridStateExitAll
 	GridStateWaitNewRange
+	GridStateOverSize  // Position size exceeds limit
+	GridStateDefensive // Extreme volatility - defensive mode
+	GridStateRecovery  // Recovery mode after losses
 )
 
 // String returns the string representation of a GridState
@@ -37,6 +40,12 @@ func (s GridState) String() string {
 		return "EXIT_ALL"
 	case GridStateWaitNewRange:
 		return "WAIT_NEW_RANGE"
+	case GridStateOverSize:
+		return "OVER_SIZE"
+	case GridStateDefensive:
+		return "DEFENSIVE"
+	case GridStateRecovery:
+		return "RECOVERY"
 	default:
 		return "UNKNOWN"
 	}
@@ -46,15 +55,21 @@ func (s GridState) String() string {
 type GridEvent int
 
 const (
-	EventRangeConfirmed  GridEvent = iota // WAIT_NEW_RANGE -> ENTER_GRID
-	EventEntryPlaced                      // ENTER_GRID -> TRADING
-	EventPartialLoss                      // TRADING -> EXIT_HALF
-	EventFullLoss                         // TRADING/EXIT_HALF -> EXIT_ALL
-	EventRecovery                         // EXIT_HALF -> TRADING
-	EventTrendExit                        // TRADING -> EXIT_ALL
-	EventEmergencyExit                    // TRADING -> EXIT_ALL (emergency)
-	EventPositionsClosed                  // EXIT_ALL -> WAIT_NEW_RANGE
-	EventNewRangeReady                    // WAIT_NEW_RANGE -> ENTER_GRID
+	EventRangeConfirmed       GridEvent = iota // WAIT_NEW_RANGE -> ENTER_GRID
+	EventEntryPlaced                           // ENTER_GRID -> TRADING
+	EventPartialLoss                           // TRADING -> EXIT_HALF
+	EventFullLoss                              // TRADING/EXIT_HALF -> EXIT_ALL
+	EventRecovery                              // EXIT_HALF -> TRADING
+	EventTrendExit                             // TRADING -> EXIT_ALL
+	EventEmergencyExit                         // TRADING -> EXIT_ALL (emergency)
+	EventPositionsClosed                       // EXIT_ALL -> WAIT_NEW_RANGE
+	EventNewRangeReady                         // WAIT_NEW_RANGE -> ENTER_GRID
+	EventOverSizeLimit                         // TRADING -> OVER_SIZE
+	EventSizeNormalized                        // OVER_SIZE -> TRADING
+	EventExtremeVolatility                     // TRADING -> DEFENSIVE
+	EventVolatilityNormalized                  // DEFENSIVE -> TRADING
+	EventRecoveryStart                         // EXIT_HALF/EXIT_ALL -> RECOVERY
+	EventRecoveryComplete                      // RECOVERY -> TRADING
 )
 
 // String returns the string representation of a GridEvent
@@ -78,6 +93,18 @@ func (e GridEvent) String() string {
 		return "POSITIONS_CLOSED"
 	case EventNewRangeReady:
 		return "NEW_RANGE_READY"
+	case EventOverSizeLimit:
+		return "OVER_SIZE_LIMIT"
+	case EventSizeNormalized:
+		return "SIZE_NORMALIZED"
+	case EventExtremeVolatility:
+		return "EXTREME_VOLATILITY"
+	case EventVolatilityNormalized:
+		return "VOLATILITY_NORMALIZED"
+	case EventRecoveryStart:
+		return "RECOVERY_START"
+	case EventRecoveryComplete:
+		return "RECOVERY_COMPLETE"
 	default:
 		return "UNKNOWN"
 	}
@@ -159,20 +186,34 @@ func (sm *GridStateMachine) CanTransition(symbol string, event GridEvent) bool {
 		return event == EventEntryPlaced
 
 	case GridStateTrading:
-		// From TRADING, PartialLoss moves to EXIT_HALF, TrendExit/EmergencyExit to EXIT_ALL
-		return event == EventPartialLoss || event == EventTrendExit || event == EventEmergencyExit
+		// From TRADING: PartialLoss/OverSizeLimit/ExtremeVolatility/RecoveryStart -> EXIT_HALF/OVER_SIZE/DEFENSIVE/RECOVERY
+		// TrendExit/EmergencyExit -> EXIT_ALL
+		return event == EventPartialLoss || event == EventTrendExit || event == EventEmergencyExit ||
+			event == EventOverSizeLimit || event == EventExtremeVolatility || event == EventRecoveryStart
 
 	case GridStateExitHalf:
-		// From EXIT_HALF, FullLoss moves to EXIT_ALL, Recovery moves to TRADING
-		return event == EventFullLoss || event == EventRecovery
+		// From EXIT_HALF: FullLoss -> EXIT_ALL, RecoveryStart -> RECOVERY, Recovery -> TRADING
+		return event == EventFullLoss || event == EventRecovery || event == EventRecoveryStart
 
 	case GridStateExitAll:
-		// From EXIT_ALL, PositionsClosed moves to WAIT_NEW_RANGE
-		return event == EventPositionsClosed
+		// From EXIT_ALL: PositionsClosed -> WAIT_NEW_RANGE, RecoveryStart -> RECOVERY
+		return event == EventPositionsClosed || event == EventRecoveryStart
 
 	case GridStateWaitNewRange:
-		// From WAIT_NEW_RANGE, NewRangeReady moves to ENTER_GRID
+		// From WAIT_NEW_RANGE: NewRangeReady -> ENTER_GRID
 		return event == EventNewRangeReady
+
+	case GridStateOverSize:
+		// From OVER_SIZE: SizeNormalized -> TRADING, FullLoss -> EXIT_ALL
+		return event == EventSizeNormalized || event == EventFullLoss
+
+	case GridStateDefensive:
+		// From DEFENSIVE: VolatilityNormalized -> TRADING, EmergencyExit -> EXIT_ALL
+		return event == EventVolatilityNormalized || event == EventEmergencyExit
+
+	case GridStateRecovery:
+		// From RECOVERY: RecoveryComplete -> TRADING, PartialLoss -> EXIT_HALF
+		return event == EventRecoveryComplete || event == EventPartialLoss
 
 	default:
 		return false
@@ -215,6 +256,12 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 	case GridStateTrading:
 		if event == EventPartialLoss {
 			newState = GridStateExitHalf
+		} else if event == EventOverSizeLimit {
+			newState = GridStateOverSize
+		} else if event == EventExtremeVolatility {
+			newState = GridStateDefensive
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
 		} else if event == EventTrendExit || event == EventEmergencyExit {
 			newState = GridStateExitAll
 			state.ExitTime = time.Now()
@@ -228,6 +275,8 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 			state.ExitTime = time.Now()
 		} else if event == EventRecovery {
 			newState = GridStateTrading
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
 		} else {
 			return false
 		}
@@ -235,6 +284,8 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 	case GridStateExitAll:
 		if event == EventPositionsClosed {
 			newState = GridStateWaitNewRange
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
 		} else {
 			return false
 		}
@@ -242,6 +293,35 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 	case GridStateWaitNewRange:
 		if event == EventNewRangeReady {
 			newState = GridStateEnterGrid
+		} else {
+			return false
+		}
+
+	case GridStateOverSize:
+		if event == EventSizeNormalized {
+			newState = GridStateTrading
+		} else if event == EventFullLoss {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateDefensive:
+		if event == EventVolatilityNormalized {
+			newState = GridStateTrading
+		} else if event == EventEmergencyExit {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateRecovery:
+		if event == EventRecoveryComplete {
+			newState = GridStateTrading
+		} else if event == EventPartialLoss {
+			newState = GridStateExitHalf
 		} else {
 			return false
 		}

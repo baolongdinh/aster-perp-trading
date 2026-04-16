@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"aster-bot/internal/auth"
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
+	"aster-bot/internal/dashboard"
 	"aster-bot/internal/farming/adaptive_config"
 	"aster-bot/internal/farming/adaptive_grid"
 	"aster-bot/internal/farming/market_regime"
@@ -65,11 +67,12 @@ type VolumeFarmEngine struct {
 	userStream          *stream.UserStream
 
 	// NEW: Continuous Volume Farming components
-	modeManager    *tradingmode.ModeManager
-	circuitBreaker *agentic.CircuitBreaker // Unified trading decision brain (single source of truth)
-	exitExecutor   *ExitExecutor
-	syncManager    *farmsync.SyncManager
-	wsClient       *client.WebSocketClient
+	modeManager     *tradingmode.ModeManager
+	circuitBreaker  *agentic.CircuitBreaker // Unified trading decision brain (single source of truth)
+	exitExecutor    *ExitExecutor
+	syncManager     *farmsync.SyncManager
+	wsClient        *client.WebSocketClient
+	metricsStreamer *dashboard.MetricsStreamer // Real-time metrics streaming
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -77,6 +80,8 @@ type VolumeFarmEngine struct {
 
 // NewVolumeFarmEngine creates a new volume farming engine.
 func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEngine, error) {
+	logger.Info("=== NewVolumeFarmEngine called ===")
+
 	engine := &VolumeFarmEngine{
 		config: cfg,
 		logger: logger,
@@ -140,6 +145,25 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 
 	volumeConfig := engine.extractVolumeFarmConfig(cfg)
 	engine.volumeConfig = volumeConfig
+
+	// DEBUG: Check Risk config structure
+	logger.Info("=== Volume Config Extracted ===",
+		zap.Bool("market_eval_is_nil", volumeConfig.Risk.MarketConditionEvaluator == nil),
+		zap.Float64("max_position_usdt", volumeConfig.Risk.MaxPositionUSDTPerSymbol),
+		zap.Bool("pnl_risk_control_is_nil", volumeConfig.Risk.PnLRiskControl == nil),
+		zap.Bool("over_size_is_nil", volumeConfig.Risk.OverSize == nil),
+		zap.Bool("defensive_state_is_nil", volumeConfig.Risk.DefensiveState == nil),
+		zap.Bool("recovery_state_is_nil", volumeConfig.Risk.RecoveryState == nil))
+
+	if volumeConfig.Risk.MarketConditionEvaluator != nil {
+		logger.Info("=== MarketConditionEvaluator Config Found ===",
+			zap.Bool("enabled", volumeConfig.Risk.MarketConditionEvaluator.Enabled),
+			zap.Int("interval", volumeConfig.Risk.MarketConditionEvaluator.EvaluationIntervalSec),
+			zap.Float64("confidence", volumeConfig.Risk.MarketConditionEvaluator.MinConfidenceThreshold))
+	} else {
+		logger.Warn("=== MarketConditionEvaluator Config NOT Found ===")
+	}
+
 	engine.futuresClient = client.NewFuturesClient(httpClient, volumeConfig.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
 	engine.riskManager = risk.NewManager(volumeConfig.Risk, logger, engine.futuresClient)
 
@@ -215,6 +239,51 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 			zap.Float64("full_loss_usdt", volumeConfig.Risk.PnLRiskControl.FullLossUSDT))
 	}
 
+	// Initialize and wire Market Condition Evaluator
+	logger.Info("Checking Market Condition Evaluator config",
+		zap.Bool("is_nil", volumeConfig.Risk.MarketConditionEvaluator == nil))
+
+	if volumeConfig.Risk.MarketConditionEvaluator != nil && volumeConfig.Risk.MarketConditionEvaluator.Enabled {
+		logger.Info("Initializing Market Condition Evaluator",
+			zap.Bool("enabled", volumeConfig.Risk.MarketConditionEvaluator.Enabled),
+			zap.Int("evaluation_interval_sec", volumeConfig.Risk.MarketConditionEvaluator.EvaluationIntervalSec))
+
+		marketEval := adaptive_grid.NewMarketConditionEvaluator(volumeConfig.Risk.MarketConditionEvaluator, logger)
+		// Wire data sources
+		marketEval.SetAdaptiveGridManager(adaptiveGridManager)
+		marketEval.SetWebSocketClient(sharedWSClient)
+		// Set to grid manager
+		engine.gridManager.SetMarketConditionEvaluator(marketEval)
+		logger.Info("Market Condition Evaluator initialized and wired",
+			zap.Bool("enabled", volumeConfig.Risk.MarketConditionEvaluator.Enabled),
+			zap.Int("evaluation_interval_sec", volumeConfig.Risk.MarketConditionEvaluator.EvaluationIntervalSec),
+			zap.Float64("min_confidence_threshold", volumeConfig.Risk.MarketConditionEvaluator.MinConfidenceThreshold))
+	} else {
+		logger.Warn("Market Condition Evaluator NOT initialized",
+			zap.Bool("config_is_nil", volumeConfig.Risk.MarketConditionEvaluator == nil),
+			zap.Bool("enabled", volumeConfig.Risk.MarketConditionEvaluator != nil && volumeConfig.Risk.MarketConditionEvaluator.Enabled))
+	}
+
+	// Set adaptive state configurations
+	if volumeConfig.Risk.OverSize != nil {
+		engine.gridManager.SetOverSizeConfig(volumeConfig.Risk.OverSize)
+		logger.Info("OVER_SIZE state config set",
+			zap.Float64("threshold_pct", volumeConfig.Risk.OverSize.ThresholdPct),
+			zap.Float64("recovery_pct", volumeConfig.Risk.OverSize.RecoveryPct))
+	}
+	if volumeConfig.Risk.DefensiveState != nil {
+		engine.gridManager.SetDefensiveConfig(volumeConfig.Risk.DefensiveState)
+		logger.Info("DEFENSIVE state config set",
+			zap.Float64("atr_multiplier_threshold", volumeConfig.Risk.DefensiveState.ATRMultiplierThreshold),
+			zap.Float64("bb_width_threshold", volumeConfig.Risk.DefensiveState.BBWidthThreshold))
+	}
+	if volumeConfig.Risk.RecoveryState != nil {
+		engine.gridManager.SetRecoveryConfig(volumeConfig.Risk.RecoveryState)
+		logger.Info("RECOVERY state config set",
+			zap.Float64("recovery_threshold_usdt", volumeConfig.Risk.RecoveryState.RecoveryThresholdUSDT),
+			zap.Float64("size_multiplier", volumeConfig.Risk.RecoveryState.SizeMultiplier))
+	}
+
 	// Connect adaptive manager as risk checker for grid manager
 	engine.gridManager.SetRiskChecker(adaptiveGridManager)
 
@@ -249,6 +318,14 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	// NEW: Wire CircuitBreaker into AdaptiveGridManager for unified decisions
 	adaptiveGridManager.SetCircuitBreaker(engine.circuitBreaker)
 	logger.Info("CircuitBreaker wired into AdaptiveGridManager")
+
+	// NEW: Initialize MetricsStreamer for real-time dashboard
+	engine.metricsStreamer = dashboard.NewMetricsStreamer(logger)
+	logger.Info("MetricsStreamer initialized for dashboard WebSocket")
+
+	// Wire metricsStreamer to GridManager for broadcasting metrics
+	engine.gridManager.SetMetricsStreamer(engine.metricsStreamer)
+	logger.Info("MetricsStreamer wired to GridManager")
 
 	// NEW: Wire CircuitBreaker callbacks for automatic actions
 	engine.circuitBreaker.SetOnTripCallback(func(symbol, reason string) {
@@ -407,6 +484,9 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	e.isRunningMu.Unlock()
 
 	e.logger.Info("Starting Volume Farming Engine")
+
+	// Start WebSocket server for dashboard
+	go e.startWebSocketServer()
 
 	// Bridge context cancellation to stopCh
 	// This ensures that when context is cancelled (e.g., from signal), stopCh is also closed
@@ -1294,4 +1374,55 @@ func (e *VolumeFarmEngine) TriggerForcePlacement() error {
 		zap.Int("symbols", len(symbols)))
 
 	return nil
+}
+
+// startWebSocketServer starts the WebSocket server for dashboard
+func (e *VolumeFarmEngine) startWebSocketServer() {
+	e.logger.Info("=== startWebSocketServer called ===")
+
+	if e.metricsStreamer == nil {
+		e.logger.Error("metricsStreamer is nil, cannot start WebSocket server")
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/metrics", e.metricsStreamer.HandleWebSocket)
+
+	// Add a simple health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})
+
+	port := ":8083"
+	e.logger.Info("Starting WebSocket server for dashboard", zap.String("port", port))
+	e.logger.Info("WebSocket endpoints:", zap.String("ws_metrics", "/ws/metrics"), zap.String("health", "/health"))
+
+	// Start periodic metrics broadcast
+	go e.periodicMetricsBroadcast()
+
+	if err := http.ListenAndServe(port, mux); err != nil {
+		e.logger.Error("WebSocket server failed", zap.Error(err))
+	}
+}
+
+// periodicMetricsBroadcast broadcasts metrics to dashboard every second
+func (e *VolumeFarmEngine) periodicMetricsBroadcast() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if e.metricsStreamer == nil {
+			continue
+		}
+
+		// Get current metrics from GridManager
+		totalVolume := e.gridManager.GetTotalVolume()
+		activeOrders := e.gridManager.GetActiveOrderCount()
+
+		e.metricsStreamer.BroadcastMetric("metrics_update", "", map[string]interface{}{
+			"total_volume":  totalVolume,
+			"active_orders": activeOrders,
+			"timestamp":     time.Now().Format(time.RFC3339),
+		}, time.Now())
+	}
 }

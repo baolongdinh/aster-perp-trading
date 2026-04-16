@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <title>Aster Perp Trading Dashboard | OBSERVATORY</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&amp;family=Inter:wght@400;500;600&amp;display=swap" rel="stylesheet"/>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+    <script id="tailwind-config">
+        tailwind.config = {
+          darkMode: "class",
+          theme: {
+            extend: {
+              "colors": {
+                "surface-variant": "#31353c",
+                "surface-container-low": "#181c22",
+                "surface-container": "#1c2026",
+                "surface-container-highest": "#31353c",
+                "surface-container-lowest": "#0a0e14",
+                "surface-bright": "#353940",
+                "surface-dim": "#10141a",
+                "surface": "#10141a",
+                "background": "#10141a",
+                "on-surface": "#dfe2eb",
+                "on-surface-variant": "#c3c5d9",
+                "outline": "#8d90a2",
+                "outline-variant": "#434656",
+                "primary": "#b7c4ff",
+                "primary-container": "#0052ff",
+                "on-primary": "#002682",
+                "on-primary-container": "#dfe3ff",
+                "secondary": "#44e092",
+                "secondary-container": "#03c177",
+                "on-secondary": "#00391f",
+                "on-secondary-container": "#004729",
+                "tertiary": "#ffb4aa",
+                "tertiary-container": "#cc0d11",
+                "on-tertiary": "#690003",
+                "on-tertiary-container": "#ffddd8",
+                "error": "#ffb4ab",
+                "error-container": "#93000a",
+                "on-error": "#690005",
+                "on-error-container": "#ffdad6",
+              },
+              "borderRadius": {
+                "DEFAULT": "0.125rem",
+                "lg": "0.25rem",
+                "xl": "0.5rem",
+                "full": "0.75rem"
+              },
+              "fontFamily": {
+                "headline": ["Manrope"],
+                "body": ["Inter"],
+                "label": ["Inter"]
+              }
+            },
+          },
+        }
+    </script>
+    <style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .glass-card {
+            background: rgba(28, 32, 38, 0.6);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+        }
+        .pulse-secondary {
+            box-shadow: 0 0 0 0 rgba(68, 224, 146, 0.4);
+            animation: pulse-secondary 2s infinite;
+        }
+        @keyframes pulse-secondary {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(68, 224, 146, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(68, 224, 146, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(68, 224, 146, 0); }
+        }
+        .pulse-error {
+            box-shadow: 0 0 0 0 rgba(255, 180, 171, 0.4);
+            animation: pulse-error 2s infinite;
+        }
+        @keyframes pulse-error {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 180, 171, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(255, 180, 171, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 180, 171, 0); }
+        }
+    </style>
+</head>
+<body class="bg-surface text-on-surface font-body selection:bg-primary/30 min-h-screen">
+    <!-- Main Content -->
+    <main class="flex-1 flex flex-col">
+        <!-- TopAppBar -->
+        <header class="w-full top-0 sticky z-40 bg-[#181c22] px-6 py-4 flex justify-between items-center border-b border-outline-variant/10">
+            <div class="flex items-center gap-8">
+                <div class="text-xl font-headline font-bold tracking-widest text-on-surface">OBSERVATORY</div>
+                <nav class="hidden md:flex gap-6">
+                    <a class="font-headline tracking-tight font-semibold transition-colors text-on-surface-variant hover:text-on-surface" href="#">Market</a>
+                    <a class="font-headline tracking-tight font-semibold transition-colors text-primary border-b-2 border-primary pb-1" href="#">Portfolio</a>
+                    <a class="font-headline tracking-tight font-semibold transition-colors text-on-surface-variant hover:text-on-surface" href="#">Analytics</a>
+                </nav>
+            </div>
+            <div class="flex items-center gap-6">
+                <div class="flex items-center gap-3 bg-surface-container-highest/30 px-3 py-1.5 rounded-full border border-outline-variant/10">
+                    <span class="w-2.5 h-2.5 rounded-full bg-secondary pulse-secondary" id="statusDot"></span>
+                    <span class="text-xs font-semibold text-secondary tracking-wide" id="statusText">CONNECTED</span>
+                    <span class="text-[10px] text-on-surface-variant font-mono" id="currentTime">--:--:-- UTC</span>
+                </div>
+                <div class="flex gap-4">
+                    <span class="material-symbols-outlined text-on-surface-variant cursor-pointer hover:text-on-surface">account_balance_wallet</span>
+                    <span class="material-symbols-outlined text-on-surface-variant cursor-pointer hover:text-on-surface">sensors</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Page Header -->
+        <section class="px-8 pt-8 pb-4">
+            <h2 class="text-3xl font-headline font-extrabold text-on-surface tracking-tight">Aster Perp Trading Dashboard</h2>
+            <p class="text-on-surface-variant text-sm mt-1 font-medium">Real-time algorithmic execution monitoring</p>
+        </section>
+
+        <!-- Top Stats Row -->
+        <section class="grid grid-cols-1 md:grid-cols-5 gap-4 px-8 py-4">
+            <!-- Total Volume -->
+            <div class="surface-container-low p-5 rounded-xl border border-outline-variant/10 flex flex-col justify-between group hover:bg-surface-container transition-all">
+                <div class="flex justify-between items-start">
+                    <span class="text-[10px] font-bold text-on-surface-variant tracking-widest uppercase">Total Volume</span>
+                </div>
+                <div class="mt-4">
+                    <span class="text-2xl font-headline font-bold text-secondary" id="totalVolume">$0.00</span>
+                </div>
+            </div>
+
+            <!-- Orders Placed -->
+            <div class="surface-container-low p-5 rounded-xl border border-outline-variant/10 flex flex-col justify-between">
+                <span class="text-[10px] font-bold text-on-surface-variant tracking-widest uppercase">Orders Placed</span>
+                <div class="mt-4">
+                    <span class="text-2xl font-headline font-bold" id="ordersPlaced">0</span>
+                </div>
+            </div>
+
+            <!-- Orders Filled -->
+            <div class="surface-container-low p-5 rounded-xl border border-outline-variant/10 flex flex-col justify-between">
+                <span class="text-[10px] font-bold text-on-surface-variant tracking-widest uppercase">Orders Filled</span>
+                <div class="mt-4">
+                    <span class="text-2xl font-headline font-bold text-primary" id="ordersFilled">0</span>
+                </div>
+            </div>
+
+            <!-- Fill Rate -->
+            <div class="surface-container-low p-5 rounded-xl border border-outline-variant/10 flex items-center justify-between">
+                <div>
+                    <span class="text-[10px] font-bold text-on-surface-variant tracking-widest uppercase">Fill Rate</span>
+                    <div class="mt-1">
+                        <span class="text-2xl font-headline font-bold" id="fillRate">0.0%</span>
+                    </div>
+                </div>
+                <div class="relative w-12 h-12">
+                    <svg class="w-full h-full" viewbox="0 0 36 36">
+                        <circle class="stroke-surface-container" cx="18" cy="18" fill="none" r="16" stroke-width="3"></circle>
+                        <circle class="stroke-secondary" cx="18" cy="18" fill="none" r="16" stroke-dasharray="0, 100" stroke-linecap="round" stroke-width="3" id="fillRateCircle"></circle>
+                    </svg>
+                </div>
+            </div>
+
+            <!-- Active Orders -->
+            <div class="surface-container-low p-5 rounded-xl border border-outline-variant/10 flex flex-col justify-between">
+                <span class="text-[10px] font-bold text-on-surface-variant tracking-widest uppercase">Active Orders</span>
+                <div class="mt-4">
+                    <span class="text-2xl font-headline font-bold" id="activeOrders">0</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Main Dashboard Content -->
+        <section class="grid grid-cols-1 lg:grid-cols-12 gap-6 px-8 py-4 flex-1">
+            <!-- Left Column: Symbol States -->
+            <div class="lg:col-span-8 flex flex-col">
+                <div class="surface-container-low rounded-xl border border-outline-variant/10 overflow-hidden flex flex-col">
+                    <div class="px-6 py-5 border-b border-outline-variant/5 flex justify-between items-center bg-surface-container-low/50">
+                        <h3 class="font-headline font-bold text-on-surface">Symbol States &amp; Market Conditions</h3>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left">
+                            <thead class="bg-surface-container-lowest">
+                                <tr class="text-[10px] font-bold text-on-surface-variant tracking-widest uppercase">
+                                    <th class="px-6 py-4">Symbol</th>
+                                    <th class="px-6 py-4">State</th>
+                                    <th class="px-6 py-4">Volatility</th>
+                                    <th class="px-6 py-4">Trend</th>
+                                    <th class="px-6 py-4">Position</th>
+                                    <th class="px-6 py-4">Risk</th>
+                                    <th class="px-6 py-4">Last Update</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-outline-variant/5" id="symbolStates">
+                                <tr>
+                                    <td colspan="7" class="px-6 py-8 text-center text-on-surface-variant">No symbols active yet</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Recent Transitions -->
+            <div class="lg:col-span-4 flex flex-col">
+                <div class="surface-container-low rounded-xl border border-outline-variant/10 flex-1 flex flex-col overflow-hidden">
+                    <div class="px-6 py-5 border-b border-outline-variant/5 bg-surface-container-low/50">
+                        <h3 class="font-headline font-bold text-on-surface">Recent State Transitions</h3>
+                    </div>
+                    <div class="p-6 space-y-6 overflow-y-auto" id="stateTransitions">
+                        <div class="text-center text-on-surface-variant text-sm">No state transitions yet</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Bottom Bar -->
+        <footer class="mt-auto px-8 py-4 bg-surface-container-lowest flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="flex items-center gap-6">
+                <div class="flex items-center gap-2">
+                    <span class="text-[10px] text-on-surface-variant font-bold tracking-widest uppercase">Last Update:</span>
+                    <span class="text-xs font-mono text-on-surface" id="lastUpdate">Never</span>
+                </div>
+            </div>
+            <div class="flex items-center gap-8">
+                <div class="flex items-center gap-3">
+                    <span class="text-[10px] text-on-surface-variant font-bold tracking-widest uppercase">Auto-Reconnect</span>
+                    <div class="relative inline-flex items-center cursor-pointer">
+                        <div class="w-9 h-5 bg-primary-container rounded-full ring-2 ring-primary/20"></div>
+                        <div class="absolute right-1 w-3 h-3 bg-on-primary-container rounded-full transition-transform"></div>
+                    </div>
+                </div>
+            </div>
+        </footer>
+    </main>
+
+    <script>
+        const WS_URL = 'ws://localhost:8083/ws/metrics';
+        let ws = null;
+        let metrics = {
+            totalVolume: 0,
+            ordersPlaced: 0,
+            ordersFilled: 0,
+            activeOrders: 0,
+            symbolStates: {},
+            stateTransitions: []
+        };
+
+        function connectWebSocket() {
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                console.log('Connected to dashboard');
+                updateStatus(true);
+            };
+
+            ws.onclose = () => {
+                console.log('Disconnected from dashboard');
+                updateStatus(false);
+                setTimeout(connectWebSocket, 5000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMetric(data);
+            };
+        }
+
+        function updateStatus(connected) {
+            const statusDot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+            
+            if (connected) {
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-secondary pulse-secondary';
+                statusText.textContent = 'CONNECTED';
+                statusText.className = 'text-xs font-semibold text-secondary tracking-wide';
+            } else {
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-tertiary pulse-error';
+                statusText.textContent = 'RECONNECTING...';
+                statusText.className = 'text-xs font-semibold text-tertiary tracking-wide';
+            }
+        }
+
+        function handleMetric(data) {
+            const type = data.type;
+            const symbol = data.symbol;
+            const metricData = data.data;
+
+            switch (type) {
+                case 'connection':
+                    console.log('Connection confirmed');
+                    break;
+                case 'metrics_update':
+                    if (metricData.total_volume !== undefined) {
+                        metrics.totalVolume = metricData.total_volume;
+                    }
+                    if (metricData.active_orders !== undefined) {
+                        metrics.activeOrders = metricData.active_orders;
+                    }
+                    updateMetricsDisplay();
+                    break;
+                case 'order_placed':
+                    metrics.ordersPlaced++;
+                    updateMetricsDisplay();
+                    addTransition(symbol, 'N/A', 'PLACED', 'Order Placed', 'secondary');
+                    break;
+                case 'order_filled':
+                    metrics.ordersFilled++;
+                    if (metricData.volume) {
+                        metrics.totalVolume += metricData.volume;
+                    }
+                    updateMetricsDisplay();
+                    addTransition(symbol, 'PLACED', 'FILLED', 'Order Filled', 'primary');
+                    break;
+                case 'state_transition':
+                    handleStateTransition(symbol, metricData);
+                    break;
+                case 'market_condition':
+                    handleMarketCondition(symbol, metricData);
+                    break;
+            }
+
+            document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+        }
+
+        function updateMetricsDisplay() {
+            document.getElementById('totalVolume').textContent = '$' + metrics.totalVolume.toFixed(2);
+            document.getElementById('ordersPlaced').textContent = metrics.ordersPlaced.toLocaleString();
+            document.getElementById('ordersFilled').textContent = metrics.ordersFilled.toLocaleString();
+            
+            const fillRate = metrics.ordersPlaced > 0 
+                ? (metrics.ordersFilled / metrics.ordersPlaced * 100).toFixed(1)
+                : '0.0';
+            document.getElementById('fillRate').textContent = fillRate + '%';
+            document.getElementById('fillRateCircle').setAttribute('stroke-dasharray', fillRate + ', 100');
+            
+            document.getElementById('activeOrders').textContent = metrics.activeOrders.toLocaleString();
+        }
+
+        function handleStateTransition(symbol, data) {
+            const fromState = data.from_state || 'N/A';
+            const toState = data.to_state || 'N/A';
+            const event = data.event || 'State Change';
+            
+            metrics.symbolStates[symbol] = {
+                state: toState,
+                lastUpdate: new Date().toLocaleTimeString()
+            };
+            
+            addTransition(symbol, fromState, toState, event, 'primary');
+            updateSymbolStates();
+        }
+
+        function handleMarketCondition(symbol, data) {
+            metrics.symbolStates[symbol] = {
+                state: data.state || 'UNKNOWN',
+                volatilityScore: data.volatility_score || 0,
+                trendScore: data.trend_score || 0,
+                positionScore: data.position_score || 0,
+                riskScore: data.risk_score || 0,
+                marketScore: data.market_score || 0,
+                lastUpdate: new Date().toLocaleTimeString()
+            };
+            updateSymbolStates();
+        }
+
+        function addTransition(symbol, from, to, event, color) {
+            const transition = {
+                time: new Date().toLocaleTimeString(),
+                symbol,
+                from,
+                to,
+                event,
+                color
+            };
+            
+            metrics.stateTransitions.unshift(transition);
+            if (metrics.stateTransitions.length > 10) {
+                metrics.stateTransitions.pop();
+            }
+            
+            updateTransitionsDisplay();
+        }
+
+        function updateSymbolStates() {
+            const container = document.getElementById('symbolStates');
+            const symbols = Object.keys(metrics.symbolStates);
+            
+            if (symbols.length === 0) {
+                container.innerHTML = '<tr><td colspan="7" class="px-6 py-8 text-center text-on-surface-variant">No symbols active yet</td></tr>';
+                return;
+            }
+
+            let html = '';
+            symbols.forEach(symbol => {
+                const state = metrics.symbolStates[symbol];
+                const stateClass = getStateClass(state.state);
+                
+                html += `
+                    <tr class="hover:bg-surface-container/40 transition-colors group">
+                        <td class="px-6 py-4">
+                            <div class="flex flex-col">
+                                <span class="font-headline font-bold text-sm tracking-tight">${symbol}</span>
+                                <span class="text-[10px] text-on-surface-variant">Binance Perp</span>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full ${stateClass}">
+                                <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+                                <span class="text-[10px] font-bold uppercase tracking-tighter">${state.state}</span>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">${renderScoreBar(state.volatilityScore)}</td>
+                        <td class="px-6 py-4">${renderScoreBar(state.trendScore)}</td>
+                        <td class="px-6 py-4">${renderScoreBar(state.positionScore)}</td>
+                        <td class="px-6 py-4">${renderScoreBar(state.riskScore)}</td>
+                        <td class="px-6 py-4 text-[10px] text-on-surface-variant">${state.lastUpdate}</td>
+                    </tr>
+                `;
+            });
+
+            container.innerHTML = html;
+        }
+
+        function renderScoreBar(score) {
+            const percentage = Math.min(100, Math.max(0, (score || 0) * 100));
+            let colorClass = 'bg-primary';
+            if (percentage > 70) colorClass = 'bg-tertiary';
+            else if (percentage > 40) colorClass = 'bg-secondary';
+            
+            return `
+                <div class="flex items-center gap-2">
+                    <div class="w-12 h-1.5 bg-surface-container rounded-full overflow-hidden">
+                        <div class="h-full ${colorClass}" style="width: ${percentage}%"></div>
+                    </div>
+                    <span class="text-[9px] font-mono text-on-surface-variant">${percentage.toFixed(0)}%</span>
+                </div>
+            `;
+        }
+
+        function getStateClass(state) {
+            switch (state) {
+                case 'TRADING':
+                case 'ACTIVE':
+                case 'IN-TRADE':
+                    return 'bg-secondary/10 text-secondary border border-secondary/20';
+                case 'IDLE':
+                case 'INACTIVE':
+                    return 'bg-surface-container-highest text-on-surface-variant border border-outline-variant/20';
+                case 'WARNING':
+                case 'DEFENSIVE':
+                case 'MONITORING':
+                    return 'bg-primary/10 text-primary border border-primary/20';
+                case 'ERROR':
+                case 'EMERGENCY':
+                case 'ENTRY_FOUND':
+                    return 'bg-tertiary/10 text-tertiary border border-tertiary/20';
+                default:
+                    return 'bg-surface-container-highest text-on-surface-variant border border-outline-variant/20';
+            }
+        }
+
+        function updateTransitionsDisplay() {
+            const container = document.getElementById('stateTransitions');
+            
+            if (metrics.stateTransitions.length === 0) {
+                container.innerHTML = '<div class="text-center text-on-surface-variant text-sm">No state transitions yet</div>';
+                return;
+            }
+
+            let html = '';
+            metrics.stateTransitions.forEach((t, index) => {
+                const colorClass = t.color === 'secondary' ? 'bg-secondary' : t.color === 'primary' ? 'bg-primary' : 'bg-tertiary';
+                const textColorClass = t.color === 'secondary' ? 'text-secondary' : t.color === 'primary' ? 'text-primary' : 'text-tertiary';
+                const opacityClass = index > 2 ? 'opacity-40' : index > 1 ? 'opacity-60' : '';
+                
+                html += `
+                    <div class="relative pl-6 border-l border-outline-variant/20 ${opacityClass}">
+                        <div class="absolute -left-1.5 top-0 w-3 h-3 rounded-full ${colorClass} shadow-[0_0_8px_rgba(255,255,255,0.3)]"></div>
+                        <div class="flex flex-col">
+                            <span class="text-[10px] font-bold ${textColorClass} tracking-widest uppercase mb-1">${t.event}</span>
+                            <span class="text-sm font-semibold text-on-surface">[${t.symbol}] ${t.from} → ${t.to}</span>
+                            <span class="text-[10px] text-on-surface-variant mt-1">${t.time}</span>
+                        </div>
+                    </div>
+                `;
+            });
+
+            container.innerHTML = html;
+        }
+
+        // Update time every second
+        setInterval(() => {
+            const now = new Date();
+            document.getElementById('currentTime').textContent = now.toISOString().slice(11, 19) + ' UTC';
+        }, 1000);
+
+        // Start connection
+        connectWebSocket();
+    </script>
+</body>
+</html>

@@ -373,12 +373,14 @@ dashboard:
 	@echo "  • Real-time metrics (refresh 1s)"
 	@echo "  • Volume, orders, fill rate"
 	@echo "  • PnL, positions, risk status"
+	@echo "  • Symbol states & market conditions"
+	@echo "  • State transitions history"
 	@echo "  • Press Ctrl+C to exit"
 	@echo ""
 	@if command -v python3 >/dev/null 2>&1; then \
-		python3 ./scripts/dashboard.py; \
+		cd .. && python3 dashboard.py; \
 	elif command -v python >/dev/null 2>&1; then \
-		python ./scripts/dashboard.py; \
+		cd .. && python dashboard.py; \
 	else \
 		echo "ERROR: Python not found. Install with: pkg install python"; \
 		exit 1; \

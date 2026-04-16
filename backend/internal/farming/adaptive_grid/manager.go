@@ -445,6 +445,13 @@ func (a *AdaptiveGridManager) GetStateMachine() *GridStateMachine {
 	return a.stateMachine
 }
 
+// GetRangeDetector returns the range detector for a specific symbol
+func (a *AdaptiveGridManager) GetRangeDetector(symbol string) *RangeDetector {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.rangeDetectors[symbol]
+}
+
 // SetExitExecutor wires the exit executor for fast exit on breakouts
 func (a *AdaptiveGridManager) SetExitExecutor(executor interface{}) {
 	a.mu.Lock()
@@ -2677,13 +2684,39 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		a.logger.Debug("Check 2 PASS: no position", zap.String("symbol", symbol))
 	}
 
-	// Check 3: CircuitBreaker (single source of truth)
+	// Check 3: Grid State - Block new orders in OVER_SIZE, DEFENSIVE (unless allowed), EXIT_HALF, EXIT_ALL, RECOVERY
+	currentState := a.stateMachine.GetState(symbol)
+	if currentState == GridStateOverSize {
+		a.logger.Warn("CanPlaceOrder BLOCKED: OVER_SIZE state",
+			zap.String("symbol", symbol),
+			zap.String("state", currentState.String()))
+		return false
+	}
+	if currentState == GridStateDefensive {
+		// Check if DEFENSIVE allows new positions (configurable)
+		// For now, default to blocking
+		a.logger.Warn("CanPlaceOrder BLOCKED: DEFENSIVE state",
+			zap.String("symbol", symbol),
+			zap.String("state", currentState.String()))
+		return false
+	}
+	if currentState == GridStateExitHalf || currentState == GridStateExitAll || currentState == GridStateRecovery {
+		a.logger.Warn("CanPlaceOrder BLOCKED: exit/recovery state",
+			zap.String("symbol", symbol),
+			zap.String("state", currentState.String()))
+		return false
+	}
+	a.logger.Debug("Check 3 PASS: grid state allows new orders",
+		zap.String("symbol", symbol),
+		zap.String("state", currentState.String()))
+
+	// Check 4: CircuitBreaker (single source of truth)
 	if a.circuitBreaker != nil {
 		if cb, ok := a.circuitBreaker.(interface {
 			GetSymbolDecision(symbol string) (canTrade bool, tradingMode string)
 		}); ok {
 			canTrade, mode := cb.GetSymbolDecision(symbol)
-			a.logger.Info("Check 3: CircuitBreaker decision",
+			a.logger.Info("Check 4: CircuitBreaker decision",
 				zap.String("symbol", symbol),
 				zap.Bool("can_trade", canTrade),
 				zap.String("mode", mode))
@@ -2701,12 +2734,12 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		a.logger.Warn("CircuitBreaker is nil",
 			zap.String("symbol", symbol))
 	}
-	a.logger.Debug("Check 3 PASS: CircuitBreaker allows trading", zap.String("symbol", symbol))
+	a.logger.Debug("Check 4 PASS: CircuitBreaker allows trading", zap.String("symbol", symbol))
 
-	// Check 4: TimeFilter - DISABLED for volume farming (trade 24/7)
+	// Check 5: TimeFilter - DISABLED for volume farming (trade 24/7)
 	// if a.timeFilter != nil {
 	// 	canTrade := a.timeFilter.CanTrade()
-	// 	a.logger.Info("Check 4: TimeFilter",
+	// 	a.logger.Info("Check 5: TimeFilter",
 	// 		zap.String("symbol", symbol),
 	// 		zap.Bool("can_trade", canTrade))
 	// 	if !canTrade {
@@ -2715,14 +2748,14 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 	// 		return false
 	// 	}
 	// } else {
-	// 	a.logger.Debug("Check 4 SKIP: TimeFilter is nil", zap.String("symbol", symbol))
+	// 	a.logger.Debug("Check 5 SKIP: TimeFilter is nil", zap.String("symbol", symbol))
 	// }
-	a.logger.Debug("Check 4 SKIP: TimeFilter disabled for volume farming", zap.String("symbol", symbol))
+	a.logger.Debug("Check 5 SKIP: TimeFilter disabled for volume farming", zap.String("symbol", symbol))
 
-	// Check 5: FundingRate
+	// Check 6: FundingRate
 	if a.fundingMonitor != nil {
 		biasSide, _, shouldSkip := a.fundingMonitor.GetFundingBias(symbol)
-		a.logger.Info("Check 5: FundingRate",
+		a.logger.Info("Check 6: FundingRate",
 			zap.String("symbol", symbol),
 			zap.String("bias_side", biasSide),
 			zap.Bool("should_skip", shouldSkip))

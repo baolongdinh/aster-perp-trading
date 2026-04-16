@@ -10,17 +10,44 @@ from datetime import datetime
 from collections import defaultdict
 
 class DashboardApp:
-    def __init__(self, stdscr, log_file):
+    def __init__(self, stdscr, log_file=None):
         self.stdscr = stdscr
-        self.log_file = log_file
         self.running = True
+
+        # Auto-detect log file if not provided
+        if log_file is None:
+            log_file = self.find_log_file()
+            if log_file is None:
+                raise FileNotFoundError("Cannot find log file. Please specify log file path or ensure bot is running.")
+
+        self.log_file = log_file
         self.metrics = {
             'total_volume': 0.0, 'orders_placed': 0, 'orders_filled': 0,
             'fill_rate': 0.0, 'active_orders': 0, 'positions': {},
             'symbols': set(), 'last_update': '', 'errors': 0, 'warnings': 0,
             'status': 'WAITING'
         }
-        
+        # Track per-symbol state and market conditions
+        self.symbol_states = {}  # {symbol: {'state': 'TRADING', 'volatility_score': 0.5, ...}}
+        self.state_transitions = []  # List of recent state transitions
+
+    def find_log_file(self):
+        """Auto-detect log file from common locations"""
+        possible_paths = [
+            'agentic-vf.log',
+            'volume-farm.log',
+            'logs/agentic-vf.log',
+            'logs/volume-farm.log',
+            'backend/agentic-vf.log',
+            'backend/volume-farm.log',
+        ]
+
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+
+        return None
+
         curses.start_color()
         for i, (fg, bg) in enumerate([
             (curses.COLOR_GREEN, curses.COLOR_BLACK),
@@ -219,6 +246,64 @@ class DashboardApp:
                     except:
                         pass
 
+                # State Transitions
+                if 'state_transition' in msg:
+                    try:
+                        symbol = data.get('symbol', '')
+                        from_state = data.get('from_state', '')
+                        to_state = data.get('to_state', '')
+                        event = data.get('event', '')
+                        if symbol and to_state:
+                            # Update symbol state
+                            if symbol not in self.symbol_states:
+                                self.symbol_states[symbol] = {}
+                            self.symbol_states[symbol]['state'] = to_state
+                            self.symbol_states[symbol]['last_transition_event'] = event
+                            # Add to transitions list (keep last 20)
+                            self.state_transitions.insert(0, {
+                                'symbol': symbol,
+                                'from_state': from_state,
+                                'to_state': to_state,
+                                'event': event,
+                                'time': datetime.now().strftime('%H:%M:%S')
+                            })
+                            if len(self.state_transitions) > 20:
+                                self.state_transitions.pop()
+                    except:
+                        pass
+
+                # Market Condition Evaluation
+                if 'Market condition evaluation' in msg:
+                    try:
+                        symbol = data.get('symbol', '')
+                        if symbol:
+                            if symbol not in self.symbol_states:
+                                self.symbol_states[symbol] = {}
+                            self.symbol_states[symbol]['volatility_score'] = float(data.get('volatility_score', 0.5))
+                            self.symbol_states[symbol]['trend_score'] = float(data.get('trend_score', 0.5))
+                            self.symbol_states[symbol]['position_score'] = float(data.get('position_score', 0.5))
+                            self.symbol_states[symbol]['risk_score'] = float(data.get('risk_score', 0.5))
+                            self.symbol_states[symbol]['market_score'] = float(data.get('market_score', 0.5))
+                            self.symbol_states[symbol]['recommended_state'] = data.get('recommended_state', '')
+                            self.symbol_states[symbol]['confidence'] = float(data.get('confidence', 0.0))
+                            self.symbol_states[symbol]['reason'] = data.get('reason', '')
+                            self.symbol_states[symbol]['last_eval_time'] = datetime.now().strftime('%H:%M:%S')
+                    except:
+                        pass
+
+                # Position Size Check
+                if 'Position Size Check' in msg:
+                    try:
+                        symbol = data.get('symbol', '')
+                        if symbol:
+                            if symbol not in self.symbol_states:
+                                self.symbol_states[symbol] = {}
+                            self.symbol_states[symbol]['position_notional'] = float(data.get('position_notional', 0.0))
+                            self.symbol_states[symbol]['threshold'] = float(data.get('threshold', 0.0))
+                            self.symbol_states[symbol]['recovery_level'] = float(data.get('recovery_level', 0.0))
+                    except:
+                        pass
+
             self.metrics.update(temp)
             if temp['orders_placed'] > 0:
                 self.metrics['fill_rate'] = (temp['orders_filled'] / temp['orders_placed']) * 100
@@ -397,27 +482,110 @@ class DashboardApp:
 
         gy = 14
         self.stdscr.addstr(gy, 2, "─" * (w - 4), self.WHITE)
-        self.stdscr.addstr(gy + 1, 2, f" ACTIVE GRIDS ({len(self.metrics['symbols'])})", self.CYAN + self.BOLD)
-        syms = list(self.metrics['symbols'])[:6]
+        self.stdscr.addstr(gy + 1, 2, f" SYMBOL STATES ({len(self.symbol_states)})", self.CYAN + self.BOLD)
         r = gy + 3
         h, w = self.stdscr.getmaxyx()
-        if syms:
-            for sym in syms:
-                if r >= h - 1:
+
+        # Display symbol states with market conditions
+        if self.symbol_states:
+            for sym, state_data in list(self.symbol_states.items())[:5]:
+                if r >= h - 2:
                     break
-                fp = self.metrics['fill_rate'] if self.metrics['fill_rate'] > 0 else 0
+                state = state_data.get('state', 'UNKNOWN')
+                # Color code states
+                state_color = self.GREEN
+                if state in ['OVER_SIZE', 'DEFENSIVE', 'EXIT_ALL']:
+                    state_color = self.RED + self.BOLD
+                elif state in ['EXIT_HALF', 'RECOVERY']:
+                    state_color = self.YELLOW + self.BOLD
+                elif state == 'TRADING':
+                    state_color = self.BG_GREEN + self.BOLD
+                elif state == 'IDLE':
+                    state_color = self.CYAN
+
                 try:
-                    self.stdscr.addstr(r, 4, f"{sym:8}", self.CYAN)
-                    self.draw_bar(r, 15, 25, fp)
-                    self.stdscr.addstr(r, 42, f"{fp:5.1f}%", self.WHITE)
+                    self.stdscr.addstr(r, 4, f"{sym:10}", self.CYAN + self.BOLD)
+                    self.stdscr.addstr(r, 15, f"{state:12}", state_color)
+
+                    # Show market condition scores if available
+                    vol_score = state_data.get('volatility_score')
+                    if vol_score is not None:
+                        vol_color = self.RED if vol_score > 0.7 else (self.YELLOW if vol_score > 0.4 else self.GREEN)
+                        self.stdscr.addstr(r, 28, f"V:{vol_score:.2f}", vol_color)
+
+                    trend_score = state_data.get('trend_score')
+                    if trend_score is not None:
+                        trend_color = self.GREEN if trend_score > 0.6 else self.CYAN
+                        self.stdscr.addstr(r, 35, f"T:{trend_score:.2f}", trend_color)
+
+                    risk_score = state_data.get('risk_score')
+                    if risk_score is not None:
+                        risk_color = self.RED if risk_score > 0.7 else (self.YELLOW if risk_score > 0.4 else self.GREEN)
+                        self.stdscr.addstr(r, 42, f"R:{risk_score:.2f}", risk_color)
+
+                    # Show recommended state if different from current
+                    rec_state = state_data.get('recommended_state', '')
+                    if rec_state and rec_state != state:
+                        conf = state_data.get('confidence', 0)
+                        self.stdscr.addstr(r, 49, f"→{rec_state[:8]:8}", self.MAGENTA)
+                        self.stdscr.addstr(r, 58, f"({conf:.0%})", self.CYAN)
+
                 except curses.error:
                     pass
                 r += 1
         else:
             if r < h:
-                self.stdscr.addstr(r, 10, "Waiting for data...", self.YELLOW)
+                self.stdscr.addstr(r, 10, "Waiting for state data...", self.YELLOW)
 
-        ry = gy + 10
+        # Active grids section (simplified)
+        gy = r + 2
+        if gy < h - 5:
+            self.stdscr.addstr(gy, 2, "─" * (w - 4), self.WHITE)
+            self.stdscr.addstr(gy + 1, 2, f" ACTIVE GRIDS ({len(self.metrics['symbols'])})", self.CYAN + self.BOLD)
+            r = gy + 3
+            syms = list(self.metrics['symbols'])[:6]
+            if syms:
+                for sym in syms:
+                    if r >= h - 2:
+                        break
+                    fp = self.metrics['fill_rate'] if self.metrics['fill_rate'] > 0 else 0
+                    try:
+                        self.stdscr.addstr(r, 4, f"{sym:8}", self.CYAN)
+                        self.draw_bar(r, 15, 20, fp)
+                        self.stdscr.addstr(r, 37, f"{fp:5.1f}%", self.WHITE)
+                    except curses.error:
+                        pass
+                    r += 1
+            else:
+                if r < h:
+                    self.stdscr.addstr(r, 10, "No active grids", self.YELLOW)
+
+        # Recent state transitions
+        gy = r + 2
+        if gy < h - 5 and self.state_transitions:
+            self.stdscr.addstr(gy, 2, "─" * (w - 4), self.WHITE)
+            self.stdscr.addstr(gy + 1, 2, " RECENT STATE TRANSITIONS", self.CYAN + self.BOLD)
+            r = gy + 3
+            for trans in self.state_transitions[:4]:
+                if r >= h - 2:
+                    break
+                try:
+                    sym = trans['symbol']
+                    from_state = trans['from_state']
+                    to_state = trans['to_state']
+                    event = trans['event']
+                    time = trans['time']
+                    self.stdscr.addstr(r, 4, f"{time}", self.CYAN)
+                    self.stdscr.addstr(r, 10, f"{sym:10}", self.WHITE)
+                    self.stdscr.addstr(r, 21, f"{from_state:12}", self.CYAN)
+                    self.stdscr.addstr(r, 34, "→", self.WHITE)
+                    self.stdscr.addstr(r, 36, f"{to_state:12}", self.GREEN + self.BOLD)
+                    self.stdscr.addstr(r, 49, f"({event[:15]:15})", self.YELLOW)
+                except curses.error:
+                    pass
+                r += 1
+
+        ry = r + 2
         if ry < h - 3:
             self.stdscr.addstr(ry, 2, "─" * (w - 4), self.WHITE)
             self.stdscr.addstr(ry + 1, 2, " RISK", self.CYAN + self.BOLD)

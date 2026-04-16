@@ -66,7 +66,22 @@ type GridManager struct {
 	minNotionalUSD  float64 // Minimum order in USD (e.g., $20)
 
 	// PnL Risk Control configuration
-	pnlRiskConfig    *config.PnLRiskControlConfig
+	pnlRiskConfig *config.PnLRiskControlConfig
+
+	// Market Condition Evaluator for adaptive state selection
+	marketConditionEvaluator *adaptive_grid.MarketConditionEvaluator
+
+	// Adaptive state configurations
+	overSizeConfig  *config.OverSizeConfig
+	defensiveConfig *config.DefensiveStateConfig
+	recoveryConfig  *config.RecoveryStateConfig
+
+	// Track which symbols have been warned about missing evaluator
+	evaluatorNotLogged map[string]bool
+
+	// Metrics streamer for real-time dashboard
+	metricsStreamer interface{}
+
 	maxNotionalUSD   float64 // Maximum order in USD (e.g., $500)
 	gridSpreadPct    float64
 	maxOrdersSide    int
@@ -228,6 +243,59 @@ func initTakeProfitManager(logger *zap.Logger) *adaptive_grid.TakeProfitManager 
 // SetPnLRiskConfig sets the PnL risk control configuration
 func (g *GridManager) SetPnLRiskConfig(cfg *config.PnLRiskControlConfig) {
 	g.pnlRiskConfig = cfg
+}
+
+// SetMarketConditionEvaluator sets the market condition evaluator
+func (g *GridManager) SetMarketConditionEvaluator(eval *adaptive_grid.MarketConditionEvaluator) {
+	g.marketConditionEvaluator = eval
+}
+
+// SetOverSizeConfig sets the OVER_SIZE state configuration
+func (g *GridManager) SetOverSizeConfig(cfg *config.OverSizeConfig) {
+	g.overSizeConfig = cfg
+}
+
+// SetDefensiveConfig sets the DEFENSIVE state configuration
+func (g *GridManager) SetDefensiveConfig(cfg *config.DefensiveStateConfig) {
+	g.defensiveConfig = cfg
+}
+
+// SetRecoveryConfig sets the RECOVERY state configuration
+func (g *GridManager) SetRecoveryConfig(cfg *config.RecoveryStateConfig) {
+	g.recoveryConfig = cfg
+}
+
+// SetMetricsStreamer sets the metrics streamer for real-time dashboard
+func (g *GridManager) SetMetricsStreamer(streamer interface{}) {
+	g.metricsStreamer = streamer
+}
+
+// broadcastMetric sends a metric to the dashboard if metricsStreamer is available
+func (g *GridManager) broadcastMetric(metricType string, symbol string, data map[string]interface{}) {
+	if g.metricsStreamer == nil {
+		return
+	}
+
+	// Use type assertion to call BroadcastMetric method
+	if streamer, ok := g.metricsStreamer.(interface {
+		BroadcastMetric(metricType string, symbol string, data map[string]interface{}, timestamp time.Time)
+	}); ok {
+		streamer.BroadcastMetric(metricType, symbol, data, time.Now())
+	}
+}
+
+// GetTotalVolume returns the total volume traded
+func (g *GridManager) GetTotalVolume() float64 {
+	g.volumeMetricsMu.RLock()
+	defer g.volumeMetricsMu.RUnlock()
+	return g.totalVolumeUSDT
+}
+
+// GetActiveOrderCount returns the number of active orders
+func (g *GridManager) GetActiveOrderCount() int {
+	g.ordersMu.RLock()
+	defer g.ordersMu.RUnlock()
+	return len(g.activeOrders)
 }
 
 // NewGridManager creates a new grid manager with volume farm config.
@@ -1102,6 +1170,49 @@ func (g *GridManager) globalKlineProcessor() {
 			// Check PnL-based risk control
 			g.checkPnLRisk(symbol)
 
+			// Check position size for OVER_SIZE state
+			g.checkPositionSize(symbol)
+
+			// Evaluate market conditions and recommend state (if enabled)
+			if g.marketConditionEvaluator != nil {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":    symbol,
+					"evaluator": "market_condition_evaluator",
+				}).Debug("Calling market condition evaluator")
+
+				recommendation, err := g.marketConditionEvaluator.Evaluate(symbol)
+				if err == nil {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":     symbol,
+						"state":      recommendation.State.String(),
+						"confidence": recommendation.Confidence,
+						"reason":     recommendation.Reason,
+					}).Debug("Market condition evaluation")
+
+					// Trigger state transition based on recommendation and confidence
+					evalConfig := g.marketConditionEvaluator.GetConfig()
+					if recommendation.Confidence >= evalConfig.MinConfidenceThreshold {
+						g.triggerStateTransitionFromRecommendation(symbol, recommendation)
+					}
+				} else {
+					g.logger.WithFields(logrus.Fields{
+						"symbol": symbol,
+						"error":  err,
+					}).Error("Market condition evaluation failed")
+				}
+			} else {
+				// Log once per symbol that evaluator is not available
+				if _, logged := g.evaluatorNotLogged[symbol]; !logged {
+					g.logger.WithFields(logrus.Fields{
+						"symbol": symbol,
+					}).Warn("Market condition evaluator not initialized - adaptive states disabled")
+					if g.evaluatorNotLogged == nil {
+						g.evaluatorNotLogged = make(map[string]bool)
+					}
+					g.evaluatorNotLogged[symbol] = true
+				}
+			}
+
 		case <-depthMonitor.C:
 			// Periodic channel depth check
 			depth := g.wsClient.GetKlineChannelDepth()
@@ -1176,6 +1287,156 @@ func (g *GridManager) checkPnLRisk(symbol string) {
 
 			g.adaptiveMgr.GetStateMachine().Transition(symbol, adaptive_grid.EventRecovery)
 		}
+	}
+}
+
+// checkPositionSize checks position size and triggers OVER_SIZE state transitions
+func (g *GridManager) checkPositionSize(symbol string) {
+	// Check if OVER_SIZE config is enabled
+	if g.overSizeConfig == nil {
+		return
+	}
+
+	// Get position from WebSocket cache
+	positions := g.wsClient.GetCachedPositions()
+	position, hasPosition := positions[symbol]
+
+	if !hasPosition || position.PositionAmt == 0 {
+		// No position, nothing to check
+		return
+	}
+
+	// Calculate position notional value
+	positionNotional := math.Abs(position.PositionAmt * position.MarkPrice)
+	currentState := g.adaptiveMgr.GetStateMachine().GetState(symbol)
+
+	// Get max position USDT from config (default to 100 if not set)
+	maxPositionUSDT := 100.0
+	if g.maxNotionalUSD > 0 {
+		maxPositionUSDT = g.maxNotionalUSD
+	}
+
+	threshold := maxPositionUSDT * g.overSizeConfig.ThresholdPct
+	recoveryLevel := maxPositionUSDT * g.overSizeConfig.RecoveryPct
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":            symbol,
+		"position_notional": positionNotional,
+		"max_position_usdt": maxPositionUSDT,
+		"threshold":         threshold,
+		"recovery_level":    recoveryLevel,
+		"state":             currentState.String(),
+	}).Info("Position Size Check")
+
+	switch currentState {
+	case adaptive_grid.GridStateTrading:
+		// TRADING: Check if position size > threshold → trigger OVER_SIZE
+		if positionNotional > threshold {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":            symbol,
+				"position_notional": positionNotional,
+				"threshold":         threshold,
+			}).Warn("Position Size: Size exceeds threshold, triggering OVER_SIZE")
+
+			g.adaptiveMgr.GetStateMachine().Transition(symbol, adaptive_grid.EventOverSizeLimit)
+		}
+
+	case adaptive_grid.GridStateOverSize:
+		// OVER_SIZE: Check if position size <= recovery level → trigger TRADING
+		if positionNotional <= recoveryLevel {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":            symbol,
+				"position_notional": positionNotional,
+				"recovery_level":    recoveryLevel,
+			}).Info("Position Size: Size normalized, triggering TRADING")
+
+			g.adaptiveMgr.GetStateMachine().Transition(symbol, adaptive_grid.EventSizeNormalized)
+		}
+	}
+}
+
+// triggerStateTransitionFromRecommendation triggers state transition based on market condition evaluator recommendation
+func (g *GridManager) triggerStateTransitionFromRecommendation(symbol string, recommendation *adaptive_grid.StateRecommendation) {
+	currentState := g.adaptiveMgr.GetStateMachine().GetState(symbol)
+
+	// Only transition if recommended state is different from current state
+	if recommendation.State == currentState {
+		return
+	}
+
+	var event adaptive_grid.GridEvent
+
+	// Map recommended state to appropriate event
+	switch recommendation.State {
+	case adaptive_grid.GridStateOverSize:
+		event = adaptive_grid.EventOverSizeLimit
+	case adaptive_grid.GridStateDefensive:
+		event = adaptive_grid.EventExtremeVolatility
+	case adaptive_grid.GridStateRecovery:
+		event = adaptive_grid.EventRecoveryStart
+	case adaptive_grid.GridStateExitHalf:
+		event = adaptive_grid.EventPartialLoss
+	case adaptive_grid.GridStateExitAll:
+		event = adaptive_grid.EventEmergencyExit
+	case adaptive_grid.GridStateTrading:
+		// For TRADING, need to determine which event based on current state
+		switch currentState {
+		case adaptive_grid.GridStateOverSize:
+			event = adaptive_grid.EventSizeNormalized
+		case adaptive_grid.GridStateDefensive:
+			event = adaptive_grid.EventVolatilityNormalized
+		case adaptive_grid.GridStateRecovery:
+			event = adaptive_grid.EventRecoveryComplete
+		case adaptive_grid.GridStateExitHalf:
+			event = adaptive_grid.EventRecovery
+		default:
+			g.logger.WithFields(logrus.Fields{
+				"symbol":        symbol,
+				"current_state": currentState.String(),
+				"recommended":   recommendation.State.String(),
+			}).Warn("Market Condition: Cannot transition to TRADING from current state")
+			return
+		}
+	default:
+		g.logger.WithFields(logrus.Fields{
+			"symbol":      symbol,
+			"recommended": recommendation.State.String(),
+		}).Warn("Market Condition: Unsupported recommended state")
+		return
+	}
+
+	// Check if transition is valid
+	if !g.adaptiveMgr.GetStateMachine().CanTransition(symbol, event) {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":        symbol,
+			"current_state": currentState.String(),
+			"event":         event.String(),
+			"recommended":   recommendation.State.String(),
+		}).Warn("Market Condition: Invalid transition")
+		return
+	}
+
+	// Perform transition
+	g.logger.WithFields(logrus.Fields{
+		"symbol":     symbol,
+		"from":       currentState.String(),
+		"to":         recommendation.State.String(),
+		"event":      event.String(),
+		"confidence": recommendation.Confidence,
+		"reason":     recommendation.Reason,
+	}).Info("Market Condition: Triggering state transition")
+
+	g.adaptiveMgr.GetStateMachine().Transition(symbol, event)
+
+	// Execute state-specific actions
+	switch recommendation.State {
+	case adaptive_grid.GridStateExitHalf:
+		positions := g.wsClient.GetCachedPositions()
+		if position, hasPos := positions[symbol]; hasPos {
+			g.triggerExitHalf(symbol, position, position.UnrealizedProfit)
+		}
+	case adaptive_grid.GridStateExitAll:
+		g.executeExitAll(symbol, "Market condition recommendation")
 	}
 }
 
@@ -2487,6 +2748,16 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		"status":  order.Status,
 	}).Info("Grid order placed successfully")
 
+	// Broadcast order placed metric to dashboard
+	g.broadcastMetric("order_placed", order.Symbol, map[string]interface{}{
+		"order_id":   order.OrderID,
+		"side":       order.Side,
+		"price":      order.Price,
+		"size":       order.Size,
+		"notional":   order.Size * order.Price,
+		"grid_level": order.GridLevel,
+	})
+
 	return nil
 }
 
@@ -2496,6 +2767,11 @@ func (g *GridManager) handleOrderFill(orderID string, symbol string) {
 		"order_id": orderID,
 		"symbol":   symbol,
 	}).Info("handleOrderFill called - processing fill event")
+
+	// Broadcast order filled metric to dashboard
+	g.broadcastMetric("order_filled", symbol, map[string]interface{}{
+		"order_id": orderID,
+	})
 
 	// NEW: Check for duplicate fill event
 	if g.deduplicator.IsDuplicate(orderID, time.Now()) {
