@@ -62,8 +62,11 @@ type GridManager struct {
 	filledOrders map[string]*GridOrder // OrderID -> GridOrder
 
 	// Configuration - Now using Notional Value based sizing
-	baseNotionalUSD  float64 // Base order size in USD (e.g., $100)
-	minNotionalUSD   float64 // Minimum order in USD (e.g., $20)
+	baseNotionalUSD float64 // Base order size in USD (e.g., $100)
+	minNotionalUSD  float64 // Minimum order in USD (e.g., $20)
+
+	// PnL Risk Control configuration
+	pnlRiskConfig    *config.PnLRiskControlConfig
 	maxNotionalUSD   float64 // Maximum order in USD (e.g., $500)
 	gridSpreadPct    float64
 	maxOrdersSide    int
@@ -220,6 +223,11 @@ func initTakeProfitManager(logger *zap.Logger) *adaptive_grid.TakeProfitManager 
 	}
 
 	return tpMgr
+}
+
+// SetPnLRiskConfig sets the PnL risk control configuration
+func (g *GridManager) SetPnLRiskConfig(cfg *config.PnLRiskControlConfig) {
+	g.pnlRiskConfig = cfg
 }
 
 // NewGridManager creates a new grid manager with volume farm config.
@@ -1067,6 +1075,10 @@ func (g *GridManager) globalKlineProcessor() {
 		return
 	}
 
+	// Start periodic depth monitor
+	depthMonitor := time.NewTicker(10 * time.Second)
+	defer depthMonitor.Stop()
+
 	for {
 		select {
 		case <-g.warmupStopCh:
@@ -1087,10 +1099,239 @@ func (g *GridManager) globalKlineProcessor() {
 			// Feed OHLC data to RangeDetector for this symbol
 			g.adaptiveMgr.UpdatePriceForRange(symbol, kline.High, kline.Low, kline.Close)
 
-		case <-time.After(5 * time.Second):
-			// Periodic check - continue loop
+			// Check PnL-based risk control
+			g.checkPnLRisk(symbol)
+
+		case <-depthMonitor.C:
+			// Periodic channel depth check
+			depth := g.wsClient.GetKlineChannelDepth()
+			if depth > 1000 {
+				g.logger.WithField("depth", depth).Warn("GLOBAL: kline channel depth high - consumer may be slow")
+			}
 		}
 	}
+}
+
+// checkPnLRisk checks unrealized PnL and triggers state transitions for risk control
+func (g *GridManager) checkPnLRisk(symbol string) {
+	// Check if PnL risk control is enabled
+	if g.pnlRiskConfig == nil || !g.pnlRiskConfig.Enabled {
+		return
+	}
+
+	// Get position from WebSocket cache
+	positions := g.wsClient.GetCachedPositions()
+	position, hasPosition := positions[symbol]
+
+	if !hasPosition || position.PositionAmt == 0 {
+		// No position, nothing to check
+		return
+	}
+
+	unrealizedPnL := position.UnrealizedProfit
+	currentState := g.adaptiveMgr.GetStateMachine().GetState(symbol)
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":         symbol,
+		"unrealized_pnl": unrealizedPnL,
+		"state":          currentState.String(),
+	}).Debug("PnL Risk Check")
+
+	// Get thresholds from config
+	partialLossThreshold := -g.pnlRiskConfig.PartialLossUSDT
+	fullLossThreshold := -g.pnlRiskConfig.FullLossUSDT
+	recoveryThreshold := g.pnlRiskConfig.RecoveryThresholdUSDT
+
+	switch currentState {
+	case adaptive_grid.GridStateTrading:
+		// TRADING: Check if loss > threshold → trigger EXIT_HALF
+		if unrealizedPnL <= partialLossThreshold {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"unrealized_pnl": unrealizedPnL,
+				"threshold":      partialLossThreshold,
+			}).Warn("PnL Risk: Partial loss threshold hit, triggering EXIT_HALF")
+
+			g.triggerExitHalf(symbol, position, unrealizedPnL)
+		}
+
+	case adaptive_grid.GridStateExitHalf:
+		// EXIT_HALF: Check if loss > full threshold → trigger EXIT_ALL
+		// OR if recovered → trigger RECOVERY back to TRADING
+		if unrealizedPnL <= fullLossThreshold {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"unrealized_pnl": unrealizedPnL,
+				"threshold":      fullLossThreshold,
+			}).Error("PnL Risk: Full loss threshold hit in EXIT_HALF, triggering EXIT_ALL")
+
+			g.adaptiveMgr.GetStateMachine().Transition(symbol, adaptive_grid.EventFullLoss)
+			g.executeExitAll(symbol, "Full loss in EXIT_HALF state")
+		} else if unrealizedPnL >= recoveryThreshold {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":         symbol,
+				"unrealized_pnl": unrealizedPnL,
+				"threshold":      recoveryThreshold,
+			}).Info("PnL Risk: Position recovered, triggering RECOVERY to TRADING")
+
+			g.adaptiveMgr.GetStateMachine().Transition(symbol, adaptive_grid.EventRecovery)
+		}
+	}
+}
+
+// triggerExitHalf executes partial exit: cut 50% position, cancel opposite side grid
+func (g *GridManager) triggerExitHalf(symbol string, position client.Position, unrealizedPnL float64) {
+	ctx := context.Background()
+
+	// Transition state
+	g.adaptiveMgr.GetStateMachine().Transition(symbol, adaptive_grid.EventPartialLoss)
+
+	// Calculate close amount from config (default 50%)
+	closePct := 0.5
+	if g.pnlRiskConfig != nil && g.pnlRiskConfig.PartialClosePct > 0 {
+		closePct = g.pnlRiskConfig.PartialClosePct
+	}
+	closeAmt := math.Abs(position.PositionAmt) * closePct
+	closeSide := "SELL"
+	if position.PositionSide == "SHORT" {
+		closeSide = "BUY"
+	}
+
+	// Place market order to close 50%
+	orderReq := client.PlaceOrderRequest{
+		Symbol:       symbol,
+		Side:         closeSide,
+		Type:         "MARKET",
+		Quantity:     fmt.Sprintf("%.6f", closeAmt),
+		PositionSide: position.PositionSide,
+		ReduceOnly:   true,
+	}
+
+	order, err := g.futuresClient.PlaceOrder(ctx, orderReq)
+	if err != nil {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"error":  err,
+		}).Error("Failed to place partial close order for EXIT_HALF")
+		return
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":    symbol,
+		"order_id":  order.OrderID,
+		"close_amt": closeAmt,
+	}).Info("EXIT_HALF: Partial close order placed")
+
+	// Cancel opposite side grid orders (keep TP/SL and reduce-only orders)
+	g.cancelOppositeSideGridOrders(ctx, symbol, position.PositionSide)
+}
+
+// executeExitAll executes full exit: cancel all orders, close position
+func (g *GridManager) executeExitAll(symbol, reason string) {
+	ctx := context.Background()
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol": symbol,
+		"reason": reason,
+	}).Warn("Executing EXIT_ALL")
+
+	// Cancel all orders
+	if err := g.CancelAllOrders(ctx, symbol); err != nil {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"error":  err,
+		}).Error("Failed to cancel orders during EXIT_ALL")
+	}
+
+	// Close position
+	positions := g.wsClient.GetCachedPositions()
+	position, hasPosition := positions[symbol]
+	if hasPosition && position.PositionAmt != 0 {
+		closeAmt := math.Abs(position.PositionAmt)
+		closeSide := "SELL"
+		if position.PositionSide == "SHORT" {
+			closeSide = "BUY"
+		}
+
+		orderReq := client.PlaceOrderRequest{
+			Symbol:       symbol,
+			Side:         closeSide,
+			Type:         "MARKET",
+			Quantity:     fmt.Sprintf("%.6f", closeAmt),
+			PositionSide: position.PositionSide,
+			ReduceOnly:   true,
+		}
+
+		_, err := g.futuresClient.PlaceOrder(ctx, orderReq)
+		if err != nil {
+			g.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"error":  err,
+			}).Error("Failed to close position during EXIT_ALL")
+		}
+	}
+
+	// Clear grid
+	if err := g.ClearGrid(ctx, symbol); err != nil {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"error":  err,
+		}).Error("Failed to clear grid during EXIT_ALL")
+	}
+}
+
+// cancelOppositeSideGridOrders cancels grid orders on the opposite side, keeps TP/SL and reduce-only
+func (g *GridManager) cancelOppositeSideGridOrders(ctx context.Context, symbol, positionSide string) {
+	orders, err := g.futuresClient.GetOpenOrders(ctx, symbol)
+	if err != nil {
+		g.logger.WithFields(logrus.Fields{
+			"symbol": symbol,
+			"error":  err,
+		}).Error("Failed to get open orders for opposite side cancellation")
+		return
+	}
+
+	cancelledCount := 0
+	for _, order := range orders {
+		// Skip reduce-only orders (TP/SL)
+		if order.ReduceOnly {
+			continue
+		}
+
+		// Determine if this order is on the opposite side
+		orderSide := order.Side
+		shouldCancel := false
+
+		if positionSide == "LONG" && orderSide == "BUY" {
+			// LONG position: cancel BUY orders (would increase position)
+			shouldCancel = true
+		} else if positionSide == "SHORT" && orderSide == "SELL" {
+			// SHORT position: cancel SELL orders (would increase position)
+			shouldCancel = true
+		}
+
+		if shouldCancel {
+			cancelReq := client.CancelOrderRequest{
+				Symbol:  symbol,
+				OrderID: order.OrderID,
+			}
+			_, err := g.futuresClient.CancelOrder(ctx, cancelReq)
+			if err != nil {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":   symbol,
+					"order_id": order.OrderID,
+					"error":    err,
+				}).Error("Failed to cancel opposite side order")
+			} else {
+				cancelledCount++
+			}
+		}
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":          symbol,
+		"cancelled_count": cancelledCount,
+	}).Info("Cancelled opposite side grid orders")
 }
 
 // warmupCompletionChecker monitors a single symbol's warm-up progress

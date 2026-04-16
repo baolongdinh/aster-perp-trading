@@ -17,6 +17,7 @@ const (
 	GridStateIdle GridState = iota
 	GridStateEnterGrid
 	GridStateTrading
+	GridStateExitHalf // Partial exit - cut 50% position
 	GridStateExitAll
 	GridStateWaitNewRange
 )
@@ -30,6 +31,8 @@ func (s GridState) String() string {
 		return "ENTER_GRID"
 	case GridStateTrading:
 		return "TRADING"
+	case GridStateExitHalf:
+		return "EXIT_HALF"
 	case GridStateExitAll:
 		return "EXIT_ALL"
 	case GridStateWaitNewRange:
@@ -45,6 +48,9 @@ type GridEvent int
 const (
 	EventRangeConfirmed  GridEvent = iota // WAIT_NEW_RANGE -> ENTER_GRID
 	EventEntryPlaced                      // ENTER_GRID -> TRADING
+	EventPartialLoss                      // TRADING -> EXIT_HALF
+	EventFullLoss                         // TRADING/EXIT_HALF -> EXIT_ALL
+	EventRecovery                         // EXIT_HALF -> TRADING
 	EventTrendExit                        // TRADING -> EXIT_ALL
 	EventEmergencyExit                    // TRADING -> EXIT_ALL (emergency)
 	EventPositionsClosed                  // EXIT_ALL -> WAIT_NEW_RANGE
@@ -58,6 +64,12 @@ func (e GridEvent) String() string {
 		return "RANGE_CONFIRMED"
 	case EventEntryPlaced:
 		return "ENTRY_PLACED"
+	case EventPartialLoss:
+		return "PARTIAL_LOSS"
+	case EventFullLoss:
+		return "FULL_LOSS"
+	case EventRecovery:
+		return "RECOVERY"
 	case EventTrendExit:
 		return "TREND_EXIT"
 	case EventEmergencyExit:
@@ -147,8 +159,12 @@ func (sm *GridStateMachine) CanTransition(symbol string, event GridEvent) bool {
 		return event == EventEntryPlaced
 
 	case GridStateTrading:
-		// From TRADING, TrendExit or EmergencyExit moves to EXIT_ALL
-		return event == EventTrendExit || event == EventEmergencyExit
+		// From TRADING, PartialLoss moves to EXIT_HALF, TrendExit/EmergencyExit to EXIT_ALL
+		return event == EventPartialLoss || event == EventTrendExit || event == EventEmergencyExit
+
+	case GridStateExitHalf:
+		// From EXIT_HALF, FullLoss moves to EXIT_ALL, Recovery moves to TRADING
+		return event == EventFullLoss || event == EventRecovery
 
 	case GridStateExitAll:
 		// From EXIT_ALL, PositionsClosed moves to WAIT_NEW_RANGE
@@ -197,9 +213,21 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 		}
 
 	case GridStateTrading:
-		if event == EventTrendExit || event == EventEmergencyExit {
+		if event == EventPartialLoss {
+			newState = GridStateExitHalf
+		} else if event == EventTrendExit || event == EventEmergencyExit {
 			newState = GridStateExitAll
 			state.ExitTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateExitHalf:
+		if event == EventFullLoss {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else if event == EventRecovery {
+			newState = GridStateTrading
 		} else {
 			return false
 		}

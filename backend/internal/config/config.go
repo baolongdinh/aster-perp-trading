@@ -45,27 +45,36 @@ type ExchangeConfig struct {
 }
 
 type RiskConfig struct {
-	MaxPositionUSDTPerSymbol    float64 `mapstructure:"max_position_usdt_per_symbol"`
-	MaxTotalPositionsUSDT       float64 `mapstructure:"max_total_positions_usdt"`
-	FeeLossThresholdPct         float64 `mapstructure:"fee_loss_threshold_pct"`
-	PositionTimeoutMinutes      int     `mapstructure:"position_timeout_minutes"`
-	MaxPositionUSDT             float64 `mapstructure:"max_position_usdt"`
-	MaxOpenPositions            int     `mapstructure:"max_open_positions"`
-	MaxTradesPerSymbol          int     `mapstructure:"max_trades_per_symbol"`
-	MaxGlobalPendingLimitOrders int     `mapstructure:"max_global_pending_limit_orders"`
-	MaxPendingPerSide           int     `mapstructure:"max_pending_per_side"`
-	DailyLossLimitUSDT          float64 `mapstructure:"daily_loss_limit_usdt"`
-	DailyDrawdownPct            float64 `mapstructure:"daily_drawdown_pct"`
-	PerTradeStopLossPct         float64 `mapstructure:"per_trade_stop_loss_pct"`
-	PerTradeTakeProfitPct       float64 `mapstructure:"per_trade_take_profit_pct"`
-	TakeProfitRRatio            float64 `mapstructure:"take_profit_rr_ratio"` // Target R:R ratio (e.g., 1.5 = 1.5:1)
-	MinTakeProfitPct            float64 `mapstructure:"min_take_profit_pct"`  // Minimum TP as % (e.g., 0.01 = 1%)
-	MaxTakeProfitPct            float64 `mapstructure:"max_take_profit_pct"`  // Maximum TP as % (e.g., 0.05 = 5%)
-	RiskPerTradeUSDT            float64 `mapstructure:"risk_per_trade_usdt"`
-	ATRMultiplier               float64 `mapstructure:"atr_multiplier"`
-	PositionMode                string  `mapstructure:"position_mode"` // one_way | hedge
-	CorrelationThreshold        float64 `mapstructure:"correlation_threshold"`
-	MakerPriority               bool    `mapstructure:"maker_priority"`
+	MaxPositionUSDTPerSymbol    float64               `mapstructure:"max_position_usdt_per_symbol"`
+	MaxTotalPositionsUSDT       float64               `mapstructure:"max_total_positions_usdt"`
+	FeeLossThresholdPct         float64               `mapstructure:"fee_loss_threshold_pct"`
+	PositionTimeoutMinutes      int                   `mapstructure:"position_timeout_minutes"`
+	MaxPositionUSDT             float64               `mapstructure:"max_position_usdt"`
+	MaxOpenPositions            int                   `mapstructure:"max_open_positions"`
+	MaxTradesPerSymbol          int                   `mapstructure:"max_trades_per_symbol"`
+	MaxGlobalPendingLimitOrders int                   `mapstructure:"max_global_pending_limit_orders"`
+	MaxPendingPerSide           int                   `mapstructure:"max_pending_per_side"`
+	DailyLossLimitUSDT          float64               `mapstructure:"daily_loss_limit_usdt"`
+	DailyDrawdownPct            float64               `mapstructure:"daily_drawdown_pct"`
+	PerTradeStopLossPct         float64               `mapstructure:"per_trade_stop_loss_pct"`
+	PerTradeTakeProfitPct       float64               `mapstructure:"per_trade_take_profit_pct"`
+	TakeProfitRRatio            float64               `mapstructure:"take_profit_rr_ratio"` // Target R:R ratio (e.g., 1.5 = 1.5:1)
+	MinTakeProfitPct            float64               `mapstructure:"min_take_profit_pct"`  // Minimum TP as % (e.g., 0.01 = 1%)
+	MaxTakeProfitPct            float64               `mapstructure:"max_take_profit_pct"`  // Maximum TP as % (e.g., 0.05 = 5%)
+	RiskPerTradeUSDT            float64               `mapstructure:"risk_per_trade_usdt"`
+	ATRMultiplier               float64               `mapstructure:"atr_multiplier"`
+	PositionMode                string                `mapstructure:"position_mode"` // one_way | hedge
+	CorrelationThreshold        float64               `mapstructure:"correlation_threshold"`
+	MakerPriority               bool                  `mapstructure:"maker_priority"`
+	PnLRiskControl              *PnLRiskControlConfig `mapstructure:"pnl_risk_control"`
+}
+
+type PnLRiskControlConfig struct {
+	Enabled               bool    `mapstructure:"enabled"`
+	PartialLossUSDT       float64 `mapstructure:"partial_loss_usdt"`
+	FullLossUSDT          float64 `mapstructure:"full_loss_usdt"`
+	RecoveryThresholdUSDT float64 `mapstructure:"recovery_threshold_usdt"`
+	PartialClosePct       float64 `mapstructure:"partial_close_pct"`
 }
 
 type APIConfig struct {

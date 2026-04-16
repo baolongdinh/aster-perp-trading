@@ -206,6 +206,15 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		zap.Float64("per_trade_sl_pct", volumeConfig.Risk.PerTradeStopLossPct),
 	)
 
+	// Set PnL risk control config to grid manager
+	if volumeConfig.Risk.PnLRiskControl != nil {
+		engine.gridManager.SetPnLRiskConfig(volumeConfig.Risk.PnLRiskControl)
+		logger.Info("GridManager PnL risk control config set",
+			zap.Bool("enabled", volumeConfig.Risk.PnLRiskControl.Enabled),
+			zap.Float64("partial_loss_usdt", volumeConfig.Risk.PnLRiskControl.PartialLossUSDT),
+			zap.Float64("full_loss_usdt", volumeConfig.Risk.PnLRiskControl.FullLossUSDT))
+	}
+
 	// Connect adaptive manager as risk checker for grid manager
 	engine.gridManager.SetRiskChecker(adaptiveGridManager)
 

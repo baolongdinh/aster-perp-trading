@@ -182,28 +182,30 @@ volume_farming:
 
   # ORDER CONFIGURATION - Cấu hình lệnh
   # =====================================
-  # 
-  # order_size_usdt: Kích thước mỗi lệnh (USDT)
-  # TRADE-OFF:
-  #   Lớn (20-50): Lợi nhuận cao mỗi fill, nhưng rủi ro lớn nếu sai
-  #   Nhỏ (3-10): An toàn, nhiều fill, nhưng phí cao/profit
   #
-  # TỐI ƯU:
-  #   - Sideways chặt: 3-5 USDT (micro grid)
-  #   - Sideways rộng: 10-20 USDT
-  #   - Volatile: 5-10 USDT
+  # TRADE-OFF TABLE:
+  # ┌─────────────────────────┬──────────────────┬──────────────────┐
+  # │   Tham số               │   TĂNG           │   GIẢM          │
+  # ├─────────────────────────┼──────────────────┼──────────────────┤
+  # │ order_size_usdt         │ Profit/fill cao  │ Risk thấp       │
+  # │   (3-50)                │ Margin nhiều     │ Margin ít       │
+  # ├─────────────────────────┼──────────────────┼──────────────────┤
+  # │ grid_spread_pct         │ Profit/fill cao  │ Nhiều fill hơn  │
+  # │   (0.05-0.5%)           │ Ít fill          │ Volume cao      │
+  # ├─────────────────────────┼──────────────────┼──────────────────┤
+  # │ max_orders_per_side     │ Bao phủ rộng     │ Margin ít       │
+  # │   (3-10)                │ Nhiều cơ hội     │ Tập trung       │
+  # ├─────────────────────────┼──────────────────┼──────────────────┤
+  # │ position_timeout_       │ Chờ hồi phục     │ Cắt lỗ nhanh    │
+  # │   minutes (3-10)         │ Có thể miss      │ An toàn hơn     │
+  # └─────────────────────────┴──────────────────┴──────────────────┘
+  #
+  # KHUYẾN NGHỊ CHO VOLUME FARMING:
+  # - order_size_usdt: 3-5 (micro grid), 10-20 (normal)
+  # - grid_spread_pct: 0.05-0.1% (micro grid), 0.15-0.2% (normal)
+  # - max_orders_per_side: 5 (micro grid), 10 (normal)
   order_size_usdt: 20.5
-  
-  # grid_spread_pct: Khoảng cách giữa các lệnh (%)
-  # =================================================
-  # TRADE-OFF:
-  #   Rộng (0.3-0.5%): Ít fill, lợi nhuận cao/fill
-  #   Hẹp (0.05-0.1%): Nhiều fill, volume cao
-  #
-  # TỐI ƯU THEO ĐIỀU KIỆN:
-  #   - Sideways chặt: 0.05-0.1%
-  #   - Sideways bình thường: 0.15-0.2%
-  #   - Biến động cao: 0.3-0.5%
+
   grid_spread_pct: 0.0015
   
   # max_orders_per_side: Số lệnh tối đa mỗi bên
@@ -342,24 +344,78 @@ volume_farming:
 
   # RISK MANAGEMENT
   # ===============
+  # Cấu hình quản lý rủi ro chi tiết
+  #
+  # TRADE-OFF:
+  # ┌──────────────────────────┬──────────────────┬──────────────────┐
+  # │   Tham số               │   TĂNG           │   GIẢM          │
+  # ├──────────────────────────┼──────────────────┼──────────────────┤
+  # │ max_position_usdt       │ Profit cao       │ Risk thấp       │
+  # │   (100-500)             │ Margin nhiều     │ Margin ít       │
+  # ├──────────────────────────┼──────────────────┼──────────────────┤
+  # │ stop_loss_pct           │ Ít stop loss     │ Nhiều stop loss │
+  # │   (0.5-2.0%)            │ Profit cao       │ An toàn hơn     │
+  # ├──────────────────────────┼──────────────────┼──────────────────┤
+  # │ liquidation_buffer_pct  │ Margin ít        │ Margin nhiều     │
+  # │   (0.2-0.5)             │ Risk cao         │ Risk thấp       │
+  # ├──────────────────────────┼──────────────────┼──────────────────┤
+  # │ max_consecutive_losses  │ Trade nhiều      │ Trade ít         │
+  # │   (2-5)                 │ nhưng rủi ro cao │ nhưng an toàn   │
+  # └──────────────────────────┴──────────────────┴──────────────────┘
   risk:
-    max_position_usdt_per_symbol: 300
-    max_total_positions_usdt: 500
-    daily_loss_limit_usdt: 3
-    daily_drawdown_pct: 50.0
-    max_open_positions: 3
-    max_global_pending_limit_orders: 30
-    max_pending_per_side: 15
-    per_trade_stop_loss_pct: 2.0
-    per_trade_take_profit_pct: 1.0
-    take_profit_rratio: 1.5
-    min_take_profit_pct: 0.5
-    max_take_profit_pct: 2.0
-    risk_per_trade_usdt: 2.0
-    atr_multiplier: 2.0
-    position_mode: "one_way"
-    correlation_threshold: 0.8
-    maker_priority: true
+    # Position Limits
+    max_position_usdt_per_symbol: 300      # Max 300 USDT per symbol
+    max_unhedged_exposure_usdt: 200        # Max 200 USDT unhedged
+    max_total_positions_usdt: 500          # Max 500 USDT total
+    max_open_positions: 3                  # Max 3 positions cùng lúc
+
+    # Loss Limits
+    max_unrealized_loss_usdt: 3.0          # Close nếu unrealized loss > 3 USDT/position
+    per_position_loss_limit_usdt: 1.0       # Close position nếu loss > 1 USDT
+    total_net_loss_limit_usdt: 5.0          # Close ALL nếu total loss > 5 USDT
+    daily_loss_limit_usdt: 3               # Lỗ tối đa/ngày
+    daily_drawdown_pct: 50.0               # Drawdown tối đa %
+
+    # Stop Loss & Take Profit
+    stop_loss_pct: 0.01                    # 1% stop loss
+    trailing_stop_pct: 0.01                # Activate tại 1% profit
+    trailing_stop_distance_pct: 0.005      # 0.5% trailing distance
+    per_trade_stop_loss_pct: 2.0           # 2% SL per trade
+    per_trade_take_profit_pct: 1.0         # 1% TP per trade
+    take_profit_rratio: 1.5                # 1.5:1 R:R
+    min_take_profit_pct: 0.5               # Min 0.5% TP
+    max_take_profit_pct: 2.0               # Max 2% TP
+
+    # Liquidation Protection
+    liquidation_buffer_pct: 0.35           # Close tại 35% distance đến liquidation
+    position_check_interval: 10s           # Kiểm tra position mỗi 10s
+
+    # Trend Protection
+    trending_threshold: 0.7                # Pause nếu trending > 70%
+    use_directional_bias: true             # Chỉ trade với trend
+
+    # Consecutive Loss Protection
+    max_consecutive_losses: 3             # Exit sau 3 loss liên tiếp
+    cooldown_duration: 30s                # Cooldown 30s sau 3 loss
+
+    # Order Limits
+    max_global_pending_limit_orders: 30   # Max 30 orders pending
+    max_pending_per_side: 15               # Max 15 orders mỗi side
+
+    # Other Risk Settings
+    risk_per_trade_usdt: 2.0               # 2 USDT risk/trade
+    atr_multiplier: 2.0                    # 2x ATR cho stop loss
+    position_mode: "one_way"               # one_way: chỉ LONG hoặc SHORT
+    correlation_threshold: 0.8             # Correlation > 80% = risky
+    maker_priority: true                   # Ưu tiên maker orders
+
+    # PnL Risk Control - Cắt lỗ động dựa trên unrealized PnL
+    pnl_risk_control:
+      enabled: true                        # Bật/tắt PnL risk control
+      partial_loss_usdt: 1.0               # Cắt 50% position khi loss > $1 (TRADING -> EXIT_HALF)
+      full_loss_usdt: 1.0                  # Cắt toàn bộ khi loss > $1 trong EXIT_HALF (EXIT_HALF -> EXIT_ALL)
+      recovery_threshold_usdt: 0.0         # Recovery threshold để về TRADING (0 = break even)
+      partial_close_pct: 0.5               # Tỷ lệ cắt khi partial loss (0.5 = 50%)
 
 # =============================================================================
 # API & LOGGING
@@ -371,6 +427,244 @@ api:
 log:
   level: "info"
   file: "logs/agentic-vf.log"
+
+# =============================================================================
+# RANGE DETECTOR CONFIGURATION - Phát hiện range giá
+# =============================================================================
+# RangeDetector xác định vùng giá sideways để grid trading hoạt động tốt nhất
+#
+# THAM SỐ QUAN TRỌNG:
+# - method: Phương pháp tính range (BB, ATR, combined)
+# - periods: Số nến để tính range (5 = fast warm-up)
+# - breakout_threshold: Ngưỡng breakout (2% = price vượt range 2%)
+# - stabilization_period: Thời gian chờ sau breakout trước khi reentry
+#
+# TRADE-OFF:
+# ┌────────────────────┬──────────────────┬──────────────────┐
+# │   Tham số          │   TĂNG           │   GIẢM          │
+# ├────────────────────┼──────────────────┼──────────────────┤
+# │ periods            │ Warm-up lâu hơn  │ Warm-up nhanh   │
+# │   (5-20)           │ Range ổn định    │ Range nhạy cảm  │
+# ├────────────────────┼──────────────────┼──────────────────┤
+# │ breakout_threshold│ Ít breakout      │ Nhiều breakout  │
+# │   (0.01-0.05)      │ Trade nhiều hơn  │ An toàn hơn     │
+# ├────────────────────┼──────────────────┼──────────────────┤
+# │ stabilization_     │ Chờ lâu hơn      │ Reentry nhanh   │
+# │   period (5-30s)   │ Range chắc chắn  │ Có thể nhầm    │
+# └────────────────────┴──────────────────┴──────────────────┘
+#
+# KHUYẾN NGHỊ: periods: 5, breakout_threshold: 0.02, stabilization_period: 10s
+range_detector:
+  method: "combined"          # combined: Dùng cả BB và ATR
+  periods: 5                  # 5 nến (fast warm-up: 5 phút cho 1m klines)
+  bb_multiplier: 2.0         # 2 sigma cho BB (chuẩn)
+  atr_multiplier: 1.5        # 1.5x ATR cho range
+  breakout_threshold: 0.02   # 2% vượt range = breakout
+  stabilization_period: 10s  # Chờ 10s sau breakout
+  min_range_width_pct: 0.0001  # Tối thiểu 0.01% range width
+  adx_period: 14
+  material_shift_pct: 0.005  # 0.5% shift = material
+  width_change_pct: 0.0015   # 0.15% width change = significant
+  reentry_confirmations: 2   # Số xác nhận để reentry
+  entry_confirmations: 1     # Số xác nhận để entry
+  outside_band_confirmations: 3  # Số nến outside band để breakout
+  bb_expansion_factor: 1.5   # 1.5x expansion = breakout
+
+# =============================================================================
+# INVENTORY MANAGEMENT - Quản lý inventory skew
+# =============================================================================
+# InventoryManager theo dõi skew giữa LONG và SHORT positions
+# Tự động điều chỉnh size/pause side khi skew quá lớn
+#
+# LOGIC:
+# - Skew = |LONG - SHORT| / Total Position
+# - Skew thấp (<40%): Không điều chỉnh
+# - Skew trung bình (40-80%): Giảm size 20% side skew
+# - Skew cao (80-100%): Giảm size 30% + giảm TP 20% side skew
+# - Skew nghiêm trọng (>120%): Giảm size 50% + giảm TP 30% + PAUSE side skew
+#
+# TRADE-OFF:
+#   max_inventory_pct cao: Cho phép skew lớn, nhưng rủi ro directional
+#   max_inventory_pct thấp: Skew nhỏ, an toàn hơn, nhưng có thể miss opportunity
+inventory_management:
+  enabled: true
+  max_inventory_pct: 0.30     # Tối đa 30% skew cho phép
+
+  # Ngưỡng skew và hành động tương ứng
+  low_threshold:
+    threshold: 0.40            # 40% skew
+    size_reduction: 0.0         # Không giảm size
+    pause_side: false          # Không pause
+
+  moderate_threshold:
+    threshold: 0.80            # 80% skew
+    size_reduction: 0.20       # Giảm 20% size
+    pause_side: false          # Không pause
+
+  high_threshold:
+    threshold: 1.0             # 100% skew
+    size_reduction: 0.30       # Giảm 30% size
+    pause_side: false          # Không pause
+    take_profit_reduction: 0.20  # Giảm 20% TP
+
+  critical_threshold:
+    threshold: 1.2             # 120% skew
+    size_reduction: 0.50       # Giảm 50% size
+    pause_side: true           # PAUSE side skew
+    take_profit_reduction: 0.30  # Giảm 30% TP
+
+# =============================================================================
+# CLUSTER STOP LOSS - Stop loss cho cluster positions
+# =============================================================================
+# ClusterManager theo dõi drawdown của cluster positions
+# Tự động đóng position khi drawdown quá lớn
+#
+# LOGIC:
+# - Monitor: Theo dõi 2 giờ, drawdown < -0.5%
+# - Emergency: Theo dõi 4 giờ, drawdown < -1.0%
+# - Breakeven: Breakeven 50% tại -0.2%, 100% tại 0%
+#
+# TRADE-OFF:
+#   monitor_hours dài: Theo dõi lâu hơn, nhưng có thể miss early exit
+#   monitor_hours ngắn: Exit sớm hơn, an toàn hơn, nhưng có thể miss recovery
+cluster_stop_loss:
+  enabled: false              # TẮT mặc định (chỉ bật khi cần)
+  monitor_hours: 2            # Theo dõi 2 giờ
+  emergency_hours: 4          # Emergency sau 4 giờ
+  stale_hours: 8              # Stale sau 8 giờ
+  monitor_drawdown: -0.005    # -0.5% drawdown = monitor
+  emergency_drawdown: -0.01   # -1.0% drawdown = emergency
+  breakeven50_pct_at: -0.002  # Breakeven 50% tại -0.2%
+  breakeven100_pct_at: 0.0    # Breakeven 100% tại 0%
+  min_drawdown_for50_pct: -0.02  # Min -2% để breakeven 50%
+  min_drawdown_for100_pct: -0.03 # Min -3% để breakeven 100%
+
+# =============================================================================
+# DYNAMIC SPREAD CALCULATOR - Tự động điều chỉnh spread
+# =============================================================================
+# DynamicSpreadCalculator điều chỉnh spread theo ATR (volatility)
+#
+# LOGIC:
+# - ATR thấp (<0.3%): Spread hẹp (0.8x base) → Nhiều fill
+# - ATR bình thường (0.3-0.8%): Spread chuẩn (1.0x base)
+# - ATR cao (0.8-1.5%): Spread rộng (1.5x base) → Ít fill hơn
+# - ATR cực cao (>1.5%): Spread rất rộng (2.0x base) → Rất ít fill
+#
+# TRADE-OFF:
+#   base_spread_pct cao: Profit/fill cao, nhưng ít fill hơn
+#   base_spread_pct thấp: Nhiều fill, nhưng profit/fill thấp
+dynamic_spread:
+  enabled: true
+  base_spread_pct: 0.01       # 0.01% base spread
+  low_threshold: 0.3          # ATR < 0.3% = low vol
+  normal_threshold: 0.8       # ATR < 0.8% = normal vol
+  high_threshold: 1.5          # ATR < 1.5% = high vol
+  low_multiplier: 0.8          # 0.8x spread khi low vol
+  normal_multiplier: 1.0      # 1.0x spread khi normal vol
+  high_multiplier: 1.5        # 1.5x spread khi high vol
+  extreme_multiplier: 2.0     # 2.0x spread khi extreme vol
+  atr_period: 7               # 7 nến ATR
+
+# =============================================================================
+# TREND DETECTOR - Phát hiện trend
+# =============================================================================
+# TrendDetector phát hiện trend strength dựa trên RSI
+#
+# LOGIC:
+# - RSI > 70: Overbought → Trend UP mạnh
+# - RSI < 30: Oversold → Trend DOWN mạnh
+# - RSI 30-70: Sideways
+#
+# TRADE-OFF:
+#   rsi_period dài: Trend detection chậm hơn, nhưng ổn định hơn
+#   rsi_period ngắn: Trend detection nhanh hơn, nhưng nhiều false signal
+trend_detector:
+  enabled: false              # TẮT mặc định (chỉ bật khi cần)
+  rsi_period: 14              # 14 nến RSI (chuẩn)
+  update_interval: 5m         # Cập nhật mỗi 5 phút
+
+# =============================================================================
+# FUNDING RATE MONITOR - Theo dõi funding rate
+# =============================================================================
+# FundingRateMonitor theo dõi funding rate để điều chỉnh bias
+#
+# LOGIC:
+# - Funding < 0.1%: Bias SHORT (tránh phí funding)
+# - Funding > 0.1%: Bias LONG (kiếm phí funding)
+# - Funding > 0.5%: Skip symbol (quá cao)
+#
+# TRADE-OFF:
+#   high_threshold thấp: Bắt đầu bias sớm hơn, an toàn hơn
+#   high_threshold cao: Bắt đầu bias muộn hơn, nhưng nhiều opportunity
+funding_monitor:
+  enabled: true
+  high_threshold: 0.001      # 0.1% = high (bias adjustment)
+  extreme_threshold: 0.005   # 0.5% = extreme (skip opening)
+  bias_strength: 0.7         # 70% bias strength
+  skip_threshold: 0.01       # 1% = skip symbol
+  check_interval_minutes: 5  # Kiểm tra mỗi 5 phút
+
+# =============================================================================
+# VOLUME SCALER - Điều chỉnh size theo volume
+# =============================================================================
+# VolumeScaler điều chỉnh order size theo volume 24h
+#
+# LOGIC:
+# - Volume cao: Size lớn (center notional)
+# - Volume thấp: Size nhỏ (edge notional)
+#
+# TRADE-OFF:
+#   center_notional cao: Profit cao, nhưng rủi ro cao
+#   edge_notional thấp: An toàn, nhưng profit thấp
+volume_scaler:
+  enabled: false              # TẮT mặc định (chỉ bật khi cần)
+  center_notional: 150.0      # $150 ở center (volume cao)
+  edge_notional: 20.0         # $20 ở edge (volume thấp)
+  scaling_factor: 0.5         # 50% scaling
+
+# =============================================================================
+# TIME FILTER - Lọc giờ giao dịch
+# =============================================================================
+# TimeFilter giới hạn giờ giao dịch theo timezone
+#
+# LOGIC:
+# - Mode: select (chỉ trade trong slot được chọn)
+# - Mode: exclude (trade trừ slot được loại)
+# - Slots: Danh sách giờ trade với size multiplier
+#
+# TRADE-OFF:
+#   Nhiều slots: Trade nhiều giờ, volume cao, nhưng rủi ro cao
+#   Ít slots: Trade ít giờ, an toàn hơn, nhưng volume thấp
+time_filter:
+  enabled: true
+  mode: "select"              # select: chỉ trade trong slot
+  timezone: "Asia/Ho_Chi_Minh"  # Timezone
+
+  # Trading slots với size multiplier
+  slots:
+    - name: "Phiên Á"
+      start: "07:00"
+      end: "12:00"
+      size_multiplier: 1.0    # Full size
+      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+
+    - name: "Phiên Âu"
+      start: "13:00"
+      end: "18:00"
+      size_multiplier: 0.7    # Giảm 30%
+      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+
+    - name: "Phiên Mỹ"
+      start: "19:00"
+      end: "23:00"
+      size_multiplier: 0.3    # Giảm 70%
+      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+
+    - name: "Phiên khuya"
+      start: "01:00"
+      end: "07:00"
+      size_multiplier: 0.8    # Giảm 20%
+      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
 
 # =============================================================================
 # OPTIMIZATION CONFIGURATION - TỐI ƯU GRID TRADING ⭐ NEW
@@ -535,33 +829,166 @@ optimization:
 # HƯỚNG DẪN TỐI ƯU THEO MỤC TIÊU
 # =============================================================================
 #
-# MỤC TIÊU 1: Tối đa VOLUME (Farming Points)
+# MỤC TIÊU 1: Tối đa VOLUME (Farming Points) ⚡
 # ────────────────────────────────────────────
+# Ưu tiên: Nhiều fill nhất, volume cao nhất, profit micro
+#
+# Config đề xuất:
 # optimization:
-#   micro_grid: { enabled: true, spread_pct: 0.0005, orders_per_side: 7 }
+#   micro_grid: { enabled: true, spread_pct: 0.0005, orders_per_side: 7, order_size_usdt: 3.0 }
 #   fast_range: { enabled: true, bb_period: 10 }
-#   adx_filter: { enabled: true }
+#   adx_filter: { enabled: true, sideways_adx_max: 20 }
 # volume_farming:
 #   order_size_usdt: 3
 #   grid_spread_pct: 0.0005
 #   max_orders_per_side: 7
+#   replace_immediately: true
+# risk:
+#   max_position_usdt_per_symbol: 100
+#   max_consecutive_losses: 5
 #
-# MỤC TIÊU 2: Tối đa PROFIT (Risk cao hơn)
+# Kết quả dự kiến:
+# - Volume: ~$15,000-20,000/ngày
+# - Win rate: ~55-60%
+# - Profit/fill: ~2-5 bps
+# - Risk: HIGH (tight spread, high leverage)
+#
+# ⚠️ CHỈ DÙNG KHI: Capital đủ lớn, chịu được drawdown 20-30%
+#
+# MỤC TIÊU 2: Tối đa PROFIT (Risk cao hơn) 💰
 # ────────────────────────────────────────────
+# Ưu tiên: Profit/fill cao, leverage tối ưu
+#
+# Config đề xuất:
 # optimization:
 #   micro_grid: { enabled: false }
-#   dynamic_leverage: { enabled: true }
-# volume_farming:
-#   order_size_usdt: 20
-#   grid_spread_pct: 0.002
-#
-# MỤC TIÊU 3: AN TOÀN (Risk thấp)
-# ─────────────────────────────────────────
-# optimization:
+#   dynamic_leverage: { enabled: true, base_leverage: 50 }
 #   multi_layer_liquidation: { enabled: true }
+# volume_farming:
+#   order_size_usdt: 15
+#   grid_spread_pct: 0.002
+#   max_orders_per_side: 8
+#   partial_close: { enabled: true }
+# risk:
+#   max_position_usdt_per_symbol: 300
+#   stop_loss_pct: 0.02
+#   take_profit_rratio: 2.0
+#
+# Kết quả dự kiến:
+# - Volume: ~$8,000-12,000/ngày
+# - Win rate: ~60-65%
+# - Profit/fill: ~10-20 bps
+# - Risk: MEDIUM-HIGH
+#
+# ⚠️ CHỈ DÙNG KHI: Hiểu rõ risk management, chịu được drawdown 15-20%
+#
+# MỤC TIÊU 3: AN TOÀN (Risk thấp) 🛡️
+# ─────────────────────────────────────────
+# Ưu tiên: Risk thấp, drawdown nhỏ, ổn định
+#
+# Config đề xuất:
+# optimization:
+#   micro_grid: { enabled: false }
 #   adx_filter: { enabled: true, sideways_adx_max: 15 }
+#   multi_layer_liquidation: { enabled: true, layer3_close_pct: 0.20 }
+#   dynamic_leverage: { enabled: false }
 # volume_farming:
 #   order_size_usdt: 5
+#   grid_spread_pct: 0.002
+#   max_orders_per_side: 5
 #   max_daily_loss_usdt: 2
+# risk:
+#   max_position_usdt_per_symbol: 100
+#   max_consecutive_losses: 2
+#   cooldown_duration: 60s
+#   liquidation_buffer_pct: 0.50
+#
+# Kết quả dự kiến:
+# - Volume: ~$5,000-8,000/ngày
+# - Win rate: ~65-70%
+# - Profit/fill: ~5-10 bps
+# - Risk: LOW-MEDIUM
+#
+# ✅ KHUYẾN NGHỊ CHO NGƯỜI MỚI: Bắt đầu với mục tiêu này
+#
+# MỤC TIÊU 4: BALANCE (Cân bằng) ⚖️
+# ──────────────────────────────────────
+# Ưu tiên: Balance giữa volume, profit, và risk
+#
+# Config đề xuất (HIỆN TẠI):
+# optimization:
+#   micro_grid: { enabled: true, spread_pct: 0.0005, orders_per_side: 5, order_size_usdt: 3.0 }
+#   fast_range: { enabled: true, bb_period: 10 }
+#   adx_filter: { enabled: true, sideways_adx_max: 20 }
+#   dynamic_leverage: { enabled: true, base_leverage: 50 }
+#   multi_layer_liquidation: { enabled: true }
+# volume_farming:
+#   order_size_usdt: 20.5
+#   grid_spread_pct: 0.0015
+#   max_orders_per_side: 10
+#   max_daily_loss_usdt: 3
+# risk:
+#   max_position_usdt_per_symbol: 300
+#   max_consecutive_losses: 3
+#   cooldown_duration: 30s
+#   liquidation_buffer_pct: 0.35
+#
+# Kết quả dự kiến:
+# - Volume: ~$10,000-15,000/ngày
+# - Win rate: ~60-65%
+# - Profit/fill: ~5-10 bps
+# - Risk: MEDIUM
+#
+# ✅ KHUYẾN NGHỊ CHO PRODUCTION: Cân bằng tốt nhất
+#
+# =============================================================================
+# QUICK REFERENCE - CÁC CONFIG QUAN TRỌNG NHẤT
+# =============================================================================
+#
+# 1. NẾU MUỐN TĂNG VOLUME:
+#    - Tăng max_orders_per_side (5 → 10)
+#    - Giảm grid_spread_pct (0.002 → 0.0005)
+#    - Bật optimization.micro_grid
+#    - Giảm order_size_usdt (20 → 3)
+#
+# 2. NẾU MUỐN TĂNG PROFIT:
+#    - Tăng grid_spread_pct (0.0015 → 0.002)
+#    - Tăng order_size_usdt (3 → 15)
+#    - Bật optimization.dynamic_leverage
+#    - Tăng take_profit_rratio (1.5 → 2.0)
+#
+# 3. NẾU MUỐN GIẢM RISK:
+#    - Giảm max_position_usdt_per_symbol (300 → 100)
+#    - Tăng liquidation_buffer_pct (0.35 → 0.50)
+#    - Giảm max_consecutive_losses (3 → 2)
+#    - Tăng cooldown_duration (30s → 60s)
+#    - Giảm adx_filter.sideways_adx_max (20 → 15)
+#
+# 4. NẾU MARGIN INSUFFICIENT:
+#    - Giảm order_size_usdt (20 → 5)
+#    - Giảm max_orders_per_side (10 → 5)
+#    - Giảm max_position_usdt_per_symbol (300 → 100)
+#    - Tắt optimization.dynamic_leverage
+#
+# 5. NẾU BỊ LIQUIDATION:
+#    - Tăng liquidation_buffer_pct (0.35 → 0.50)
+#    - Giảm leverage (dynamic_leverage.base_leverage: 50 → 20)
+#    - Giảm order_size_usdt (20 → 5)
+#    - Bật optimization.multi_layer_liquidation
+#
+# =============================================================================
+# CHECKLIST TRƯỚC KHI CHẠY PRODUCTION
+# =============================================================================
+#
+# [ ] Bot đã test với dry_run: true
+# [ ] Margin đủ cho max_position_usdt_per_symbol
+# [ ] API key có quyền futures trading
+# [ ] Config đã backup
+# [ ] Monitoring đã setup (logs, alerts)
+# [ ] Stop-loss đã test
+# [ ] Circuit breakers đã test
+# [ ] Risk limits đã review
+# [ ] Trading hours đã config
+# [ ] Whitelist đã verify
 #
 # =============================================================================

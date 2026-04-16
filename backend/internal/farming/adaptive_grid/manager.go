@@ -438,6 +438,13 @@ func (a *AdaptiveGridManager) SetStateMachine(sm *GridStateMachine) {
 	a.stateMachine = sm
 }
 
+// GetStateMachine returns the state machine
+func (a *AdaptiveGridManager) GetStateMachine() *GridStateMachine {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.stateMachine
+}
+
 // SetExitExecutor wires the exit executor for fast exit on breakouts
 func (a *AdaptiveGridManager) SetExitExecutor(executor interface{}) {
 	a.mu.Lock()

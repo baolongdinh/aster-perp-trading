@@ -63,7 +63,7 @@ func NewWebSocketClient(baseURL string, logger *zap.Logger) *WebSocketClient {
 		logger:            logger,
 		stopCh:            make(chan struct{}),
 		tickerCh:          make(chan map[string]interface{}, 2000),
-		klineCh:           make(chan KlineMessage, 1000),
+		klineCh:           make(chan KlineMessage, 5000),
 		subscribedSymbols: make(map[string]bool),
 		orderCache:        make(map[string]map[int64]Order),
 		positionCache:     make(map[string]Position),
@@ -342,14 +342,31 @@ func (ws *WebSocketClient) processKlineMessage(msg map[string]interface{}) bool 
 		EndTime:   endTime,
 	}
 
+	// Circular buffer: when full, drop oldest and insert new
+	// For trading, we want the MOST RECENT data, not stale old data
 	select {
 	case ws.klineCh <- klineMsg:
-		ws.logger.Debug("Kline message processed",
-			zap.String("symbol", symbol),
-			zap.String("interval", interval),
-			zap.Bool("is_closed", isClosed))
+		// Log channel depth periodically (every 100 messages when > 50% full)
+		depth := len(ws.klineCh)
+		if depth > 2500 && depth%100 == 0 {
+			ws.logger.Warn("Kline channel depth high",
+				zap.String("symbol", symbol),
+				zap.Int("depth", depth),
+				zap.Int("capacity", cap(ws.klineCh)))
+		} else {
+			ws.logger.Debug("Kline message processed",
+				zap.String("symbol", symbol),
+				zap.String("interval", interval),
+				zap.Bool("is_closed", isClosed))
+		}
 	default:
-		ws.logger.Warn("Kline channel full, dropping message", zap.String("symbol", symbol))
+		// Channel full: drop oldest message to make room for new one
+		<-ws.klineCh           // Drop oldest
+		ws.klineCh <- klineMsg // Insert new
+		ws.logger.Warn("Kline channel full, dropped oldest message to insert new",
+			zap.String("symbol", symbol),
+			zap.Int("depth", len(ws.klineCh)),
+			zap.Int("capacity", cap(ws.klineCh)))
 	}
 	return true
 }
@@ -357,6 +374,11 @@ func (ws *WebSocketClient) processKlineMessage(msg map[string]interface{}) bool 
 // GetKlineChannel returns the kline update channel for RangeDetector warm-up
 func (ws *WebSocketClient) GetKlineChannel() <-chan KlineMessage {
 	return ws.klineCh
+}
+
+// GetKlineChannelDepth returns current kline channel depth for monitoring
+func (ws *WebSocketClient) GetKlineChannelDepth() int {
+	return len(ws.klineCh)
 }
 
 // UnsubscribeFromKlines unsubscribes from kline streams after warm-up complete
@@ -424,11 +446,17 @@ func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 	if stream, ok := msg["stream"].(string); ok {
 		// Look for @ticker streams
 		if len(stream) > 7 && stream[len(stream)-7:] == "@ticker" {
+			// Circular buffer: when full, drop oldest and insert new
 			select {
 			case ws.tickerCh <- msg:
 				ws.logger.Debug("Ticker message processed", zap.String("stream", stream))
 			default:
-				ws.logger.Warn("Ticker channel full, dropping message")
+				<-ws.tickerCh      // Drop oldest
+				ws.tickerCh <- msg // Insert new
+				ws.logger.Warn("Ticker channel full, dropped oldest message to insert new",
+					zap.String("stream", stream),
+					zap.Int("depth", len(ws.tickerCh)),
+					zap.Int("capacity", cap(ws.tickerCh)))
 			}
 			return
 		}
@@ -612,11 +640,17 @@ func (ws *WebSocketClient) processArrayMessage(msgArray []interface{}) {
 		"data":   msgArray,
 	}
 
+	// Circular buffer: when full, drop oldest and insert new
 	select {
 	case ws.tickerCh <- wrapperMsg:
 		// ws.logger.Debug("Array ticker message processed", zap.Int("count", len(msgArray)))
 	default:
-		ws.logger.Warn("Ticker channel full, dropping array message")
+		<-ws.tickerCh             // Drop oldest
+		ws.tickerCh <- wrapperMsg // Insert new
+		ws.logger.Warn("Ticker channel full, dropped oldest array message to insert new",
+			zap.Int("array_count", len(msgArray)),
+			zap.Int("depth", len(ws.tickerCh)),
+			zap.Int("capacity", cap(ws.tickerCh)))
 	}
 }
 
