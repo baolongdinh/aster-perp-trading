@@ -444,6 +444,154 @@ volume_farming:
       spread_multiplier: 1.5               # Nhân spread trong RECOVERY (1.5x)
       stable_duration_min: 30              # Thời gian PnL ổn định tối thiểu (phút)
 
+    # ConditionBlocker - Conditional blocking (replaces state-based blocking)
+    condition_blocker:
+      enabled: true                        # Bật/tắt ConditionBlocker
+      # Score weights (tổng = 1.0)
+      position_size_weight: 0.3            # Trọng số position size (30%)
+      volatility_weight: 0.2              # Trọng số volatility (20%)
+      risk_weight: 0.25                    # Trọng số risk (25%)
+      trend_weight: 0.1                   # Trọng số trend (10%)
+      skew_weight: 0.15                    # Trọng số skew (15%)
+      # Blocking thresholds
+      blocking_threshold: 0.7              # Ngưỡng kích hoạt blocking (0.7 = 70%)
+      micro_mode_min: 0.1                  # Ngưỡng MICRO mode (0.1 = 10% size)
+
+    # AdaptiveThresholds - Adaptive threshold management
+    adaptive_thresholds:
+      enabled: true                        # Bật/tắt adaptive thresholds
+      # Base thresholds
+      base_position_threshold: 0.8        # Base threshold for position size
+      base_volatility_threshold: 0.8      # Base threshold for volatility
+      base_risk_threshold: 0.6            # Base threshold for risk
+      base_trend_threshold: 0.7           # Base threshold for trend
+      # Adaptation parameters
+      adaptation_rate: 0.1                # How quickly thresholds adapt (0-1)
+      min_threshold: 0.1                   # Minimum threshold value
+      max_threshold: 1.0                   # Maximum threshold value
+      # Learning parameters
+      enable_learning: true                # Enable threshold learning from performance
+      learning_rate: 0.05                  # Learning rate for threshold adaptation
+
+    # Dynamic Sizing - Enhanced position sizing with multiple factors
+    dynamic_sizing:
+      enabled: true                        # Bật/tắt dynamic sizing
+      # Kelly Criterion
+      kelly_fraction: 0.25                 # Conservative Kelly fraction (25%)
+      min_kelly: 0.1                       # Minimum Kelly (10%)
+      max_kelly: 1.0                       # Maximum Kelly (100%)
+      # Consecutive loss decay
+      loss_decay_rate: 0.8                 # Size reduction per loss (20%)
+      win_recovery_rate: 1.1               # Size increase per win (10%)
+      max_recovery_multiplier: 1.5        # Max size multiplier after wins
+      # Risk adjustment
+      drawdown_factor: 1.0                 # Drawdown impact (1.0 = 100%)
+      min_drawdown_factor: 0.5             # Minimum factor after drawdown
+      pnl_increase_cap: 0.5                # Max size increase from PnL (+50%)
+      pnl_decrease_cap: 0.3                # Max size decrease from PnL (-30%)
+      # Opportunity adjustment
+      spread_factor: 10.0                  # Spread impact multiplier
+      min_spread_factor: 0.3               # Minimum spread factor
+      depth_factor: 10000.0                # Order book depth divisor
+      max_depth_increase: 0.2              # Max size increase from depth (+20%)
+      funding_factor: 10.0                 # Funding rate impact
+      max_funding_adjustment: 0.2          # Max size adjustment from funding (±20%)
+      # Liquidity adjustment
+      depth_divisor: 50000.0               # Order book depth divisor for liquidity
+      max_depth_liquidity: 0.3            # Max size increase from liquidity (+30%)
+      volume_divisor: 1000000.0            # Volume divisor
+      max_volume_increase: 0.2             # Max size increase from volume (+20%)
+      # Size limits
+      min_size_usdt: 5.0                   # Minimum order size
+      max_size_usdt: 100.0                 # Maximum order size
+      base_size_pct: 0.01                  # Base size as % of equity (1%)
+      leverage_normalization: 50.0         # Leverage normalization (50x base)
+
+    # Dynamic Timeout - Adaptive EXIT_ALL timeout based on conditions
+    dynamic_timeout:
+      enabled: true                        # Bật/tắt dynamic timeout
+      base_timeout_seconds: 15             # Base timeout in seconds
+      min_timeout_seconds: 5               # Minimum timeout (loss positions)
+      max_timeout_seconds: 60              # Maximum timeout (profitable positions)
+      # PnL-based adjustment
+      pnl_multiplier: 10.0                 # PnL impact on timeout (profitable = longer)
+      loss_multiplier: 5.0                 # Loss impact on timeout (loss = shorter)
+      max_pnl_multiplier: 4.0              # Max timeout multiplier from PnL
+      min_loss_multiplier: 0.33            # Min timeout multiplier from loss
+      # Volatility-based adjustment
+      low_volatility_adx: 30              # ADX threshold for low volatility
+      low_volatility_multiplier: 1.2       # Timeout multiplier in low volatility
+      high_volatility_adx: 60             # ADX threshold for high volatility
+      high_volatility_multiplier: 0.7      # Timeout multiplier in high volatility
+      # Regime-based adjustment
+      ranging_multiplier: 1.1              # Timeout multiplier in ranging regime
+      trending_multiplier: 0.8             # Timeout multiplier in trending regime
+      volatile_multiplier: 0.6             # Timeout multiplier in volatile regime
+
+    # Conditional Transitions - Advanced state transition logic
+    conditional_transitions:
+      enabled: true                        # Bật/tắt conditional transitions
+      confidence_threshold: 0.6            # Minimum confidence to allow transition (0-1)
+      # Emergency transition thresholds
+      emergency_risk_count: 2              # Number of high risks to trigger emergency EXIT_ALL
+      position_risk_threshold: 0.8         # Position % threshold for risk (80%)
+      volatility_risk_threshold: 0.8       # Volatility threshold for risk (0-1)
+      drawdown_risk_threshold: 0.15        # Drawdown threshold for risk (15%)
+      # Conditional transition thresholds
+      over_size_to_defensive:
+        position_threshold: 0.7            # Position % to allow OVER_SIZE → DEFENSIVE
+        volatility_threshold: 0.8          # Volatility to allow transition
+      defensive_to_recovery:
+        pnl_threshold: 0.0                 # PnL threshold to allow DEFENSIVE → RECOVERY (negative = loss)
+      recovery_to_over_size:
+        position_threshold: 0.6            # Position % to allow RECOVERY → OVER_SIZE
+
+    # Graduated Trading Modes - Circuit breaker mode management
+    graduated_modes:
+      enabled: true                        # Bật/tắt graduated trading modes
+      # Mode thresholds for CalculateTradingMode
+      paused_drawdown_threshold: 0.2        # Drawdown threshold for PAUSED mode (20%)
+      paused_loss_threshold: 5              # Consecutive losses threshold for PAUSED
+      paused_volatility_threshold: 0.9      # Volatility threshold for PAUSED
+      reduced_drawdown_threshold: 0.1       # Drawdown threshold for REDUCED mode (10%)
+      reduced_loss_threshold: 3             # Consecutive losses threshold for REDUCED
+      reduced_risk_threshold: 0.8          # Risk threshold for REDUCED
+      reduced_volatility_threshold: 0.6     # Volatility threshold for REDUCED
+      full_risk_threshold: 0.5             # Risk threshold for FULL mode
+      full_volatility_threshold: 0.4       # Volatility threshold for FULL mode
+      full_drawdown_threshold: 0.05        # Drawdown threshold for FULL mode
+      # Mode parameters
+      min_mode_duration_minutes: 5          # Minimum time to stay in each mode (5 minutes)
+      full_mode:
+        spread_multiplier: 1.0              # Spread multiplier (1x normal)
+        order_multiplier: 1.0              # Order count multiplier (1x normal)
+        size_multiplier: 1.0               # Order size multiplier (1x normal)
+      reduced_mode:
+        spread_multiplier: 1.5              # Spread multiplier (1.5x wider)
+        order_multiplier: 0.5              # Order count multiplier (0.5x fewer)
+        size_multiplier: 0.5               # Order size multiplier (0.5x smaller)
+      micro_mode:
+        spread_multiplier: 0.5              # Spread multiplier (0.5x tighter)
+        order_multiplier: 2.0              # Order count multiplier (2x more)
+        size_multiplier: 0.1               # Order size multiplier (0.1x tiny)
+      paused_mode:
+        spread_multiplier: 0.0              # No trading
+        order_multiplier: 0.0              # No orders
+        size_multiplier: 0.0               # No size
+
+    # Graduated Exit Options - Dynamic exit logic
+    graduated_exit:
+      enabled: true                        # Bật/tắt graduated exit
+      small_loss_threshold: 0.02          # 2% loss threshold for 25% exit
+      medium_loss_threshold: 0.05         # 5% loss threshold for 50% exit
+      large_loss_threshold: 0.10          # 10% loss threshold for 75% exit
+      extreme_loss_threshold: 0.15         # 15% loss threshold for 100% exit
+      exit_percentages:
+        small_loss: 0.25                   # 25% exit for small loss
+        medium_loss: 0.50                 # 50% exit for medium loss
+        large_loss: 0.75                  # 75% exit for large loss
+        extreme_loss: 1.0                 # 100% exit for extreme loss
+
 # =============================================================================
 # API & LOGGING
 # =============================================================================
@@ -968,6 +1116,63 @@ optimization:
 #
 # ✅ KHUYẾN NGHỊ CHO PRODUCTION: Cân bằng tốt nhất
 #
+# =============================================================================
+# =============================================================================
+# VOLUME FARMING OPTIMIZATION - Tối ưu hóa volume farming
+# =============================================================================
+# Các cải tiến để tăng hiệu quả volume farming và giảm rủi ro
+# =============================================================================
+volume_farming_optimization:
+  enabled: true
+
+  # Order Priority - Ưu tiên thứ tự lệnh
+  # ====================================
+  order_priority:
+    tick_size_awareness:
+      enabled: true
+      tick_sizes:
+        BTCUSD1: 0.1
+        ETHUSD1: 0.01
+        SOLUSD1: 0.001
+        XRPUSD1: 0.0001
+        DOGEUSD1: 0.00001
+      default_tick_size: 0.01
+    penny_jumping:
+      enabled: false  # Phase 3 - cần backtesting
+      jump_threshold: 0.1  # 10% của spread
+      max_jump: 3  # Max 3 ticks
+
+  # Toxic Flow Detection - Phát hiện dòng chảy độc hại
+  # ===================================================
+  toxic_flow_detection:
+    enabled: true
+    window_size: 50  # Số buckets
+    bucket_size: 1000.0  # Volume mỗi bucket (USDT)
+    vpin_threshold: 0.3  # Ngưỡng VPIN (0-1)
+    sustained_breaches: 2  # Số breach liên tiếp
+    action: "pause"  # pause, widen_spread, reduce_size
+    auto_resume_delay: 5s  # Thời gian auto-resume
+
+  # Maker/Taker Optimization - Tối ưu phí maker/taker
+  # ==================================================
+  maker_taker_optimization:
+    post_only_enabled: true  # Luôn dùng post-only flag
+    post_only_fallback: true  # Fallback nếu post-only reject
+    smart_cancellation:
+      enabled: true
+      spread_change_threshold: 0.2  # 20% spread change
+      check_interval: 5s  # Kiểm tra mỗi 5s
+
+  # Inventory Hedging - Quản lý inventory (Phase 3)
+  # ================================================
+  inventory_hedging:
+    enabled: false  # Phase 3
+    hedge_threshold: 0.3  # 30% inventory trigger
+    hedge_ratio: 0.3  # Hedge 30% của position
+    max_hedge_size: 100.0  # Max 100 USDT
+    hedging_mode: "internal"  # internal, cross_pair, scalping
+    hedge_pair: "ETH"  # Hedge pair cho cross-pair mode
+
 # =============================================================================
 # QUICK REFERENCE - CÁC CONFIG QUAN TRỌNG NHẤT
 # =============================================================================

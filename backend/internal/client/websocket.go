@@ -363,10 +363,6 @@ func (ws *WebSocketClient) processKlineMessage(msg map[string]interface{}) bool 
 		// Channel full: drop oldest message to make room for new one
 		<-ws.klineCh           // Drop oldest
 		ws.klineCh <- klineMsg // Insert new
-		ws.logger.Warn("Kline channel full, dropped oldest message to insert new",
-			zap.String("symbol", symbol),
-			zap.Int("depth", len(ws.klineCh)),
-			zap.Int("capacity", cap(ws.klineCh)))
 	}
 	return true
 }

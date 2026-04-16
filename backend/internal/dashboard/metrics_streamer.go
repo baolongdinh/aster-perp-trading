@@ -164,3 +164,15 @@ func (s *MetricsStreamer) ClientCount() int {
 	defer s.mu.RUnlock()
 	return len(s.clients)
 }
+
+// BroadcastContinuousState broadcasts continuous state dimensions to dashboard
+func (s *MetricsStreamer) BroadcastContinuousState(symbol string, positionSize, volatility, risk, trend, skew float64) {
+	data := map[string]interface{}{
+		"position_size": positionSize,
+		"volatility":    volatility,
+		"risk":          risk,
+		"trend":         trend,
+		"skew":          skew,
+	}
+	s.BroadcastMetric("continuous_state", symbol, data, time.Now())
+}

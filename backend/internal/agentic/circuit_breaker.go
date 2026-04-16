@@ -9,6 +9,22 @@ import (
 	"go.uber.org/zap"
 )
 
+// TradingMode constants for graduated trading modes
+const (
+	TradingModeFull    = "FULL"    // Normal trading - normal spread, normal orders, normal size
+	TradingModeReduced = "REDUCED" // Reduced trading - wider spread, fewer orders, reduced size
+	TradingModeMicro   = "MICRO"   // Micro trading - ultra-tight spread, many orders, tiny size
+	TradingModePaused  = "PAUSED"  // Paused - no trading
+)
+
+// ModeParameters holds trading parameters for each mode
+type ModeParameters struct {
+	SpreadMultiplier float64       // Spread multiplier relative to base
+	OrderMultiplier  float64       // Number of orders multiplier relative to base
+	SizeMultiplier   float64       // Order size multiplier relative to base
+	MinModeDuration  time.Duration // Minimum time to stay in this mode
+}
+
 // SymbolDecisionState holds circuit breaker and mode decision state for a single symbol
 type SymbolDecisionState struct {
 	isTripped         bool
@@ -40,6 +56,12 @@ type CircuitBreaker struct {
 	evaluationInterval time.Duration // How often to evaluate market conditions (default 3s)
 	stopCh             chan struct{}
 
+	// Mode parameters for each trading mode
+	modeParameters map[string]*ModeParameters
+
+	// Graduated modes config
+	graduatedModesConfig *config.GraduatedModesConfig
+
 	// Callback when circuit breaker trips for a symbol
 	// Used to trigger emergency exit in farming engine
 	onTripCallback func(symbol, reason string)
@@ -62,6 +84,37 @@ func NewCircuitBreaker(cfg config.AgenticCircuitBreakerConfig, logger *zap.Logge
 		maxATRHistory:      20,
 		evaluationInterval: 3 * time.Second,
 		stopCh:             make(chan struct{}),
+		modeParameters:     getDefaultModeParameters(),
+	}
+}
+
+// getDefaultModeParameters returns default mode parameters
+func getDefaultModeParameters() map[string]*ModeParameters {
+	return map[string]*ModeParameters{
+		TradingModeFull: {
+			SpreadMultiplier: 1.0,
+			OrderMultiplier:  1.0,
+			SizeMultiplier:   1.0,
+			MinModeDuration:  5 * time.Minute,
+		},
+		TradingModeReduced: {
+			SpreadMultiplier: 1.5,
+			OrderMultiplier:  0.5,
+			SizeMultiplier:   0.5,
+			MinModeDuration:  5 * time.Minute,
+		},
+		TradingModeMicro: {
+			SpreadMultiplier: 0.5,
+			OrderMultiplier:  2.0,
+			SizeMultiplier:   0.1,
+			MinModeDuration:  5 * time.Minute,
+		},
+		TradingModePaused: {
+			SpreadMultiplier: 0.0,
+			OrderMultiplier:  0.0,
+			SizeMultiplier:   0.0,
+			MinModeDuration:  5 * time.Minute,
+		},
 	}
 }
 
@@ -613,8 +666,8 @@ func (cb *CircuitBreaker) GetSymbolDecision(symbol string) (bool, string) {
 
 	state, exists := cb.symbolStates[symbol]
 	if !exists {
-		// New symbol - can trade with default MICRO mode
-		return true, "MICRO"
+		// New symbol - can trade with default FULL mode
+		return true, TradingModeFull
 	}
 
 	// If circuit breaker is tripped, cannot trade
@@ -622,11 +675,210 @@ func (cb *CircuitBreaker) GetSymbolDecision(symbol string) (bool, string) {
 		return false, state.tradingMode
 	}
 
-	// If in COOLDOWN mode, cannot trade
-	if state.tradingMode == "COOLDOWN" {
+	// If in PAUSED mode, cannot trade
+	if state.tradingMode == TradingModePaused {
 		return false, state.tradingMode
 	}
 
 	// Can trade
 	return true, state.tradingMode
+}
+
+// CalculateTradingMode calculates the appropriate trading mode based on conditions
+// Mode = f(risk, volatility, drawdown, losses, funding)
+func (cb *CircuitBreaker) CalculateTradingMode(
+	risk float64, // Risk level (0-1)
+	volatility float64, // Volatility level (0-1)
+	drawdown float64, // Drawdown (0-1)
+	losses int, // Consecutive losses
+	funding float64, // Funding rate
+) string {
+	// Use config thresholds if available, otherwise use defaults
+	pausedDrawdown := 0.2
+	pausedLosses := 5
+	pausedVolatility := 0.9
+	reducedDrawdown := 0.1
+	reducedLosses := 3
+	reducedRisk := 0.8
+	reducedVolatility := 0.6
+	fullRisk := 0.5
+	fullVolatility := 0.4
+	fullDrawdown := 0.05
+
+	if cb.graduatedModesConfig != nil {
+		pausedDrawdown = cb.graduatedModesConfig.PausedDrawdownThreshold
+		pausedLosses = cb.graduatedModesConfig.PausedLossThreshold
+		pausedVolatility = cb.graduatedModesConfig.PausedVolatilityThreshold
+		reducedDrawdown = cb.graduatedModesConfig.ReducedDrawdownThreshold
+		reducedLosses = cb.graduatedModesConfig.ReducedLossThreshold
+		reducedRisk = cb.graduatedModesConfig.ReducedRiskThreshold
+		reducedVolatility = cb.graduatedModesConfig.ReducedVolatilityThreshold
+		fullRisk = cb.graduatedModesConfig.FullRiskThreshold
+		fullVolatility = cb.graduatedModesConfig.FullVolatilityThreshold
+		fullDrawdown = cb.graduatedModesConfig.FullDrawdownThreshold
+	}
+
+	// Priority 1: Extreme conditions -> PAUSED
+	if drawdown > pausedDrawdown || losses >= pausedLosses || volatility > pausedVolatility {
+		return TradingModePaused
+	}
+
+	// Priority 2: High risk/drawdown -> REDUCED
+	if drawdown > reducedDrawdown || losses >= reducedLosses || risk > reducedRisk {
+		return TradingModeReduced
+	}
+
+	// Priority 3: Moderate conditions -> REDUCED or FULL
+	if volatility > reducedVolatility || losses >= 1 {
+		return TradingModeReduced
+	}
+
+	// Priority 4: Good conditions -> FULL
+	if risk < fullRisk && volatility < fullVolatility && drawdown < fullDrawdown {
+		return TradingModeFull
+	}
+
+	// Priority 5: Default -> MICRO (always trade)
+	return TradingModeMicro
+}
+
+// SetGraduatedModesConfig sets the graduated modes configuration
+func (cb *CircuitBreaker) SetGraduatedModesConfig(config *config.GraduatedModesConfig) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.graduatedModesConfig = config
+	cb.logger.Info("Graduated modes config set on circuit breaker")
+
+	// Update mode parameters from config if available
+	if config != nil {
+		if config.FullMode != nil {
+			cb.modeParameters[TradingModeFull] = &ModeParameters{
+				SpreadMultiplier: config.FullMode.SpreadMultiplier,
+				OrderMultiplier:  config.FullMode.OrderMultiplier,
+				SizeMultiplier:   config.FullMode.SizeMultiplier,
+				MinModeDuration:  time.Duration(config.MinModeDurationMinutes) * time.Minute,
+			}
+		}
+		if config.ReducedMode != nil {
+			cb.modeParameters[TradingModeReduced] = &ModeParameters{
+				SpreadMultiplier: config.ReducedMode.SpreadMultiplier,
+				OrderMultiplier:  config.ReducedMode.OrderMultiplier,
+				SizeMultiplier:   config.ReducedMode.SizeMultiplier,
+				MinModeDuration:  time.Duration(config.MinModeDurationMinutes) * time.Minute,
+			}
+		}
+		if config.MicroMode != nil {
+			cb.modeParameters[TradingModeMicro] = &ModeParameters{
+				SpreadMultiplier: config.MicroMode.SpreadMultiplier,
+				OrderMultiplier:  config.MicroMode.OrderMultiplier,
+				SizeMultiplier:   config.MicroMode.SizeMultiplier,
+				MinModeDuration:  time.Duration(config.MinModeDurationMinutes) * time.Minute,
+			}
+		}
+		if config.PausedMode != nil {
+			cb.modeParameters[TradingModePaused] = &ModeParameters{
+				SpreadMultiplier: config.PausedMode.SpreadMultiplier,
+				OrderMultiplier:  config.PausedMode.OrderMultiplier,
+				SizeMultiplier:   config.PausedMode.SizeMultiplier,
+				MinModeDuration:  time.Duration(config.MinModeDurationMinutes) * time.Minute,
+			}
+		}
+	}
+}
+
+// UpdateTradingMode updates the trading mode for a symbol with cooldown enforcement
+// Minimum 5 minutes per mode to prevent rapid switching
+func (cb *CircuitBreaker) UpdateTradingMode(symbol string, newMode string) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	state, exists := cb.symbolStates[symbol]
+	if !exists {
+		state = &SymbolDecisionState{
+			atrHistory:     make([]float64, 0, cb.maxATRHistory),
+			bbWidthHistory: make([]float64, 0, cb.maxATRHistory),
+			priceHistory:   make([]float64, 0, cb.maxATRHistory),
+			volumeHistory:  make([]float64, 0, cb.maxATRHistory),
+			adxHistory:     make([]float64, 0, cb.maxATRHistory),
+			tradingMode:    TradingModeMicro,
+			modeSince:      time.Now(),
+		}
+		cb.symbolStates[symbol] = state
+	}
+
+	// Check if minimum mode duration has elapsed
+	if state.tradingMode == newMode {
+		return // Already in this mode
+	}
+
+	modeParams, exists := cb.modeParameters[state.tradingMode]
+	if !exists {
+		modeParams = cb.modeParameters[TradingModeMicro] // Default to MICRO
+	}
+
+	timeInMode := time.Since(state.modeSince)
+	if timeInMode < modeParams.MinModeDuration {
+		cb.logger.Debug("Mode transition rejected: minimum duration not met",
+			zap.String("symbol", symbol),
+			zap.String("currentMode", state.tradingMode),
+			zap.String("newMode", newMode),
+			zap.Duration("timeInMode", timeInMode),
+			zap.Duration("minDuration", modeParams.MinModeDuration))
+		return
+	}
+
+	// Allow mode transition
+	oldMode := state.tradingMode
+	state.tradingMode = newMode
+	state.modeSince = time.Now()
+
+	cb.logger.Info("Trading mode updated",
+		zap.String("symbol", symbol),
+		zap.String("oldMode", oldMode),
+		zap.String("newMode", newMode),
+		zap.Duration("timeInPreviousMode", timeInMode))
+
+	// Trigger callback if set
+	if cb.onModeChangeCallback != nil {
+		cb.onModeChangeCallback(symbol, oldMode, newMode)
+	}
+}
+
+// GetModeParameters returns the parameters for a specific trading mode
+func (cb *CircuitBreaker) GetModeParameters(mode string) *ModeParameters {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	params, exists := cb.modeParameters[mode]
+	if !exists {
+		// Default to MICRO mode parameters
+		return cb.modeParameters[TradingModeMicro]
+	}
+	return params
+}
+
+// SetModeParameters sets custom parameters for a specific trading mode
+func (cb *CircuitBreaker) SetModeParameters(mode string, params *ModeParameters) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.modeParameters[mode] = params
+	cb.logger.Info("Mode parameters updated",
+		zap.String("mode", mode),
+		zap.Float64("spreadMultiplier", params.SpreadMultiplier),
+		zap.Float64("orderMultiplier", params.OrderMultiplier),
+		zap.Float64("sizeMultiplier", params.SizeMultiplier),
+		zap.Duration("minModeDuration", params.MinModeDuration))
+}
+
+// GetTradingMode returns the current trading mode for a symbol
+func (cb *CircuitBreaker) GetTradingMode(symbol string) string {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	state, exists := cb.symbolStates[symbol]
+	if !exists {
+		return TradingModeMicro
+	}
+	return state.tradingMode
 }

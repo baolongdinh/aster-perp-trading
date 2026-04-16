@@ -1,6 +1,7 @@
 package adaptive_grid
 
 import (
+	"aster-bot/internal/config"
 	"fmt"
 	"sync"
 	"time"
@@ -119,13 +120,19 @@ type SymbolState struct {
 	ConsecutiveLosses    int
 	RegridCooldownActive bool
 	RegridCooldownUntil  time.Time
+	ContinuousState      *ContinuousState   // NEW: Continuous multi-dimensional state
+	MergedStates         []GridState        // NEW: Allow multiple states to coexist (e.g., OVER_SIZE + DEFENSIVE)
+	TransitionConfidence float64            // NEW: Confidence score for last transition (0-1)
+	LastConditions       map[string]float64 // NEW: Last condition values used for transition
+	ExitPercentage       float64            // NEW: Graduated exit percentage (0-1) for EXIT_ALL state
 }
 
 // GridStateMachine manages the trading lifecycle state for all symbols
 type GridStateMachine struct {
-	states map[string]*SymbolState
-	mu     sync.RWMutex
-	logger *zap.Logger
+	states                       map[string]*SymbolState
+	mu                           sync.RWMutex
+	logger                       *zap.Logger
+	conditionalTransitionsConfig *config.ConditionalTransitionsConfig
 }
 
 // NewGridStateMachine creates a new state machine
@@ -134,6 +141,14 @@ func NewGridStateMachine(logger *zap.Logger) *GridStateMachine {
 		states: make(map[string]*SymbolState),
 		logger: logger,
 	}
+}
+
+// SetConditionalTransitionsConfig sets the conditional transitions configuration
+func (sm *GridStateMachine) SetConditionalTransitionsConfig(config *config.ConditionalTransitionsConfig) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.conditionalTransitionsConfig = config
+	sm.logger.Info("Conditional transitions config set on state machine")
 }
 
 // GetState returns the current state for a symbol
@@ -170,6 +185,32 @@ func (sm *GridStateMachine) GetSymbolState(symbol string) *SymbolState {
 		return &SymbolState{State: GridStateIdle}
 	}
 	return state
+}
+
+// GetContinuousState returns the continuous state for a symbol
+func (sm *GridStateMachine) GetContinuousState(symbol string) *ContinuousState {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	state, exists := sm.states[symbol]
+	if !exists || state.ContinuousState == nil {
+		// Return a new continuous state with default values if not exists
+		return NewContinuousState()
+	}
+	return state.ContinuousState
+}
+
+// UpdateContinuousState updates the continuous state for a symbol
+func (sm *GridStateMachine) UpdateContinuousState(symbol string, state *ContinuousState) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	symbolState, exists := sm.states[symbol]
+	if !exists {
+		symbolState = &SymbolState{State: GridStateIdle}
+		sm.states[symbol] = symbolState
+	}
+	symbolState.ContinuousState = state
 }
 
 // CanTransition checks if a transition is valid from the current state
@@ -361,6 +402,326 @@ func (sm *GridStateMachine) ForceState(symbol string, state GridState) {
 		zap.String("state", state.String()),
 		zap.Time("timestamp", time.Now()),
 	)
+}
+
+// CanConditionalTransition checks if a conditional transition is valid based on conditions
+// This allows transitions based on combined conditions rather than just events
+func (sm *GridStateMachine) CanConditionalTransition(symbol string, event GridEvent, conditions map[string]float64, confidenceThreshold float64) bool {
+	currentState := sm.GetState(symbol)
+
+	// Calculate transition confidence
+	confidence := sm.CalculateTransitionConfidence(symbol, event, conditions)
+
+	// Only allow transition if confidence exceeds threshold
+	if confidence < confidenceThreshold {
+		sm.logger.Debug("Conditional transition rejected: confidence too low",
+			zap.String("symbol", symbol),
+			zap.String("from_state", currentState.String()),
+			zap.String("event", event.String()),
+			zap.Float64("confidence", confidence),
+			zap.Float64("threshold", confidenceThreshold))
+		return false
+	}
+
+	// Check if the base transition is valid
+	if !sm.CanTransition(symbol, event) {
+		return false
+	}
+
+	// Get config thresholds (use defaults if not available)
+	positionThreshold := 0.7
+	volatilityThreshold := 0.8
+	pnlThreshold := 0.0
+
+	if sm.conditionalTransitionsConfig != nil {
+		if sm.conditionalTransitionsConfig.OverSizeToDefensive != nil {
+			positionThreshold = sm.conditionalTransitionsConfig.OverSizeToDefensive.PositionThreshold
+			volatilityThreshold = sm.conditionalTransitionsConfig.OverSizeToDefensive.VolatilityThreshold
+		}
+		if sm.conditionalTransitionsConfig.DefensiveToRecovery != nil {
+			pnlThreshold = sm.conditionalTransitionsConfig.DefensiveToRecovery.PnlThreshold
+		}
+		if sm.conditionalTransitionsConfig.RecoveryToOverSize != nil {
+			positionThreshold = sm.conditionalTransitionsConfig.RecoveryToOverSize.PositionThreshold
+		}
+	}
+
+	// Additional conditional logic for specific transitions
+	switch currentState {
+	case GridStateOverSize:
+		// OVER_SIZE → DEFENSIVE if position large AND volatility high
+		if event == EventExtremeVolatility {
+			positionPct, hasPosition := conditions["position_pct"]
+			volatility, hasVolatility := conditions["volatility"]
+			if hasPosition && hasVolatility && positionPct > positionThreshold && volatility > volatilityThreshold {
+				return true
+			}
+		}
+
+	case GridStateDefensive:
+		// DEFENSIVE → RECOVERY if loss during defensive
+		if event == EventRecoveryStart {
+			pnl, hasPnL := conditions["pnl"]
+			if hasPnL && pnl < pnlThreshold {
+				return true
+			}
+		}
+
+	case GridStateRecovery:
+		// RECOVERY → OVER_SIZE if position grows
+		if event == EventOverSizeLimit {
+			positionPct, hasPosition := conditions["position_pct"]
+			if hasPosition && positionPct > positionThreshold {
+				return true
+			}
+		}
+	}
+
+	return true
+}
+
+// CalculateTransitionConfidence calculates the confidence score for a transition (0-1)
+// Higher confidence means the transition is more appropriate
+func (sm *GridStateMachine) CalculateTransitionConfidence(symbol string, event GridEvent, conditions map[string]float64) float64 {
+	confidence := 0.5 // Base confidence
+
+	// Adjust confidence based on conditions
+	if drawdown, hasDrawdown := conditions["drawdown"]; hasDrawdown {
+		// Higher drawdown = higher confidence for defensive/exit states
+		if drawdown > 0.1 {
+			confidence += 0.2
+		}
+	}
+
+	if volatility, hasVolatility := conditions["volatility"]; hasVolatility {
+		// Higher volatility = higher confidence for defensive states
+		if volatility > 0.7 {
+			confidence += 0.15
+		}
+	}
+
+	if positionPct, hasPosition := conditions["position_pct"]; hasPosition {
+		// Higher position = higher confidence for OVER_SIZE
+		if positionPct > 0.8 {
+			confidence += 0.25
+		}
+	}
+
+	if pnl, hasPnL := conditions["pnl"]; hasPnL {
+		// Negative PnL = higher confidence for recovery/exit states
+		if pnl < 0 {
+			confidence += 0.15
+		}
+		// Positive PnL = higher confidence for trading states
+		if pnl > 0 {
+			confidence += 0.1
+		}
+	}
+
+	// Clamp to 0-1 range
+	if confidence > 1.0 {
+		confidence = 1.0
+	}
+	if confidence < 0.0 {
+		confidence = 0.0
+	}
+
+	return confidence
+}
+
+// TransitionWithConfidence performs a state transition with confidence tracking
+// Returns true if transition was successful, false otherwise
+func (sm *GridStateMachine) TransitionWithConfidence(symbol string, event GridEvent, conditions map[string]float64, confidenceThreshold float64) bool {
+	// Check conditional transition
+	if !sm.CanConditionalTransition(symbol, event, conditions, confidenceThreshold) {
+		return false
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Initialize state if not exists
+	state, exists := sm.states[symbol]
+	if !exists {
+		state = &SymbolState{State: GridStateIdle}
+		sm.states[symbol] = state
+	}
+
+	// Calculate and store confidence
+	confidence := sm.CalculateTransitionConfidence(symbol, event, conditions)
+	state.TransitionConfidence = confidence
+	state.LastConditions = conditions
+
+	// Perform the transition using the standard Transition logic
+	oldState := state.State
+	var newState GridState
+
+	switch oldState {
+	case GridStateIdle:
+		if event == EventRangeConfirmed {
+			newState = GridStateEnterGrid
+		} else {
+			return false
+		}
+
+	case GridStateEnterGrid:
+		if event == EventEntryPlaced {
+			newState = GridStateTrading
+			state.EntryTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateTrading:
+		if event == EventPartialLoss {
+			newState = GridStateExitHalf
+		} else if event == EventOverSizeLimit {
+			newState = GridStateOverSize
+		} else if event == EventExtremeVolatility {
+			newState = GridStateDefensive
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
+		} else if event == EventTrendExit || event == EventEmergencyExit {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateExitHalf:
+		if event == EventFullLoss {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else if event == EventRecovery {
+			newState = GridStateTrading
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
+		} else {
+			return false
+		}
+
+	case GridStateExitAll:
+		if event == EventPositionsClosed {
+			newState = GridStateWaitNewRange
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
+		} else {
+			return false
+		}
+
+	case GridStateWaitNewRange:
+		if event == EventNewRangeReady {
+			newState = GridStateEnterGrid
+		} else {
+			return false
+		}
+
+	case GridStateOverSize:
+		if event == EventSizeNormalized {
+			newState = GridStateTrading
+		} else if event == EventFullLoss {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateDefensive:
+		if event == EventVolatilityNormalized {
+			newState = GridStateTrading
+		} else if event == EventEmergencyExit {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateRecovery:
+		if event == EventRecoveryComplete {
+			newState = GridStateTrading
+		} else if event == EventPartialLoss {
+			newState = GridStateExitHalf
+		} else {
+			return false
+		}
+
+	default:
+		return false
+	}
+
+	// Perform the transition
+	state.State = newState
+	state.LastTransition = time.Now()
+
+	// Handle state merging (e.g., OVER_SIZE + DEFENSIVE)
+	sm.handleStateMerging(symbol, newState, conditions)
+
+	// JSONL logging as per spec
+	sm.logger.Info("state_transition",
+		zap.String("symbol", symbol),
+		zap.String("from_state", oldState.String()),
+		zap.String("to_state", newState.String()),
+		zap.String("event", event.String()),
+		zap.Float64("confidence", confidence),
+		zap.Time("timestamp", time.Now()),
+	)
+
+	return true
+}
+
+// handleStateMerging handles state merging logic for coexisting states
+func (sm *GridStateMachine) handleStateMerging(symbol string, newState GridState, conditions map[string]float64) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	state, exists := sm.states[symbol]
+	if !exists {
+		return
+	}
+
+	// Clear merged states when transitioning to IDLE, WAIT_NEW_RANGE, or TRADING
+	if newState == GridStateIdle || newState == GridStateWaitNewRange || newState == GridStateTrading {
+		state.MergedStates = nil
+		return
+	}
+
+	// Add state to merged states
+	state.MergedStates = append(state.MergedStates, newState)
+
+	// Check for emergency transitions (direct to EXIT_ALL if multiple risks high)
+	// Use config values if available, otherwise use defaults
+	positionRiskThreshold := 0.8
+	volatilityRiskThreshold := 0.8
+	drawdownRiskThreshold := 0.15
+	emergencyRiskCount := 2
+
+	if sm.conditionalTransitionsConfig != nil {
+		positionRiskThreshold = sm.conditionalTransitionsConfig.PositionRiskThreshold
+		volatilityRiskThreshold = sm.conditionalTransitionsConfig.VolatilityRiskThreshold
+		drawdownRiskThreshold = sm.conditionalTransitionsConfig.DrawdownRiskThreshold
+		emergencyRiskCount = sm.conditionalTransitionsConfig.EmergencyRiskCount
+	}
+
+	riskCount := 0
+	if positionPct, hasPosition := conditions["position_pct"]; hasPosition && positionPct > positionRiskThreshold {
+		riskCount++
+	}
+	if volatility, hasVolatility := conditions["volatility"]; hasVolatility && volatility > volatilityRiskThreshold {
+		riskCount++
+	}
+	if drawdown, hasDrawdown := conditions["drawdown"]; hasDrawdown && drawdown > drawdownRiskThreshold {
+		riskCount++
+	}
+
+	// If 2+ risks are high, emergency transition to EXIT_ALL
+	if riskCount >= emergencyRiskCount && newState != GridStateExitAll {
+		sm.logger.Warn("Emergency transition to EXIT_ALL: multiple risks high",
+			zap.String("symbol", symbol),
+			zap.Int("risk_count", riskCount))
+		state.State = GridStateExitAll
+		state.ExitTime = time.Now()
+		state.MergedStates = []GridState{GridStateExitAll}
+	}
 }
 
 // IsTrading returns true if the symbol is in TRADING state

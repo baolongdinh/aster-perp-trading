@@ -1,7 +1,6 @@
 package adaptive_grid
 
 import (
-	"aster-bot/internal/farming/adaptive_grid"
 	"context"
 	"testing"
 	"time"
@@ -91,7 +90,7 @@ func TestSlotTransitionHandler_CanTransition(t *testing.T) {
 func TestSlotTransitionHandler_HandleTransition_DisabledSlot(t *testing.T) {
 	logger := zap.NewNop()
 	mockGrid := &mockGridManager{}
-	adaptiveGridManager := adaptive_grid.NewAdaptiveGridManager(
+	adaptiveGridManager := NewAdaptiveGridManager(
 		nil, nil, nil, nil, nil, "", logger,
 	)
 	// Initialize required maps
@@ -135,7 +134,7 @@ func TestSlotTransitionHandler_HandleTransition_DisabledSlot(t *testing.T) {
 func TestSlotTransitionHandler_HandleTransition_EnabledSlot(t *testing.T) {
 	logger := zap.NewNop()
 	mockGrid := &mockGridManager{}
-	adaptiveGridManager := adaptive_grid.NewAdaptiveGridManager(
+	adaptiveGridManager := NewAdaptiveGridManager(
 		nil, nil, nil, nil, nil, "", logger,
 	)
 	// Initialize required maps

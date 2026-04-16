@@ -41,6 +41,9 @@ type MarketConditionEvaluator struct {
 	wsClient            interface{} // WebSocketClient reference
 	circuitBreaker      interface{} // CircuitBreaker reference
 
+	// NEW: AdaptiveThresholdManager for adaptive thresholds
+	adaptiveThresholdManager *AdaptiveThresholdManager
+
 	// State tracking for stability duration
 	lastStateChangeTime map[string]time.Time // symbol -> last state change time
 }
@@ -80,6 +83,14 @@ func (e *MarketConditionEvaluator) SetCircuitBreaker(cb interface{}) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.circuitBreaker = cb
+}
+
+// SetAdaptiveThresholdManager sets the adaptive threshold manager
+func (e *MarketConditionEvaluator) SetAdaptiveThresholdManager(atm *AdaptiveThresholdManager) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.adaptiveThresholdManager = atm
+	e.logger.Info("AdaptiveThresholdManager set on MarketConditionEvaluator")
 }
 
 // GetConfig returns the evaluator config
@@ -321,52 +332,77 @@ func (e *MarketConditionEvaluator) evaluateMarket(symbol string) float64 {
 func (e *MarketConditionEvaluator) recommendState(conditions MarketCondition, symbol string) *StateRecommendation {
 	// State selection logic (from plan)
 
-	// OVER_SIZE: PositionScore > 0.8
-	if conditions.PositionScore > 0.8 {
+	// Get adaptive thresholds if available, otherwise use fixed defaults
+	positionThreshold := 0.8
+	volatilityThreshold := 0.8
+	riskThreshold := 0.6
+	riskThresholdHigh := 0.7
+	riskThresholdCritical := 0.9
+	positionThresholdLow := 0.5
+	positionThresholdHigh := 0.95
+
+	if e.adaptiveThresholdManager != nil {
+		positionThreshold = e.adaptiveThresholdManager.GetThreshold(symbol, "position")
+		volatilityThreshold = e.adaptiveThresholdManager.GetThreshold(symbol, "volatility")
+		riskThreshold = e.adaptiveThresholdManager.GetThreshold(symbol, "risk")
+		riskThresholdHigh = e.adaptiveThresholdManager.GetThreshold(symbol, "risk")         // Could use different threshold
+		riskThresholdCritical = e.adaptiveThresholdManager.GetThreshold(symbol, "risk")     // Could use different threshold
+		positionThresholdLow = e.adaptiveThresholdManager.GetThreshold(symbol, "position")  // Could use different threshold
+		positionThresholdHigh = e.adaptiveThresholdManager.GetThreshold(symbol, "position") // Could use different threshold
+
+		e.logger.Debug("Using adaptive thresholds",
+			zap.String("symbol", symbol),
+			zap.Float64("position_threshold", positionThreshold),
+			zap.Float64("volatility_threshold", volatilityThreshold),
+			zap.Float64("risk_threshold", riskThreshold))
+	}
+
+	// OVER_SIZE: PositionScore > threshold
+	if conditions.PositionScore > positionThreshold {
 		return &StateRecommendation{
 			State:      GridStateOverSize,
 			Confidence: 0.8,
-			Reason:     fmt.Sprintf("Position size too large (score: %.2f)", conditions.PositionScore),
+			Reason:     fmt.Sprintf("Position size too large (score: %.2f, threshold: %.2f)", conditions.PositionScore, positionThreshold),
 			Conditions: conditions,
 		}
 	}
 
-	// DEFENSIVE: VolatilityScore > 0.8 OR RiskScore > 0.8
-	if conditions.VolatilityScore > 0.8 || conditions.RiskScore > 0.8 {
+	// DEFENSIVE: VolatilityScore > threshold OR RiskScore > threshold
+	if conditions.VolatilityScore > volatilityThreshold || conditions.RiskScore > riskThreshold {
 		return &StateRecommendation{
 			State:      GridStateDefensive,
 			Confidence: 0.8,
-			Reason:     fmt.Sprintf("Extreme volatility or risk (vol: %.2f, risk: %.2f)", conditions.VolatilityScore, conditions.RiskScore),
+			Reason:     fmt.Sprintf("Extreme volatility or risk (vol: %.2f, risk: %.2f, vol_threshold: %.2f, risk_threshold: %.2f)", conditions.VolatilityScore, conditions.RiskScore, volatilityThreshold, riskThreshold),
 			Conditions: conditions,
 		}
 	}
 
-	// RECOVERY: RiskScore > 0.6 AND PositionScore < 0.5
-	if conditions.RiskScore > 0.6 && conditions.PositionScore < 0.5 {
+	// RECOVERY: RiskScore > threshold AND PositionScore < low threshold
+	if conditions.RiskScore > riskThreshold && conditions.PositionScore < positionThresholdLow {
 		return &StateRecommendation{
 			State:      GridStateRecovery,
 			Confidence: 0.7,
-			Reason:     fmt.Sprintf("Recovery mode (risk: %.2f, position: %.2f)", conditions.RiskScore, conditions.PositionScore),
+			Reason:     fmt.Sprintf("Recovery mode (risk: %.2f, position: %.2f, risk_threshold: %.2f, pos_threshold_low: %.2f)", conditions.RiskScore, conditions.PositionScore, riskThreshold, positionThresholdLow),
 			Conditions: conditions,
 		}
 	}
 
-	// EXIT_HALF: RiskScore > 0.7 AND PositionScore > 0.5
-	if conditions.RiskScore > 0.7 && conditions.PositionScore > 0.5 {
+	// EXIT_HALF: RiskScore > high threshold AND PositionScore > low threshold
+	if conditions.RiskScore > riskThresholdHigh && conditions.PositionScore > positionThresholdLow {
 		return &StateRecommendation{
 			State:      GridStateExitHalf,
 			Confidence: 0.7,
-			Reason:     fmt.Sprintf("Partial loss (risk: %.2f, position: %.2f)", conditions.RiskScore, conditions.PositionScore),
+			Reason:     fmt.Sprintf("Partial loss (risk: %.2f, position: %.2f, risk_threshold_high: %.2f, pos_threshold_low: %.2f)", conditions.RiskScore, conditions.PositionScore, riskThresholdHigh, positionThresholdLow),
 			Conditions: conditions,
 		}
 	}
 
-	// EXIT_ALL: RiskScore > 0.9 OR PositionScore > 0.95
-	if conditions.RiskScore > 0.9 || conditions.PositionScore > 0.95 {
+	// EXIT_ALL: RiskScore > critical threshold OR PositionScore > high threshold
+	if conditions.RiskScore > riskThresholdCritical || conditions.PositionScore > positionThresholdHigh {
 		return &StateRecommendation{
 			State:      GridStateExitAll,
 			Confidence: 0.9,
-			Reason:     fmt.Sprintf("Critical risk (risk: %.2f, position: %.2f)", conditions.RiskScore, conditions.PositionScore),
+			Reason:     fmt.Sprintf("Critical risk (risk: %.2f, position: %.2f, risk_threshold_critical: %.2f, pos_threshold_high: %.2f)", conditions.RiskScore, conditions.PositionScore, riskThresholdCritical, positionThresholdHigh),
 			Conditions: conditions,
 		}
 	}

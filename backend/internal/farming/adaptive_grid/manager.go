@@ -89,6 +89,9 @@ type AdaptiveGridManager struct {
 	// Risk parameters
 	riskConfig *RiskConfig
 
+	// NEW: Dynamic timeout config for EXIT_ALL state
+	dynamicTimeoutConfig *config.DynamicTimeoutConfig
+
 	// NEW: RiskMonitor for dynamic sizing and exposure
 	riskMonitor *RiskMonitor
 
@@ -149,18 +152,41 @@ type AdaptiveGridManager struct {
 	// Trading lifecycle state machine for runtime execution governance
 	stateMachine *GridStateMachine
 
+	// NEW: RealTimeOptimizer for real-time parameter optimization
+	realtimeOptimizer *RealTimeOptimizer
+
+	// NEW: LearningEngine for adaptive threshold learning
+	learningEngine *LearningEngine
+
+	// NEW: FluidFlowEngine for continuous flow behavior (fluid like water)
+	fluidFlowEngine *FluidFlowEngine
+
 	// NEW: Consecutive loss tracking for cooldown
 	consecutiveLosses map[string]int       // symbol -> consecutive loss count
 	lastLossTime      map[string]time.Time // symbol -> last loss timestamp
 	cooldownActive    map[string]bool      // symbol -> cooldown status
 	totalLossesToday  int                  // total losses today
 
+	// NEW: Kline counters for periodic learning engine adaptation
+	klineCounters map[string]int // symbol -> kline counter
+
 	// NEW: Partial close tracking for TP levels
 	partialCloseConfig *PartialCloseConfig
-	positionSlices     map[string]*PositionSlice // symbol -> position slice tracking
+
+	// NEW: ConditionBlocker for conditional blocking (replaces state-based blocking)
+	conditionBlocker *ConditionBlocker
+	positionSlices   map[string]*PositionSlice // symbol -> position slice tracking
 
 	// NEW: Position reduction tracking for gradual size reduction
 	positionReductionTime map[string]time.Time // symbol -> last reduction timestamp
+
+	// NEW: VPIN monitor for toxic flow detection
+	vpinMonitor interface {
+		IsToxic() bool
+		TriggerPause()
+		Resume()
+		UpdateVolume(buyVol, sellVol float64)
+	}
 
 	// Control channels
 	stopCh chan struct{}
@@ -245,6 +271,9 @@ type RiskConfig struct {
 
 	// NEW: Dynamic spread adjustment
 	BaseGridSpreadPct float64 // Base grid spread percentage (e.g., 0.0015 = 0.15%)
+
+	// NEW: Conditional transitions config
+	ConditionalTransitions *config.ConditionalTransitionsConfig
 }
 
 // ConvertRiskConfig converts config.RiskConfig to adaptive_grid.RiskConfig
@@ -276,6 +305,9 @@ func ConvertRiskConfig(cfg config.RiskConfig) *RiskConfig {
 
 		// Grid spread - default for volume farming
 		BaseGridSpreadPct: 0.0015, // Default 0.15%
+
+		// Conditional transitions from config
+		ConditionalTransitions: cfg.ConditionalTransitions,
 	}
 }
 
@@ -412,6 +444,7 @@ func NewAdaptiveGridManager(
 		lastLossTime:          make(map[string]time.Time),      // NEW: Track last loss time
 		cooldownActive:        make(map[string]bool),           // NEW: Track cooldown state
 		positionReductionTime: make(map[string]time.Time),      // NEW: Track last position reduction time
+		klineCounters:         make(map[string]int),            // NEW: Track kline counters for learning engine
 		microGridCalc:         NewMicroGridCalculator(nil),     // NEW: Micro grid calculator (disabled by default)
 		stopCh:                make(chan struct{}),
 		mu:                    sync.RWMutex{},
@@ -445,11 +478,363 @@ func (a *AdaptiveGridManager) GetStateMachine() *GridStateMachine {
 	return a.stateMachine
 }
 
+// SetRealTimeOptimizer sets the real-time optimizer
+func (a *AdaptiveGridManager) SetRealTimeOptimizer(optimizer *RealTimeOptimizer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.realtimeOptimizer = optimizer
+	a.logger.Info("RealTimeOptimizer set on AdaptiveGridManager")
+}
+
+// GetRealTimeOptimizer returns the real-time optimizer
+func (a *AdaptiveGridManager) GetRealTimeOptimizer() *RealTimeOptimizer {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.realtimeOptimizer
+}
+
+// SetLearningEngine sets the learning engine
+func (a *AdaptiveGridManager) SetLearningEngine(engine *LearningEngine) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.learningEngine = engine
+	a.logger.Info("LearningEngine set on AdaptiveGridManager")
+}
+
+// GetLearningEngine returns the learning engine
+func (a *AdaptiveGridManager) GetLearningEngine() *LearningEngine {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.learningEngine
+}
+
+// SetFluidFlowEngine sets the fluid flow engine for continuous flow behavior
+func (a *AdaptiveGridManager) SetFluidFlowEngine(engine *FluidFlowEngine) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.fluidFlowEngine = engine
+	a.logger.Info("FluidFlowEngine set on AdaptiveGridManager")
+}
+
+// GetFluidFlowEngine returns the fluid flow engine
+func (a *AdaptiveGridManager) GetFluidFlowEngine() *FluidFlowEngine {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.fluidFlowEngine
+}
+
+// SetVPINMonitor sets the VPIN monitor for toxic flow detection
+func (a *AdaptiveGridManager) SetVPINMonitor(vpinMonitor interface {
+	IsToxic() bool
+	TriggerPause()
+	Resume()
+	UpdateVolume(buyVol, sellVol float64)
+}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.vpinMonitor = vpinMonitor
+	a.logger.Info("VPINMonitor set on AdaptiveGridManager")
+}
+
+// GetVPINMonitor returns the VPIN monitor
+func (a *AdaptiveGridManager) GetVPINMonitor() interface{} {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.vpinMonitor
+}
+
+// GetRiskMonitor returns the risk monitor
+func (a *AdaptiveGridManager) GetRiskMonitor() *RiskMonitor {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.riskMonitor
+}
+
+// SetDynamicTimeoutConfig sets the dynamic timeout configuration
+func (a *AdaptiveGridManager) SetDynamicTimeoutConfig(config *config.DynamicTimeoutConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.dynamicTimeoutConfig = config
+	a.logger.Info("Dynamic timeout config set on AdaptiveGridManager")
+}
+
+// BuildTransitionConditions builds a conditions map for conditional transitions
+// This aggregates current market and position conditions for transition evaluation
+func (a *AdaptiveGridManager) BuildTransitionConditions(symbol string) map[string]float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	conditions := make(map[string]float64)
+
+	// Position conditions
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		positionPct := position.NotionalValue / a.riskConfig.MaxPositionUSDT
+		conditions["position_pct"] = positionPct
+		conditions["pnl"] = position.UnrealizedPnL
+		conditions["notional"] = position.NotionalValue
+	}
+
+	// Volatility conditions
+	if detector, exists := a.rangeDetectors[symbol]; exists {
+		avgADX := detector.averageADXLocked()
+		// Normalize ADX to 0-1 range (ADX 0-100)
+		conditions["volatility"] = avgADX / 100.0
+		conditions["adx"] = avgADX
+
+		// BB width for volatility context
+		if detector.currentRange != nil {
+			conditions["bb_width"] = detector.currentRange.WidthPct
+		}
+	}
+
+	// Regime conditions (convert to numeric)
+	regime := a.GetCurrentRegime(symbol)
+	switch regime {
+	case market_regime.RegimeRanging:
+		conditions["regime"] = 0.0
+	case market_regime.RegimeTrending:
+		conditions["regime"] = 1.0
+	case market_regime.RegimeVolatile:
+		conditions["regime"] = 2.0
+	default:
+		conditions["regime"] = 0.5
+	}
+
+	return conditions
+}
+
+// TryConditionalTransition attempts a conditional transition if enabled
+// Falls back to regular transition if conditional transitions disabled
+func (a *AdaptiveGridManager) TryConditionalTransition(symbol string, event GridEvent) bool {
+	// Check if conditional transitions are enabled
+	stateMachine := a.stateMachine
+	if stateMachine == nil {
+		return false
+	}
+
+	// Check if conditional transitions are enabled and config is available
+	enabled := false
+	confidenceThreshold := 0.6 // default
+
+	if a.riskConfig != nil && a.riskConfig.ConditionalTransitions != nil {
+		enabled = a.riskConfig.ConditionalTransitions.Enabled
+		confidenceThreshold = a.riskConfig.ConditionalTransitions.ConfidenceThreshold
+	}
+
+	if enabled {
+		// Build conditions
+		conditions := a.BuildTransitionConditions(symbol)
+		// Try conditional transition
+		return stateMachine.TransitionWithConfidence(symbol, event, conditions, confidenceThreshold)
+	}
+
+	// Fall back to regular transition
+	return stateMachine.Transition(symbol, event)
+}
+
+// GetTradingMode returns the current trading mode for a symbol from CircuitBreaker
+func (a *AdaptiveGridManager) GetTradingMode(symbol string) string {
+	// This will be called by the circuit breaker
+	// For now, return a default mode
+	// TODO: Integrate with CircuitBreaker to get actual mode
+	return "FULL"
+}
+
+// GetModeSizeMultiplier returns the size multiplier for a trading mode
+func (a *AdaptiveGridManager) GetModeSizeMultiplier(mode string) float64 {
+	switch mode {
+	case "FULL":
+		return 1.0
+	case "REDUCED":
+		return 0.5
+	case "MICRO":
+		return 0.1
+	case "PAUSED":
+		return 0.0
+	default:
+		return 1.0
+	}
+}
+
+// CalculateExitPercentage calculates the graduated exit percentage based on conditions
+// Returns percentage (0-1) of position to exit
+func (a *AdaptiveGridManager) CalculateExitPercentage(symbol string, volatility, timeInPosition float64, regime string) float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	// Get position PnL
+	position, exists := a.positions[symbol]
+	if !exists {
+		return 1.0 // Default to full exit if no position
+	}
+
+	pnlRatio := position.UnrealizedPnL / position.NotionalValue
+
+	// Use config thresholds if available, otherwise use defaults
+	smallLossThreshold := -0.02   // 2% loss
+	mediumLossThreshold := -0.05  // 5% loss
+	largeLossThreshold := -0.10   // 10% loss
+	extremeLossThreshold := -0.15 // 15% loss
+
+	smallLossExit := 0.25
+	mediumLossExit := 0.50
+	largeLossExit := 0.75
+	extremeLossExit := 1.0
+
+	if a.riskConfig != nil && a.riskConfig.ConditionalTransitions != nil {
+		// For now, use hardcoded defaults
+		// TODO: Wire graduated exit config from RiskConfig
+	}
+
+	// Calculate exit percentage based on loss
+	if pnlRatio < extremeLossThreshold {
+		// Extreme loss: 100% exit
+		a.logger.Info("Extreme loss detected, full exit",
+			zap.String("symbol", symbol),
+			zap.Float64("pnl_ratio", pnlRatio),
+			zap.Float64("exit_percentage", extremeLossExit))
+		return extremeLossExit
+	} else if pnlRatio < largeLossThreshold {
+		// Large loss: 75% exit
+		a.logger.Info("Large loss detected, partial exit",
+			zap.String("symbol", symbol),
+			zap.Float64("pnl_ratio", pnlRatio),
+			zap.Float64("exit_percentage", largeLossExit))
+		return largeLossExit
+	} else if pnlRatio < mediumLossThreshold {
+		// Medium loss: 50% exit
+		a.logger.Info("Medium loss detected, partial exit",
+			zap.String("symbol", symbol),
+			zap.Float64("pnl_ratio", pnlRatio),
+			zap.Float64("exit_percentage", mediumLossExit))
+		return mediumLossExit
+	} else if pnlRatio < smallLossThreshold {
+		// Small loss: 25% exit
+		a.logger.Info("Small loss detected, partial exit",
+			zap.String("symbol", symbol),
+			zap.Float64("pnl_ratio", pnlRatio),
+			zap.Float64("exit_percentage", smallLossExit))
+		return smallLossExit
+	}
+
+	// Profit or neutral: no forced exit
+	return 0.0
+}
+
 // GetRangeDetector returns the range detector for a specific symbol
 func (a *AdaptiveGridManager) GetRangeDetector(symbol string) *RangeDetector {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.rangeDetectors[symbol]
+}
+
+// callRealTimeOptimizer calls the real-time optimizer to update parameters
+func (a *AdaptiveGridManager) callRealTimeOptimizer(symbol string, high, low, close, bid, ask float64) {
+	if a.realtimeOptimizer == nil {
+		return
+	}
+
+	// Get market conditions
+	detector := a.rangeDetectors[symbol]
+	if detector == nil {
+		return
+	}
+
+	// Calculate volatility from ATR
+	volatility := 0.0
+	if a.atrCalc != nil {
+		volatility = a.atrCalc.GetATR() / close
+	}
+
+	// Get regime (convert to string manually)
+	regime := "RANGING" // Default
+	currentRegime := a.GetCurrentRegime(symbol)
+	if currentRegime == market_regime.RegimeTrending {
+		regime = "TRENDING"
+	} else if currentRegime == market_regime.RegimeVolatile {
+		regime = "VOLATILE"
+	}
+
+	// Get skew from inventory (default to 0 for now)
+	skew := 0.0
+	// TODO: Get actual skew from inventory manager when available
+
+	// Get funding rate
+	funding := 0.0
+	if a.fundingMonitor != nil {
+		fundingInfo := a.fundingMonitor.GetFundingRate(symbol)
+		if fundingInfo != nil {
+			funding = fundingInfo.Rate
+		}
+	}
+
+	// Get depth (estimate from range)
+	depth := 0.5 // Default
+	if detector.currentRange != nil {
+		depth = 0.5 // TODO: Calculate actual depth from range
+	}
+
+	// Get risk (estimate from position)
+	risk := 0.5 // Default
+	if position, exists := a.positions[symbol]; exists {
+		risk = position.NotionalValue / a.riskConfig.MaxPositionUSDT
+	}
+
+	// Get equity
+	equity := 1000.0 // Default
+
+	// Get opportunity
+	opportunity := 0.5 // Default
+
+	// Get liquidity
+	liquidity := 0.5 // Default
+
+	// Get drawdown
+	drawdown := 0.0
+	// TODO: Get actual drawdown from risk monitor when available
+
+	// Get consecutive losses
+	losses := 0
+	if l, exists := a.consecutiveLosses[symbol]; exists {
+		losses = l
+	}
+
+	currentTime := time.Now()
+
+	// Optimize parameters
+	newSpread := a.realtimeOptimizer.OptimizeSpread(volatility, skew, funding, currentTime)
+	newOrderCount := a.realtimeOptimizer.OptimizeOrderCount(depth, risk, regime, currentTime)
+	newSize := a.realtimeOptimizer.OptimizeSize(equity, risk, opportunity, liquidity, currentTime)
+	newMode := a.realtimeOptimizer.OptimizeMode(risk, volatility, drawdown, losses, currentTime)
+
+	// Log parameter changes - SAMPLING LOGGING to prevent log flooding
+	// Only log when parameters change significantly (>5%)
+	currentSpread, currentOrderCount, currentSize, currentMode := a.realtimeOptimizer.GetCurrentParameters()
+
+	spreadChange := math.Abs(newSpread-currentSpread) / currentSpread
+	sizeChange := math.Abs(newSize-currentSize) / currentSize
+
+	shouldLog := false
+	if newMode != currentMode {
+		shouldLog = true
+	} else if spreadChange > 0.05 || sizeChange > 0.05 {
+		shouldLog = true
+	} else if newOrderCount != currentOrderCount {
+		shouldLog = true
+	}
+
+	if shouldLog {
+		a.logger.Info("Real-time optimizer updated parameters",
+			zap.String("symbol", symbol),
+			zap.Float64("old_spread", currentSpread),
+			zap.Float64("new_spread", newSpread),
+			zap.Int("old_order_count", currentOrderCount),
+			zap.Int("new_order_count", newOrderCount),
+			zap.Float64("old_size", currentSize),
+			zap.Float64("new_size", newSize),
+			zap.String("old_mode", currentMode),
+			zap.String("new_mode", newMode))
+	}
 }
 
 // SetExitExecutor wires the exit executor for fast exit on breakouts
@@ -2684,31 +3069,36 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		a.logger.Debug("Check 2 PASS: no position", zap.String("symbol", symbol))
 	}
 
-	// Check 3: Grid State - Block new orders in OVER_SIZE, DEFENSIVE (unless allowed), EXIT_HALF, EXIT_ALL, RECOVERY
+	// Check 3: Grid State - REMOVED state-based blocking
+	// Replaced with ConditionBlocker for graduated blocking (see GetOrderSizeMultiplier)
+	// State transitions still tracked for logging and other purposes
 	currentState := a.stateMachine.GetState(symbol)
-	if currentState == GridStateOverSize {
-		a.logger.Warn("CanPlaceOrder BLOCKED: OVER_SIZE state",
-			zap.String("symbol", symbol),
-			zap.String("state", currentState.String()))
-		return false
-	}
-	if currentState == GridStateDefensive {
-		// Check if DEFENSIVE allows new positions (configurable)
-		// For now, default to blocking
-		a.logger.Warn("CanPlaceOrder BLOCKED: DEFENSIVE state",
-			zap.String("symbol", symbol),
-			zap.String("state", currentState.String()))
-		return false
-	}
-	if currentState == GridStateExitHalf || currentState == GridStateExitAll || currentState == GridStateRecovery {
-		a.logger.Warn("CanPlaceOrder BLOCKED: exit/recovery state",
-			zap.String("symbol", symbol),
-			zap.String("state", currentState.String()))
-		return false
-	}
-	a.logger.Debug("Check 3 PASS: grid state allows new orders",
+	a.logger.Debug("Check 3: State-based blocking removed, using ConditionBlocker for graduated blocking",
 		zap.String("symbol", symbol),
 		zap.String("state", currentState.String()))
+
+	// Check 3.5: ConditionBlocker - graduated blocking based on conditions
+	if a.conditionBlocker != nil {
+		blockingFactor := a.GetOrderSizeMultiplier(symbol)
+		a.logger.Info("Check 3.5: ConditionBlocker decision",
+			zap.String("symbol", symbol),
+			zap.Float64("blocking_factor", blockingFactor))
+
+		// If blocking factor is 0, fully block trading
+		if blockingFactor <= 0.01 {
+			a.logger.Warn("CanPlaceOrder BLOCKED: ConditionBlocker full block",
+				zap.String("symbol", symbol),
+				zap.Float64("blocking_factor", blockingFactor))
+			return false
+		}
+
+		// If blocking factor is very low (MICRO mode threshold), still allow but log
+		if blockingFactor < 0.1 {
+			a.logger.Info("CanPlaceOrder: MICRO mode allowed by ConditionBlocker",
+				zap.String("symbol", symbol),
+				zap.Float64("blocking_factor", blockingFactor))
+		}
+	}
 
 	// Check 4: CircuitBreaker (single source of truth)
 	if a.circuitBreaker != nil {
@@ -2716,10 +3106,31 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 			GetSymbolDecision(symbol string) (canTrade bool, tradingMode string)
 		}); ok {
 			canTrade, mode := cb.GetSymbolDecision(symbol)
+			modeMultiplier := a.GetModeSizeMultiplier(mode)
+
 			a.logger.Info("Check 4: CircuitBreaker decision",
 				zap.String("symbol", symbol),
 				zap.Bool("can_trade", canTrade),
-				zap.String("mode", mode))
+				zap.String("mode", mode),
+				zap.Float64("mode_multiplier", modeMultiplier))
+
+			// MICRO mode always allows trading (never blocks)
+			if mode == "MICRO" {
+				a.logger.Info("MICRO mode: always allows trading",
+					zap.String("symbol", symbol),
+					zap.Float64("size_multiplier", modeMultiplier))
+				return true
+			}
+
+			// PAUSED mode blocks all trading
+			if mode == "PAUSED" {
+				a.logger.Warn("CanPlaceOrder BLOCKED: PAUSED mode",
+					zap.String("symbol", symbol),
+					zap.String("mode", mode))
+				return false
+			}
+
+			// Respect CircuitBreaker's canTrade decision for other modes
 			if !canTrade {
 				a.logger.Warn("CanPlaceOrder BLOCKED: CircuitBreaker",
 					zap.String("symbol", symbol),
@@ -2769,8 +3180,139 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 		a.logger.Debug("Check 5 SKIP: FundingMonitor is nil", zap.String("symbol", symbol))
 	}
 
+	// Check 7: VPIN Toxic Flow Detection
+	if a.vpinMonitor != nil {
+		if a.vpinMonitor.IsToxic() {
+			a.logger.Warn("CanPlaceOrder BLOCKED: Toxic flow detected by VPIN",
+				zap.String("symbol", symbol))
+			return false
+		}
+		a.logger.Debug("Check 7 PASS: No toxic flow detected", zap.String("symbol", symbol))
+	} else {
+		a.logger.Debug("Check 7 SKIP: VPIN monitor is nil", zap.String("symbol", symbol))
+	}
+
 	a.logger.Info("=== CanPlaceOrder ALL CHECKS PASSED ===", zap.String("symbol", symbol))
 	return true
+}
+
+// GetOrderSizeMultiplier calculates the order size multiplier using ConditionBlocker
+// Returns a value between 0 and 1, where 1 = full size, 0.1 = MICRO mode
+func (a *AdaptiveGridManager) GetOrderSizeMultiplier(symbol string) float64 {
+	if a.conditionBlocker == nil {
+		// If ConditionBlocker not initialized, return 1.0 (full size)
+		return 1.0
+	}
+
+	// Get market data from RangeDetector
+	detector := a.rangeDetectors[symbol]
+	if detector == nil {
+		return 1.0
+	}
+
+	// Calculate position size score
+	positionSizeScore := 0.0
+	if position, exists := a.positions[symbol]; exists {
+		positionSizeScore = a.conditionBlocker.NormalizePositionSize(
+			position.NotionalValue,
+			a.riskConfig.MaxPositionUSDT,
+		)
+	}
+
+	// Calculate volatility score from ATR and volatility
+	atrPct := 0.0
+	volatilityPct := 0.0
+	if detector.currentRange != nil {
+		atr := detector.currentRange.ATR
+		currentPrice := detector.currentRange.MidPrice // Use MidPrice as current price
+		if currentPrice > 0 {
+			atrPct = atr / currentPrice
+		}
+		volatilityPct = detector.currentRange.Volatility
+	}
+	volatilityScore := a.conditionBlocker.NormalizeVolatility(atrPct, volatilityPct)
+
+	// Calculate risk score from PnL and drawdown
+	riskScore := 0.0
+	if position, exists := a.positions[symbol]; exists {
+		drawdown := 0.0
+		// RiskMonitor may not have GetDrawdown method, use default
+		drawdown = 0.0
+		riskScore = a.conditionBlocker.NormalizeRisk(position.UnrealizedPnL, drawdown)
+	}
+
+	// Calculate trend score from volatility (use as proxy for ADX)
+	trendScore := 0.0
+	if detector.currentRange != nil {
+		// Use volatility as proxy for trend strength
+		trendScore = detector.currentRange.Volatility
+		if trendScore > 1 {
+			trendScore = 1
+		}
+	}
+
+	// Calculate skew score from inventory (default to 0 if not available)
+	skewScore := 0.0
+	// InventoryManager may not have GetSkew method, use default
+	skewScore = 0.0
+
+	// Calculate blocking factor
+	blockingFactor := a.conditionBlocker.CalculateBlockingFactor(
+		positionSizeScore,
+		volatilityScore,
+		riskScore,
+		trendScore,
+		skewScore,
+	)
+
+	// Get size multiplier from ConditionBlocker
+	sizeMultiplier := a.conditionBlocker.GetSizeMultiplier(blockingFactor)
+
+	// NEW: Apply FluidFlowEngine size multiplier for continuous flow behavior
+	if a.fluidFlowEngine != nil {
+		// Calculate flow parameters
+		flowParams := a.fluidFlowEngine.CalculateFlow(
+			symbol,
+			positionSizeScore,
+			volatilityScore,
+			riskScore,
+			trendScore,
+			skewScore,
+			0.5, // liquidity (default)
+		)
+
+		// Apply fluid flow size multiplier
+		sizeMultiplier *= flowParams.SizeMultiplier
+
+		a.logger.Debug("FluidFlowEngine applied",
+			zap.String("symbol", symbol),
+			zap.Float64("flow_intensity", flowParams.Intensity),
+			zap.Float64("flow_direction", flowParams.Direction),
+			zap.Float64("flow_velocity", flowParams.Velocity),
+			zap.Float64("size_multiplier", flowParams.SizeMultiplier),
+			zap.Float64("spread_multiplier", flowParams.SpreadMultiplier),
+			zap.Float64("final_size_multiplier", sizeMultiplier))
+	}
+
+	a.logger.Debug("Order size multiplier calculated",
+		zap.String("symbol", symbol),
+		zap.Float64("position_size_score", positionSizeScore),
+		zap.Float64("volatility_score", volatilityScore),
+		zap.Float64("risk_score", riskScore),
+		zap.Float64("trend_score", trendScore),
+		zap.Float64("skew_score", skewScore),
+		zap.Float64("blocking_factor", blockingFactor),
+		zap.Float64("size_multiplier", sizeMultiplier))
+
+	return sizeMultiplier
+}
+
+// SetConditionBlocker sets the ConditionBlocker instance
+func (a *AdaptiveGridManager) SetConditionBlocker(cb *ConditionBlocker) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.conditionBlocker = cb
+	a.logger.Info("ConditionBlocker set")
 }
 
 // ApplyFundingBias applies funding rate bias to inventory manager
@@ -3025,6 +3567,9 @@ func (a *AdaptiveGridManager) AddPriceData(high, low, close float64) {
 func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, bid, ask float64) {
 	a.logger.Warn(">>> UpdatePriceData START <<<")
 
+	// Call real-time optimizer if enabled
+	a.callRealTimeOptimizer(symbol, high, low, close, bid, ask)
+
 	// Feed ATR calculator
 	if a.atrCalc != nil {
 		a.atrCalc.AddPrice(high, low, close)
@@ -3090,6 +3635,44 @@ func (a *AdaptiveGridManager) UpdatePriceData(symbol string, high, low, close, b
 		// Trigger exit for symbol
 		a.ExitAll(context.Background(), symbol, EventEmergencyExit, "Breakeven exit triggered")
 	}
+
+	// NEW: Periodically adapt thresholds using LearningEngine (every 100 klines ~ 100 seconds)
+	// This enables continuous learning and adaptation
+	if a.learningEngine != nil {
+		// Use a simple counter to trigger adaptation periodically
+		a.mu.Lock()
+		if _, exists := a.klineCounters[symbol]; !exists {
+			a.klineCounters[symbol] = 0
+		}
+		a.klineCounters[symbol]++
+		counter := a.klineCounters[symbol]
+		a.mu.Unlock()
+
+		// Adapt thresholds every 100 klines
+		if counter%100 == 0 {
+			// Get recent performance for this symbol
+			avgProfit, avgRisk, _, _, count := a.learningEngine.GetPerformance("TRADING", "GRID")
+			recentPerformance := avgProfit / avgRisk
+			if avgRisk == 0 {
+				recentPerformance = 0
+			}
+
+			// Adapt each dimension
+			positionThreshold := a.learningEngine.AdaptThreshold(symbol, "position", recentPerformance)
+			volatilityThreshold := a.learningEngine.AdaptThreshold(symbol, "volatility", recentPerformance)
+			riskThreshold := a.learningEngine.AdaptThreshold(symbol, "risk", recentPerformance)
+			trendThreshold := a.learningEngine.AdaptThreshold(symbol, "trend", recentPerformance)
+
+			a.logger.Info("LearningEngine adapted thresholds",
+				zap.String("symbol", symbol),
+				zap.Int("sample_count", count),
+				zap.Float64("recent_performance", recentPerformance),
+				zap.Float64("position_threshold", positionThreshold),
+				zap.Float64("volatility_threshold", volatilityThreshold),
+				zap.Float64("risk_threshold", riskThreshold),
+				zap.Float64("trend_threshold", trendThreshold))
+		}
+	}
 }
 
 // RecordTradeResult records trade result for loss tracking with cooldown
@@ -3109,6 +3692,42 @@ func (a *AdaptiveGridManager) RecordTradeResult(symbol string, isWin bool) {
 			pnl = 1.0
 		}
 		a.riskMonitor.RecordTradeResult(symbol, pnl)
+	}
+
+	// NEW: Record performance for LearningEngine adaptive learning
+	if a.learningEngine != nil {
+		// Estimate PnL and risk for learning
+		pnl := -1.0
+		if isWin {
+			pnl = 1.0
+		}
+		risk := 0.5     // Default risk
+		volume := 1.0   // Default volume
+		drawdown := 0.0 // Default drawdown
+
+		// Get actual position data if available
+		if position, exists := a.positions[symbol]; exists {
+			pnl = position.UnrealizedPnL
+			risk = position.NotionalValue / a.riskConfig.MaxPositionUSDT
+			if risk > 1 {
+				risk = 1
+			}
+		}
+
+		// Record performance with current market condition
+		condition := "TRADING"
+		if a.stateMachine != nil {
+			condition = a.stateMachine.GetState(symbol).String()
+		}
+		strategy := "GRID"
+
+		a.learningEngine.RecordPerformance(condition, strategy, pnl, risk, volume, drawdown)
+		a.logger.Info("LearningEngine recorded performance",
+			zap.String("symbol", symbol),
+			zap.String("condition", condition),
+			zap.String("strategy", strategy),
+			zap.Float64("pnl", pnl),
+			zap.Float64("risk", risk))
 	}
 
 	// Get RiskConfig values (fallback to defaults if not set)
@@ -3312,6 +3931,62 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 		zap.Float64("close", closePrice))
 
 	detector.AddPrice(high, low, closePrice)
+
+	// NEW: Update continuous state every kline
+	if stateMachine != nil {
+		currentCS := stateMachine.GetContinuousState(symbol)
+		config := &ContinuousStateConfig{SmoothingAlpha: 0.3} // Default smoothing
+
+		// Get market data for continuous state calculation
+		a.mu.RLock()
+		position, hasPosition := a.positions[symbol]
+		maxPosition := a.riskConfig.MaxPositionUSDT
+		currentRange := detector.GetCurrentRange()
+		a.mu.RUnlock()
+
+		// Calculate dimensions
+		positionNotional := 0.0
+		if hasPosition && position != nil {
+			positionNotional = position.NotionalValue
+		}
+
+		atrPct := 0.0
+		bbWidthPct := 0.0
+		if currentRange != nil {
+			// Calculate ATR as percentage of price
+			if currentRange.MidPrice > 0 {
+				atrPct = currentRange.ATR / currentRange.MidPrice
+			}
+			bbWidthPct = currentRange.WidthPct
+		}
+
+		// For now, use placeholder values for PnL, drawdown, ADX, inventory
+		// TODO: Integrate with actual PnL tracking, ADX from detector, inventory from InventoryManager
+		pnl := 0.0
+		drawdown := 0.0
+		adx := detector.GetCurrentADX()
+		inventory := 0.0
+
+		currentCS.UpdateContinuousState(
+			positionNotional, maxPosition,
+			atrPct, bbWidthPct,
+			pnl, drawdown,
+			adx, inventory,
+			config, a.logger,
+		)
+
+		stateMachine.UpdateContinuousState(symbol, currentCS)
+
+		// Log continuous state
+		posSize, vol, risk, trend, skew := currentCS.GetSmoothedState()
+		a.logger.Debug("Continuous state updated",
+			zap.String("symbol", symbol),
+			zap.Float64("position_size", posSize),
+			zap.Float64("volatility", vol),
+			zap.Float64("risk", risk),
+			zap.Float64("trend", trend),
+			zap.Float64("skew", skew))
+	}
 
 	if currentRange := detector.GetCurrentRange(); currentRange != nil {
 		a.UpdateDynamicLeverageMetrics(currentRange.ATR, detector.GetCurrentADX(), currentRange.WidthPct)
@@ -4481,71 +5156,273 @@ func (a *AdaptiveGridManager) GetLiquidationTierStatus(symbol string) map[string
 }
 
 // isReadyForRegrid checks if all conditions are met for re-gridding after exit
-// For volume farming: VERY RELAXED conditions - provides context for CircuitBreaker to decide trade mode
-//  1. Current state is IDLE or WAIT_NEW_RANGE (REQUIRED)
+// For volume farming: State-aware conditions - allows regrid from any state with specific criteria
+//  1. State-specific criteria (see below)
 //  2. No regrid cooldown (REQUIRED)
-//  3. Position ≈ 0 (REQUIRED, dust < 10 USDT allowed)
-//  4. ADX < 50 (very relaxed, provides volatility context)
-//  5. BB width < 5x (very relaxed, provides volatility context)
-//  6. Range shift ≥ 0.05% (very relaxed, provides trend context)
+//  3. Market conditions (ADX, BB width)
 //
-// This function is called to determine if we can transition from IDLE or WAIT_NEW_RANGE to ENTER_GRID
-// CircuitBreaker uses these conditions to decide trade mode (MICRO/SMALL/MEDIUM/LARGE)
+// State-specific criteria:
+//   - IDLE/WAIT_NEW_RANGE: Standard conditions (position ≈ 0, ADX < 70, BB width < 10x)
+//   - OVER_SIZE: position ≤ 60% max + ADX < 50 + BB width < 5x
+//   - DEFENSIVE: BB width < 3x + ADX < 50
+//   - RECOVERY: PnL ≥ 0 + stable 5 minutes
+//   - EXIT_HALF: PnL ≥ 0
+//   - EXIT_ALL: position = 0 OR dynamic timeout expired
+//   - TRADING: Allow regrid with position check
 func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	// Check state machine (IDLE or WAIT_NEW_RANGE)
+	// Get current state
+	var currentState GridState
 	if a.stateMachine != nil {
-		state := a.stateMachine.GetState(symbol)
-		if state != GridStateIdle && state != GridStateWaitNewRange {
-			a.logger.Debug("Regrid check: not in IDLE or WAIT_NEW_RANGE state",
-				zap.String("symbol", symbol),
-				zap.String("state", state.String()))
-			return false
-		}
-		// Removed regrid cooldown check - only rely on market conditions
+		currentState = a.stateMachine.GetState(symbol)
+	} else {
+		currentState = GridStateIdle
 	}
 
-	// Must have zero or negligible position before re-entry.
-	// For volume farming, allow tiny positions (< 10 USDT notional) to avoid blocking on dust
+	// State-specific regrid criteria
+	switch currentState {
+	case GridStateOverSize:
+		return a.canRegridFromOverSize(symbol)
+	case GridStateDefensive:
+		return a.canRegridFromDefensive(symbol)
+	case GridStateRecovery:
+		return a.canRegridFromRecovery(symbol)
+	case GridStateExitHalf:
+		return a.canRegridFromExitHalf(symbol)
+	case GridStateExitAll:
+		return a.canRegridFromExitAll(symbol)
+	case GridStateTrading:
+		return a.canRegridFromTrading(symbol)
+	case GridStateIdle, GridStateWaitNewRange:
+		// Standard regrid conditions for these states
+		return a.canRegridStandard(symbol, currentState)
+	default:
+		a.logger.Debug("Regrid check: unknown state",
+			zap.String("symbol", symbol),
+			zap.String("state", currentState.String()))
+		return false
+	}
+}
+
+// canRegridStandard checks standard regrid conditions for IDLE/WAIT_NEW_RANGE
+func (a *AdaptiveGridManager) canRegridStandard(symbol string, state GridState) bool {
+	// Must have zero or negligible position before re-entry
 	if position, exists := a.positions[symbol]; exists && position != nil {
 		if math.Abs(position.PositionAmt) > 0 && position.NotionalValue >= 10.0 {
-			a.logger.Debug("Regrid check: position not zero",
+			a.logger.Debug("Standard regrid check: position not zero",
 				zap.String("symbol", symbol),
+				zap.String("state", state.String()),
 				zap.Float64("position_amt", position.PositionAmt),
 				zap.Float64("notional", position.NotionalValue))
 			return false
 		}
 		if math.Abs(position.PositionAmt) > 0 && position.NotionalValue < 10.0 {
-			a.logger.Info("Regrid check: ignoring dust position",
+			a.logger.Info("Standard regrid check: ignoring dust position",
 				zap.String("symbol", symbol),
+				zap.String("state", state.String()),
 				zap.Float64("position_amt", position.PositionAmt),
 				zap.Float64("notional", position.NotionalValue))
 		}
 	}
 
+	return a.checkMarketConditionsForRegrid(symbol, state)
+}
+
+// canRegridFromOverSize checks if regrid is allowed from OVER_SIZE state
+func (a *AdaptiveGridManager) canRegridFromOverSize(symbol string) bool {
+	// OVER_SIZE: position ≤ 60% max + ADX < 50 + BB width < 5x
+	maxPosition := a.riskConfig.MaxPositionUSDT
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		positionPct := position.NotionalValue / maxPosition
+		if positionPct > 0.6 {
+			a.logger.Debug("OVER_SIZE regrid check: position too large",
+				zap.String("symbol", symbol),
+				zap.Float64("position_pct", positionPct))
+			return false
+		}
+	}
+
+	// Check market conditions
 	detector, exists := a.rangeDetectors[symbol]
 	if !exists {
-		a.logger.Debug("Regrid check: no range detector", zap.String("symbol", symbol))
 		return false
 	}
 
-	// Condition 4: ADX < 70 (relaxed for faster reentry after breakout)
+	// ADX < 50
 	avgADX := detector.averageADXLocked()
-	if avgADX >= 70.0 {
-		a.logger.Debug("Regrid check: ADX too high",
+	if avgADX >= 50.0 {
+		a.logger.Debug("OVER_SIZE regrid check: ADX too high",
 			zap.String("symbol", symbol),
 			zap.Float64("avg_adx", avgADX))
 		return false
 	}
 
-	// Condition 5: BB width contraction check (relaxed to 10x)
+	// BB width < 5x
+	currentRange := detector.currentRange
+	lastAccepted := detector.lastAcceptedRange
+	if currentRange != nil && lastAccepted != nil {
+		widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
+		if widthRatio >= 5.0 {
+			a.logger.Debug("OVER_SIZE regrid check: BB width not contracted enough",
+				zap.String("symbol", symbol),
+				zap.Float64("width_ratio", widthRatio))
+			return false
+		}
+	}
+
+	a.logger.Info("OVER_SIZE regrid allowed",
+		zap.String("symbol", symbol))
+	return true
+}
+
+// canRegridFromDefensive checks if regrid is allowed from DEFENSIVE state
+func (a *AdaptiveGridManager) canRegridFromDefensive(symbol string) bool {
+	// DEFENSIVE: BB width < 3x + ADX < 50
+	detector, exists := a.rangeDetectors[symbol]
+	if !exists {
+		return false
+	}
+
+	// ADX < 50
+	avgADX := detector.averageADXLocked()
+	if avgADX >= 50.0 {
+		a.logger.Debug("DEFENSIVE regrid check: ADX too high",
+			zap.String("symbol", symbol),
+			zap.Float64("avg_adx", avgADX))
+		return false
+	}
+
+	// BB width < 3x
+	currentRange := detector.currentRange
+	lastAccepted := detector.lastAcceptedRange
+	if currentRange != nil && lastAccepted != nil {
+		widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
+		if widthRatio >= 3.0 {
+			a.logger.Debug("DEFENSIVE regrid check: BB width not contracted enough",
+				zap.String("symbol", symbol),
+				zap.Float64("width_ratio", widthRatio))
+			return false
+		}
+	}
+
+	a.logger.Info("DEFENSIVE regrid allowed",
+		zap.String("symbol", symbol))
+	return true
+}
+
+// canRegridFromRecovery checks if regrid is allowed from RECOVERY state
+func (a *AdaptiveGridManager) canRegridFromRecovery(symbol string) bool {
+	// RECOVERY: PnL ≥ 0 + stable 5 minutes
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		if position.UnrealizedPnL < 0 {
+			a.logger.Debug("RECOVERY regrid check: PnL negative",
+				zap.String("symbol", symbol),
+				zap.Float64("pnl", position.UnrealizedPnL))
+			return false
+		}
+	}
+
+	// Check stability (5 minutes in RECOVERY state)
+	if a.stateMachine != nil {
+		stateTime := a.stateMachine.GetStateTime(symbol)
+		if time.Since(stateTime) < 5*time.Minute {
+			a.logger.Debug("RECOVERY regrid check: not stable enough yet",
+				zap.String("symbol", symbol),
+				zap.Duration("time_in_recovery", time.Since(stateTime)))
+			return false
+		}
+	}
+
+	a.logger.Info("RECOVERY regrid allowed",
+		zap.String("symbol", symbol))
+	return true
+}
+
+// canRegridFromExitHalf checks if regrid is allowed from EXIT_HALF state
+func (a *AdaptiveGridManager) canRegridFromExitHalf(symbol string) bool {
+	// EXIT_HALF: PnL ≥ 0
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		if position.UnrealizedPnL < 0 {
+			a.logger.Debug("EXIT_HALF regrid check: PnL negative",
+				zap.String("symbol", symbol),
+				zap.Float64("pnl", position.UnrealizedPnL))
+			return false
+		}
+	}
+
+	a.logger.Info("EXIT_HALF regrid allowed",
+		zap.String("symbol", symbol))
+	return true
+}
+
+// canRegridFromExitAll checks if regrid is allowed from EXIT_ALL state
+func (a *AdaptiveGridManager) canRegridFromExitAll(symbol string) bool {
+	// EXIT_ALL: position = 0 OR dynamic timeout expired
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		if math.Abs(position.PositionAmt) > 0 {
+			// Position not zero - check dynamic timeout
+			stateTime := a.stateMachine.GetStateTime(symbol)
+			dynamicTimeout := a.calculateDynamicTimeout(symbol, position)
+			if time.Since(stateTime) < dynamicTimeout {
+				a.logger.Debug("EXIT_ALL regrid check: dynamic timeout not expired",
+					zap.String("symbol", symbol),
+					zap.Duration("elapsed", time.Since(stateTime)),
+					zap.Duration("timeout", dynamicTimeout))
+				return false
+			}
+		}
+	}
+
+	a.logger.Info("EXIT_ALL regrid allowed",
+		zap.String("symbol", symbol))
+	return true
+}
+
+// canRegridFromTrading checks if regrid is allowed from TRADING state
+func (a *AdaptiveGridManager) canRegridFromTrading(symbol string) bool {
+	// TRADING: Allow regrid with position check (must not exceed max)
+	maxPosition := a.riskConfig.MaxPositionUSDT
+	if position, exists := a.positions[symbol]; exists && position != nil {
+		if position.NotionalValue > maxPosition {
+			a.logger.Debug("TRADING regrid check: position exceeds max",
+				zap.String("symbol", symbol),
+				zap.Float64("position", position.NotionalValue),
+				zap.Float64("max", maxPosition))
+			return false
+		}
+	}
+
+	// Check standard market conditions
+	return a.checkMarketConditionsForRegrid(symbol, GridStateTrading)
+}
+
+// checkMarketConditionsForRegrid checks common market conditions for regrid
+func (a *AdaptiveGridManager) checkMarketConditionsForRegrid(symbol string, state GridState) bool {
+	detector, exists := a.rangeDetectors[symbol]
+	if !exists {
+		a.logger.Debug("Market condition check: no range detector", zap.String("symbol", symbol))
+		return false
+	}
+
+	// ADX < 70 (relaxed for faster reentry after breakout)
+	avgADX := detector.averageADXLocked()
+	if avgADX >= 70.0 {
+		a.logger.Debug("Market condition check: ADX too high",
+			zap.String("symbol", symbol),
+			zap.String("state", state.String()),
+			zap.Float64("avg_adx", avgADX))
+		return false
+	}
+
+	// BB width contraction check (relaxed to 10x)
 	currentRange := detector.currentRange
 	lastAccepted := detector.lastAcceptedRange
 	if currentRange == nil || lastAccepted == nil {
-		a.logger.Debug("Regrid check: no range data",
+		a.logger.Debug("Market condition check: no range data",
 			zap.String("symbol", symbol),
+			zap.String("state", state.String()),
 			zap.Bool("has_current", currentRange != nil),
 			zap.Bool("has_last", lastAccepted != nil))
 		return false
@@ -4554,32 +5431,125 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 	// Check BB width contraction (current width < 10x last accepted) - very relaxed
 	widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
 	if widthRatio >= 10.0 {
-		a.logger.Debug("Regrid check: BB width not contracted enough",
+		a.logger.Debug("Market condition check: BB width not contracted enough",
 			zap.String("symbol", symbol),
+			zap.String("state", state.String()),
 			zap.Float64("width_ratio", widthRatio))
 		return false
 	}
 
-	// Condition 6: Range shift ≥ 0.01% (very relaxed for faster reentry)
-	centerShiftPct := math.Abs(currentRange.MidPrice-lastAccepted.MidPrice) / lastAccepted.MidPrice
-	if centerShiftPct < 0.0001 { // 0.01% minimum shift
-		a.logger.Debug("Regrid check: range shift too small",
-			zap.String("symbol", symbol),
-			zap.Float64("center_shift_pct", centerShiftPct))
-		return false
+	return true
+}
+
+// calculateDynamicTimeout calculates dynamic timeout for EXIT_ALL state
+// Timeout varies based on:
+// - PnL: profitable positions get longer timeout (up to 60s)
+// - Loss positions get shorter timeout (as low as 5s)
+// - Volatility: calm market = longer timeout, volatile = shorter
+// - Regime: ranging = longer, trending/volatile = shorter
+func (a *AdaptiveGridManager) calculateDynamicTimeout(symbol string, position *SymbolPosition) time.Duration {
+	// Use config values if available, otherwise use defaults
+	baseTimeoutSeconds := 15.0
+	minTimeoutSeconds := 5.0
+	maxTimeoutSeconds := 60.0
+
+	if a.dynamicTimeoutConfig != nil {
+		baseTimeoutSeconds = float64(a.dynamicTimeoutConfig.BaseTimeoutSeconds)
+		minTimeoutSeconds = float64(a.dynamicTimeoutConfig.MinTimeoutSeconds)
+		maxTimeoutSeconds = float64(a.dynamicTimeoutConfig.MaxTimeoutSeconds)
 	}
 
-	// Get current regime for context
-	currentRegime := a.GetCurrentRegime(symbol)
+	baseTimeout := time.Duration(baseTimeoutSeconds) * time.Second
 
-	a.logger.Info("Regrid ready: market conditions met (very relaxed)",
+	// 1. PnL-based adjustment
+	if position != nil {
+		pnlPct := position.UnrealizedPnL / position.NotionalValue
+		if pnlPct > 0 {
+			// Profitable: increase timeout
+			pnlMultiplier := 10.0
+			maxMultiplier := 4.0
+			if a.dynamicTimeoutConfig != nil {
+				pnlMultiplier = a.dynamicTimeoutConfig.PnlMultiplier
+				maxMultiplier = a.dynamicTimeoutConfig.MaxPnlMultiplier
+			}
+			adjustedMultiplier := math.Min(1.0+pnlPct*pnlMultiplier, maxMultiplier)
+			baseTimeout = time.Duration(float64(baseTimeout) * adjustedMultiplier)
+		} else if pnlPct < 0 {
+			// Loss: decrease timeout
+			lossMultiplier := 5.0
+			minMultiplier := 0.33
+			if a.dynamicTimeoutConfig != nil {
+				lossMultiplier = a.dynamicTimeoutConfig.LossMultiplier
+				minMultiplier = a.dynamicTimeoutConfig.MinLossMultiplier
+			}
+			adjustedMultiplier := math.Max(1.0+pnlPct*lossMultiplier, minMultiplier)
+			baseTimeout = time.Duration(float64(baseTimeout) * adjustedMultiplier)
+		}
+	}
+
+	// 2. Volatility-based adjustment
+	detector, exists := a.rangeDetectors[symbol]
+	if exists {
+		avgADX := detector.averageADXLocked()
+		lowADX := 30.0
+		highADX := 60.0
+		lowMult := 1.2
+		highMult := 0.7
+
+		if a.dynamicTimeoutConfig != nil {
+			lowADX = a.dynamicTimeoutConfig.LowVolatilityADX
+			highADX = a.dynamicTimeoutConfig.HighVolatilityADX
+			lowMult = a.dynamicTimeoutConfig.LowVolatilityMultiplier
+			highMult = a.dynamicTimeoutConfig.HighVolatilityMultiplier
+		}
+
+		if avgADX < lowADX {
+			// Low volatility: longer timeout
+			baseTimeout = time.Duration(float64(baseTimeout) * lowMult)
+		} else if avgADX > highADX {
+			// High volatility: shorter timeout
+			baseTimeout = time.Duration(float64(baseTimeout) * highMult)
+		}
+	}
+
+	// 3. Regime-based adjustment
+	regime := a.GetCurrentRegime(symbol)
+	rangingMult := 1.1
+	trendingMult := 0.8
+	volatileMult := 0.6
+
+	if a.dynamicTimeoutConfig != nil {
+		rangingMult = a.dynamicTimeoutConfig.RangingMultiplier
+		trendingMult = a.dynamicTimeoutConfig.TrendingMultiplier
+		volatileMult = a.dynamicTimeoutConfig.VolatileMultiplier
+	}
+
+	switch regime {
+	case market_regime.RegimeRanging:
+		baseTimeout = time.Duration(float64(baseTimeout) * rangingMult)
+	case market_regime.RegimeTrending:
+		baseTimeout = time.Duration(float64(baseTimeout) * trendingMult)
+	case market_regime.RegimeVolatile:
+		baseTimeout = time.Duration(float64(baseTimeout) * volatileMult)
+	}
+
+	// 4. Clamp to min/max bounds
+	minTimeout := time.Duration(minTimeoutSeconds) * time.Second
+	maxTimeout := time.Duration(maxTimeoutSeconds) * time.Second
+	if baseTimeout < minTimeout {
+		baseTimeout = minTimeout
+	}
+	if baseTimeout > maxTimeout {
+		baseTimeout = maxTimeout
+	}
+
+	a.logger.Debug("Dynamic timeout calculated",
 		zap.String("symbol", symbol),
-		zap.Float64("avg_adx", avgADX),
-		zap.Float64("width_ratio", widthRatio),
-		zap.Float64("center_shift_pct", centerShiftPct),
-		zap.String("regime", string(currentRegime)))
+		zap.Duration("timeout", baseTimeout),
+		zap.Float64("pnl", position.UnrealizedPnL),
+		zap.String("regime", string(regime)))
 
-	return true
+	return baseTimeout
 }
 
 // =============================================================================

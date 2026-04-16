@@ -91,7 +91,156 @@ func (d *DynamicSizeCalculator) AddPriceData(high, low, close float64) {
 
 }
 
-// CalculateOrderSize calculates appropriate order size
+// CalculateBaseSize calculates base order size from equity, leverage, and max position
+func (d *DynamicSizeCalculator) CalculateBaseSize(equity, leverage, maxPosition float64) float64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Base size = equity * leverage fraction (e.g., 1% of equity)
+	baseSize := equity * 0.01
+
+	// Cap at max position
+	if baseSize > maxPosition {
+		baseSize = maxPosition
+	}
+
+	// Apply leverage (higher leverage = larger size)
+	baseSize = baseSize * (leverage / 50.0) // Normalize to 50x base
+
+	return baseSize
+}
+
+// CalculateRiskAdjustment calculates size adjustment based on risk factors
+func (d *DynamicSizeCalculator) CalculateRiskAdjustment(drawdown, consecutiveLosses, pnl float64) float64 {
+	// Drawdown reduces size (10% drawdown = 90% size)
+	drawdownFactor := 1.0 - drawdown
+	if drawdownFactor < 0.5 {
+		drawdownFactor = 0.5 // Minimum 50% size
+	}
+
+	// Consecutive losses reduce size (exponential decay)
+	lossFactor := math.Pow(0.8, consecutiveLosses)
+
+	// PnL adjustment (positive PnL allows larger size)
+	pnlFactor := 1.0
+	if pnl > 0 {
+		pnlFactor = 1.0 + math.Min(pnl/100.0, 0.5) // Max +50%
+	} else if pnl < 0 {
+		pnlFactor = 1.0 + math.Max(pnl/100.0, -0.3) // Min -30%
+	}
+
+	return drawdownFactor * lossFactor * pnlFactor
+}
+
+// CalculateOpportunityAdjustment calculates size adjustment based on market opportunity
+func (d *DynamicSizeCalculator) CalculateOpportunityAdjustment(spread, depth, funding float64) float64 {
+	// Tight spread = larger size (0.1% spread = 1.0x, 1% spread = 0.5x)
+	spreadFactor := 1.0 - spread*10
+	if spreadFactor < 0.3 {
+		spreadFactor = 0.3
+	}
+
+	// Deep order book = larger size
+	depthFactor := 1.0
+	if depth > 0 {
+		depthFactor = math.Min(depth/10000.0, 1.2) // Max +20%
+	}
+
+	// Funding rate adjustment (negative funding = long bias, positive = short bias)
+	fundingFactor := 1.0
+	if funding < 0 {
+		fundingFactor = 1.0 + math.Min(math.Abs(funding)*10, 0.2) // Max +20%
+	} else if funding > 0.01 {
+		fundingFactor = 1.0 - math.Min(funding*5, 0.2) // Max -20%
+	}
+
+	return spreadFactor * depthFactor * fundingFactor
+}
+
+// CalculateLiquidityAdjustment calculates size adjustment based on liquidity
+func (d *DynamicSizeCalculator) CalculateLiquidityAdjustment(orderBookDepth, volume float64) float64 {
+	// Deep order book = larger size
+	depthFactor := 1.0
+	if orderBookDepth > 0 {
+		depthFactor = math.Min(orderBookDepth/50000.0, 1.3) // Max +30%
+	}
+
+	// High volume = larger size
+	volumeFactor := 1.0
+	if volume > 0 {
+		volumeFactor = math.Min(volume/1000000.0, 1.2) // Max +20%
+	}
+
+	return depthFactor * volumeFactor
+}
+
+// CalculateKelly calculates Kelly Criterion
+func (d *DynamicSizeCalculator) CalculateKelly(winRate, avgWin, avgLoss float64) float64 {
+	// Kelly = (WinRate * avgWin - (1 - WinRate) * avgLoss) / avgWin
+	// Simplified: Kelly = (WinRate * RewardRatio - (1 - WinRate)) / RewardRatio
+	rewardRatio := 1.5
+	kelly := (winRate*rewardRatio - (1 - winRate)) / rewardRatio
+
+	// Clamp to avoid extreme values
+	if kelly < 0.1 {
+		kelly = 0.1
+	}
+	if kelly > 1.0 {
+		kelly = 1.0
+	}
+
+	return kelly
+}
+
+// CalculateKellySize calculates order size using Kelly Criterion with fractional Kelly and hard caps
+func (d *DynamicSizeCalculator) CalculateKellySize(kellyFraction, equity, leverage float64) float64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Use Fractional Kelly (1/4 of full Kelly to avoid over-betting)
+	fractionalKelly := d.CalculateKelly(0.5, 1.5, 1.0) * 0.25 // 25% of full Kelly
+
+	// Calculate base size
+	size := equity * fractionalKelly * kellyFraction * (leverage / 50.0)
+
+	// HARD CAP: Never exceed 5% of equity per position
+	maxPositionPct := 0.05 // 5% hard cap
+	maxSize := equity * maxPositionPct
+
+	if size > maxSize {
+		size = maxSize
+	}
+
+	// Also respect configured max notional
+	if d.maxNotional > 0 && size > d.maxNotional {
+		size = d.maxNotional
+	}
+
+	return size
+}
+
+// ApplyLossDecay applies consecutive loss decay to base size
+func (d *DynamicSizeCalculator) ApplyLossDecay(baseSize float64, consecutiveLosses int) float64 {
+	decayRate := 0.8 // 20% reduction per loss
+	decay := math.Pow(decayRate, float64(consecutiveLosses))
+	return baseSize * decay
+}
+
+// ApplyWinRecovery applies win recovery to base size
+func (d *DynamicSizeCalculator) ApplyWinRecovery(baseSize float64, consecutiveWins int) float64 {
+	recoveryRate := 1.1 // 10% increase per win
+	recovery := math.Pow(recoveryRate, float64(consecutiveWins))
+	size := baseSize * recovery
+
+	// Cap at 1.5x base size
+	if size > baseSize*1.5 {
+		size = baseSize * 1.5
+	}
+
+	return size
+}
+
+// CalculateOrderSize calculates appropriate order size with all factors
 
 func (d *DynamicSizeCalculator) CalculateOrderSize(
 
@@ -103,113 +252,129 @@ func (d *DynamicSizeCalculator) CalculateOrderSize(
 
 	marketRegime market_regime.MarketRegime,
 
+	// NEW: Additional factors for enhanced sizing
+	drawdown float64,
+	consecutiveLosses int,
+	pnl float64,
+	spread float64,
+	orderBookDepth float64,
+	volume float64,
+	funding float64,
+	leverage float64,
+
 ) (float64, error) {
 
 	d.mu.RLock()
 
 	defer d.mu.RUnlock()
 
-	// 1. Calculate max allowed exposure based on equity
+	// 1. Calculate base size
+	baseSize := d.CalculateBaseSize(d.equity, leverage, d.maxNotional)
 
+	// 2. Apply risk adjustment
+	riskFactor := d.CalculateRiskAdjustment(drawdown, float64(consecutiveLosses), pnl)
+
+	// 3. Apply opportunity adjustment
+	opportunityFactor := d.CalculateOpportunityAdjustment(spread, orderBookDepth, funding)
+
+	// 4. Apply liquidity adjustment
+	liquidityFactor := d.CalculateLiquidityAdjustment(orderBookDepth, volume)
+
+	// 5. Get ATR-based volatility adjustment
+	atrPct := d.atrCalc.GetATRPct(currentPrice)
+
+	// Calculate volatility factor (reduce size when volatile)
+	volatilityFactor := 1.0
+	if atrPct > 0 {
+		if atrPct > 0.01 {
+			volatilityFactor = math.Max(0.3, 1.0-(atrPct-0.01)*d.atrMultiplier)
+		}
+	}
+
+	// 6. Regime adjustment
+	regimeFactor := 1.0
+	switch marketRegime {
+	case market_regime.RegimeTrending:
+		regimeFactor = 0.5
+	case market_regime.RegimeVolatile:
+		regimeFactor = 0.3
+	case market_regime.RegimeRanging:
+		regimeFactor = 1.0
+	}
+
+	// 7. Calculate final notional size with all factors
+	notionalSize := baseSize * riskFactor * opportunityFactor * liquidityFactor * volatilityFactor * regimeFactor
+
+	// 8. Calculate max allowed exposure based on equity
 	maxExposure := d.equity * d.maxTotalExposurePct
-
 	availableExposure := maxExposure - currentExposure
 
 	if availableExposure <= 0 {
-
 		return 0, fmt.Errorf("max exposure reached: %.2f/%.2f", currentExposure, maxExposure)
-
 	}
 
-	// 2. Get ATR-based volatility adjustment
-
-	atrPct := d.atrCalc.GetATRPct(currentPrice)
-
-	// 3. Calculate volatility factor (reduce size when volatile)
-
-	// Base: 1.0, High volatility: < 1.0
-
-	volatilityFactor := 1.0
-
-	if atrPct > 0 {
-
-		// If ATR > 1%, reduce size proportionally
-
-		if atrPct > 0.01 {
-
-			volatilityFactor = math.Max(0.3, 1.0-(atrPct-0.01)*d.atrMultiplier)
-
-		}
-
-	}
-
-	// 4. Regime adjustment
-
-	regimeFactor := 1.0
-
-	switch marketRegime {
-
-	case market_regime.RegimeTrending:
-
-		regimeFactor = 0.5 // Reduce 50% in trending (risk of reversal)
-
-	case market_regime.RegimeVolatile:
-
-		regimeFactor = 0.3 // Reduce 70% in volatile markets
-
-	case market_regime.RegimeRanging:
-
-		regimeFactor = 1.0 // Full size in ranging
-
-	}
-
-	// 5. Calculate final notional size
-
-	notionalSize := d.baseNotional * volatilityFactor * regimeFactor
-
-	// Apply bounds
-
+	// 9. Apply bounds
 	if notionalSize < d.minNotional {
-
 		notionalSize = d.minNotional
-
 	}
 
 	if notionalSize > d.maxNotional {
-
 		notionalSize = d.maxNotional
-
 	}
 
 	if notionalSize > availableExposure {
-
 		notionalSize = availableExposure
-
 	}
 
-	// 6. Convert to quantity
-
+	// 10. Convert to quantity
 	quantity := notionalSize / currentPrice
 
-	d.logger.Info("Order size calculated",
-
+	// 11. Detailed logging
+	d.logger.Info("Order size calculated with all factors",
 		zap.Float64("current_price", currentPrice),
-
-		zap.Float64("atr_pct", atrPct*100),
-
+		zap.Float64("base_size", baseSize),
+		zap.Float64("risk_factor", riskFactor),
+		zap.Float64("opportunity_factor", opportunityFactor),
+		zap.Float64("liquidity_factor", liquidityFactor),
 		zap.Float64("volatility_factor", volatilityFactor),
-
 		zap.Float64("regime_factor", regimeFactor),
-
+		zap.Float64("drawdown", drawdown),
+		zap.Int("consecutive_losses", consecutiveLosses),
+		zap.Float64("pnl", pnl),
+		zap.Float64("spread", spread),
+		zap.Float64("funding", funding),
+		zap.Float64("atr_pct", atrPct*100),
 		zap.Float64("notional_usd", notionalSize),
-
 		zap.Float64("quantity", quantity),
-
 		zap.String("regime", string(marketRegime)),
 	)
 
 	return quantity, nil
 
+}
+
+// CalculateOrderSizeSimple calculates order size with default values for new parameters (backward compatibility)
+func (d *DynamicSizeCalculator) CalculateOrderSizeSimple(
+	currentPrice float64,
+	currentExposure float64,
+	isLong bool,
+	marketRegime market_regime.MarketRegime,
+) (float64, error) {
+	// Use default values for new parameters
+	return d.CalculateOrderSize(
+		currentPrice,
+		currentExposure,
+		isLong,
+		marketRegime,
+		0.0,       // drawdown
+		0,         // consecutiveLosses
+		0.0,       // pnl
+		0.001,     // spread (0.1%)
+		10000.0,   // orderBookDepth
+		1000000.0, // volume
+		0.0,       // funding
+		50.0,      // leverage
+	)
 }
 
 // GetMaxExposure returns max allowed exposure
@@ -958,7 +1123,7 @@ func (r *RiskMonitor) GetOrderSize(
 
 	// Calculate size
 
-	size, err := r.sizeCalc.CalculateOrderSize(currentPrice, totalExposure, isLong, regime)
+	size, err := r.sizeCalc.CalculateOrderSizeSimple(currentPrice, totalExposure, isLong, regime)
 
 	if err != nil {
 

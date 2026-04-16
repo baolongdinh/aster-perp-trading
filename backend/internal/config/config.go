@@ -71,6 +71,13 @@ type RiskConfig struct {
 	OverSize                    *OverSizeConfig                 `mapstructure:"over_size"`
 	DefensiveState              *DefensiveStateConfig           `mapstructure:"defensive_state"`
 	RecoveryState               *RecoveryStateConfig            `mapstructure:"recovery_state"`
+	ConditionBlocker            *ConditionBlockerConfig         `mapstructure:"condition_blocker"`
+	AdaptiveThresholds          *AdaptiveThresholdsConfig       `mapstructure:"adaptive_thresholds"`
+	DynamicSizing               *DynamicSizingConfig            `mapstructure:"dynamic_sizing"`
+	DynamicTimeout              *DynamicTimeoutConfig           `mapstructure:"dynamic_timeout"`
+	ConditionalTransitions      *ConditionalTransitionsConfig   `mapstructure:"conditional_transitions"`
+	GraduatedModes              *GraduatedModesConfig           `mapstructure:"graduated_modes"`
+	GraduatedExit               *GraduatedExitConfig            `mapstructure:"graduated_exit"`
 }
 
 type PnLRiskControlConfig struct {
@@ -106,6 +113,135 @@ type RecoveryStateConfig struct {
 	SizeMultiplier        float64 `mapstructure:"size_multiplier"`         // Order size multiplier in RECOVERY (e.g., 0.5)
 	SpreadMultiplier      float64 `mapstructure:"spread_multiplier"`       // Spread multiplier in RECOVERY (e.g., 1.5)
 	StableDurationMin     int     `mapstructure:"stable_duration_min"`     // Minimum stable PnL duration (minutes)
+}
+
+type ConditionBlockerConfig struct {
+	Enabled            bool    `mapstructure:"enabled"`
+	PositionSizeWeight float64 `mapstructure:"position_size_weight"`
+	VolatilityWeight   float64 `mapstructure:"volatility_weight"`
+	RiskWeight         float64 `mapstructure:"risk_weight"`
+	TrendWeight        float64 `mapstructure:"trend_weight"`
+	SkewWeight         float64 `mapstructure:"skew_weight"`
+	BlockingThreshold  float64 `mapstructure:"blocking_threshold"`
+	MicroModeMin       float64 `mapstructure:"micro_mode_min"`
+}
+
+type AdaptiveThresholdsConfig struct {
+	Enabled                 bool    `mapstructure:"enabled"`
+	BasePositionThreshold   float64 `mapstructure:"base_position_threshold"`
+	BaseVolatilityThreshold float64 `mapstructure:"base_volatility_threshold"`
+	BaseRiskThreshold       float64 `mapstructure:"base_risk_threshold"`
+	BaseTrendThreshold      float64 `mapstructure:"base_trend_threshold"`
+	AdaptationRate          float64 `mapstructure:"adaptation_rate"`
+	MinThreshold            float64 `mapstructure:"min_threshold"`
+	MaxThreshold            float64 `mapstructure:"max_threshold"`
+	EnableLearning          bool    `mapstructure:"enable_learning"`
+	LearningRate            float64 `mapstructure:"learning_rate"`
+}
+
+type DynamicSizingConfig struct {
+	Enabled               bool    `mapstructure:"enabled"`
+	KellyFraction         float64 `mapstructure:"kelly_fraction"`
+	MinKelly              float64 `mapstructure:"min_kelly"`
+	MaxKelly              float64 `mapstructure:"max_kelly"`
+	LossDecayRate         float64 `mapstructure:"loss_decay_rate"`
+	WinRecoveryRate       float64 `mapstructure:"win_recovery_rate"`
+	MaxRecoveryMultiplier float64 `mapstructure:"max_recovery_multiplier"`
+	DrawdownFactor        float64 `mapstructure:"drawdown_factor"`
+	MinDrawdownFactor     float64 `mapstructure:"min_drawdown_factor"`
+	PnLIncreaseCap        float64 `mapstructure:"pnl_increase_cap"`
+	PnLDecreaseCap        float64 `mapstructure:"pnl_decrease_cap"`
+	SpreadFactor          float64 `mapstructure:"spread_factor"`
+	MinSpreadFactor       float64 `mapstructure:"min_spread_factor"`
+	DepthFactor           float64 `mapstructure:"depth_factor"`
+	MaxDepthIncrease      float64 `mapstructure:"max_depth_increase"`
+	FundingFactor         float64 `mapstructure:"funding_factor"`
+	MaxFundingAdjustment  float64 `mapstructure:"max_funding_adjustment"`
+	DepthDivisor          float64 `mapstructure:"depth_divisor"`
+	MaxDepthLiquidity     float64 `mapstructure:"max_depth_liquidity"`
+	VolumeDivisor         float64 `mapstructure:"volume_divisor"`
+	MaxVolumeIncrease     float64 `mapstructure:"max_volume_increase"`
+	MinSizeUSDT           float64 `mapstructure:"min_size_usdt"`
+	MaxSizeUSDT           float64 `mapstructure:"max_size_usdt"`
+	BaseSizePct           float64 `mapstructure:"base_size_pct"`
+	LeverageNormalization float64 `mapstructure:"leverage_normalization"`
+}
+
+type DynamicTimeoutConfig struct {
+	Enabled                  bool    `mapstructure:"enabled"`
+	BaseTimeoutSeconds       int     `mapstructure:"base_timeout_seconds"`
+	MinTimeoutSeconds        int     `mapstructure:"min_timeout_seconds"`
+	MaxTimeoutSeconds        int     `mapstructure:"max_timeout_seconds"`
+	PnlMultiplier            float64 `mapstructure:"pnl_multiplier"`
+	LossMultiplier           float64 `mapstructure:"loss_multiplier"`
+	MaxPnlMultiplier         float64 `mapstructure:"max_pnl_multiplier"`
+	MinLossMultiplier        float64 `mapstructure:"min_loss_multiplier"`
+	LowVolatilityADX         float64 `mapstructure:"low_volatility_adx"`
+	LowVolatilityMultiplier  float64 `mapstructure:"low_volatility_multiplier"`
+	HighVolatilityADX        float64 `mapstructure:"high_volatility_adx"`
+	HighVolatilityMultiplier float64 `mapstructure:"high_volatility_multiplier"`
+	RangingMultiplier        float64 `mapstructure:"ranging_multiplier"`
+	TrendingMultiplier       float64 `mapstructure:"trending_multiplier"`
+	VolatileMultiplier       float64 `mapstructure:"volatile_multiplier"`
+}
+
+type ConditionalTransitionsConfig struct {
+	Enabled                 bool                       `mapstructure:"enabled"`
+	ConfidenceThreshold     float64                    `mapstructure:"confidence_threshold"`
+	EmergencyRiskCount      int                        `mapstructure:"emergency_risk_count"`
+	PositionRiskThreshold   float64                    `mapstructure:"position_risk_threshold"`
+	VolatilityRiskThreshold float64                    `mapstructure:"volatility_risk_threshold"`
+	DrawdownRiskThreshold   float64                    `mapstructure:"drawdown_risk_threshold"`
+	OverSizeToDefensive     *TransitionThresholdConfig `mapstructure:"over_size_to_defensive"`
+	DefensiveToRecovery     *TransitionThresholdConfig `mapstructure:"defensive_to_recovery"`
+	RecoveryToOverSize      *TransitionThresholdConfig `mapstructure:"recovery_to_over_size"`
+}
+
+type TransitionThresholdConfig struct {
+	PositionThreshold   float64 `mapstructure:"position_threshold"`
+	VolatilityThreshold float64 `mapstructure:"volatility_threshold"`
+	PnlThreshold        float64 `mapstructure:"pnl_threshold"`
+}
+
+type GraduatedModesConfig struct {
+	Enabled                    bool                 `mapstructure:"enabled"`
+	PausedDrawdownThreshold    float64              `mapstructure:"paused_drawdown_threshold"`
+	PausedLossThreshold        int                  `mapstructure:"paused_loss_threshold"`
+	PausedVolatilityThreshold  float64              `mapstructure:"paused_volatility_threshold"`
+	ReducedDrawdownThreshold   float64              `mapstructure:"reduced_drawdown_threshold"`
+	ReducedLossThreshold       int                  `mapstructure:"reduced_loss_threshold"`
+	ReducedRiskThreshold       float64              `mapstructure:"reduced_risk_threshold"`
+	ReducedVolatilityThreshold float64              `mapstructure:"reduced_volatility_threshold"`
+	FullRiskThreshold          float64              `mapstructure:"full_risk_threshold"`
+	FullVolatilityThreshold    float64              `mapstructure:"full_volatility_threshold"`
+	FullDrawdownThreshold      float64              `mapstructure:"full_drawdown_threshold"`
+	MinModeDurationMinutes     int                  `mapstructure:"min_mode_duration_minutes"`
+	FullMode                   *ModeParameterConfig `mapstructure:"full_mode"`
+	ReducedMode                *ModeParameterConfig `mapstructure:"reduced_mode"`
+	MicroMode                  *ModeParameterConfig `mapstructure:"micro_mode"`
+	PausedMode                 *ModeParameterConfig `mapstructure:"paused_mode"`
+}
+
+type ModeParameterConfig struct {
+	SpreadMultiplier float64 `mapstructure:"spread_multiplier"`
+	OrderMultiplier  float64 `mapstructure:"order_multiplier"`
+	SizeMultiplier   float64 `mapstructure:"size_multiplier"`
+}
+
+type GraduatedExitConfig struct {
+	Enabled              bool                   `mapstructure:"enabled"`
+	SmallLossThreshold   float64                `mapstructure:"small_loss_threshold"`
+	MediumLossThreshold  float64                `mapstructure:"medium_loss_threshold"`
+	LargeLossThreshold   float64                `mapstructure:"large_loss_threshold"`
+	ExtremeLossThreshold float64                `mapstructure:"extreme_loss_threshold"`
+	ExitPercentages      *ExitPercentagesConfig `mapstructure:"exit_percentages"`
+}
+
+type ExitPercentagesConfig struct {
+	SmallLoss   float64 `mapstructure:"small_loss"`
+	MediumLoss  float64 `mapstructure:"medium_loss"`
+	LargeLoss   float64 `mapstructure:"large_loss"`
+	ExtremeLoss float64 `mapstructure:"extreme_loss"`
 }
 
 type APIConfig struct {
@@ -254,29 +390,30 @@ func validate(cfg *Config) error {
 
 // VolumeFarmConfig contains volume farming specific configuration
 type VolumeFarmConfig struct {
-	Enabled                  bool                `mapstructure:"enabled"`
-	MaxDailyLossUSDT         float64             `mapstructure:"max_daily_loss_usdt"`
-	MaxTotalDrawdownPct      float64             `mapstructure:"max_total_drawdown_pct"`
-	OrderSizeUSDT            float64             `mapstructure:"order_size_usdt"`
-	GridSpreadPct            float64             `mapstructure:"grid_spread_pct"`
-	MaxOrdersPerSide         int                 `mapstructure:"max_orders_per_side"`
-	ReplaceImmediately       bool                `mapstructure:"replace_immediately"`
-	PositionTimeoutMinutes   int                 `mapstructure:"position_timeout_minutes"`
-	TickerStream             string              `mapstructure:"ticker_stream"`
-	SymbolRefreshIntervalSec int                 `mapstructure:"symbol_refresh_interval_seconds"`
-	GridPlacementCooldownSec int                 `mapstructure:"grid_placement_cooldown_seconds"`
-	RateLimitCooldownSec     int                 `mapstructure:"rate_limit_cooldown_seconds"`
-	RateLimiterCapacity      int                 `mapstructure:"rate_limiter_capacity"`
-	RateLimiterRefillRate    float64             `mapstructure:"rate_limiter_refill_rate"`
-	SupportedQuoteCurrencies []string            `mapstructure:"supported_quote_currencies"`
-	MinVolume24h             float64             `mapstructure:"min_volume_24h"`
-	Bot                      BotConfig           `mapstructure:"bot"`
-	Symbols                  SymbolsConfig       `mapstructure:"symbols"`
-	Exchange                 ExchangeConfig      `mapstructure:"exchange"`
-	Risk                     RiskConfig          `mapstructure:"risk"`
-	API                      APIConfig           `mapstructure:"api"`
-	TradingModes             *TradingModesConfig `mapstructure:"trading_modes,omitempty"`
-	PartialClose             *PartialCloseConfig `mapstructure:"partial_close,omitempty"`
+	Enabled                  bool                      `mapstructure:"enabled"`
+	MaxDailyLossUSDT         float64                   `mapstructure:"max_daily_loss_usdt"`
+	MaxTotalDrawdownPct      float64                   `mapstructure:"max_total_drawdown_pct"`
+	OrderSizeUSDT            float64                   `mapstructure:"order_size_usdt"`
+	GridSpreadPct            float64                   `mapstructure:"grid_spread_pct"`
+	MaxOrdersPerSide         int                       `mapstructure:"max_orders_per_side"`
+	ReplaceImmediately       bool                      `mapstructure:"replace_immediately"`
+	PositionTimeoutMinutes   int                       `mapstructure:"position_timeout_minutes"`
+	TickerStream             string                    `mapstructure:"ticker_stream"`
+	SymbolRefreshIntervalSec int                       `mapstructure:"symbol_refresh_interval_seconds"`
+	GridPlacementCooldownSec int                       `mapstructure:"grid_placement_cooldown_seconds"`
+	RateLimitCooldownSec     int                       `mapstructure:"rate_limit_cooldown_seconds"`
+	RateLimiterCapacity      int                       `mapstructure:"rate_limiter_capacity"`
+	RateLimiterRefillRate    float64                   `mapstructure:"rate_limiter_refill_rate"`
+	SupportedQuoteCurrencies []string                  `mapstructure:"supported_quote_currencies"`
+	MinVolume24h             float64                   `mapstructure:"min_volume_24h"`
+	Bot                      BotConfig                 `mapstructure:"bot"`
+	Symbols                  SymbolsConfig             `mapstructure:"symbols"`
+	Exchange                 ExchangeConfig            `mapstructure:"exchange"`
+	Risk                     RiskConfig                `mapstructure:"risk"`
+	API                      APIConfig                 `mapstructure:"api"`
+	TradingModes             *TradingModesConfig       `mapstructure:"trading_modes,omitempty"`
+	PartialClose             *PartialCloseConfig       `mapstructure:"partial_close,omitempty"`
+	VolumeOptimization       *VolumeOptimizationConfig `mapstructure:"volume_optimization,omitempty"`
 }
 
 // TradingModesConfig holds configuration for all trading modes

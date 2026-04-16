@@ -19,6 +19,7 @@ import (
 	"aster-bot/internal/farming/market_regime"
 	farmsync "aster-bot/internal/farming/sync"
 	"aster-bot/internal/farming/tradingmode"
+	"aster-bot/internal/farming/volume_optimization"
 	"aster-bot/internal/risk"
 	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
@@ -252,6 +253,32 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		// Wire data sources
 		marketEval.SetAdaptiveGridManager(adaptiveGridManager)
 		marketEval.SetWebSocketClient(sharedWSClient)
+
+		// Initialize AdaptiveThresholdManager and wire to MarketConditionEvaluator
+		if volumeConfig.Risk.AdaptiveThresholds != nil && volumeConfig.Risk.AdaptiveThresholds.Enabled {
+			logger.Info("Initializing AdaptiveThresholdManager",
+				zap.Bool("enabled", volumeConfig.Risk.AdaptiveThresholds.Enabled))
+
+			atConfig := &adaptive_grid.AdaptiveThresholdConfig{
+				BasePositionThreshold:   volumeConfig.Risk.AdaptiveThresholds.BasePositionThreshold,
+				BaseVolatilityThreshold: volumeConfig.Risk.AdaptiveThresholds.BaseVolatilityThreshold,
+				BaseRiskThreshold:       volumeConfig.Risk.AdaptiveThresholds.BaseRiskThreshold,
+				BaseTrendThreshold:      volumeConfig.Risk.AdaptiveThresholds.BaseTrendThreshold,
+				AdaptationRate:          volumeConfig.Risk.AdaptiveThresholds.AdaptationRate,
+				MinThreshold:            volumeConfig.Risk.AdaptiveThresholds.MinThreshold,
+				MaxThreshold:            volumeConfig.Risk.AdaptiveThresholds.MaxThreshold,
+				EnableLearning:          volumeConfig.Risk.AdaptiveThresholds.EnableLearning,
+				LearningRate:            volumeConfig.Risk.AdaptiveThresholds.LearningRate,
+			}
+			atm := adaptive_grid.NewAdaptiveThresholdManager(logger, atConfig)
+			marketEval.SetAdaptiveThresholdManager(atm)
+			logger.Info("AdaptiveThresholdManager initialized and set on MarketConditionEvaluator")
+		} else {
+			logger.Warn("AdaptiveThresholdManager NOT initialized",
+				zap.Bool("config_is_nil", volumeConfig.Risk.AdaptiveThresholds == nil),
+				zap.Bool("enabled", volumeConfig.Risk.AdaptiveThresholds != nil && volumeConfig.Risk.AdaptiveThresholds.Enabled))
+		}
+
 		// Set to grid manager
 		engine.gridManager.SetMarketConditionEvaluator(marketEval)
 		logger.Info("Market Condition Evaluator initialized and wired",
@@ -284,8 +311,166 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 			zap.Float64("size_multiplier", volumeConfig.Risk.RecoveryState.SizeMultiplier))
 	}
 
+	// Initialize ConditionBlocker for conditional blocking
+	if volumeConfig.Risk.ConditionBlocker != nil && volumeConfig.Risk.ConditionBlocker.Enabled {
+		logger.Info("Initializing ConditionBlocker",
+			zap.Bool("enabled", volumeConfig.Risk.ConditionBlocker.Enabled))
+
+		cb := adaptive_grid.NewConditionBlocker(logger)
+		// Set config from YAML
+		cbConfig := &adaptive_grid.ConditionBlockerConfig{
+			PositionSizeWeight: volumeConfig.Risk.ConditionBlocker.PositionSizeWeight,
+			VolatilityWeight:   volumeConfig.Risk.ConditionBlocker.VolatilityWeight,
+			RiskWeight:         volumeConfig.Risk.ConditionBlocker.RiskWeight,
+			TrendWeight:        volumeConfig.Risk.ConditionBlocker.TrendWeight,
+			SkewWeight:         volumeConfig.Risk.ConditionBlocker.SkewWeight,
+			BlockingThreshold:  volumeConfig.Risk.ConditionBlocker.BlockingThreshold,
+			MicroModeMin:       volumeConfig.Risk.ConditionBlocker.MicroModeMin,
+		}
+		cb.SetConfig(cbConfig)
+		adaptiveGridManager.SetConditionBlocker(cb)
+		logger.Info("ConditionBlocker initialized and set on AdaptiveGridManager")
+	} else {
+		logger.Warn("ConditionBlocker NOT initialized",
+			zap.Bool("config_is_nil", volumeConfig.Risk.ConditionBlocker == nil),
+			zap.Bool("enabled", volumeConfig.Risk.ConditionBlocker != nil && volumeConfig.Risk.ConditionBlocker.Enabled))
+	}
+
+	// NEW: Initialize Volume Optimization Components
+	if volumeConfig.VolumeOptimization != nil && volumeConfig.VolumeOptimization.Enabled {
+		logger.Info("=== Initializing Volume Optimization Components ===",
+			zap.Bool("enabled", volumeConfig.VolumeOptimization.Enabled))
+
+		// Initialize TickSizeManager
+		if volumeConfig.VolumeOptimization.OrderPriority.TickSizeAwareness.Enabled {
+			logger.Info("Initializing TickSizeManager")
+			tickSizeMgr := volume_optimization.NewTickSizeManager(logger)
+
+			// Set tick sizes from config
+			for symbol, tickSize := range volumeConfig.VolumeOptimization.OrderPriority.TickSizeAwareness.TickSizes {
+				tickSizeMgr.SetTickSize(symbol, tickSize)
+			}
+
+			// Start periodic refresh (every 5 minutes)
+			ctx := context.Background()
+			go tickSizeMgr.StartPeriodicRefresh(ctx, 5*time.Minute)
+
+			logger.Info("TickSizeManager initialized and started",
+				zap.Int("tick_sizes_count", len(volumeConfig.VolumeOptimization.OrderPriority.TickSizeAwareness.TickSizes)))
+		}
+
+		// Initialize VPINMonitor
+		if volumeConfig.VolumeOptimization.ToxicFlow.Enabled {
+			logger.Info("Initializing VPINMonitor")
+			vpinConfig := volume_optimization.VPINConfig{
+				WindowSize:        volumeConfig.VolumeOptimization.ToxicFlow.WindowSize,
+				BucketSize:        volumeConfig.VolumeOptimization.ToxicFlow.BucketSize,
+				VPINThreshold:     volumeConfig.VolumeOptimization.ToxicFlow.VPINThreshold,
+				SustainedBreaches: volumeConfig.VolumeOptimization.ToxicFlow.SustainedBreaches,
+				AutoResumeDelay:   volumeConfig.VolumeOptimization.ToxicFlow.AutoResumeDelay,
+			}
+			vpinMonitor := volume_optimization.NewVPINMonitor(vpinConfig, logger)
+
+			// Wire to adaptiveGridManager
+			adaptiveGridManager.SetVPINMonitor(vpinMonitor)
+
+			logger.Info("VPINMonitor initialized and wired to AdaptiveGridManager",
+				zap.Int("window_size", vpinConfig.WindowSize),
+				zap.Float64("bucket_size", vpinConfig.BucketSize),
+				zap.Float64("vpin_threshold", vpinConfig.VPINThreshold))
+		}
+
+		// Initialize PostOnlyHandler
+		if volumeConfig.VolumeOptimization.MakerTaker.PostOnlyEnabled {
+			logger.Info("Initializing PostOnlyHandler")
+			postOnlyConfig := volume_optimization.PostOnlyConfig{
+				Enabled:    volumeConfig.VolumeOptimization.MakerTaker.PostOnlyEnabled,
+				Fallback:   volumeConfig.VolumeOptimization.MakerTaker.PostOnlyFallback,
+				MaxRetries: 3,                      // Default
+				RetryDelay: 100 * time.Millisecond, // Default
+			}
+			_ = volume_optimization.NewPostOnlyHandler(postOnlyConfig, logger)
+
+			logger.Info("PostOnlyHandler initialized",
+				zap.Bool("enabled", postOnlyConfig.Enabled),
+				zap.Bool("fallback", postOnlyConfig.Fallback))
+		}
+	} else {
+		logger.Warn("Volume Optimization Components NOT initialized",
+			zap.Bool("config_is_nil", volumeConfig.VolumeOptimization == nil),
+			zap.Bool("enabled", volumeConfig.VolumeOptimization != nil && volumeConfig.VolumeOptimization.Enabled))
+	}
+
+	// NEW: Initialize FluidFlowEngine for continuous flow behavior (always init, independent of config)
+	logger.Info("Initializing FluidFlowEngine for continuous flow behavior")
+	fluidFlowEngine := adaptive_grid.NewFluidFlowEngine(logger)
+	adaptiveGridManager.SetFluidFlowEngine(fluidFlowEngine)
+	logger.Info("FluidFlowEngine initialized and wired (US13: Fluid Flow Behavior)")
+
 	// Connect adaptive manager as risk checker for grid manager
 	engine.gridManager.SetRiskChecker(adaptiveGridManager)
+
+	// NEW: Set dynamic size calculator callback on GridManager
+	if volumeConfig.Risk.DynamicSizing != nil && volumeConfig.Risk.DynamicSizing.Enabled {
+		logger.Info("Setting dynamic size calculator callback on GridManager",
+			zap.Bool("enabled", volumeConfig.Risk.DynamicSizing.Enabled))
+
+		// Create dynamic size calculator function that uses RiskMonitor's smart sizing
+		engine.gridManager.SetDynamicSizeCalculator(func(symbol string, baseSize float64, currentPrice float64) float64 {
+			// Use AdaptiveGridManager's RiskMonitor GetSmartOrderSize with baseSize as input
+			if adaptiveGridManager != nil {
+				// Access riskMonitor via adaptiveGridManager
+				riskMonitor := adaptiveGridManager.GetRiskMonitor()
+				if riskMonitor != nil {
+					return riskMonitor.GetSmartOrderSize(symbol, baseSize)
+				}
+			}
+			return baseSize // Fallback to base size if RiskMonitor not available
+		})
+		logger.Info("Dynamic size calculator callback set on GridManager")
+	} else {
+		logger.Warn("Dynamic size calculator NOT set",
+			zap.Bool("config_is_nil", volumeConfig.Risk.DynamicSizing == nil),
+			zap.Bool("enabled", volumeConfig.Risk.DynamicSizing != nil && volumeConfig.Risk.DynamicSizing.Enabled))
+	}
+
+	// NEW: Set dynamic timeout config on AdaptiveGridManager
+	if volumeConfig.Risk.DynamicTimeout != nil && volumeConfig.Risk.DynamicTimeout.Enabled {
+		logger.Info("Setting dynamic timeout config on AdaptiveGridManager",
+			zap.Bool("enabled", volumeConfig.Risk.DynamicTimeout.Enabled))
+		adaptiveGridManager.SetDynamicTimeoutConfig(volumeConfig.Risk.DynamicTimeout)
+	} else {
+		logger.Warn("Dynamic timeout config NOT set",
+			zap.Bool("config_is_nil", volumeConfig.Risk.DynamicTimeout == nil),
+			zap.Bool("enabled", volumeConfig.Risk.DynamicTimeout != nil && volumeConfig.Risk.DynamicTimeout.Enabled))
+	}
+
+	// NEW: Set conditional transitions config on state machine
+	if volumeConfig.Risk.ConditionalTransitions != nil && volumeConfig.Risk.ConditionalTransitions.Enabled {
+		logger.Info("Setting conditional transitions config on state machine",
+			zap.Bool("enabled", volumeConfig.Risk.ConditionalTransitions.Enabled))
+		stateMachine := adaptiveGridManager.GetStateMachine()
+		if stateMachine != nil {
+			stateMachine.SetConditionalTransitionsConfig(volumeConfig.Risk.ConditionalTransitions)
+		}
+	} else {
+		logger.Warn("Conditional transitions config NOT set",
+			zap.Bool("config_is_nil", volumeConfig.Risk.ConditionalTransitions == nil),
+			zap.Bool("enabled", volumeConfig.Risk.ConditionalTransitions != nil && volumeConfig.Risk.ConditionalTransitions.Enabled))
+	}
+
+	// NEW: Set graduated modes config on circuit breaker
+	if volumeConfig.Risk.GraduatedModes != nil && volumeConfig.Risk.GraduatedModes.Enabled {
+		logger.Info("Setting graduated modes config on circuit breaker",
+			zap.Bool("enabled", volumeConfig.Risk.GraduatedModes.Enabled))
+		if engine.circuitBreaker != nil {
+			engine.circuitBreaker.SetGraduatedModesConfig(volumeConfig.Risk.GraduatedModes)
+		}
+	} else {
+		logger.Warn("Graduated modes config NOT set",
+			zap.Bool("config_is_nil", volumeConfig.Risk.GraduatedModes == nil),
+			zap.Bool("enabled", volumeConfig.Risk.GraduatedModes != nil && volumeConfig.Risk.GraduatedModes.Enabled))
+	}
 
 	// NEW: Connect adaptive manager reference for optimization features
 	engine.gridManager.SetAdaptiveManager(adaptiveGridManager)
@@ -357,6 +542,21 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		// Could trigger grid rebuild or parameter adjustment based on mode change
 	})
 	logger.Info("CircuitBreaker callbacks wired")
+
+	// NEW: Initialize RealTimeOptimizer for parameter optimization
+	realtimeOptimizer := adaptive_grid.NewRealTimeOptimizer(logger)
+	adaptiveGridManager.SetRealTimeOptimizer(realtimeOptimizer)
+	logger.Info("RealTimeOptimizer initialized and set on AdaptiveGridManager")
+
+	// NEW: Initialize LearningEngine for adaptive threshold learning
+	learningEngine := adaptive_grid.NewLearningEngine(logger)
+	adaptiveGridManager.SetLearningEngine(learningEngine)
+	logger.Info("LearningEngine initialized and set on AdaptiveGridManager")
+
+	// NEW: Initialize AdaptiveGridGeometry for adaptive spread/order count/spacing
+	gridGeometry := adaptive_grid.NewAdaptiveGridGeometry(logger)
+	engine.gridManager.SetGridGeometry(gridGeometry)
+	logger.Info("AdaptiveGridGeometry initialized and set on GridManager")
 
 	// NEW: Load and set partial close configuration
 	if volumeConfig.PartialClose != nil && volumeConfig.PartialClose.Enabled {
@@ -1094,6 +1294,7 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 				MaxSymbolsPerQuote: 20,  // More symbols
 				MinVolume24h:       500, // Lower volume threshold
 			},
+			VolumeOptimization: config.DefaultVolumeOptimizationConfig(),
 		}
 	}
 
@@ -1125,6 +1326,7 @@ func (e *VolumeFarmEngine) extractVolumeFarmConfig(cfg *config.Config) *config.V
 		Exchange:                 cfg.Exchange,
 		Risk:                     cfg.Risk,
 		API:                      cfg.API,
+		VolumeOptimization:       cfg.VolumeFarming.VolumeOptimization,
 	}
 
 	if volumeConfig.MinVolume24h <= 0 {

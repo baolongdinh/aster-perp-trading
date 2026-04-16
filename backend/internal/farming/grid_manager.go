@@ -15,6 +15,7 @@ import (
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/farming/adaptive_grid"
+	"aster-bot/internal/farming/volume_optimization"
 	"aster-bot/internal/stream"
 
 	"github.com/sirupsen/logrus"
@@ -33,6 +34,9 @@ type PricePoint struct {
 type RiskChecker interface {
 	CanPlaceOrder(symbol string) bool
 }
+
+// DynamicSizeCalculatorFunc function type for dynamic order size calculation
+type DynamicSizeCalculatorFunc func(symbol string, baseSize float64, currentPrice float64) float64
 
 // GridManager manages trading grids for multiple symbols.
 type GridManager struct {
@@ -114,6 +118,10 @@ type GridManager struct {
 	riskChecker   RiskChecker
 	riskCheckerMu sync.RWMutex
 
+	// Dynamic size calculator callback for enhanced sizing
+	dynamicSizeCalculator   DynamicSizeCalculatorFunc
+	dynamicSizeCalculatorMu sync.RWMutex
+
 	// ATR tracking for dynamic sizing
 	priceHistory   map[string][]PricePoint // symbol -> price history for ATR
 	priceHistoryMu sync.RWMutex
@@ -126,6 +134,16 @@ type GridManager struct {
 
 	// NEW: Reference to AdaptiveGridManager for optimization features
 	adaptiveMgr *adaptive_grid.AdaptiveGridManager
+
+	// NEW: Adaptive grid geometry for adaptive spread, order count, spacing
+	gridGeometry *adaptive_grid.AdaptiveGridGeometry
+
+	// NEW: Fluid flow parameters for "soft like water" behavior
+	flowParameters map[string]adaptive_grid.FlowParameters // symbol -> flow params
+	flowParamsMu   sync.RWMutex
+
+	// NEW: VPIN monitor for toxic flow detection
+	vpinMonitor *volume_optimization.VPINMonitor
 
 	// NEW: Take profit manager for micro profit feature
 	takeProfitMgr *adaptive_grid.TakeProfitManager
@@ -171,6 +189,14 @@ func (g *GridManager) SetActivityLogger(al *activitylog.ActivityLogger) {
 // SetOnOrderPlacedCallback sets callback when order is placed (for sync worker integration)
 func (g *GridManager) SetOnOrderPlacedCallback(fn func(symbol string, order client.Order)) {
 	g.onOrderPlaced = fn
+}
+
+// SetDynamicSizeCalculator sets the dynamic size calculator callback
+func (g *GridManager) SetDynamicSizeCalculator(fn DynamicSizeCalculatorFunc) {
+	g.dynamicSizeCalculatorMu.Lock()
+	defer g.dynamicSizeCalculatorMu.Unlock()
+	g.dynamicSizeCalculator = fn
+	g.logger.Info("Dynamic size calculator set on GridManager")
 }
 
 // SetWebSocketClient sets an external WebSocket client to share connection
@@ -358,6 +384,8 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		orderLockMgr:          adaptive_grid.NewOrderLockManager(zapLogger),
 		deduplicator:          adaptive_grid.NewFillEventDeduplicator(zapLogger),
 		stateValidator:        adaptive_grid.NewStateValidator(zapLogger),
+		gridGeometry:          adaptive_grid.NewAdaptiveGridGeometry(zapLogger),
+		flowParameters:        make(map[string]adaptive_grid.FlowParameters),
 		// Initialize take profit manager with micro profit config
 		takeProfitMgr: initTakeProfitManager(zapLogger),
 		// Position rebalancer defaults - OPTIMIZED for faster response
@@ -1200,8 +1228,81 @@ func (g *GridManager) globalKlineProcessor() {
 						"error":  err,
 					}).Error("Market condition evaluation failed")
 				}
-			} else {
-				// Log once per symbol that evaluator is not available
+			}
+
+			// NEW: Calculate FluidFlow parameters for "soft like water" behavior
+			if g.adaptiveMgr != nil {
+				// Get market condition data for flow calculation
+				positions := g.wsClient.GetCachedPositions()
+				position, hasPosition := positions[symbol]
+				positionSize := 0.0
+				if hasPosition && position.PositionAmt != 0 {
+					positionSize = math.Abs(position.PositionAmt * position.MarkPrice)
+				}
+
+				// Get max position for normalization
+				maxPosition := 100.0
+				if g.maxNotionalUSD > 0 {
+					maxPosition = g.maxNotionalUSD
+				}
+				normalizedPositionSize := positionSize / maxPosition
+
+				// Get volatility from range detector (ATR)
+				volatility := 0.5 // default
+				rangeDetector := g.adaptiveMgr.GetRangeDetector(symbol)
+				if rangeDetector != nil {
+					atr := rangeDetector.GetATR()
+					if atr > 0 && kline.Close > 0 {
+						volatility = math.Min(atr/kline.Close, 1.0)
+					}
+				}
+
+				// Get trend from range detector (ADX)
+				trend := 0.5 // neutral
+				if rangeDetector != nil {
+					adx := rangeDetector.GetCurrentADX()
+					if adx > 25 {
+						trend = 0.8 // trending
+					} else if adx < 20 {
+						trend = 0.2 // sideways
+					}
+				}
+
+				// Get risk from unrealized PnL
+				risk := 0.0
+				if hasPosition {
+					risk = math.Abs(position.UnrealizedProfit) / positionSize
+					if risk > 0.1 {
+						risk = 0.9 // high risk
+					}
+				}
+
+				// Calculate flow parameters
+				intensity := (1.0 - normalizedPositionSize) * (1.0 - volatility) * (1.0 - risk)
+				intensity += trend * 0.2
+				intensity = math.Max(0, math.Min(1, intensity))
+
+				// Store flow parameters for use in order placement
+				g.flowParamsMu.Lock()
+				g.flowParameters[symbol] = adaptive_grid.FlowParameters{
+					Intensity:        intensity,
+					Direction:        0.5, // neutral for now
+					Velocity:         0.0,
+					SizeMultiplier:   intensity * (1.0 - risk*0.3),
+					SpreadMultiplier: (2.0 - intensity) + volatility*1.5,
+				}
+				g.flowParamsMu.Unlock()
+
+				g.logger.WithFields(logrus.Fields{
+					"symbol":            symbol,
+					"intensity":         intensity,
+					"size_multiplier":   g.flowParameters[symbol].SizeMultiplier,
+					"spread_multiplier": g.flowParameters[symbol].SpreadMultiplier,
+				}).Debug("Fluid flow parameters calculated")
+			}
+
+			// Log once per symbol that evaluator is not available
+			if g.marketConditionEvaluator == nil {
 				if _, logged := g.evaluatorNotLogged[symbol]; !logged {
 					g.logger.WithFields(logrus.Fields{
 						"symbol": symbol,
@@ -1740,32 +1841,63 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		"existing_sell_levels": len(existingSellLevels),
 	}).Info("Checked existing grid levels")
 
-	// NEW: Get dynamic spread from AdaptiveGridManager if available
+	// NEW: Get dynamic spread from AdaptiveGridGeometry if available
 	spreadPct := grid.GridSpreadPct
-	if g.adaptiveMgr != nil {
-		dynamicSpread := g.adaptiveMgr.GetDynamicSpread()
-		// Only use dynamic spread if it's SMALLER than our configured spread
-		// For volume farming, we want tight spreads, not wide ones
-		if dynamicSpread > 0 && dynamicSpread < spreadPct {
-			spreadPct = dynamicSpread
+	adaptiveSpread, adaptiveOrderCount, useAdaptive := g.CalculateAdaptiveGeometry(symbol, grid.CurrentPrice)
+	if useAdaptive && adaptiveSpread > 0 {
+		// For volume farming, use adaptive spread if it's reasonable
+		// Prefer tighter spreads for volume farming
+		if adaptiveSpread < spreadPct {
+			spreadPct = adaptiveSpread
+			g.logger.WithFields(logrus.Fields{
+				"symbol":               symbol,
+				"adaptive_spread":      adaptiveSpread,
+				"base_spread":          grid.GridSpreadPct,
+				"final_spread":         spreadPct,
+				"adaptive_order_count": adaptiveOrderCount,
+			}).Info("Using adaptive spread for grid")
+		} else {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":               symbol,
+				"adaptive_spread":      adaptiveSpread,
+				"base_spread":          grid.GridSpreadPct,
+				"final_spread":         spreadPct,
+				"adaptive_order_count": adaptiveOrderCount,
+			}).Info("Adaptive spread wider than config - using config spread")
+		}
+
+		// Adjust order count if adaptive geometry suggests different count
+		if adaptiveOrderCount > 0 && adaptiveOrderCount != grid.MaxOrdersSide {
+			// For safety, don't exceed configured max by too much
+			if adaptiveOrderCount > grid.MaxOrdersSide*2 {
+				adaptiveOrderCount = grid.MaxOrdersSide * 2
+			}
+			if adaptiveOrderCount < 2 {
+				adaptiveOrderCount = 2
+			}
+			grid.MaxOrdersSide = adaptiveOrderCount
 			g.logger.WithFields(logrus.Fields{
 				"symbol":         symbol,
-				"dynamic_spread": dynamicSpread,
-				"base_spread":    grid.GridSpreadPct,
-				"final_spread":   spreadPct,
-			}).Info("Using tighter dynamic spread for grid")
-		} else if dynamicSpread > 0 {
-			g.logger.WithFields(logrus.Fields{
-				"symbol":         symbol,
-				"dynamic_spread": dynamicSpread,
-				"base_spread":    grid.GridSpreadPct,
-				"final_spread":   spreadPct,
-			}).Warn("Dynamic spread wider than config - using config spread")
+				"adaptive_count": adaptiveOrderCount,
+				"base_count":     grid.MaxOrdersSide,
+			}).Info("Adjusted order count based on adaptive geometry")
 		}
 	}
 
 	// For volume farming, use ultra-small spreads for maximum fills
 	spreadAmount := grid.CurrentPrice * (spreadPct / 100)
+
+	// NEW: Apply fluid flow spread multiplier for "soft like water" behavior
+	g.flowParamsMu.RLock()
+	if flowParams, hasFlow := g.flowParameters[symbol]; hasFlow {
+		spreadAmount *= flowParams.SpreadMultiplier
+		g.logger.WithFields(logrus.Fields{
+			"symbol":            symbol,
+			"flow_intensity":    flowParams.Intensity,
+			"spread_multiplier": flowParams.SpreadMultiplier,
+		}).Debug("Applied fluid flow spread multiplier")
+	}
+	g.flowParamsMu.RUnlock()
 
 	// Ensure minimum spread amount for very low prices or tiny percentages
 	minSpreadAmount := grid.CurrentPrice * 0.0001 // 0.01% minimum
@@ -1823,6 +1955,25 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 		orderSize := g.baseNotionalUSD / buyPrice
 
+		// NEW: Apply dynamic size calculator if available
+		g.dynamicSizeCalculatorMu.RLock()
+		if g.dynamicSizeCalculator != nil {
+			baseNotional := g.baseNotionalUSD
+			dynamicSize := g.dynamicSizeCalculator(symbol, baseNotional, buyPrice)
+			if dynamicSize > 0 {
+				orderSize = dynamicSize / buyPrice
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"grid_level":    i,
+					"side":          "BUY",
+					"base_notional": baseNotional,
+					"dynamic_size":  dynamicSize,
+					"final_size":    orderSize,
+				}).Info("Dynamic size calculator applied to BUY order")
+			}
+		}
+		g.dynamicSizeCalculatorMu.RUnlock()
+
 		// NEW: Apply time-based size multiplier from TimeFilter
 		if g.adaptiveMgr != nil {
 			sizeMultiplier := g.adaptiveMgr.GetTimeBasedSizeMultiplier()
@@ -1869,6 +2020,18 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 			}
 			orderSize = adjustedSize
 		}
+
+		// NEW: Apply fluid flow size multiplier for "soft like water" behavior
+		g.flowParamsMu.RLock()
+		if flowParams, hasFlow := g.flowParameters[symbol]; hasFlow {
+			orderSize *= flowParams.SizeMultiplier
+			g.logger.WithFields(logrus.Fields{
+				"symbol":          symbol,
+				"flow_intensity":  flowParams.Intensity,
+				"size_multiplier": flowParams.SizeMultiplier,
+			}).Debug("Applied fluid flow size multiplier to BUY order")
+		}
+		g.flowParamsMu.RUnlock()
 
 		if orderSize <= 0 {
 			g.logger.WithFields(logrus.Fields{
@@ -1923,6 +2086,25 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		sellPrice := grid.CurrentPrice + (spreadAmount * float64(i))
 		orderSize := g.baseNotionalUSD / sellPrice
 
+		// NEW: Apply dynamic size calculator if available
+		g.dynamicSizeCalculatorMu.RLock()
+		if g.dynamicSizeCalculator != nil {
+			baseNotional := g.baseNotionalUSD
+			dynamicSize := g.dynamicSizeCalculator(symbol, baseNotional, sellPrice)
+			if dynamicSize > 0 {
+				orderSize = dynamicSize / sellPrice
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"grid_level":    i,
+					"side":          "SELL",
+					"base_notional": baseNotional,
+					"dynamic_size":  dynamicSize,
+					"final_size":    orderSize,
+				}).Info("Dynamic size calculator applied to SELL order")
+			}
+		}
+		g.dynamicSizeCalculatorMu.RUnlock()
+
 		// NEW: Apply time-based size multiplier from TimeFilter
 		if g.adaptiveMgr != nil {
 			sizeMultiplier := g.adaptiveMgr.GetTimeBasedSizeMultiplier()
@@ -1968,6 +2150,18 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 			}
 			orderSize = adjustedSize
 		}
+
+		// NEW: Apply fluid flow size multiplier for "soft like water" behavior
+		g.flowParamsMu.RLock()
+		if flowParams, hasFlow := g.flowParameters[symbol]; hasFlow {
+			orderSize *= flowParams.SizeMultiplier
+			g.logger.WithFields(logrus.Fields{
+				"symbol":          symbol,
+				"flow_intensity":  flowParams.Intensity,
+				"size_multiplier": flowParams.SizeMultiplier,
+			}).Debug("Applied fluid flow size multiplier to SELL order")
+		}
+		g.flowParamsMu.RUnlock()
 
 		if orderSize <= 0 {
 			g.logger.WithFields(logrus.Fields{
@@ -2230,6 +2424,23 @@ func (g *GridManager) placeMicroGridOrders(ctx context.Context, symbol string, g
 
 	// Get order size from micro grid config
 	orderSize := g.adaptiveMgr.GetMicroGridOrderSize(grid.CurrentPrice)
+
+	// NEW: Apply dynamic size calculator if available
+	g.dynamicSizeCalculatorMu.RLock()
+	if g.dynamicSizeCalculator != nil {
+		baseNotional := orderSize * grid.CurrentPrice // Convert back to notional
+		dynamicSize := g.dynamicSizeCalculator(symbol, baseNotional, grid.CurrentPrice)
+		if dynamicSize > 0 {
+			orderSize = dynamicSize / grid.CurrentPrice
+			g.logger.WithFields(logrus.Fields{
+				"symbol":        symbol,
+				"base_notional": baseNotional,
+				"dynamic_size":  dynamicSize,
+				"final_size":    orderSize,
+			}).Info("Dynamic size calculator applied to micro grid orders")
+		}
+	}
+	g.dynamicSizeCalculatorMu.RUnlock()
 
 	var orders []*GridOrder
 	orderID := time.Now().UnixNano()
@@ -3697,14 +3908,76 @@ func (g *GridManager) SetRiskChecker(checker RiskChecker) {
 }
 
 // SetAdaptiveManager sets the adaptive grid manager reference
-func (g *GridManager) SetAdaptiveManager(mgr *adaptive_grid.AdaptiveGridManager) {
-	g.riskCheckerMu.Lock()
-	defer g.riskCheckerMu.Unlock()
-	g.adaptiveMgr = mgr
-	g.logger.Info("Adaptive grid manager reference set")
+func (g *GridManager) SetAdaptiveManager(adaptiveMgr *adaptive_grid.AdaptiveGridManager) {
+	g.adaptiveMgr = adaptiveMgr
+	g.logger.Info("AdaptiveGridManager reference set on GridManager")
 }
 
-// SetStateMachine sets the trading lifecycle state machine
+// SetGridGeometry sets the adaptive grid geometry calculator
+func (g *GridManager) SetGridGeometry(geometry *adaptive_grid.AdaptiveGridGeometry) {
+	g.gridGeometry = geometry
+	g.logger.Info("AdaptiveGridGeometry set on GridManager")
+}
+
+// CalculateAdaptiveGeometry calculates adaptive grid parameters using AdaptiveGridGeometry
+// Returns (spread, orderCount, useAdaptive) where useAdaptive indicates if adaptive geometry was used
+func (g *GridManager) CalculateAdaptiveGeometry(symbol string, currentPrice float64) (float64, int, bool) {
+	if g.gridGeometry == nil {
+		return 0, 0, false
+	}
+
+	// Get market data from adaptive manager
+	atr := 0.0
+	skew := 0.0
+	funding := 0.0
+	depth := 0.5
+	risk := 0.5
+	trend := 0.5
+	regime := "RANGING"
+
+	if g.adaptiveMgr != nil {
+		// Get ATR
+		if rangeDetector := g.adaptiveMgr.GetRangeDetector(symbol); rangeDetector != nil {
+			if currentRange := rangeDetector.GetCurrentRange(); currentRange != nil {
+				atr = currentRange.ATR
+			}
+		}
+
+		// Get skew from inventory manager (default to 0 if not available)
+		skew = 0.0
+
+		// Get funding rate - skip if method doesn't exist
+		funding = 0.0
+
+		// Get regime
+		regime = "RANGING"
+		currentRegime := g.adaptiveMgr.GetCurrentRegime(symbol)
+		// MarketRegime is a string type, compare directly
+		if currentRegime == "TRENDING" {
+			regime = "TRENDING"
+		} else if currentRegime == "VOLATILE" {
+			regime = "VOLATILE"
+		}
+	}
+
+	// Calculate full geometry
+	currentTime := time.Now()
+	spread, _, orderCount, _, _, _, _ := g.gridGeometry.CalculateFullGeometry(
+		atr, skew, funding, depth, risk, trend, regime, currentTime,
+	)
+
+	g.logger.WithFields(logrus.Fields{
+		"symbol":      symbol,
+		"atr":         atr,
+		"regime":      regime,
+		"spread":      spread,
+		"order_count": orderCount,
+	}).Info("Calculated adaptive geometry")
+
+	return spread, orderCount, true
+}
+
+// SetTakeProfitManager sets the take profit manager lifecycle state machine
 func (g *GridManager) SetStateMachine(sm *adaptive_grid.GridStateMachine) {
 	g.gridsMu.Lock()
 	defer g.gridsMu.Unlock()
@@ -3810,6 +4083,34 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 			"order_id": orderUpdate.OrderID,
 			"symbol":   orderUpdate.Symbol,
 		}).Info("WebSocket order fill detected - processing immediately")
+
+		// NEW: Update VPIN monitor with fill volume
+		if g.adaptiveMgr != nil {
+			vpinMonitorInterface := g.adaptiveMgr.GetVPINMonitor()
+			if vpinMonitorInterface != nil {
+				// Type assert to concrete VPINMonitor
+				if vpinMonitor, ok := vpinMonitorInterface.(*volume_optimization.VPINMonitor); ok {
+					// Calculate fill volume (price * quantity)
+					fillVolume := orderUpdate.Price * orderUpdate.Quantity
+					// Determine buy/sell volume based on side
+					var buyVol, sellVol float64
+					if orderUpdate.Side == "BUY" {
+						buyVol = fillVolume
+						sellVol = 0
+					} else {
+						buyVol = 0
+						sellVol = fillVolume
+					}
+					vpinMonitor.UpdateVolume(buyVol, sellVol)
+					g.logger.WithFields(logrus.Fields{
+						"symbol":   orderUpdate.Symbol,
+						"side":     orderUpdate.Side,
+						"buy_vol":  buyVol,
+						"sell_vol": sellVol,
+					}).Debug("VPIN monitor updated with fill volume")
+				}
+			}
+		}
 
 		// Check if this is a take profit order fill
 		if g.takeProfitMgr != nil && len(orderUpdate.OrderID) > 3 && orderUpdate.OrderID[:3] == "TP-" {
