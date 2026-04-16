@@ -472,23 +472,82 @@ Mỗi cặp có pattern storage riêng, accuracy tracking riêng.
 
 ---
 
-## 11. Re-grid Logic (Strict Conditions)
+## 11. Re-grid Logic (Market-Based Conditions Only)
 
-Chỉ cho phép re-grid khi **TẤT CẢ** điều kiện sau đúng:
+Chỉ cho phép re-grid khi **TẤT CẢ** điều kiện sau đúng (KHÔNG có time-based cooldown):
 
 | Điều Kiện | Ngưỡng | Kiểm Tra |
 |-----------|--------|----------|
 | 1. Zero open orders | actual == 0 | GridManager |
-| 2. Zero position | positionAmt == 0 | Position tracker |
-| 3. Range shift | ≥ 0.5% from last accepted | RangeDetector |
-| 4. BB width contraction | < 1.5x average | RangeDetector |
-| 5. ADX low | < 20 for 3+ candles | TrendDetector |
-| 6. State | WAIT_NEW_RANGE | GridStateMachine |
+| 2. Zero position | positionAmt ≈ 0 (dust < 10 USDT allowed) | Position tracker |
+| 3. ADX low | < 70 (sideways/trending nhẹ) | TrendDetector |
+| 4. BB width contraction | < 10x last accepted (không quá volatile) | RangeDetector |
+| 5. Range shift | > 0.01% (có sự thay đổi đủ lớn) | RangeDetector |
+| 6. State | IDLE hoặc WAIT_NEW_RANGE | GridStateMachine |
 
 **Flow:**
 ```
-EXIT_ALL → PositionsClosed → WAIT_NEW_RANGE → [check conditions] → NewRangeReady → ENTER_GRID
+EXIT_ALL → [UpdatePriceForRange check positions=0] → WAIT_NEW_RANGE
+WAIT_NEW_RANGE → [UpdatePriceForRange check isReadyForRegrid] → ENTER_GRID
 ```
+
+**Quan trọng:**
+- **KHÔNG có regrid cooldown** - chỉ dựa vào market conditions
+- UpdatePriceForRange được gọi mỗi tick (mỗi khi có kline mới)
+- isReadyForRegrid() được evaluate liên tục để detect khi thị trường ổn định
+
+---
+
+## 11.1 Cleanup Worker - Dọn Dẹp Tự Động
+
+**Mục đích:** Tránh race condition khi orders/positions còn sót trong non-trading states
+
+**Logic:**
+```go
+Chạy mỗi 10s:
+  Check state IDLE/EXIT_ALL/WAIT_NEW_RANGE
+    ↓
+  Cancel all orders
+    ↓
+  Close all positions
+    ↓
+  State sạch sẽ → sẵn sàng reentry
+```
+
+**States được dọn dẹp:**
+- IDLE: Không nên có orders/positions
+- EXIT_ALL: Đang thoát, cần dọn sạch
+- WAIT_NEW_RANGE: Chờ range mới, không nên trade
+
+---
+
+## 11.2 Auto-Recovery Logic - Tự Động Unblock
+
+**Mục đích:** Force transition nếu stuck quá lâu trong 1 state
+
+**Logic (chạy mỗi 30s):**
+```go
+AutoRecovery():
+  1. RangeDetector Unknown/Initializing
+     → Force initialize (30s stabilization)
+  
+  2. GridStateExitAll > 2min
+     → Force WAIT_NEW_RANGE
+  
+  3. GridStateWaitNewRange > 2min
+     → Force IDLE
+  
+  4. GridStateIdle > 10min + range ready
+     → Force ENTER_GRID
+  
+  5. tradingPaused in IDLE/WAIT_NEW_RANGE
+     → Auto resume
+```
+
+**Timeouts:**
+- EXIT_ALL: 2 phút
+- WAIT_NEW_RANGE: 2 phút (giảm từ 5 phút)
+- IDLE: 10 phút
 
 ---
 

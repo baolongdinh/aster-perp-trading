@@ -122,7 +122,8 @@ graph TB
     CB --> DL Decision Log
 ```
 
-**Mô tả (V2 - Unified State Machine):**
+**Mô tả (V3 - Continuous Price Feed + Auto-Recovery):**
+- **Global kline processor start ngay khi GridManager khởi tạo** (không đợi warmup)
 - WebSocket đẩy nến mới mỗi phút → Update RangeDetector + StateMachine
 - **T001**: `shouldSchedulePlacement()` kiểm tra **cả** `RangeState == Active` **và** `GridState ∈ {ENTER_GRID, TRADING}`
 - **T003**: Micro grid (0.05% spread, 5 orders/side) là **primary geometry**, BB chỉ dùng để gate permission
@@ -131,6 +132,8 @@ graph TB
 - **T009**: Real-time exit goroutine monitor ADX/BB mỗi **100ms**
 - **T011**: Multi-layer liquidation protection (4-tier: warn→reduce50%→close→hedge)
 - State machine điều khiển placement gating, không chỉ là advisory
+- **Cleanup worker chạy mỗi 10s** để dọn orders/positions trong non-trading states
+- **Auto-recovery chạy mỗi 30s** để force transition nếu stuck
 
 ### 2.3 ModeManager Flow (Mới - Phase 2)
 
@@ -230,6 +233,46 @@ stateDiagram
 - Trending:  ADX > 25 → EventTrendExit → EXIT_ALL
 - Breakout:  Price outside BB → EventEmergencyExit → EXIT_ALL
 - Stabilizing: After breakout, wait for new range → WAIT_NEW_RANGE
+
+### 3.1 State Machine Auto-Transitions (UpdatePriceForRange)
+
+```mermaid
+graph TB
+    UPF UpdatePriceForRange called every tick --> CS Check Current State
+
+    CS --> IDLE IDLE State
+    CS --> WNR WAIT NEW RANGE State
+    CS --> EA EXIT ALL State
+
+    IDLE --> IFR isReadyForRegrid
+    IFR -->|Yes| T1 Transition ENTER GRID
+    IFR -->|No| IFR
+
+    WNR --> IFR
+    T1 --> T1 Record enterGridTime
+
+    EA --> PZ Check positions zero
+    PZ -->|Yes| T2 Transition WAIT NEW RANGE
+    PZ -->|No| CS2 Check stuck 30s
+    CS2 -->|Yes| FC Force close position
+    CS2 -->|No| EA
+
+    FC --> EA
+    T2 --> WNR
+```
+
+**Logic trong UpdatePriceForRange (được gọi mỗi tick):**
+- **IDLE state**: Check `isReadyForRegrid()` → transition ENTER_GRID nếu market conditions ổn định
+- **WAIT_NEW_RANGE state**: Check `isReadyForRegrid()` → transition ENTER_GRID nếu market conditions ổn định
+- **EXIT_ALL state**: Check positions = 0 → transition WAIT_NEW_RANGE
+  - Nếu stuck > 30s với positions → force close position
+
+**isReadyForRegrid conditions (market-based only):**
+1. State: IDLE hoặc WAIT_NEW_RANGE
+2. Position: ≈ 0 (dust < 10 USDT allowed)
+3. ADX < 70 (sideways/trending nhẹ)
+4. BB width < 10x last accepted (không quá volatile)
+5. Range shift > 0.01% (có sự thay đổi)
 
 ---
 
@@ -439,6 +482,84 @@ graph TB
 - File: `internal/client/websocket.go`
 - Methods: `SubscribeToUserData()`, `processAccountUpdate()`, `processOrderTradeUpdate()`
 - Cache: `orderCache`, `positionCache`, `balanceCache` with TTL 60s
+
+---
+
+## 9. Luồng Cleanup Worker - Dọn Dẹp Tự Động (Mới)
+
+```mermaid
+graph TB
+    Ticker 10s Ticker --> Check Check all symbols
+    Check --> CS Check state
+
+    CS --> IDLE IDLE State
+    CS --> EA EXIT ALL State
+    CS --> WNR WAIT NEW RANGE State
+
+    IDLE --> Cancel Cancel all orders
+    EA --> Cancel
+    WNR --> Cancel
+
+    Cancel --> Close Close all positions
+    Close --> Verify Verify closure
+    Verify --> State State clean ready for reentry
+```
+
+**Logic:**
+- Chạy mỗi 10s
+- Check state IDLE/EXIT_ALL/WAIT_NEW_RANGE
+- Cancel all orders
+- Close all positions
+- Tránh race condition khi orders/positions còn sót
+
+**Implementation:**
+- File: `internal/farming/adaptive_grid/manager.go`
+- Methods: `cleanupWorker()`, `cleanupNonTradingSymbols()`
+- Interval: 10s
+
+---
+
+## 10. Luồng Auto-Recovery - Tự Động Unblock (Mới)
+
+```mermaid
+graph TB
+    Ticker 30s Ticker --> Check Check all symbols
+
+    Check --> RD RangeDetector state
+    Check --> GSM GridStateMachine state
+    Check --> TP tradingPaused status
+
+    RD -->|Unknown/Initializing| FI Force initialize
+    FI --> RD
+
+    GSM -->|EXIT ALL > 2min| FW1 Force WAIT NEW RANGE
+    GSM -->|WAIT NEW RANGE > 2min| FW2 Force IDLE
+    GSM -->|IDLE > 10min + range ready| FW3 Force ENTER GRID
+
+    TP -->|Paused in IDLE/WNR| AR Auto resume
+
+    FW1 --> GSM
+    FW2 --> GSM
+    FW3 --> GSM
+    AR --> TP
+```
+
+**Logic (chạy mỗi 30s):**
+1. RangeDetector Unknown/Initializing → Force initialize (30s stabilization)
+2. GridStateExitAll > 2min → Force WAIT_NEW_RANGE
+3. GridStateWaitNewRange > 2min → Force IDLE
+4. GridStateIdle > 10min + range ready → Force ENTER_GRID
+5. tradingPaused in IDLE/WAIT_NEW_RANGE → Auto resume
+
+**Timeouts:**
+- EXIT_ALL: 2 phút
+- WAIT_NEW_RANGE: 2 phút
+- IDLE: 10 phút
+
+**Implementation:**
+- File: `internal/farming/adaptive_grid/manager.go`
+- Method: `AutoRecovery()`
+- Interval: 30s
 
 ---
 
