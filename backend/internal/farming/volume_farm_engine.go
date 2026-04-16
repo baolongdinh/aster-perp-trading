@@ -28,6 +28,73 @@ import (
 	"go.uber.org/zap"
 )
 
+// validateVolumeOptimizationConfig validates all required fields in volume optimization config
+func validateVolumeOptimizationConfig(cfg *config.VolumeOptimizationConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("volume optimization config is nil")
+	}
+
+	// Validate OrderPriority
+	if cfg.OrderPriority.TickSizeAwareness.Enabled && len(cfg.OrderPriority.TickSizeAwareness.TickSizes) == 0 {
+		return fmt.Errorf("tick_size_awareness is enabled but no tick sizes configured")
+	}
+	if cfg.OrderPriority.TickSizeAwareness.DefaultTickSize <= 0 {
+		return fmt.Errorf("default_tick_size must be > 0")
+	}
+
+	// Validate ToxicFlow
+	if cfg.ToxicFlow.Enabled {
+		if cfg.ToxicFlow.WindowSize <= 0 {
+			return fmt.Errorf("toxic_flow window_size must be > 0")
+		}
+		if cfg.ToxicFlow.BucketSize <= 0 {
+			return fmt.Errorf("toxic_flow bucket_size must be > 0")
+		}
+		if cfg.ToxicFlow.VPINThreshold <= 0 || cfg.ToxicFlow.VPINThreshold > 1 {
+			return fmt.Errorf("toxic_flow vpin_threshold must be between 0 and 1")
+		}
+		if cfg.ToxicFlow.SustainedBreaches <= 0 {
+			return fmt.Errorf("toxic_flow sustained_breaches must be > 0")
+		}
+		if cfg.ToxicFlow.AutoResumeDelay <= 0 {
+			return fmt.Errorf("toxic_flow auto_resume_delay must be > 0")
+		}
+		validActions := map[string]bool{"pause": true, "widen_spread": true, "reduce_size": true}
+		if !validActions[cfg.ToxicFlow.Action] {
+			return fmt.Errorf("toxic_flow action must be one of: pause, widen_spread, reduce_size")
+		}
+	}
+
+	// Validate MakerTaker
+	if cfg.MakerTaker.SmartCancellation.Enabled {
+		if cfg.MakerTaker.SmartCancellation.SpreadChangeThreshold <= 0 {
+			return fmt.Errorf("smart_cancellation spread_change_threshold must be > 0")
+		}
+		if cfg.MakerTaker.SmartCancellation.CheckInterval <= 0 {
+			return fmt.Errorf("smart_cancellation check_interval must be > 0")
+		}
+	}
+
+	// Validate InventoryHedge
+	if cfg.InventoryHedge.Enabled {
+		if cfg.InventoryHedge.HedgeThreshold <= 0 || cfg.InventoryHedge.HedgeThreshold > 1 {
+			return fmt.Errorf("inventory_hedge hedge_threshold must be between 0 and 1")
+		}
+		if cfg.InventoryHedge.HedgeRatio <= 0 || cfg.InventoryHedge.HedgeRatio > 1 {
+			return fmt.Errorf("inventory_hedge hedge_ratio must be between 0 and 1")
+		}
+		if cfg.InventoryHedge.MaxHedgeSize <= 0 {
+			return fmt.Errorf("inventory_hedge max_hedge_size must be > 0")
+		}
+		validModes := map[string]bool{"internal": true, "cross_pair": true, "scalping": true}
+		if !validModes[cfg.InventoryHedge.HedgingMode] {
+			return fmt.Errorf("inventory_hedge hedging_mode must be one of: internal, cross_pair, scalping")
+		}
+	}
+
+	return nil
+}
+
 // MarkPrice represents a mark price update.
 type MarkPrice struct {
 	Symbol    string  `json:"symbol"`
@@ -77,6 +144,9 @@ type VolumeFarmEngine struct {
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+
+	// NEW: PostOnlyHandler for maker order optimization
+	postOnlyHandler interface{}
 }
 
 // NewVolumeFarmEngine creates a new volume farming engine.
@@ -338,8 +408,20 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 
 	// NEW: Initialize Volume Optimization Components
 	if volumeConfig.VolumeOptimization != nil && volumeConfig.VolumeOptimization.Enabled {
-		logger.Info("=== Initializing Volume Optimization Components ===",
-			zap.Bool("enabled", volumeConfig.VolumeOptimization.Enabled))
+		logger.Info("=== Volume Optimization Config Loaded ===",
+			zap.Bool("enabled", volumeConfig.VolumeOptimization.Enabled),
+			zap.Bool("tick_size_awareness", volumeConfig.VolumeOptimization.OrderPriority.TickSizeAwareness.Enabled),
+			zap.Bool("toxic_flow_detection", volumeConfig.VolumeOptimization.ToxicFlow.Enabled),
+			zap.Bool("post_only_enabled", volumeConfig.VolumeOptimization.MakerTaker.PostOnlyEnabled),
+			zap.Bool("smart_cancellation", volumeConfig.VolumeOptimization.MakerTaker.SmartCancellation.Enabled))
+
+		// Validate required fields when enabled
+		if err := validateVolumeOptimizationConfig(volumeConfig.VolumeOptimization); err != nil {
+			logger.Error("Volume optimization config validation failed", zap.Error(err))
+			// Continue with defaults or fail fast? For now, log and continue
+		}
+
+		logger.Info("=== Initializing Volume Optimization Components ===")
 
 		// Initialize TickSizeManager
 		if volumeConfig.VolumeOptimization.OrderPriority.TickSizeAwareness.Enabled {
@@ -354,6 +436,10 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 			// Start periodic refresh (every 5 minutes)
 			ctx := context.Background()
 			go tickSizeMgr.StartPeriodicRefresh(ctx, 5*time.Minute)
+
+			// Wire TickSizeManager to GridManager
+			engine.gridManager.SetTickSizeManager(tickSizeMgr)
+			logger.Info("TickSizeManager wired to GridManager")
 
 			logger.Info("TickSizeManager initialized and started",
 				zap.Int("tick_sizes_count", len(volumeConfig.VolumeOptimization.OrderPriority.TickSizeAwareness.TickSizes)))
@@ -389,11 +475,112 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 				MaxRetries: 3,                      // Default
 				RetryDelay: 100 * time.Millisecond, // Default
 			}
-			_ = volume_optimization.NewPostOnlyHandler(postOnlyConfig, logger)
+			engine.postOnlyHandler = volume_optimization.NewPostOnlyHandler(postOnlyConfig, logger)
+
+			// Wire PostOnlyHandler to GridManager
+			engine.gridManager.SetPostOnlyHandler(engine.postOnlyHandler)
+			logger.Info("PostOnlyHandler wired to GridManager")
 
 			logger.Info("PostOnlyHandler initialized",
 				zap.Bool("enabled", postOnlyConfig.Enabled),
 				zap.Bool("fallback", postOnlyConfig.Fallback))
+		}
+
+		// Initialize SmartCancellationManager
+		if volumeConfig.VolumeOptimization.MakerTaker.SmartCancellation.Enabled {
+			logger.Info("Initializing SmartCancellationManager")
+			smartCancelConfig := volume_optimization.SmartCancelConfig{
+				Enabled:               volumeConfig.VolumeOptimization.MakerTaker.SmartCancellation.Enabled,
+				SpreadChangeThreshold: volumeConfig.VolumeOptimization.MakerTaker.SmartCancellation.SpreadChangeThreshold,
+				CheckInterval:         volumeConfig.VolumeOptimization.MakerTaker.SmartCancellation.CheckInterval,
+			}
+			smartCancelMgr := volume_optimization.NewSmartCancellationManager(smartCancelConfig, logger)
+
+			// Wire callbacks to GridManager
+			smartCancelMgr.SetCallbacks(
+				func(symbol string, oldSpread, newSpread, changePct float64) {
+					logger.Info("Spread change detected, triggering grid rebuild",
+						zap.String("symbol", symbol),
+						zap.Float64("old_spread", oldSpread),
+						zap.Float64("new_spread", newSpread),
+						zap.Float64("change_pct", changePct))
+				},
+				func(ctx context.Context, symbol string) error {
+					return engine.gridManager.CancelAllOrders(ctx, symbol)
+				},
+				func(ctx context.Context, symbol string) error {
+					return engine.gridManager.RebuildGrid(ctx, symbol)
+				},
+			)
+
+			// Start monitoring
+			ctx := context.Background()
+			smartCancelMgr.Start(ctx)
+
+			// Wire to GridManager for spread updates
+			engine.gridManager.SetSmartCancellationManager(smartCancelMgr)
+			logger.Info("SmartCancellationManager wired to GridManager")
+
+			logger.Info("SmartCancellationManager initialized",
+				zap.Float64("spread_change_threshold", smartCancelConfig.SpreadChangeThreshold),
+				zap.Duration("check_interval", smartCancelConfig.CheckInterval))
+		}
+
+		// Initialize PennyJumpManager (Phase 3 feature, initially disabled)
+		if volumeConfig.VolumeOptimization.OrderPriority.PennyJumping.Enabled {
+			logger.Info("Initializing PennyJumpManager")
+			pennyConfig := volume_optimization.PennyConfig{
+				Enabled:       volumeConfig.VolumeOptimization.OrderPriority.PennyJumping.Enabled,
+				JumpThreshold: volumeConfig.VolumeOptimization.OrderPriority.PennyJumping.JumpThreshold,
+				MaxJump:       volumeConfig.VolumeOptimization.OrderPriority.PennyJumping.MaxJump,
+			}
+			pennyJumpMgr := volume_optimization.NewPennyJumpManager(pennyConfig, logger)
+
+			// Wire TickSizeManager for tick calculations
+			if engine.gridManager.tickSizeMgr != nil {
+				pennyJumpMgr.SetTickSizeManager(engine.gridManager.tickSizeMgr.(interface {
+					GetTickSize(symbol string) float64
+					RoundToTick(price, tickSize float64) float64
+				}))
+			}
+
+			// Wire to GridManager
+			engine.gridManager.SetPennyJumpManager(pennyJumpMgr)
+			logger.Info("PennyJumpManager wired to GridManager")
+		}
+
+		// Initialize InventoryHedgeManager (Phase 3 feature, initially disabled)
+		if volumeConfig.VolumeOptimization.InventoryHedge.Enabled {
+			logger.Info("Initializing InventoryHedgeManager")
+			hedgeConfig := volume_optimization.InventoryHedgeConfig{
+				Enabled:        volumeConfig.VolumeOptimization.InventoryHedge.Enabled,
+				HedgeThreshold: volumeConfig.VolumeOptimization.InventoryHedge.HedgeThreshold,
+				HedgeRatio:     volumeConfig.VolumeOptimization.InventoryHedge.HedgeRatio,
+				MaxHedgeSize:   volumeConfig.VolumeOptimization.InventoryHedge.MaxHedgeSize,
+				HedgingMode:    volumeConfig.VolumeOptimization.InventoryHedge.HedgingMode,
+				HedgePair:      volumeConfig.VolumeOptimization.InventoryHedge.HedgePair,
+			}
+			inventoryHedgeMgr := volume_optimization.NewInventoryHedgeManager(hedgeConfig, logger)
+
+			// Set callbacks for hedge order placement
+			ctx := context.Background()
+			inventoryHedgeMgr.SetCallbacks(
+				func(ctx context.Context, symbol, side string, size float64) error {
+					logger.Info("Placing hedge order",
+						zap.String("symbol", symbol),
+						zap.String("side", side),
+						zap.Float64("size", size))
+					// Note: Actual implementation would place order via futures client
+					return nil
+				},
+			)
+
+			// Start inventory monitoring
+			inventoryHedgeMgr.Start(ctx)
+
+			// Wire to GridManager
+			engine.gridManager.SetInventoryHedgeManager(inventoryHedgeMgr)
+			logger.Info("InventoryHedgeManager wired to GridManager")
 		}
 	} else {
 		logger.Warn("Volume Optimization Components NOT initialized",
@@ -492,7 +679,13 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		zap.Bool("trend_enabled", modeConfig.TrendAdaptedMode.Enabled))
 
 	// NEW: Initialize CircuitBreaker - unified trading decision brain
-	cbConfig := cfg.Agentic.CircuitBreakers
+	var cbConfig config.AgenticCircuitBreakerConfig
+	if cfg.Agentic != nil {
+		cbConfig = cfg.Agentic.CircuitBreakers
+	} else {
+		logger.Warn("Agentic config is nil, using default CircuitBreaker config")
+		cbConfig = config.AgenticCircuitBreakerConfig{}
+	}
 	engine.circuitBreaker = agentic.NewCircuitBreaker(cbConfig, logger)
 	logger.Info("CircuitBreaker initialized as unified trading brain")
 
@@ -1627,4 +1820,9 @@ func (e *VolumeFarmEngine) periodicMetricsBroadcast() {
 			"timestamp":     time.Now().Format(time.RFC3339),
 		}, time.Now())
 	}
+}
+
+// GetPostOnlyHandler returns the post-only handler for order placement
+func (e *VolumeFarmEngine) GetPostOnlyHandler() interface{} {
+	return e.postOnlyHandler
 }

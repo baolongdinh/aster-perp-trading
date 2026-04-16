@@ -143,6 +143,10 @@ type AdaptiveGridManager struct {
 	// NEW: RSICalculator for RSI calculation
 	rsiCalc *RSICalculator
 
+	// NEW: Global trading pause state (for VPIN toxic flow)
+	tradingPausedGlobal bool   // true = global trading paused
+	pauseReason         string // reason for global pause (e.g., "toxic_vpin")
+
 	// NEW: OptimizationConfig from YAML files
 	optConfig *config.OptimizationConfig
 
@@ -1294,6 +1298,12 @@ func (a *AdaptiveGridManager) cleanupNonTradingSymbols(ctx context.Context) {
 				}
 			}
 		}
+
+		// CRITICAL: Transition from EXIT_ALL to WAIT_NEW_RANGE after cleanup
+		// This fixes the stuck EXIT_ALL state issue
+		if state == GridStateExitAll {
+			a.markExitCompleted(symbol)
+		}
 	}
 }
 
@@ -2074,29 +2084,121 @@ func (a *AdaptiveGridManager) AutoRecovery() {
 			stateTime := a.stateMachine.GetStateTime(symbol)
 			timeInState := time.Since(stateTime)
 
-			// Force transition from EXIT_ALL if stuck > 2 minutes
-			if state == GridStateExitAll && timeInState > 2*time.Minute {
-				a.logger.Warn("Auto-recovery: Force transition from EXIT_ALL to WAIT_NEW_RANGE",
-					zap.String("symbol", symbol),
-					zap.Duration("time_in_state", timeInState))
-				a.markExitCompleted(symbol)
-			}
+			switch state {
+			case GridStateExitAll:
+				// Check if position is still open from cache (fast check without API call)
+				position, hasPosition := a.positions[symbol]
+				positionZero := !hasPosition || position == nil || position.PositionAmt == 0
 
-			// Force transition from WAIT_NEW_RANGE if stuck > 2 minutes (reduced from 5min)
-			if state == GridStateWaitNewRange && timeInState > 2*time.Minute {
-				a.logger.Warn("Auto-recovery: Force transition from WAIT_NEW_RANGE to IDLE",
-					zap.String("symbol", symbol),
-					zap.Duration("time_in_state", timeInState))
-				a.stateMachine.ForceState(symbol, GridStateIdle)
-			}
-
-			// Force transition from IDLE if stuck > 10 minutes and range is ready
-			if state == GridStateIdle && timeInState > 10*time.Minute {
-				if detector, exists := a.rangeDetectors[symbol]; exists && detector.ShouldTrade() {
-					a.logger.Warn("Auto-recovery: Force transition from IDLE to ENTER_GRID (range ready)",
+				if !positionZero {
+					a.logger.Warn("Auto-recovery: EXIT_ALL with open position detected, closing position",
+						zap.String("symbol", symbol),
+						zap.Float64("position_amt", position.PositionAmt),
+						zap.Duration("time_in_state", timeInState))
+					// Unlock to allow emergencyClosePosition to acquire lock if needed
+					a.mu.Unlock()
+					a.emergencyClosePosition(context.Background(), symbol, position.PositionAmt)
+					a.mu.Lock()
+				} else {
+					a.logger.Info("Auto-recovery: EXIT_ALL position already closed, transitioning",
 						zap.String("symbol", symbol),
 						zap.Duration("time_in_state", timeInState))
-					a.stateMachine.Transition(symbol, EventRangeConfirmed)
+				}
+
+				// Transition to WAIT_NEW_RANGE (idempotent if already called)
+				if timeInState > 30*time.Second { // Give 30s for cleanup to complete
+					a.markExitCompleted(symbol)
+				}
+
+			case GridStateWaitNewRange:
+				// Fluid like water: Detect market condition and adapt strategy
+				// Trending market -> TRENDING state (breakout trading)
+				// Sideways market -> ENTER_GRID state (grid trading)
+				if detector, exists := a.rangeDetectors[symbol]; exists {
+					rangeInfo := detector.GetRangeInfo()
+					adx, _ := rangeInfo["adx"].(float64)
+					sidewaysADXMax, _ := rangeInfo["sideways_adx_max"].(float64)
+
+					// Check if we have enough price data
+					dataPoints, _ := rangeInfo["data_points"].(int)
+					if dataPoints >= 20 {
+						// Detect market condition
+						if adx > sidewaysADXMax {
+							// Trending market - switch to TRENDING strategy
+							a.logger.Info("Auto-recovery: Trending market detected, transitioning to TRENDING",
+								zap.String("symbol", symbol),
+								zap.Duration("time_in_state", timeInState),
+								zap.Float64("adx", adx),
+								zap.Float64("sideways_threshold", sidewaysADXMax),
+								zap.String("philosophy", "soft like water - adapt to trend"))
+							if a.stateMachine.CanTransition(symbol, EventTrendDetected) {
+								a.stateMachine.Transition(symbol, EventTrendDetected)
+							}
+						} else {
+							// Sideways market - switch to GRID strategy
+							a.logger.Info("Auto-recovery: Sideways market detected, transitioning to ENTER_GRID",
+								zap.String("symbol", symbol),
+								zap.Duration("time_in_state", timeInState),
+								zap.Float64("adx", adx),
+								zap.Float64("sideways_threshold", sidewaysADXMax),
+								zap.String("philosophy", "soft like water - adapt to range"))
+							if a.stateMachine.CanTransition(symbol, EventRangeConfirmed) {
+								a.stateMachine.Transition(symbol, EventRangeConfirmed)
+							}
+						}
+					} else {
+						a.logger.Info("Auto-recovery: WAIT_NEW_RANGE waiting for more data points",
+							zap.String("symbol", symbol),
+							zap.Duration("time_in_state", timeInState),
+							zap.Int("data_points", dataPoints))
+					}
+				} else if timeInState > 2*time.Minute {
+					// Stuck too long without detector, force to IDLE
+					a.logger.Warn("Auto-recovery: Force transition from WAIT_NEW_RANGE to IDLE (no detector)",
+						zap.String("symbol", symbol),
+						zap.Duration("time_in_state", timeInState))
+					a.stateMachine.ForceState(symbol, GridStateIdle)
+				}
+
+			case GridStateIdle:
+				// Fluid like water: Detect market condition and adapt strategy
+				if detector, exists := a.rangeDetectors[symbol]; exists {
+					rangeInfo := detector.GetRangeInfo()
+					dataPoints, _ := rangeInfo["data_points"].(int)
+
+					if dataPoints >= 20 && timeInState > 30*time.Second {
+						adx, _ := rangeInfo["adx"].(float64)
+						sidewaysADXMax, _ := rangeInfo["sideways_adx_max"].(float64)
+
+						if adx > sidewaysADXMax {
+							// Trending market - switch to TRENDING strategy
+							a.logger.Info("Auto-recovery: Trending market detected in IDLE, transitioning to TRENDING",
+								zap.String("symbol", symbol),
+								zap.Duration("time_in_state", timeInState),
+								zap.Float64("adx", adx),
+								zap.Float64("sideways_threshold", sidewaysADXMax),
+								zap.String("philosophy", "soft like water - adapt to trend"))
+							if a.stateMachine.CanTransition(symbol, EventTrendDetected) {
+								a.stateMachine.Transition(symbol, EventTrendDetected)
+							}
+						} else {
+							// Sideways market - switch to GRID strategy
+							a.logger.Info("Auto-recovery: Sideways market detected in IDLE, transitioning to ENTER_GRID",
+								zap.String("symbol", symbol),
+								zap.Duration("time_in_state", timeInState),
+								zap.Float64("adx", adx),
+								zap.Float64("sideways_threshold", sidewaysADXMax),
+								zap.String("philosophy", "soft like water - adapt to range"))
+							if a.stateMachine.CanTransition(symbol, EventRangeConfirmed) {
+								a.stateMachine.Transition(symbol, EventRangeConfirmed)
+							}
+						}
+					} else {
+						a.logger.Info("Auto-recovery: IDLE waiting for more data points",
+							zap.String("symbol", symbol),
+							zap.Duration("time_in_state", timeInState),
+							zap.Int("data_points", dataPoints))
+					}
 				}
 			}
 		}
@@ -3182,12 +3284,66 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 
 	// Check 7: VPIN Toxic Flow Detection
 	if a.vpinMonitor != nil {
-		if a.vpinMonitor.IsToxic() {
-			a.logger.Warn("CanPlaceOrder BLOCKED: Toxic flow detected by VPIN",
-				zap.String("symbol", symbol))
-			return false
+		// Type assertion to access VPINMonitor methods
+		vpinMonitor, ok := a.vpinMonitor.(interface {
+			IsToxic() bool
+			IsPaused() bool
+			TriggerPause()
+			Resume()
+			GetPauseStartTime() time.Time
+			GetAutoResumeDelay() time.Duration
+			GetVPIN() float64
+		})
+
+		if ok {
+			// Check if currently paused due to toxic flow
+			if a.tradingPausedGlobal {
+				// Check auto-resume condition
+				if vpinMonitor.IsPaused() {
+					pauseDuration := time.Since(vpinMonitor.GetPauseStartTime())
+					autoResumeDelay := vpinMonitor.GetAutoResumeDelay()
+
+					if pauseDuration > autoResumeDelay {
+						// Auto-resume trading
+						vpinMonitor.Resume()
+						a.mu.Lock()
+						a.tradingPausedGlobal = false
+						a.pauseReason = ""
+						a.mu.Unlock()
+						a.logger.Info("AUTO-RESUME: Trading resumed after toxic flow pause",
+							zap.String("symbol", symbol),
+							zap.Duration("pause_duration", pauseDuration),
+							zap.Duration("auto_resume_delay", autoResumeDelay))
+					} else {
+						a.logger.Warn("CanPlaceOrder BLOCKED: Trading paused due to toxic flow",
+							zap.String("symbol", symbol),
+							zap.String("pause_reason", a.pauseReason),
+							zap.Duration("pause_duration", pauseDuration),
+							zap.Duration("remaining_delay", autoResumeDelay-pauseDuration))
+						return false
+					}
+				}
+			} else {
+				// Check for toxic flow condition
+				if vpinMonitor.IsToxic() {
+					vpinMonitor.TriggerPause()
+					a.mu.Lock()
+					a.tradingPausedGlobal = true
+					a.pauseReason = "toxic_vpin"
+					a.mu.Unlock()
+					a.logger.Warn("TRADING PAUSED: Toxic flow detected by VPIN",
+						zap.String("symbol", symbol),
+						zap.Float64("vpin_value", vpinMonitor.GetVPIN()),
+						zap.String("pause_reason", a.pauseReason),
+						zap.Duration("auto_resume_delay", vpinMonitor.GetAutoResumeDelay()))
+					return false
+				}
+				a.logger.Debug("Check 7 PASS: No toxic flow detected", zap.String("symbol", symbol))
+			}
+		} else {
+			// Fallback if type assertion fails
+			a.logger.Warn("VPIN monitor type assertion failed, skipping VPIN check", zap.String("symbol", symbol))
 		}
-		a.logger.Debug("Check 7 PASS: No toxic flow detected", zap.String("symbol", symbol))
 	} else {
 		a.logger.Debug("Check 7 SKIP: VPIN monitor is nil", zap.String("symbol", symbol))
 	}

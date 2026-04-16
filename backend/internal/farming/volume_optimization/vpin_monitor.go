@@ -168,6 +168,20 @@ func (v *VPINMonitor) IsPaused() bool {
 	return v.isPaused
 }
 
+// GetPauseStartTime returns the time when trading was paused
+func (v *VPINMonitor) GetPauseStartTime() time.Time {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.pauseStartTime
+}
+
+// GetAutoResumeDelay returns the auto-resume delay duration
+func (v *VPINMonitor) GetAutoResumeDelay() time.Duration {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.autoResumeDelay
+}
+
 // Reset resets the VPIN monitor state
 func (v *VPINMonitor) Reset() {
 	v.mu.Lock()

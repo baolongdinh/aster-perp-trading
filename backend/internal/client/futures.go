@@ -281,6 +281,34 @@ func (f *FuturesClient) CancelOrder(ctx context.Context, req CancelOrderRequest)
 	return &order, nil
 }
 
+// CancelAllOpenOrders cancels all open orders for a specific symbol
+// Uses DELETE /fapi/v1/allOpenOrders endpoint
+func (f *FuturesClient) CancelAllOpenOrders(ctx context.Context, symbol string) error {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	if f.dryRun {
+		f.log.Info("[DRY-RUN] CancelAllOpenOrders",
+			zap.String("symbol", symbol))
+		return nil
+	}
+
+	params := map[string]string{
+		"symbol": symbol,
+	}
+
+	_, err := f.http.DeleteSigned(ctx, f.apiPath("/fapi/v1/allOpenOrders"), params)
+	if err != nil {
+		return fmt.Errorf("cancel all open orders: %w", err)
+	}
+
+	f.log.Info("All open orders cancelled",
+		zap.String("symbol", symbol))
+	return nil
+}
+
 // GetAccountInfo gets account information
 func (f *FuturesClient) GetAccountInfo(ctx context.Context) (*AccountInfo, error) {
 	// Wait for rate limiter

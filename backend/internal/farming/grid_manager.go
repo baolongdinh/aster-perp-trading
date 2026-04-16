@@ -104,6 +104,21 @@ type GridManager struct {
 	// Precision manager for symbol-specific formatting.
 	precisionMgr *client.PrecisionManager
 
+	// TickSize manager for price rounding to valid ticks
+	tickSizeMgr interface{}
+
+	// PostOnly handler for maker order optimization
+	postOnlyHandler interface{}
+
+	// SmartCancellation manager for spread-based order management
+	smartCancelMgr interface{}
+
+	// PennyJump manager for order priority optimization
+	pennyJumpMgr interface{}
+
+	// InventoryHedge manager for skew hedging
+	inventoryHedgeMgr interface{}
+
 	// Dynamic cooldown tracking
 	consecutiveFailures int
 	lastFailureTime     time.Time
@@ -294,6 +309,58 @@ func (g *GridManager) SetRecoveryConfig(cfg *config.RecoveryStateConfig) {
 // SetMetricsStreamer sets the metrics streamer for real-time dashboard
 func (g *GridManager) SetMetricsStreamer(streamer interface{}) {
 	g.metricsStreamer = streamer
+}
+
+// SetTickSizeManager sets the tick-size manager for price rounding
+func (g *GridManager) SetTickSizeManager(tickSizeMgr interface{}) {
+	g.tickSizeMgr = tickSizeMgr
+	g.logger.Info("TickSizeManager set on GridManager")
+}
+
+// SetPostOnlyHandler sets the post-only handler for maker order optimization
+func (g *GridManager) SetPostOnlyHandler(postOnlyHandler interface{}) {
+	g.postOnlyHandler = postOnlyHandler
+	g.logger.Info("PostOnlyHandler set on GridManager")
+}
+
+// SetSmartCancellationManager sets the smart cancellation manager
+func (g *GridManager) SetSmartCancellationManager(smartCancelMgr interface{}) {
+	g.smartCancelMgr = smartCancelMgr
+	g.logger.Info("SmartCancellationManager set on GridManager")
+}
+
+// SetPennyJumpManager sets the penny jump manager
+func (g *GridManager) SetPennyJumpManager(pennyJumpMgr interface{}) {
+	g.pennyJumpMgr = pennyJumpMgr
+	g.logger.Info("PennyJumpManager set on GridManager")
+}
+
+// SetInventoryHedgeManager sets the inventory hedge manager
+func (g *GridManager) SetInventoryHedgeManager(inventoryHedgeMgr interface{}) {
+	g.inventoryHedgeMgr = inventoryHedgeMgr
+	g.logger.Info("InventoryHedgeManager set on GridManager")
+}
+
+// UpdateSmartCancelSpread updates spread for smart cancellation monitoring
+func (g *GridManager) UpdateSmartCancelSpread(symbol string, bestBid, bestAsk float64) {
+	if g.smartCancelMgr != nil {
+		if scm, ok := g.smartCancelMgr.(interface {
+			UpdateSpread(symbol string, bestBid, bestAsk float64)
+		}); ok {
+			scm.UpdateSpread(symbol, bestBid, bestAsk)
+		}
+	}
+}
+
+// UpdatePennyJumpPrices updates best bid/ask for penny jumping
+func (g *GridManager) UpdatePennyJumpPrices(symbol string, bestBid, bestAsk float64) {
+	if g.pennyJumpMgr != nil {
+		if pjm, ok := g.pennyJumpMgr.(interface {
+			UpdateBestPrices(symbol string, bestBid, bestAsk float64)
+		}); ok {
+			pjm.UpdateBestPrices(symbol, bestBid, bestAsk)
+		}
+	}
 }
 
 // broadcastMetric sends a metric to the dashboard if metricsStreamer is available
@@ -647,6 +714,24 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 		grid.CurrentPrice = lastPrice
 		grid.MidPrice = lastPrice
 		grid.LastUpdate = time.Now()
+
+		// NEW: Update spread for SmartCancellationManager
+		if g.smartCancelMgr != nil {
+			// Estimate spread based on grid spread percentage
+			spreadAmount := lastPrice * (grid.GridSpreadPct / 100)
+			bestBid := lastPrice - (spreadAmount / 2)
+			bestAsk := lastPrice + (spreadAmount / 2)
+			g.UpdateSmartCancelSpread(symbol, bestBid, bestAsk)
+		}
+
+		// NEW: Update best prices for PennyJumpManager
+		if g.pennyJumpMgr != nil {
+			// Estimate spread based on grid spread percentage
+			spreadAmount := lastPrice * (grid.GridSpreadPct / 100)
+			bestBid := lastPrice - (spreadAmount / 2)
+			bestAsk := lastPrice + (spreadAmount / 2)
+			g.UpdatePennyJumpPrices(symbol, bestBid, bestAsk)
+		}
 
 		// NEW: Feed price data to AdaptiveGridManager calculators
 		if g.adaptiveMgr != nil {
@@ -1945,6 +2030,45 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 
 		buyPrice := grid.CurrentPrice - (spreadAmount * float64(i))
+
+		// Apply tick-size rounding if TickSizeManager is available
+		if g.tickSizeMgr != nil {
+			if tsm, ok := g.tickSizeMgr.(interface {
+				RoundToTickForSymbol(symbol string, price float64) float64
+			}); ok {
+				originalPrice := buyPrice
+				buyPrice = tsm.RoundToTickForSymbol(symbol, buyPrice)
+				if originalPrice != buyPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "BUY",
+						"original_price": originalPrice,
+						"rounded_price":  buyPrice,
+						"grid_level":     -i,
+					}).Debug("Price rounded to valid tick size")
+				}
+			}
+		}
+
+		// Apply penny jumping if PennyJumpManager is available
+		if g.pennyJumpMgr != nil {
+			if pjm, ok := g.pennyJumpMgr.(interface {
+				GetPennyJumpedPrice(symbol, side string, price float64) float64
+			}); ok {
+				originalPrice := buyPrice
+				buyPrice = pjm.GetPennyJumpedPrice(symbol, "BUY", buyPrice)
+				if originalPrice != buyPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "BUY",
+						"original_price": originalPrice,
+						"jumped_price":   buyPrice,
+						"grid_level":     -i,
+					}).Info("Penny jump applied to BUY order")
+				}
+			}
+		}
+
 		if buyPrice <= 0 {
 			g.logger.WithFields(logrus.Fields{
 				"symbol":     symbol,
@@ -2084,6 +2208,45 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 		}
 
 		sellPrice := grid.CurrentPrice + (spreadAmount * float64(i))
+
+		// Apply tick-size rounding if TickSizeManager is available
+		if g.tickSizeMgr != nil {
+			if tsm, ok := g.tickSizeMgr.(interface {
+				RoundToTickForSymbol(symbol string, price float64) float64
+			}); ok {
+				originalPrice := sellPrice
+				sellPrice = tsm.RoundToTickForSymbol(symbol, sellPrice)
+				if originalPrice != sellPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "SELL",
+						"original_price": originalPrice,
+						"rounded_price":  sellPrice,
+						"grid_level":     i,
+					}).Debug("Price rounded to valid tick size")
+				}
+			}
+		}
+
+		// Apply penny jumping if PennyJumpManager is available
+		if g.pennyJumpMgr != nil {
+			if pjm, ok := g.pennyJumpMgr.(interface {
+				GetPennyJumpedPrice(symbol, side string, price float64) float64
+			}); ok {
+				originalPrice := sellPrice
+				sellPrice = pjm.GetPennyJumpedPrice(symbol, "SELL", sellPrice)
+				if originalPrice != sellPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "SELL",
+						"original_price": originalPrice,
+						"jumped_price":   sellPrice,
+						"grid_level":     i,
+					}).Info("Penny jump applied to SELL order")
+				}
+			}
+		}
+
 		orderSize := g.baseNotionalUSD / sellPrice
 
 		// NEW: Apply dynamic size calculator if available
@@ -2276,6 +2439,45 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 
 		// Price increases as we go up from lower band
 		buyPrice := lower + (buySpacing * float64(i))
+
+		// Apply tick-size rounding if TickSizeManager is available
+		if g.tickSizeMgr != nil {
+			if tsm, ok := g.tickSizeMgr.(interface {
+				RoundToTickForSymbol(symbol string, price float64) float64
+			}); ok {
+				originalPrice := buyPrice
+				buyPrice = tsm.RoundToTickForSymbol(symbol, buyPrice)
+				if originalPrice != buyPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "BUY",
+						"original_price": originalPrice,
+						"rounded_price":  buyPrice,
+						"grid_level":     -i - 1,
+					}).Debug("BB grid price rounded to valid tick size")
+				}
+			}
+		}
+
+		// Apply penny jumping if PennyJumpManager is available
+		if g.pennyJumpMgr != nil {
+			if pjm, ok := g.pennyJumpMgr.(interface {
+				GetPennyJumpedPrice(symbol, side string, price float64) float64
+			}); ok {
+				originalPrice := buyPrice
+				buyPrice = pjm.GetPennyJumpedPrice(symbol, "BUY", buyPrice)
+				if originalPrice != buyPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "BUY",
+						"original_price": originalPrice,
+						"jumped_price":   buyPrice,
+						"grid_level":     -i - 1,
+					}).Info("Penny jump applied to BB BUY order")
+				}
+			}
+		}
+
 		if buyPrice <= 0 || buyPrice >= mid {
 			continue
 		}
@@ -2319,6 +2521,45 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 
 		// Price increases as we go up from mid to upper band
 		sellPrice := mid + (sellSpacing * float64(i+1))
+
+		// Apply tick-size rounding if TickSizeManager is available
+		if g.tickSizeMgr != nil {
+			if tsm, ok := g.tickSizeMgr.(interface {
+				RoundToTickForSymbol(symbol string, price float64) float64
+			}); ok {
+				originalPrice := sellPrice
+				sellPrice = tsm.RoundToTickForSymbol(symbol, sellPrice)
+				if originalPrice != sellPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "SELL",
+						"original_price": originalPrice,
+						"rounded_price":  sellPrice,
+						"grid_level":     i + 1,
+					}).Debug("BB grid price rounded to valid tick size")
+				}
+			}
+		}
+
+		// Apply penny jumping if PennyJumpManager is available
+		if g.pennyJumpMgr != nil {
+			if pjm, ok := g.pennyJumpMgr.(interface {
+				GetPennyJumpedPrice(symbol, side string, price float64) float64
+			}); ok {
+				originalPrice := sellPrice
+				sellPrice = pjm.GetPennyJumpedPrice(symbol, "SELL", sellPrice)
+				if originalPrice != sellPrice {
+					g.logger.WithFields(logrus.Fields{
+						"symbol":         symbol,
+						"side":           "SELL",
+						"original_price": originalPrice,
+						"jumped_price":   sellPrice,
+						"grid_level":     i + 1,
+					}).Info("Penny jump applied to BB SELL order")
+				}
+			}
+		}
+
 		if sellPrice <= mid || sellPrice > upper {
 			continue
 		}
@@ -2866,38 +3107,109 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 		"price":  order.Price,
 	}).Info("Placing grid order")
 
+	// Full PostOnlyHandler integration with retry logic
+	if g.postOnlyHandler != nil {
+		if poh, ok := g.postOnlyHandler.(interface {
+			PlaceOrderWithPostOnly(ctx context.Context, symbol, side string, price, quantity float64, placeOrder func(ctx context.Context, symbol, side string, price, quantity float64, postOnly bool) error) error
+		}); ok {
+			// Create wrapper function for actual order placement
+			placeOrderFunc := func(ctx context.Context, symbol, side string, price, quantity float64, postOnly bool) error {
+				timeInForce := "GTC"
+				if postOnly {
+					timeInForce = "GTX"
+				}
+
+				orderReq := &client.PlaceOrderRequest{
+					Symbol:      symbol,
+					Side:        side,
+					Type:        order.OrderType,
+					Quantity:    g.precisionMgr.RoundQty(symbol, quantity),
+					Price:       g.precisionMgr.RoundPrice(symbol, price),
+					TimeInForce: timeInForce,
+					ReduceOnly:  order.ReduceOnly,
+				}
+
+				// Verify notional after rounding
+				qty, _ := strconv.ParseFloat(orderReq.Quantity, 64)
+				priceStr, _ := strconv.ParseFloat(orderReq.Price, 64)
+				notional := qty * priceStr
+
+				// Only enforce min notional for non-reduce-only orders
+				if notional < 5.0 && !order.ReduceOnly {
+					minQty := 5.0 / priceStr
+					minQty = minQty * 1.02
+					orderReq.Quantity = g.precisionMgr.RoundQty(symbol, minQty)
+				}
+
+				response, err := g.futuresClient.PlaceOrder(ctx, *orderReq)
+				if err != nil {
+					return err
+				}
+
+				// Update order with response data
+				order.OrderID = fmt.Sprintf("%d", response.OrderID)
+				order.Status = response.Status
+
+				// Track the order for fill monitoring
+				g.ordersMu.Lock()
+				g.activeOrders[order.OrderID] = order
+				g.ordersMu.Unlock()
+
+				// Notify sync worker about the placed order
+				if g.onOrderPlaced != nil {
+					orderIDInt, _ := strconv.ParseInt(order.OrderID, 10, 64)
+					g.onOrderPlaced(order.Symbol, client.Order{
+						OrderID: orderIDInt,
+						Symbol:  order.Symbol,
+						Side:    order.Side,
+						Type:    order.OrderType,
+						Price:   order.Price,
+						OrigQty: order.Size,
+						Status:  "NEW",
+					})
+				}
+
+				return nil
+			}
+
+			// Use PostOnlyHandler with retry logic
+			err := poh.PlaceOrderWithPostOnly(context.Background(), order.Symbol, order.Side, order.Price, order.Size, placeOrderFunc)
+			if err != nil {
+				g.handlePlaceOrderError(err)
+				return fmt.Errorf("failed to place order with post-only handler: %w", err)
+			}
+
+			g.logger.WithFields(logrus.Fields{
+				"symbol": order.Symbol,
+				"side":   order.Side,
+				"price":  order.Price,
+				"size":   order.Size,
+			}).Info("Order placed via PostOnlyHandler")
+			return nil
+		}
+	}
+
+	// Fallback: Simple placement without PostOnlyHandler
+	timeInForce := "GTC"
 	orderReq := &client.PlaceOrderRequest{
 		Symbol:      order.Symbol,
 		Side:        order.Side,
 		Type:        order.OrderType,
 		Quantity:    g.precisionMgr.RoundQty(order.Symbol, order.Size),
 		Price:       g.precisionMgr.RoundPrice(order.Symbol, order.Price),
-		TimeInForce: "GTC",
+		TimeInForce: timeInForce,
 		ReduceOnly:  order.ReduceOnly,
 	}
 
-	// Verify notional after rounding - fix for SOL and other high-price assets
+	// Verify notional after rounding
 	qty, _ := strconv.ParseFloat(orderReq.Quantity, 64)
 	price, _ := strconv.ParseFloat(orderReq.Price, 64)
 	notional = qty * price
 
-	// Only enforce min notional for non-reduce-only orders
-	// Reduce-only orders are exempt from min notional at API level
 	if notional < 5.0 && !order.ReduceOnly {
-		// Increase quantity to meet minimum notional
 		minQty := 5.0 / price
-		// Add 2% safety margin
 		minQty = minQty * 1.02
 		orderReq.Quantity = g.precisionMgr.RoundQty(order.Symbol, minQty)
-
-		g.logger.WithFields(logrus.Fields{
-			"symbol":       order.Symbol,
-			"side":         order.Side,
-			"original_qty": qty,
-			"adjusted_qty": orderReq.Quantity,
-			"price":        price,
-			"notional":     notional,
-		}).Warn("Adjusted order quantity to meet minimum notional requirement")
 	}
 
 	response, err := g.futuresClient.PlaceOrder(context.Background(), *orderReq)
@@ -4006,22 +4318,38 @@ func (g *GridManager) GetActivePositions(symbol string) ([]interface{}, error) {
 	return positions, nil
 }
 
-// CancelAllOrders cancels all orders for a symbol
+// CancelAllOrders cancels all orders for a symbol on the exchange and clears local cache
 func (g *GridManager) CancelAllOrders(ctx context.Context, symbol string) error {
+	g.logger.WithField("symbol", symbol).Info("Cancelling all orders for symbol")
+
+	// CRITICAL: First cancel all orders on the exchange to free up margin
+	if g.futuresClient != nil {
+		if err := g.futuresClient.CancelAllOpenOrders(ctx, symbol); err != nil {
+			g.logger.WithFields(logrus.Fields{
+				"symbol": symbol,
+				"error":  err,
+			}).Warn("Failed to cancel all orders on exchange")
+			// Continue to clear local cache even if API call fails
+		} else {
+			g.logger.WithField("symbol", symbol).Info("All orders cancelled on exchange")
+		}
+
+		// Wait a short time for margin to be released on the exchange
+		// This is critical to prevent "Margin is insufficient" errors when closing positions
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	g.ordersMu.Lock()
 	defer g.ordersMu.Unlock()
 
-	g.logger.WithField("symbol", symbol).Info("Cancelling all orders for symbol")
-
-	// Cancel active orders for this symbol
+	// Clear active orders from local cache
 	for orderID, order := range g.activeOrders {
 		if order.Symbol == symbol {
-			// Remove from active orders
 			delete(g.activeOrders, orderID)
 			g.logger.WithFields(logrus.Fields{
 				"order_id": orderID,
 				"symbol":   symbol,
-			}).Info("Order cancelled")
+			}).Info("Order removed from local cache")
 		}
 	}
 

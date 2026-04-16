@@ -12,6 +12,7 @@ bin/
 *.exe
 *.test
 *.out
+
 vendor/
 
 # Activity log data

@@ -18,6 +18,7 @@ const (
 	GridStateIdle GridState = iota
 	GridStateEnterGrid
 	GridStateTrading
+	GridStateTrending // Trending market - breakout trading
 	GridStateExitHalf // Partial exit - cut 50% position
 	GridStateExitAll
 	GridStateWaitNewRange
@@ -35,6 +36,8 @@ func (s GridState) String() string {
 		return "ENTER_GRID"
 	case GridStateTrading:
 		return "TRADING"
+	case GridStateTrending:
+		return "TRENDING"
 	case GridStateExitHalf:
 		return "EXIT_HALF"
 	case GridStateExitAll:
@@ -57,11 +60,12 @@ type GridEvent int
 
 const (
 	EventRangeConfirmed       GridEvent = iota // WAIT_NEW_RANGE -> ENTER_GRID
+	EventTrendDetected                         // WAIT_NEW_RANGE/IDLE -> TRENDING (market trending)
 	EventEntryPlaced                           // ENTER_GRID -> TRADING
 	EventPartialLoss                           // TRADING -> EXIT_HALF
 	EventFullLoss                              // TRADING/EXIT_HALF -> EXIT_ALL
 	EventRecovery                              // EXIT_HALF -> TRADING
-	EventTrendExit                             // TRADING -> EXIT_ALL
+	EventTrendExit                             // TRADING/TRENDING -> EXIT_ALL
 	EventEmergencyExit                         // TRADING -> EXIT_ALL (emergency)
 	EventPositionsClosed                       // EXIT_ALL -> WAIT_NEW_RANGE
 	EventNewRangeReady                         // WAIT_NEW_RANGE -> ENTER_GRID
@@ -78,6 +82,8 @@ func (e GridEvent) String() string {
 	switch e {
 	case EventRangeConfirmed:
 		return "RANGE_CONFIRMED"
+	case EventTrendDetected:
+		return "TREND_DETECTED"
 	case EventEntryPlaced:
 		return "ENTRY_PLACED"
 	case EventPartialLoss:
@@ -219,8 +225,8 @@ func (sm *GridStateMachine) CanTransition(symbol string, event GridEvent) bool {
 
 	switch currentState {
 	case GridStateIdle:
-		// From IDLE, only RangeConfirmed is valid (to ENTER_GRID)
-		return event == EventRangeConfirmed
+		// From IDLE: RangeConfirmed -> ENTER_GRID, TrendDetected -> TRENDING
+		return event == EventRangeConfirmed || event == EventTrendDetected
 
 	case GridStateEnterGrid:
 		// From ENTER_GRID, EntryPlaced moves to TRADING
@@ -241,8 +247,8 @@ func (sm *GridStateMachine) CanTransition(symbol string, event GridEvent) bool {
 		return event == EventPositionsClosed || event == EventRecoveryStart
 
 	case GridStateWaitNewRange:
-		// From WAIT_NEW_RANGE: NewRangeReady -> ENTER_GRID
-		return event == EventNewRangeReady
+		// From WAIT_NEW_RANGE: NewRangeReady -> ENTER_GRID, TrendDetected -> TRENDING
+		return event == EventNewRangeReady || event == EventTrendDetected
 
 	case GridStateOverSize:
 		// From OVER_SIZE: SizeNormalized -> TRADING, FullLoss -> EXIT_ALL
@@ -282,6 +288,8 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 	case GridStateIdle:
 		if event == EventRangeConfirmed {
 			newState = GridStateEnterGrid
+		} else if event == EventTrendDetected {
+			newState = GridStateTrending
 		} else {
 			return false
 		}
@@ -290,6 +298,24 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 		if event == EventEntryPlaced {
 			newState = GridStateTrading
 			state.EntryTime = time.Now()
+		} else {
+			return false
+		}
+
+	case GridStateTrending:
+		// From TRENDING: EntryPlaced -> TRADING, TrendExit/EmergencyExit -> EXIT_ALL
+		if event == EventEntryPlaced {
+			newState = GridStateTrading
+			state.EntryTime = time.Now()
+		} else if event == EventTrendExit || event == EventEmergencyExit {
+			newState = GridStateExitAll
+			state.ExitTime = time.Now()
+		} else if event == EventOverSizeLimit {
+			newState = GridStateOverSize
+		} else if event == EventExtremeVolatility {
+			newState = GridStateDefensive
+		} else if event == EventRecoveryStart {
+			newState = GridStateRecovery
 		} else {
 			return false
 		}
@@ -334,6 +360,8 @@ func (sm *GridStateMachine) Transition(symbol string, event GridEvent) bool {
 	case GridStateWaitNewRange:
 		if event == EventNewRangeReady {
 			newState = GridStateEnterGrid
+		} else if event == EventTrendDetected {
+			newState = GridStateTrending
 		} else {
 			return false
 		}
@@ -612,6 +640,8 @@ func (sm *GridStateMachine) TransitionWithConfidence(symbol string, event GridEv
 	case GridStateWaitNewRange:
 		if event == EventNewRangeReady {
 			newState = GridStateEnterGrid
+		} else if event == EventTrendDetected {
+			newState = GridStateTrending
 		} else {
 			return false
 		}

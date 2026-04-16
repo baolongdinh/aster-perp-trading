@@ -604,6 +604,72 @@ log:
   file: "logs/agentic-vf.log"
 
 # =============================================================================
+# VOLUME OPTIMIZATION - Tối ưu hóa volume farming
+# =============================================================================
+# Đây là section mới để kích hoạt các tính năng tối ưu volume farming
+# Các tính năng này giúp bot trở nên "agentic" hơn với khả năng:
+# - Phát hiện toxic flow (VPIN) và tự động pause trading
+# - Rounding prices theo tick-size hợp lệ
+# - Sử dụng post-only orders để tránh taker fees
+# - Smart cancellation khi spread thay đổi nhanh
+# - Penny jumping và inventory hedging (optional, phase 3)
+# =============================================================================
+volume_optimization:
+  enabled: true
+
+  # ORDER PRIORITY - Tối ưu ưu tiên lệnh
+  # ====================================
+  order_priority:
+    # Tick-size Awareness - Đảm bảo prices trên valid tick sizes
+    tick_size_awareness:
+      enabled: true
+      tick_sizes:
+        BTCUSD1: 0.1
+        ETHUSD1: 0.01
+        SOLUSD1: 0.001
+      default_tick_size: 0.01
+
+    # Penny Jumping - Đặt lệnh 1 tick từ best bid/ask (Phase 3)
+    penny_jumping:
+      enabled: false  # Phase 3
+      jump_threshold: 0.1
+      max_jump: 3
+
+  # TOXIC FLOW DETECTION - Phát hiện toxic flow (VPIN)
+  # =================================================
+  toxic_flow_detection:
+    enabled: true
+    window_size: 50              # Số buckets để tính VPIN
+    bucket_size: 1000.0          # Kích thước bucket (USDT)
+    vpin_threshold: 0.3          # Ngưỡng VPIN để coi là toxic
+    sustained_breaches: 2        # Số breaches liên tiếp để trigger action
+    action: "pause"              # Hành động: pause, widen_spread, reduce_size
+    auto_resume_delay: 5s        # Thời gian auto-resume sau pause
+
+  # MAKER/TAKER OPTIMIZATION - Tối ưu maker/taker
+  # ================================================
+  maker_taker_optimization:
+    # Post-Only Orders - Chỉ đi maker orders
+    post_only_enabled: true
+    post_only_fallback: true     # Fallback to regular limit orders nếu post-only rejected
+
+    # Smart Cancellation - Hủy và rebuild grid khi spread thay đổi
+    smart_cancellation:
+      enabled: true
+      spread_change_threshold: 0.2  # 20% spread change trigger rebuild
+      check_interval: 5s            # Kiểm tra spread mỗi 5s
+
+  # INVENTORY HEDGING - Hedge inventory skew (Phase 3)
+  # =================================================
+  inventory_hedging:
+    enabled: false  # Phase 3
+    hedge_threshold: 0.3
+    hedge_ratio: 0.3
+    max_hedge_size: 100.0
+    hedging_mode: "internal"  # internal, cross_pair, scalping
+    hedge_pair: "ETH"
+
+# =============================================================================
 # RANGE DETECTOR CONFIGURATION - Phát hiện range giá
 # =============================================================================
 # RangeDetector xác định vùng giá sideways để grid trading hoạt động tốt nhất
