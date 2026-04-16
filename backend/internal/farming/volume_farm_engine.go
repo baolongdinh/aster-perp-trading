@@ -188,7 +188,8 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		configManager,
 		regimeDetector,
 		engine.futuresClient,
-		engine.gridManager, // GridManager implements PositionProvider interface
+		engine.gridManager,                    // GridManager implements PositionProvider interface
+		volumeConfig.Exchange.FuturesRESTBase, // API base URL for historical data fetch
 		logger,
 	)
 	engine.adaptiveGridManager = adaptiveGridManager

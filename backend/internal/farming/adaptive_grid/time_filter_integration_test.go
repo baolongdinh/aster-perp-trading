@@ -1,6 +1,7 @@
 package adaptive_grid
 
 import (
+	"aster-bot/internal/farming/adaptive_grid"
 	"context"
 	"testing"
 	"time"
@@ -141,10 +142,12 @@ func TestSlotTransitionHandlerWithTimeFilter(t *testing.T) {
 	mockGrid := &mockGridManager{}
 
 	// Create adaptive manager with initialized maps
-	adaptiveMgr := NewAdaptiveGridManager(nil, nil, nil, nil, nil, logger)
+	adaptiveGridManager := adaptive_grid.NewAdaptiveGridManager(
+		nil, nil, nil, nil, nil, "", logger,
+	)
 
 	// Create transition handler
-	handler := NewSlotTransitionHandler(mockGrid, adaptiveMgr, logger)
+	handler := NewSlotTransitionHandler(mockGrid, adaptiveGridManager, logger)
 	handler.SetCooldownPeriod(0) // Disable cooldown for testing
 
 	// Get current slot

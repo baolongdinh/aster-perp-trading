@@ -82,10 +82,10 @@ func FastRangeConfig() *EnhancedRangeConfig {
 func DefaultRangeConfig() *RangeConfig {
 	return &RangeConfig{
 		Method:                   "combined",       // Dùng cả BB và ATR
-		Periods:                  20,               // 20 periods (better range detection with historical data)
+		Periods:                  5,                // 5 periods (fast warm-up: 5 minutes for 1m klines)
 		BBMultiplier:             2.0,              // 2 sigma cho BB
 		ATRMultiplier:            1.5,              // 1.5x ATR cho range
-		BreakoutThreshold:        0.01,             // 1% vượt range = breakout
+		BreakoutThreshold:        0.02,             // 2% vượt range = breakout (tăng từ 1% để ít nhạy cảm hơn)
 		StabilizationPeriod:      10 * time.Second, // Chờ 10s sau breakout để resume siêu nhanh
 		MinRangeWidthPct:         0.0001,           // Tối thiểu 0.01% range width (giảm để dễ tạo range hơn)
 		ADXPeriod:                14,
@@ -93,7 +93,7 @@ func DefaultRangeConfig() *RangeConfig {
 		WidthChangePct:           0.0015,
 		ReentryConfirmations:     2, // Giảm từ 3 xuống 2
 		EntryConfirmations:       1, // Giữ nguyên
-		OutsideBandConfirmations: 2,
+		OutsideBandConfirmations: 3, // Tăng từ 2 lên 3 để ít nhạy cảm hơn
 		BBExpansionFactor:        1.5,
 	}
 }

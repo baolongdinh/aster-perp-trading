@@ -1,6 +1,7 @@
 package adaptive_grid
 
 import (
+	"aster-bot/internal/farming/adaptive_grid"
 	"context"
 	"testing"
 	"time"
@@ -90,11 +91,13 @@ func TestSlotTransitionHandler_CanTransition(t *testing.T) {
 func TestSlotTransitionHandler_HandleTransition_DisabledSlot(t *testing.T) {
 	logger := zap.NewNop()
 	mockGrid := &mockGridManager{}
-	mockAdaptive := NewAdaptiveGridManager(nil, nil, nil, nil, nil, logger)
+	adaptiveGridManager := adaptive_grid.NewAdaptiveGridManager(
+		nil, nil, nil, nil, nil, "", logger,
+	)
 	// Initialize required maps
-	mockAdaptive.tradingPaused = make(map[string]bool)
+	adaptiveGridManager.tradingPaused = make(map[string]bool)
 
-	handler := NewSlotTransitionHandler(mockGrid, mockAdaptive, logger)
+	handler := NewSlotTransitionHandler(mockGrid, adaptiveGridManager, logger)
 	handler.SetCooldownPeriod(0) // Disable cooldown for testing
 
 	ctx := context.Background()
@@ -132,11 +135,13 @@ func TestSlotTransitionHandler_HandleTransition_DisabledSlot(t *testing.T) {
 func TestSlotTransitionHandler_HandleTransition_EnabledSlot(t *testing.T) {
 	logger := zap.NewNop()
 	mockGrid := &mockGridManager{}
-	mockAdaptive := NewAdaptiveGridManager(nil, nil, nil, nil, nil, logger)
+	adaptiveGridManager := adaptive_grid.NewAdaptiveGridManager(
+		nil, nil, nil, nil, nil, "", logger,
+	)
 	// Initialize required maps
-	mockAdaptive.tradingPaused = make(map[string]bool)
+	adaptiveGridManager.tradingPaused = make(map[string]bool)
 
-	handler := NewSlotTransitionHandler(mockGrid, mockAdaptive, logger)
+	handler := NewSlotTransitionHandler(mockGrid, adaptiveGridManager, logger)
 	handler.SetCooldownPeriod(0) // Disable cooldown for testing
 
 	ctx := context.Background()

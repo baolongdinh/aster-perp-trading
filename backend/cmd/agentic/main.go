@@ -97,11 +97,13 @@ func main() {
 	go func() {
 		logger.Info("⏳ Waiting 3s before starting Volume Farm Engine to avoid API burst...")
 		time.Sleep(3 * time.Second)
+		logger.Info("🔔 Sleep completed, about to call vfEngine.Start()")
 		logger.Info("▶️ Starting Volume Farm Engine")
 		if err := vfEngine.Start(ctx); err != nil {
 			logger.Error("Volume Farm Engine error", zap.Error(err))
 			cancel()
 		}
+		logger.Info("✅ Volume Farm Engine started successfully")
 	}()
 
 	// Initialize and start Agentic Engine (Decision Layer) if enabled

@@ -410,6 +410,15 @@ func (g *GridManager) Start(ctx context.Context) error {
 	g.wg.Add(1)
 	go g.gridLimitEnforcerWorker(ctx)
 
+	// CRITICAL: Start global kline processor immediately for continuous price feed
+	// This ensures isReadyForRegrid is evaluated continuously even without warmup
+	// Warmup logic remains unchanged - this just ensures price feed is always available
+	g.warmupOnce.Do(func() {
+		g.warmupStopCh = make(chan struct{})
+		g.warmupWg.Add(1)
+		go g.globalKlineProcessor()
+	})
+
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
@@ -1034,13 +1043,6 @@ func (g *GridManager) startKlineWarmup(symbol string) {
 		return
 	}
 
-	// Start global kline processor singleton (only once for all symbols)
-	g.warmupOnce.Do(func() {
-		g.warmupStopCh = make(chan struct{})
-		g.warmupWg.Add(1)
-		go g.globalKlineProcessor()
-	})
-
 	// Start per-symbol warmup completion checker
 	g.wg.Add(1)
 	go g.warmupCompletionChecker(symbol)
@@ -1074,21 +1076,13 @@ func (g *GridManager) globalKlineProcessor() {
 		case kline := <-klineCh:
 			symbol := strings.ToUpper(kline.Symbol)
 
-			// Check if this symbol is in warm-up phase
-			g.warmupMu.RLock()
-			isWarmupActive := g.warmupActive[symbol]
-			g.warmupMu.RUnlock()
-
-			if !isWarmupActive {
-				// Symbol not in warm-up, skip
-				continue
-			}
-
+			// ALWAYS feed klines to AdaptiveGridManager for continuous reentry checks
+			// This ensures isReadyForRegrid is evaluated continuously even after warm-up
 			g.logger.WithFields(logrus.Fields{
 				"symbol":    symbol,
 				"is_closed": kline.IsClosed,
 				"close":     kline.Close,
-			}).Info("GLOBAL: feeding kline to RangeDetector")
+			}).Debug("GLOBAL: feeding kline to RangeDetector")
 
 			// Feed OHLC data to RangeDetector for this symbol
 			g.adaptiveMgr.UpdatePriceForRange(symbol, kline.High, kline.Low, kline.Close)
