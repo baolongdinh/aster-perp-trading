@@ -117,12 +117,128 @@ func (e GridEvent) String() string {
 	}
 }
 
-// SymbolState tracks the state for a specific symbol
+// State timeout durations (prevent deadlocks)
+const (
+	WaitNewRangeTimeout = 10 * time.Minute // Max time to wait for new range
+	ExitAllTimeout      = 10 * time.Minute // Max time to wait for positions to close
+	OverSizeTimeout     = 15 * time.Minute // Max time in OVER_SIZE before forcing action
+	DefensiveTimeout    = 20 * time.Minute // Max time in DEFENSIVE before forcing action
+	RecoveryTimeout     = 10 * time.Minute // Max time in RECOVERY before forcing action
+)
+
+// GetStateTimeout returns the timeout duration for a given state
+func (sm *GridStateMachine) GetStateTimeout(state GridState) time.Duration {
+	switch state {
+	case GridStateWaitNewRange:
+		return WaitNewRangeTimeout
+	case GridStateExitAll:
+		return ExitAllTimeout
+	case GridStateOverSize:
+		return OverSizeTimeout
+	case GridStateDefensive:
+		return DefensiveTimeout
+	case GridStateRecovery:
+		return RecoveryTimeout
+	default:
+		return 0 // No timeout for IDLE, ENTER_GRID, TRADING, EXIT_HALF, TRENDING
+	}
+}
+
+// CheckStateTimeout checks if a symbol's current state has timed out
+// Returns (isTimedOut, timeoutDuration, timeRemaining)
+func (sm *GridStateMachine) CheckStateTimeout(symbol string) (bool, time.Duration, time.Duration) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	state, exists := sm.states[symbol]
+	if !exists {
+		return false, 0, 0
+	}
+
+	timeoutDuration := sm.GetStateTimeout(state.State)
+	if timeoutDuration == 0 {
+		return false, 0, 0 // State has no timeout
+	}
+
+	elapsed := time.Since(state.LastTransition)
+	if elapsed > timeoutDuration {
+		return true, timeoutDuration, 0
+	}
+
+	return false, timeoutDuration, timeoutDuration - elapsed
+}
+
+// ForceTransitionOnTimeout forces a state transition when timeout occurs
+// Returns the event that was triggered, or empty string if no timeout
+func (sm *GridStateMachine) ForceTransitionOnTimeout(symbol string) GridEvent {
+	isTimedOut, timeoutDuration, _ := sm.CheckStateTimeout(symbol)
+	if !isTimedOut {
+		return GridEvent(-1) // No timeout
+	}
+
+	sm.mu.RLock()
+	state, exists := sm.states[symbol]
+	if !exists {
+		sm.mu.RUnlock()
+		return GridEvent(-1)
+	}
+	currentState := state.State
+	sm.mu.RUnlock()
+
+	var event GridEvent
+
+	switch currentState {
+	case GridStateWaitNewRange:
+		// Force to ENTER_GRID (assume new range is ready after timeout)
+		event = EventNewRangeReady
+		sm.logger.Warn("State timeout: WAIT_NEW_RANGE forced to ENTER_GRID",
+			zap.String("symbol", symbol),
+			zap.Duration("timeout", timeoutDuration))
+
+	case GridStateExitAll:
+		// Force to WAIT_NEW_RANGE (assume positions closed after timeout)
+		event = EventPositionsClosed
+		sm.logger.Warn("State timeout: EXIT_ALL forced to WAIT_NEW_RANGE",
+			zap.String("symbol", symbol),
+			zap.Duration("timeout", timeoutDuration))
+
+	case GridStateOverSize:
+		// Force to TRADING (assume size normalized after timeout)
+		event = EventSizeNormalized
+		sm.logger.Warn("State timeout: OVER_SIZE forced to TRADING",
+			zap.String("symbol", symbol),
+			zap.Duration("timeout", timeoutDuration))
+
+	case GridStateDefensive:
+		// Force to TRADING (assume volatility normalized after timeout)
+		event = EventVolatilityNormalized
+		sm.logger.Warn("State timeout: DEFENSIVE forced to TRADING",
+			zap.String("symbol", symbol),
+			zap.Duration("timeout", timeoutDuration))
+
+	case GridStateRecovery:
+		// Force to TRADING (assume recovery complete after timeout)
+		event = EventRecoveryComplete
+		sm.logger.Warn("State timeout: RECOVERY forced to TRADING",
+			zap.String("symbol", symbol),
+			zap.Duration("timeout", timeoutDuration))
+
+	default:
+		return GridEvent(-1) // No timeout action for this state
+	}
+
+	// Execute the forced transition
+	sm.Transition(symbol, event)
+	return event
+}
+
+// SymbolState tracks the state and timing information for a symbol
 type SymbolState struct {
 	State                GridState
-	LastTransition       time.Time
 	EntryTime            time.Time
 	ExitTime             time.Time
+	LastTransition       time.Time
+	TimeoutStart         time.Time // When the state timeout period started
 	ConsecutiveLosses    int
 	RegridCooldownActive bool
 	RegridCooldownUntil  time.Time
@@ -428,6 +544,31 @@ func (sm *GridStateMachine) ForceState(symbol string, state GridState) {
 	sm.logger.Info("state_forced",
 		zap.String("symbol", symbol),
 		zap.String("state", state.String()),
+		zap.Time("timestamp", time.Now()),
+	)
+}
+
+// EmergencyForceState forces a state change with additional safety checks
+// This should only be used in emergency situations when normal transitions fail
+func (sm *GridStateMachine) EmergencyForceState(symbol string, state GridState, reason string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	oldState := GridStateIdle
+	if existingState, exists := sm.states[symbol]; exists {
+		oldState = existingState.State
+	}
+
+	sm.states[symbol] = &SymbolState{
+		State:          state,
+		LastTransition: time.Now(),
+	}
+
+	sm.logger.Error("emergency_state_forced",
+		zap.String("symbol", symbol),
+		zap.String("from_state", oldState.String()),
+		zap.String("to_state", state.String()),
+		zap.String("reason", reason),
 		zap.Time("timestamp", time.Now()),
 	)
 }

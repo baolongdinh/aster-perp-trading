@@ -2,16 +2,14 @@ package agentic
 
 import (
 	"context"
-
 	"fmt"
-
+	"runtime/debug"
 	"sync"
-
 	"time"
 
 	"aster-bot/internal/client"
-
 	"aster-bot/internal/config"
+	"aster-bot/internal/health"
 
 	"go.uber.org/zap"
 )
@@ -60,6 +58,9 @@ type AgenticEngine struct {
 	// NEW: Hybrid integration - Event-driven communication with VF
 	stateEventBus *StateEventBus
 	vfBridge      *AgenticVFBridge
+
+	// NEW: Health monitoring
+	healthMonitor *health.Monitor
 
 	// State
 
@@ -230,8 +231,32 @@ func NewAgenticEngine(
 		zap.Duration("update_interval", updateInterval),
 	)
 
+	// Initialize health monitor
+	engine.healthMonitor = health.NewMonitor(logger)
+	logger.Info("Health monitor initialized for AgenticEngine")
+
 	return engine, nil
 
+}
+
+// registerWorkersForHealthMonitoring registers critical agentic workers for health monitoring
+func (ae *AgenticEngine) registerWorkersForHealthMonitoring(ctx context.Context) {
+	// Register detection loop worker
+	ae.healthMonitor.RegisterWorker(health.WorkerConfig{
+		Name:                "agentic_detection_loop",
+		HeartbeatInterval:   30 * time.Second,
+		HealthCheckInterval: 30 * time.Second,
+		MaxErrorCount:       5,
+		AutoRestart:         true,
+	}, func(ctx context.Context) error {
+		ae.detectionLoop(ctx)
+		return nil
+	}, func() error {
+		close(ae.stopCh)
+		return nil
+	})
+
+	ae.logger.Info("Agentic workers registered for health monitoring")
 }
 
 // Start starts the agentic engine
@@ -253,6 +278,16 @@ func (ae *AgenticEngine) Start(ctx context.Context) error {
 	ae.mu.Unlock()
 
 	ae.logger.Info("Starting AgenticEngine")
+
+	// Start health monitor
+	if err := ae.healthMonitor.Start(); err != nil {
+		ae.logger.Error("Failed to start health monitor", zap.Error(err))
+	} else {
+		ae.logger.Info("Health monitor started")
+	}
+
+	// Register workers for health monitoring
+	ae.registerWorkersForHealthMonitoring(ctx)
 
 	// Initial detection run
 
@@ -284,7 +319,16 @@ func (ae *AgenticEngine) Start(ctx context.Context) error {
 
 	ae.wg.Add(1)
 
-	go ae.detectionLoop(ctx)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ae.logger.Error("Detection loop goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
+		ae.detectionLoop(ctx)
+	}()
 
 	ae.logger.Info("AgenticEngine started successfully")
 
@@ -312,6 +356,15 @@ func (ae *AgenticEngine) Stop() error {
 
 	ae.logger.Info("Stopping AgenticEngine")
 
+	// Stop health monitor
+	if ae.healthMonitor != nil {
+		if err := ae.healthMonitor.Stop(); err != nil {
+			ae.logger.Error("Failed to stop health monitor", zap.Error(err))
+		} else {
+			ae.logger.Info("Health monitor stopped")
+		}
+	}
+
 	// Stop circuit breaker evaluation worker
 	ae.circuitBreaker.Stop()
 
@@ -324,7 +377,13 @@ func (ae *AgenticEngine) Stop() error {
 	done := make(chan struct{})
 
 	go func() {
-
+		defer func() {
+			if r := recover(); r != nil {
+				ae.logger.Error("AgenticEngine WaitGroup goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		ae.wg.Wait()
 
 		close(done)
@@ -351,6 +410,13 @@ func (ae *AgenticEngine) Stop() error {
 
 func (ae *AgenticEngine) detectionLoop(ctx context.Context) {
 
+	defer func() {
+		if r := recover(); r != nil {
+			ae.logger.Error("Detection loop panic recovered",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+		}
+	}()
 	defer ae.wg.Done()
 
 	// Parse interval from config string
@@ -386,6 +452,11 @@ func (ae *AgenticEngine) detectionLoop(ctx context.Context) {
 			return
 
 		case <-ticker.C:
+
+			// Report heartbeat
+			if ae.healthMonitor != nil {
+				ae.healthMonitor.UpdateHeartbeat("agentic_detection_loop")
+			}
 
 			if err := ae.runDetectionCycle(ctx); err != nil {
 
@@ -514,7 +585,14 @@ func (ae *AgenticEngine) detectAllSymbols(ctx context.Context) map[string]Regime
 		wg.Add(1)
 
 		go func(sym string, det *RegimeDetector) {
-
+			defer func() {
+				if r := recover(); r != nil {
+					ae.logger.Error("Regime detector goroutine panic recovered",
+						zap.String("symbol", sym),
+						zap.Any("panic", r),
+						zap.String("stack", string(debug.Stack())))
+				}
+			}()
 			defer wg.Done()
 
 			semaphore <- struct{}{}
@@ -722,6 +800,14 @@ func (ae *AgenticEngine) GetDetectionCount() int {
 // GetStateEventBus returns the state event bus for hybrid integration
 func (ae *AgenticEngine) GetStateEventBus() *StateEventBus {
 	return ae.stateEventBus
+}
+
+// GetHealthStatus returns the health status of all monitored workers
+func (ae *AgenticEngine) GetHealthStatus() map[string]health.WorkerHealth {
+	if ae.healthMonitor == nil {
+		return nil
+	}
+	return ae.healthMonitor.GetAllWorkerHealth()
 }
 
 // runStateManagement executes adaptive state management for all symbols

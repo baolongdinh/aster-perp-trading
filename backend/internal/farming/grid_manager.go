@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,10 +87,11 @@ type GridManager struct {
 	// Metrics streamer for real-time dashboard
 	metricsStreamer interface{}
 
-	maxNotionalUSD   float64 // Maximum order in USD (e.g., $500)
-	gridSpreadPct    float64
-	maxOrdersSide    int
-	useDynamicSizing bool // Use ATR-based dynamic sizing
+	maxNotionalUSD      float64 // Maximum order per symbol in USD (e.g., $300)
+	maxTotalNotionalUSD float64 // Maximum total exposure across all symbols in USD (e.g., $500)
+	gridSpreadPct       float64
+	maxOrdersSide       int
+	useDynamicSizing    bool // Use ATR-based dynamic sizing
 
 	placementQueue        chan string
 	gridPlacementCooldown time.Duration
@@ -157,6 +159,15 @@ type GridManager struct {
 	flowParameters map[string]adaptive_grid.FlowParameters // symbol -> flow params
 	flowParamsMu   sync.RWMutex
 
+	// NEW: Equity curve tracking for position sizing
+	initialEquity      float64                     // Initial equity at bot start
+	currentEquity      float64                     // Current equity
+	equityHistory      []EquitySnapshot            // History of equity snapshots
+	consecutiveWins    int                         // Consecutive winning trades
+	consecutiveLosses  int                         // Consecutive losing trades
+	equityMu           sync.RWMutex                // Mutex for equity tracking
+	equitySizingConfig *config.DynamicSizingConfig // Equity sizing configuration
+
 	// NEW: VPIN monitor for toxic flow detection
 	vpinMonitor *volume_optimization.VPINMonitor
 
@@ -171,15 +182,16 @@ type GridManager struct {
 	rebalanceAggressiveness float64       // How much to reduce (0.0-1.0, e.g., 0.3 = reduce by 30%)
 	rebalanceInterval       time.Duration // How often to check position size
 
-	// NEW: Exchange orders cache for async fetch (TTL 1s)
-	exchangeOrderCache    map[string]*ExchangeOrderCacheEntry // symbol -> cached orders
-	exchangeOrderCacheMu  sync.RWMutex
-	exchangeOrderCacheTTL time.Duration
+	// NOTE: Exchange order cache removed - using wsClient.GetCachedOrders() as single source of truth
+	// exchangeOrderCache REMOVED
+	// exchangeOrderCacheMu REMOVED
+	// exchangeOrderCacheTTL REMOVED
+	// ExchangeOrderCacheEntry struct REMOVED
 
-	// NEW: Position cache from WebSocket to avoid API polling
-	cachedPositions    map[string]*client.Position // symbol -> position
-	cachedPositionsMu  sync.RWMutex
-	lastPositionUpdate time.Time
+	// NOTE: Position cache removed - using wsClient.GetCachedPositions() as single source of truth
+	// cachedPositions REMOVED
+	// cachedPositionsMu REMOVED
+	// lastPositionUpdate REMOVED
 
 	// NEW: Singleton kline processor - only one goroutine reads from kline channel
 	warmupOnce   sync.Once
@@ -190,10 +202,12 @@ type GridManager struct {
 	onOrderPlaced func(symbol string, order client.Order)
 }
 
-// ExchangeOrderCacheEntry stores cached exchange orders with timestamp
-type ExchangeOrderCacheEntry struct {
-	Orders    []client.Order
-	Timestamp time.Time
+// EquitySnapshot represents a snapshot of equity at a point in time
+type EquitySnapshot struct {
+	Timestamp   time.Time
+	Equity      float64
+	RealizedPnL float64
+	WinRate     float64
 }
 
 // SetActivityLogger sets the activity logger for the grid manager.
@@ -272,10 +286,12 @@ func initTakeProfitManager(logger *zap.Logger) *adaptive_grid.TakeProfitManager 
 		zap.Float64("spread_pct", config.SpreadPct),
 		zap.Int("timeout_seconds", config.TimeoutSeconds))
 
-	// Start config watcher for hot-reload
-	if err := tpMgr.StartConfigWatcher("backend/config/micro_profit.yaml"); err != nil {
-		logger.Warn("Failed to start config watcher for take profit manager",
-			zap.Error(err))
+	// Start config watcher for hot-reload (only if enabled)
+	if config.Enabled {
+		if err := tpMgr.StartConfigWatcher("backend/config/micro_profit.yaml"); err != nil {
+			logger.Warn("Failed to start config watcher for take profit manager",
+				zap.Error(err))
+		}
 	}
 
 	return tpMgr
@@ -304,6 +320,103 @@ func (g *GridManager) SetDefensiveConfig(cfg *config.DefensiveStateConfig) {
 // SetRecoveryConfig sets the RECOVERY state configuration
 func (g *GridManager) SetRecoveryConfig(cfg *config.RecoveryStateConfig) {
 	g.recoveryConfig = cfg
+}
+
+// GetStateParameters returns state-specific parameter multipliers for the given symbol
+func (g *GridManager) GetStateParameters(symbol string) (spreadMultiplier, sizeMultiplier float64) {
+	if g.stateMachine == nil {
+		return 1.0, 1.0 // Default multipliers
+	}
+
+	state := g.stateMachine.GetState(symbol)
+
+	switch state {
+	case adaptive_grid.GridStateDefensive:
+		if g.defensiveConfig != nil {
+			return g.defensiveConfig.SpreadMultiplier, 1.0
+		}
+	case adaptive_grid.GridStateRecovery:
+		if g.recoveryConfig != nil {
+			return g.recoveryConfig.SpreadMultiplier, g.recoveryConfig.SizeMultiplier
+		}
+	case adaptive_grid.GridStateOverSize:
+		// OVER_SIZE doesn't have explicit multipliers in config, use conservative defaults
+		return 1.5, 0.5 // Wider spread, smaller size
+	case adaptive_grid.GridStateExitHalf, adaptive_grid.GridStateExitAll:
+		// Exit states use conservative parameters
+		return 1.2, 0.8
+	}
+
+	// Default for TRADING, IDLE, etc.
+	return 1.0, 1.0
+}
+
+// checkStateTimeouts checks all active symbols for state timeouts and forces transitions
+func (g *GridManager) checkStateTimeouts() {
+	if g.stateMachine == nil {
+		return
+	}
+
+	g.gridsMu.RLock()
+	symbols := make([]string, 0, len(g.activeGrids))
+	for symbol := range g.activeGrids {
+		symbols = append(symbols, symbol)
+	}
+	g.gridsMu.RUnlock()
+
+	for _, symbol := range symbols {
+		isTimedOut, timeoutDuration, timeRemaining := g.stateMachine.CheckStateTimeout(symbol)
+		if isTimedOut {
+			g.logger.WithFields(logrus.Fields{
+				"symbol":           symbol,
+				"timeout_duration": timeoutDuration,
+			}).Warn("State timeout detected, forcing transition")
+
+			event := g.stateMachine.ForceTransitionOnTimeout(symbol)
+			if event != adaptive_grid.GridEvent(-1) {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":      symbol,
+					"event":       event.String(),
+					"forced":      true,
+					"timeout_sec": timeoutDuration.Seconds(),
+				}).Warn("State timeout: forced transition executed")
+			}
+		} else if timeoutDuration > 0 {
+			// Log remaining time for states with timeouts (debug level)
+			g.logger.WithFields(logrus.Fields{
+				"symbol":        symbol,
+				"timeout_sec":   timeoutDuration.Seconds(),
+				"remaining_sec": timeRemaining.Seconds(),
+			}).Debug("State timeout check: not timed out yet")
+		}
+	}
+}
+
+// stateTimeoutChecker runs continuously to check for state timeouts
+// This is independent of warm-up phase and runs for the entire bot lifetime
+func (g *GridManager) stateTimeoutChecker(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("State timeout checker goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
+	defer g.wg.Done()
+
+	g.logger.Warn(" State timeout checker started (continuous)")
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			g.logger.Warn("State timeout checker stopped")
+			return
+		case <-ticker.C:
+			g.checkStateTimeouts()
+		}
+	}
 }
 
 // SetMetricsStreamer sets the metrics streamer for real-time dashboard
@@ -339,6 +452,176 @@ func (g *GridManager) SetPennyJumpManager(pennyJumpMgr interface{}) {
 func (g *GridManager) SetInventoryHedgeManager(inventoryHedgeMgr interface{}) {
 	g.inventoryHedgeMgr = inventoryHedgeMgr
 	g.logger.Info("InventoryHedgeManager set on GridManager")
+}
+
+// SetEquitySizingConfig sets the equity sizing configuration
+func (g *GridManager) SetEquitySizingConfig(cfg *config.DynamicSizingConfig) {
+	g.equityMu.Lock()
+	defer g.equityMu.Unlock()
+	g.equitySizingConfig = cfg
+	g.logger.Info("EquitySizingConfig set on GridManager")
+}
+
+// InitializeEquityTracking initializes equity tracking with the initial balance
+func (g *GridManager) InitializeEquityTracking(initialBalance float64) {
+	g.equityMu.Lock()
+	defer g.equityMu.Unlock()
+
+	g.initialEquity = initialBalance
+	g.currentEquity = initialBalance
+	g.equityHistory = []EquitySnapshot{
+		{
+			Timestamp:   time.Now(),
+			Equity:      initialBalance,
+			RealizedPnL: 0,
+			WinRate:     0,
+		},
+	}
+	g.consecutiveWins = 0
+	g.consecutiveLosses = 0
+	g.logger.WithField("initial_equity", initialBalance).Info("Equity tracking initialized")
+}
+
+// UpdateEquity updates equity after a position close
+func (g *GridManager) UpdateEquity(realizedPnL float64, isWin bool) {
+	g.equityMu.Lock()
+	defer g.equityMu.Unlock()
+
+	g.currentEquity += realizedPnL
+
+	// Update consecutive wins/losses
+	if isWin {
+		g.consecutiveWins++
+		g.consecutiveLosses = 0
+	} else {
+		g.consecutiveLosses++
+		g.consecutiveWins = 0
+	}
+
+	// Calculate win rate from history
+	winRate := g.calculateWinRate24h()
+
+	// Add snapshot
+	snapshot := EquitySnapshot{
+		Timestamp:   time.Now(),
+		Equity:      g.currentEquity,
+		RealizedPnL: realizedPnL,
+		WinRate:     winRate,
+	}
+
+	// Keep only last 1000 snapshots
+	g.equityHistory = append(g.equityHistory, snapshot)
+	if len(g.equityHistory) > 1000 {
+		g.equityHistory = g.equityHistory[len(g.equityHistory)-1000:]
+	}
+
+	g.logger.WithFields(logrus.Fields{
+		"current_equity":     g.currentEquity,
+		"realized_pnl":       realizedPnL,
+		"is_win":             isWin,
+		"consecutive_wins":   g.consecutiveWins,
+		"consecutive_losses": g.consecutiveLosses,
+		"win_rate":           winRate,
+	}).Info("Equity updated")
+}
+
+// calculateWinRate24h calculates win rate from the last 24 hours
+func (g *GridManager) calculateWinRate24h() float64 {
+	if len(g.equityHistory) < 2 {
+		return 0
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour)
+	wins := 0
+	total := 0
+
+	for _, snap := range g.equityHistory {
+		if snap.Timestamp.After(cutoff) {
+			total++
+			if snap.RealizedPnL > 0 {
+				wins++
+			}
+		}
+	}
+
+	if total == 0 {
+		return 0
+	}
+
+	return float64(wins) / float64(total)
+}
+
+// GetWinRate24h returns the win rate over the last 24 hours
+func (g *GridManager) GetWinRate24h() float64 {
+	g.equityMu.RLock()
+	defer g.equityMu.RUnlock()
+	return g.calculateWinRate24h()
+}
+
+// CalculateEquityBasedSize calculates order size based on equity curve using Kelly Criterion
+func (g *GridManager) CalculateEquityBasedSize(baseSize float64) float64 {
+	g.equityMu.RLock()
+	defer g.equityMu.RUnlock()
+
+	if g.equitySizingConfig == nil || !g.equitySizingConfig.Enabled {
+		return baseSize
+	}
+
+	// Kelly Criterion: Size = Kelly% × Equity / Leverage
+	kellyFraction := g.equitySizingConfig.KellyFraction
+	winRate := g.calculateWinRate24h()
+
+	// Adjust Kelly based on win rate
+	if winRate > 0.6 {
+		// Higher win rate, can be more aggressive
+		kellyFraction = math.Min(kellyFraction*1.2, g.equitySizingConfig.MaxKelly)
+	} else if winRate < 0.4 {
+		// Lower win rate, be more conservative
+		kellyFraction = math.Max(kellyFraction*0.8, g.equitySizingConfig.MinKelly)
+	}
+
+	// Apply consecutive loss decay
+	if g.consecutiveLosses > 0 {
+		decay := math.Pow(g.equitySizingConfig.LossDecayRate, float64(g.consecutiveLosses))
+		kellyFraction *= decay
+	}
+
+	// Apply consecutive win recovery
+	if g.consecutiveWins > 0 {
+		recovery := math.Pow(g.equitySizingConfig.WinRecoveryRate, float64(g.consecutiveWins))
+		kellyFraction *= math.Min(recovery, g.equitySizingConfig.MaxRecoveryMultiplier)
+	}
+
+	// Calculate size
+	leverage := 50.0 // Default leverage normalization
+	equitySize := kellyFraction * g.currentEquity / leverage
+
+	// Apply drawdown factor
+	drawdownPct := (g.initialEquity - g.currentEquity) / g.initialEquity
+	if drawdownPct > 0 {
+		drawdownFactor := g.equitySizingConfig.DrawdownFactor - drawdownPct
+		drawdownFactor = math.Max(drawdownFactor, g.equitySizingConfig.MinKelly)
+		equitySize *= drawdownFactor
+	}
+
+	// Apply size limits
+	minSize := g.equitySizingConfig.MinSizeUSDT
+	maxSize := g.equitySizingConfig.MaxSizeUSDT
+	equitySize = math.Max(equitySize, minSize)
+	equitySize = math.Min(equitySize, maxSize)
+
+	// Use the smaller of equity-based size and base size
+	finalSize := math.Min(equitySize, baseSize)
+
+	g.logger.WithFields(logrus.Fields{
+		"base_size":      baseSize,
+		"equity_size":    equitySize,
+		"final_size":     finalSize,
+		"kelly_fraction": kellyFraction,
+		"win_rate":       winRate,
+	}).Debug("Equity-based size calculated")
+
+	return finalSize
 }
 
 // UpdateSmartCancelSpread updates spread for smart cancellation monitoring
@@ -459,12 +742,12 @@ func NewGridManager(futuresClient *client.FuturesClient, logger *logrus.Entry, c
 		rebalanceThresholdPct:   0.75,            // Start earlier at 75% of max
 		rebalanceAggressiveness: 0.50,            // Reduce by 50% of excess (faster)
 		rebalanceInterval:       5 * time.Second, // Check every 5s (quicker response)
-		// Exchange order cache with 1s TTL
-		exchangeOrderCache:    make(map[string]*ExchangeOrderCacheEntry),
-		exchangeOrderCacheTTL: 1 * time.Second,
-		// Position cache from WebSocket
-		cachedPositions:    make(map[string]*client.Position),
-		lastPositionUpdate: time.Now(),
+		// NOTE: Exchange order cache removed - using wsClient.GetCachedOrders() as single source of truth
+		// NOTE: Position cache removed - using wsClient.GetCachedPositions() as single source of truth
+		// Equity tracking initialization
+		equityHistory:     make([]EquitySnapshot, 0),
+		consecutiveWins:   0,
+		consecutiveLosses: 0,
 	}
 }
 
@@ -493,6 +776,19 @@ func (g *GridManager) ApplyConfig(cfg *config.VolumeFarmConfig) {
 		g.maxNotionalUSD = cfg.Risk.MaxPositionUSDTPerSymbol
 		g.logger.WithField("max_notional_usd", g.maxNotionalUSD).Info("Max position size updated from config")
 	}
+
+	// Update max total exposure from Risk config (for global exposure limit)
+	if cfg.Risk.MaxTotalPositionsUSDT > 0 {
+		g.maxTotalNotionalUSD = cfg.Risk.MaxTotalPositionsUSDT
+		g.logger.WithField("max_total_notional_usd", g.maxTotalNotionalUSD).Info("Max total exposure updated from config")
+	}
+
+	// Update equity sizing config from DynamicSizing
+	if cfg.Risk.DynamicSizing != nil {
+		g.SetEquitySizingConfig(cfg.Risk.DynamicSizing)
+		g.logger.Info("Equity sizing config updated from DynamicSizing")
+	}
+
 	if wsURL := buildTickerStreamURL(cfg.Exchange.FuturesWSBase, cfg.TickerStream); wsURL != "" {
 		g.tickerStreamURL = wsURL
 	}
@@ -590,6 +886,11 @@ func (g *GridManager) Start(ctx context.Context) error {
 		go g.globalKlineProcessor()
 	})
 
+	// Start continuous state timeout checker (independent of warm-up phase)
+	// This prevents states from getting stuck in deadlocks
+	g.wg.Add(1)
+	go g.stateTimeoutChecker(ctx)
+
 	// Start multiple placement workers for high volume concurrency
 	numWorkers := 20 // 20 workers for massive volume farming
 	for i := 0; i < numWorkers; i++ {
@@ -600,7 +901,7 @@ func (g *GridManager) Start(ctx context.Context) error {
 	// Trigger warm-up for any existing grids immediately (don't wait for UpdateSymbols)
 	g.triggerWarmupForExistingGrids()
 
-	g.logger.Info("Grid Manager started successfully")
+	g.logger.Warn("Grid Manager started successfully")
 	return nil
 }
 
@@ -627,6 +928,12 @@ func (g *GridManager) triggerWarmupForExistingGrids() {
 
 // websocketProcessor processes real-time WebSocket data.
 func (g *GridManager) websocketProcessor(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("WebSocket processor goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	tickerCh := g.wsClient.GetTickerChannel()
@@ -813,6 +1120,23 @@ func (g *GridManager) processWebSocketTicker(msg map[string]interface{}) {
 
 func (g *GridManager) canPlaceForSymbol(symbol string) bool {
 	g.logger.WithField("symbol", symbol).Info("=== CHECKING canPlaceForSymbol ===")
+
+	// NEW: Root cause fix - Bypass checks if stuck in ENTER_GRID > 30 seconds
+	// This prevents single point of failure where ENTER_GRID state gets stuck
+	if g.stateMachine != nil {
+		gridState := g.stateMachine.GetState(symbol)
+		if gridState == adaptive_grid.GridStateEnterGrid {
+			stateTime := g.stateMachine.GetStateTime(symbol)
+			timeInState := time.Since(stateTime)
+			if timeInState > 30*time.Second {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":        symbol,
+					"time_in_state": timeInState,
+				}).Warn(">>> BYPASSING GATES: ENTER_GRID stuck > 30s, forcing placement <<<")
+				return true // Force bypass all checks
+			}
+		}
+	}
 
 	if g.adaptiveMgr != nil {
 		g.logger.WithField("symbol", symbol).Info("Checking AdaptiveGridManager.CanPlaceOrder")
@@ -1202,6 +1526,14 @@ func (g *GridManager) getActiveGridLevels(symbol string) (map[int]bool, map[int]
 // startKlineWarmup starts the WebSocket kline warm-up phase for a symbol
 // This feeds OHLC data to RangeDetector via WebSocket instead of REST API
 func (g *GridManager) startKlineWarmup(symbol string) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Start kline warmup goroutine panic recovered",
+				zap.String("symbol", symbol),
+				zap.Any("panic", r))
+		}
+	}()
+
 	if g.wsClient == nil {
 		g.logger.WithField("symbol", symbol).Warn("Cannot start warm-up: WebSocket client not available")
 		return
@@ -1241,6 +1573,12 @@ func (g *GridManager) startKlineWarmup(symbol string) {
 // to ALL symbols in warm-up phase. This fixes race condition where multiple goroutines
 // read from the same channel causing messages to be lost.
 func (g *GridManager) globalKlineProcessor() {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Global kline processor goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.warmupWg.Done()
 
 	g.logger.Info("🌐 Global kline processor started (singleton)")
@@ -1518,6 +1856,21 @@ func (g *GridManager) checkPositionSize(symbol string) {
 	case adaptive_grid.GridStateTrading:
 		// TRADING: Check if position size > threshold → trigger OVER_SIZE
 		if positionNotional > threshold {
+			// NEW: Check state stability duration before transition
+			lastTransitionTime := g.adaptiveMgr.GetStateMachine().GetStateTime(symbol)
+			timeSinceLastTransition := time.Since(lastTransitionTime)
+			minStabilityDuration := 30 * time.Second // Default 30s cooldown
+
+			if timeSinceLastTransition < minStabilityDuration {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":                     symbol,
+					"position_notional":          positionNotional,
+					"threshold":                  threshold,
+					"time_since_last_transition": timeSinceLastTransition.Seconds(),
+				}).Debug("Position Size: OVER_SIZE transition skipped due to stability duration")
+				return
+			}
+
 			g.logger.WithFields(logrus.Fields{
 				"symbol":            symbol,
 				"position_notional": positionNotional,
@@ -1530,6 +1883,21 @@ func (g *GridManager) checkPositionSize(symbol string) {
 	case adaptive_grid.GridStateOverSize:
 		// OVER_SIZE: Check if position size <= recovery level → trigger TRADING
 		if positionNotional <= recoveryLevel {
+			// NEW: Check state stability duration before transition
+			lastTransitionTime := g.adaptiveMgr.GetStateMachine().GetStateTime(symbol)
+			timeSinceLastTransition := time.Since(lastTransitionTime)
+			minStabilityDuration := 30 * time.Second // Default 30s cooldown
+
+			if timeSinceLastTransition < minStabilityDuration {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":                     symbol,
+					"position_notional":          positionNotional,
+					"recovery_level":             recoveryLevel,
+					"time_since_last_transition": timeSinceLastTransition.Seconds(),
+				}).Debug("Position Size: TRADING transition skipped due to stability duration")
+				return
+			}
+
 			g.logger.WithFields(logrus.Fields{
 				"symbol":            symbol,
 				"position_notional": positionNotional,
@@ -1547,6 +1915,30 @@ func (g *GridManager) triggerStateTransitionFromRecommendation(symbol string, re
 
 	// Only transition if recommended state is different from current state
 	if recommendation.State == currentState {
+		return
+	}
+
+	// NEW: Enforce state stability duration to prevent rapid state changes
+	// Default cooldown: 30 seconds (can be configured)
+	stateStabilityDuration := 30 * time.Second
+	if g.marketConditionEvaluator != nil {
+		evalConfig := g.marketConditionEvaluator.GetConfig()
+		if evalConfig.StateStabilityDuration > 0 {
+			stateStabilityDuration = time.Duration(evalConfig.StateStabilityDuration) * time.Second
+		}
+	}
+
+	lastTransitionTime := g.adaptiveMgr.GetStateMachine().GetStateTime(symbol)
+	timeSinceLastTransition := time.Since(lastTransitionTime)
+
+	if timeSinceLastTransition < stateStabilityDuration {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":                     symbol,
+			"current_state":              currentState.String(),
+			"recommended_state":          recommendation.State.String(),
+			"time_since_last_transition": timeSinceLastTransition.Seconds(),
+			"stability_duration":         stateStabilityDuration.Seconds(),
+		}).Debug("Market Condition: State transition skipped due to stability duration")
 		return
 	}
 
@@ -1784,6 +2176,13 @@ func (g *GridManager) cancelOppositeSideGridOrders(ctx context.Context, symbol, 
 // warmupCompletionChecker monitors a single symbol's warm-up progress
 // and triggers placement when range becomes active
 func (g *GridManager) warmupCompletionChecker(symbol string) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Warmup completion checker goroutine panic recovered",
+				zap.String("symbol", symbol),
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	g.logger.WithField("symbol", symbol).Info("📊 Warm-up completion checker started")
@@ -1984,6 +2383,19 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 	}
 	g.flowParamsMu.RUnlock()
 
+	// NEW: Apply state-specific spread multiplier
+	stateSpreadMultiplier, _ := g.GetStateParameters(symbol)
+	if stateSpreadMultiplier != 1.0 {
+		originalSpread := spreadAmount
+		spreadAmount *= stateSpreadMultiplier
+		g.logger.WithFields(logrus.Fields{
+			"symbol":                  symbol,
+			"state_spread_multiplier": stateSpreadMultiplier,
+			"original_spread":         originalSpread,
+			"adjusted_spread":         spreadAmount,
+		}).Info("Applied state-specific spread multiplier")
+	}
+
 	// Ensure minimum spread amount for very low prices or tiny percentages
 	minSpreadAmount := grid.CurrentPrice * 0.0001 // 0.01% minimum
 	if spreadAmount < minSpreadAmount {
@@ -2143,6 +2555,40 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 				}).Info("Order size adjusted for inventory skew")
 			}
 			orderSize = adjustedSize
+		}
+
+		// NEW: Apply equity-based sizing if enabled
+		if g.equitySizingConfig != nil && g.equitySizingConfig.Enabled {
+			baseNotional := orderSize * buyPrice
+			equityBasedNotional := g.CalculateEquityBasedSize(baseNotional)
+			equityBasedSize := equityBasedNotional / buyPrice
+			if equityBasedSize != orderSize {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":          symbol,
+					"grid_level":      i,
+					"side":            "BUY",
+					"base_notional":   baseNotional,
+					"equity_notional": equityBasedNotional,
+					"original_size":   orderSize,
+					"equity_size":     equityBasedSize,
+				}).Info("Order size adjusted by equity curve")
+				orderSize = equityBasedSize
+			}
+		}
+
+		// NEW: Apply state-specific size multiplier
+		_, stateSizeMultiplier := g.GetStateParameters(symbol)
+		if stateSizeMultiplier != 1.0 {
+			originalSize := orderSize
+			orderSize *= stateSizeMultiplier
+			g.logger.WithFields(logrus.Fields{
+				"symbol":                symbol,
+				"grid_level":            i,
+				"side":                  "BUY",
+				"state_size_multiplier": stateSizeMultiplier,
+				"original_size":         originalSize,
+				"adjusted_size":         orderSize,
+			}).Info("Order size adjusted by state-specific multiplier")
 		}
 
 		// NEW: Apply fluid flow size multiplier for "soft like water" behavior
@@ -2314,6 +2760,40 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 			orderSize = adjustedSize
 		}
 
+		// NEW: Apply equity-based sizing if enabled
+		if g.equitySizingConfig != nil && g.equitySizingConfig.Enabled {
+			baseNotional := orderSize * sellPrice
+			equityBasedNotional := g.CalculateEquityBasedSize(baseNotional)
+			equityBasedSize := equityBasedNotional / sellPrice
+			if equityBasedSize != orderSize {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":          symbol,
+					"grid_level":      i,
+					"side":            "SELL",
+					"base_notional":   baseNotional,
+					"equity_notional": equityBasedNotional,
+					"original_size":   orderSize,
+					"equity_size":     equityBasedSize,
+				}).Info("Order size adjusted by equity curve")
+				orderSize = equityBasedSize
+			}
+		}
+
+		// NEW: Apply state-specific size multiplier
+		_, stateSizeMultiplier := g.GetStateParameters(symbol)
+		if stateSizeMultiplier != 1.0 {
+			originalSize := orderSize
+			orderSize *= stateSizeMultiplier
+			g.logger.WithFields(logrus.Fields{
+				"symbol":                symbol,
+				"grid_level":            i,
+				"side":                  "SELL",
+				"state_size_multiplier": stateSizeMultiplier,
+				"original_size":         originalSize,
+				"adjusted_size":         orderSize,
+			}).Info("Order size adjusted by state-specific multiplier")
+		}
+
 		// NEW: Apply fluid flow size multiplier for "soft like water" behavior
 		g.flowParamsMu.RLock()
 		if flowParams, hasFlow := g.flowParameters[symbol]; hasFlow {
@@ -2380,6 +2860,14 @@ func (g *GridManager) placeGridOrders(ctx context.Context, symbol string, grid *
 
 	// Wait for all orders to complete in a goroutine
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				g.logger.Error("WaitGroup goroutine panic recovered",
+					zap.String("symbol", symbol),
+					zap.Any("panic", r))
+				close(successChan)
+			}
+		}()
 		wg.Wait()
 		close(successChan)
 	}()
@@ -2603,6 +3091,14 @@ func (g *GridManager) placeBBGridOrders(ctx context.Context, symbol string, grid
 
 		successChan := make(chan bool, 1)
 		go func(o *GridOrder) {
+			defer func() {
+				if r := recover(); r != nil {
+					g.logger.Error("Order placement goroutine panic recovered",
+						zap.String("symbol", order.Symbol),
+						zap.Any("panic", r))
+					successChan <- false
+				}
+			}()
 			err := g.placeOrder(o)
 			successChan <- (err == nil)
 		}(order)
@@ -2740,6 +3236,14 @@ func (g *GridManager) placeMicroGridOrders(ctx context.Context, symbol string, g
 
 	for _, order := range orders {
 		go func(o *GridOrder) {
+			defer func() {
+				if r := recover(); r != nil {
+					g.logger.Error("Micro grid order placement goroutine panic recovered",
+						zap.String("symbol", order.Symbol),
+						zap.Any("panic", r))
+					successChan <- false
+				}
+			}()
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			g.placeOrderAsync(ctx, o, &sync.WaitGroup{}, successChan)
@@ -2916,6 +3420,14 @@ func (g *GridManager) calculateOrderSize(symbol string, orderSize, price float64
 
 // placeOrderAsync places an order asynchronously with context cancellation support
 func (g *GridManager) placeOrderAsync(ctx context.Context, order *GridOrder, wg *sync.WaitGroup, successChan chan<- bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("placeOrderAsync goroutine panic recovered",
+				zap.String("symbol", order.Symbol),
+				zap.Any("panic", r))
+			successChan <- false
+		}
+	}()
 	defer wg.Done()
 
 	g.logger.WithFields(logrus.Fields{
@@ -3007,16 +3519,22 @@ func (g *GridManager) placeOrder(order *GridOrder) error {
 	if shouldCheckExposure {
 		currentExposure := g.calculateCurrentExposure(context.Background(), order.Symbol)
 		newTotalExposure := currentExposure + notional
-		exposureLimit := g.maxNotionalUSD * 1.2 // STRICT: Only allow 1.2x max position
+		// Use maxTotalNotionalUSD for global exposure limit (across all symbols)
+		// Fallback to maxNotionalUSD * 2 if maxTotalNotionalUSD not set
+		exposureLimit := g.maxTotalNotionalUSD
+		if exposureLimit == 0 {
+			exposureLimit = g.maxNotionalUSD * 2.0 // Fallback: 2x per-symbol limit
+		}
 		if newTotalExposure > exposureLimit {
 			// Instead of rejecting, reduce order size to fit within limit
 			maxAllowedNotional := exposureLimit - currentExposure
 			if maxAllowedNotional <= 0 {
 				g.logger.WithFields(logrus.Fields{
-					"symbol":           order.Symbol,
-					"current_exposure": currentExposure,
-					"exposure_limit":   exposureLimit,
-					"max_config":       g.maxNotionalUSD,
+					"symbol":             order.Symbol,
+					"current_exposure":   currentExposure,
+					"exposure_limit":     exposureLimit,
+					"max_total_notional": g.maxTotalNotionalUSD,
+					"max_per_symbol":     g.maxNotionalUSD,
 				}).Warn("ORDER SKIPPED: Exposure already at limit, cannot place any order")
 				return fmt.Errorf("exposure at limit %.2f, cannot place order", currentExposure)
 			}
@@ -3476,6 +3994,12 @@ func (g *GridManager) LogVolumeMetrics() {
 
 // metricsReporter reports volume farming metrics periodically
 func (g *GridManager) metricsReporter(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Metrics reporter goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	ticker := time.NewTicker(30 * time.Second) // Report every 30 seconds
@@ -3508,6 +4032,12 @@ func (g *GridManager) checkWebSocketHealth() {
 
 // exchangeDataReporter queries real exchange data and logs for dashboard
 func (g *GridManager) exchangeDataReporter(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Exchange data reporter goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Second) // Report every 10 seconds
@@ -3582,6 +4112,13 @@ func (g *GridManager) logExchangeData(ctx context.Context) {
 }
 
 func (g *GridManager) placementWorker(ctx context.Context, workerID int) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Placement worker goroutine panic recovered",
+				zap.Int("worker_id", workerID),
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	g.logger.WithField("worker_id", workerID).Info("Placement worker started")
@@ -3612,6 +4149,12 @@ func (g *GridManager) placementWorker(ctx context.Context, workerID int) {
 }
 
 func (g *GridManager) ordersResetWorker(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Orders reset worker goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Second) // 10s for grid reset
@@ -3691,27 +4234,27 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	g.logger.WithField("symbol", symbol).Info("Starting placement process for symbol")
 	placementStart := time.Now()
 
-	// T016: Use async fetch with timeout (max 500ms)
-	// T017: Check cache first (TTL 1s)
-	exchangeOrders, cacheHit := g.getCachedExchangeOrders(symbol)
-	if !cacheHit {
-		// Cache miss - fetch with timeout
+	// Use wsClient.GetCachedOrders (single source of truth)
+	// Fallback to API if cache stale (> 5s)
+	exchangeOrders := g.wsClient.GetCachedOrders(symbol)
+	if g.wsClient.IsCacheStale("order") || len(exchangeOrders) == 0 {
+		// Cache stale or empty - fetch with timeout
 		fetchCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		defer cancel()
 
 		orders, err := g.fetchExchangeDataAsync(fetchCtx, symbol)
 		if err != nil {
-			// T019: Fallback - skip exchange check on timeout/error, proceed with placement
+			// Fallback - skip exchange check on timeout/error, proceed with placement
 			g.logger.WithError(err).WithFields(logrus.Fields{
 				"symbol":   symbol,
 				"duration": time.Since(placementStart).Milliseconds(),
 			}).Warn("[PLACEMENT] Exchange fetch failed/timeout, proceeding without exchange check")
+			exchangeOrders = []client.Order{} // Use empty slice
 		} else {
 			exchangeOrders = orders
-			g.cacheExchangeOrders(symbol, orders)
 		}
 	} else {
-		g.logger.WithField("symbol", symbol).Debug("[PLACEMENT] Using cached exchange orders")
+		g.logger.WithField("symbol", symbol).Debug("[PLACEMENT] Using wsClient cached orders")
 	}
 
 	// Process exchange orders if available
@@ -3732,7 +4275,7 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 			"exchange_buy":  exchangeBuyCount,
 			"exchange_sell": exchangeSellCount,
 			"max_per_side":  g.maxOrdersSide,
-			"cache_hit":     cacheHit,
+			"source":        "wsClient",
 		}).Info("[PLACEMENT] Exchange order count before placing")
 
 		// Skip if already at or over limit (either side)
@@ -3850,34 +4393,7 @@ func (g *GridManager) fetchExchangeDataAsync(ctx context.Context, symbol string)
 	return g.futuresClient.GetOpenOrders(ctx, symbol)
 }
 
-// getCachedExchangeOrders returns cached orders if valid (TTL 1s)
-func (g *GridManager) getCachedExchangeOrders(symbol string) ([]client.Order, bool) {
-	g.exchangeOrderCacheMu.RLock()
-	defer g.exchangeOrderCacheMu.RUnlock()
-
-	entry, exists := g.exchangeOrderCache[symbol]
-	if !exists {
-		return nil, false
-	}
-
-	// Check TTL
-	if time.Since(entry.Timestamp) > g.exchangeOrderCacheTTL {
-		return nil, false
-	}
-
-	return entry.Orders, true
-}
-
-// cacheExchangeOrders stores orders in cache with timestamp
-func (g *GridManager) cacheExchangeOrders(symbol string, orders []client.Order) {
-	g.exchangeOrderCacheMu.Lock()
-	defer g.exchangeOrderCacheMu.Unlock()
-
-	g.exchangeOrderCache[symbol] = &ExchangeOrderCacheEntry{
-		Orders:    orders,
-		Timestamp: time.Now(),
-	}
-}
+// NOTE: getCachedExchangeOrders and cacheExchangeOrders removed - using wsClient.GetCachedOrders() as single source of truth
 
 func (g *GridManager) countActiveGridOrders(symbol string) int {
 	g.ordersMu.RLock()
@@ -4069,6 +4585,13 @@ func (g *GridManager) Stop(ctx context.Context) error {
 
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				g.logger.Error("GridManager WaitGroup goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		g.wg.Wait()
 		close(done)
 	}()
@@ -4099,22 +4622,19 @@ func (g *GridManager) SetGridSpread(spread float64) {
 	g.logger.WithField("grid_spread", spread).Info("Grid spread updated")
 }
 
-// calculateCurrentExposure calculates total exposure for a symbol from exchange positions
+// calculateCurrentExposure calculates total exposure across ALL symbols from wsClient cache
+// This is GLOBAL exposure check - total notional value of all open positions
 func (g *GridManager) calculateCurrentExposure(ctx context.Context, symbol string) float64 {
-	// Get actual positions from WebSocket cache or API
-	positions, err := g.GetCachedPositions(ctx)
-	if err != nil {
-		g.logger.WithError(err).Warn("Failed to get positions for exposure check")
-		return 0
-	}
+	// Read from wsClient cache directly (single source of truth)
+	positions := g.wsClient.GetCachedPositions()
 
 	totalExposure := 0.0
 	for _, pos := range positions {
-		if pos.Symbol == symbol && pos.PositionAmt != 0 {
+		if pos.PositionAmt != 0 {
 			exposure := math.Abs(pos.PositionAmt) * pos.MarkPrice
 			totalExposure += exposure
 			g.logger.WithFields(logrus.Fields{
-				"symbol":     symbol,
+				"symbol":     pos.Symbol,
 				"position":   pos.PositionAmt,
 				"mark_price": pos.MarkPrice,
 				"exposure":   exposure,
@@ -4122,11 +4642,24 @@ func (g *GridManager) calculateCurrentExposure(ctx context.Context, symbol strin
 		}
 	}
 
+	g.logger.WithFields(logrus.Fields{
+		"target_symbol":  symbol,
+		"total_exposure": totalExposure,
+		"positions":      len(positions),
+		"source":         "wsClient",
+	}).Debug("Total exposure calculated across all symbols")
+
 	return totalExposure
 }
 
 // orderFillPoller polls for filled orders since UserStream is not connected
 func (g *GridManager) orderFillPoller(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Order fill poller goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	ticker := time.NewTicker(30 * time.Second) // Poll every 30 seconds
@@ -4504,17 +5037,15 @@ func (g *GridManager) OnOrderUpdate(orderUpdate *OrderUpdate) {
 }
 
 // OnAccountUpdate handles real-time position updates from UserStream WebSocket
-// This replaces polling GetPositions() API calls
+// Only updates AdaptiveGridManager position tracking. wsClient cache is updated in volume_farm_engine.go.
 func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
-	g.cachedPositionsMu.Lock()
-	defer g.cachedPositionsMu.Unlock()
-
 	g.logger.WithFields(logrus.Fields{
 		"positions_count": len(accountUpdate.Update.Positions),
 		"balances_count":  len(accountUpdate.Update.Balances),
 	}).Info("WebSocket account update received")
 
-	// Update cached positions from WebSocket data
+	// Only update AdaptiveGridManager's position tracking
+	// wsClient cache is already updated in volume_farm_engine.go (single source of truth)
 	for _, pos := range accountUpdate.Update.Positions {
 		if pos.PositionAmt != 0 {
 			// Convert WebSocket position to client.Position
@@ -4528,29 +5059,14 @@ func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
 				MarginType:       pos.MarginType,
 				PositionSide:     pos.PositionSide,
 			}
-			g.cachedPositions[pos.Symbol] = cachedPos
-			g.logger.WithFields(logrus.Fields{
-				"symbol":         pos.Symbol,
-				"position_amt":   pos.PositionAmt,
-				"entry_price":    pos.EntryPrice,
-				"unrealized_pnl": pos.UnrealizedPnL,
-				"websocket":      true,
-			}).Info("Position updated from WebSocket")
 
-			// CRITICAL: Also update AdaptiveGridManager's position tracking
+			// CRITICAL: Update AdaptiveGridManager's position tracking
 			// This ensures state machine transitions (e.g., EXIT_ALL → WAIT_NEW_RANGE) work correctly
 			if g.adaptiveMgr != nil {
 				g.adaptiveMgr.UpdatePositionTracking(pos.Symbol, cachedPos)
 			}
 		} else {
-			// Remove zero positions from cache
-			delete(g.cachedPositions, pos.Symbol)
-			g.logger.WithFields(logrus.Fields{
-				"symbol": pos.Symbol,
-			}).Info("Position removed from cache (zero position)")
-
-			// CRITICAL: Also update AdaptiveGridManager's position tracking to zero
-			// This ensures state machine can detect position is closed
+			// Position closed - update AdaptiveGridManager to zero
 			if g.adaptiveMgr != nil {
 				zeroPos := &client.Position{
 					Symbol:      pos.Symbol,
@@ -4562,41 +5078,46 @@ func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
 			}
 		}
 	}
-	g.lastPositionUpdate = time.Now()
-	g.logger.WithFields(logrus.Fields{
-		"cache_size":  len(g.cachedPositions),
-		"last_update": g.lastPositionUpdate,
-	}).Info("Position cache updated from WebSocket")
+
+	g.logger.Info("AdaptiveGridManager position tracking updated from WebSocket")
 }
 
-// GetCachedPositions returns cached positions from WebSocket data
-// This replaces API calls to avoid rate limiting
+// GetCachedPositions returns positions from wsClient cache (single source of truth)
+// WebSocket updates wsClient cache directly. Fallback to API if cache stale.
 func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position, error) {
-	g.cachedPositionsMu.RLock()
-	defer g.cachedPositionsMu.RUnlock()
+	// Read from wsClient cache (single source of truth)
+	positions := g.wsClient.GetCachedPositions()
 
-	// If cache is empty or stale, fallback to API call
-	if len(g.cachedPositions) == 0 || time.Since(g.lastPositionUpdate) > 30*time.Second {
-		g.logger.Info("Position cache empty or stale, falling back to API call",
-			logrus.Fields{
-				"cache_size":    len(g.cachedPositions),
-				"last_update":   g.lastPositionUpdate,
-				"stale_seconds": time.Since(g.lastPositionUpdate).Seconds(),
-			})
+	// Fallback to API if wsClient cache stale (> 5s)
+	if g.wsClient.IsCacheStale("position") {
+		g.logger.WithFields(logrus.Fields{
+			"stale": true,
+		}).Warn("wsClient position cache stale, falling back to API call")
 		return g.futuresClient.GetPositions(ctx)
 	}
 
-	// Convert cached positions to slice
-	positions := make([]client.Position, 0, len(g.cachedPositions))
-	for _, pos := range g.cachedPositions {
-		positions = append(positions, *pos)
+	// Convert map to slice
+	result := make([]client.Position, 0, len(positions))
+	for _, pos := range positions {
+		result = append(result, pos)
 	}
 
-	return positions, nil
+	g.logger.WithFields(logrus.Fields{
+		"count":  len(result),
+		"source": "wsClient",
+	}).Debug("Positions retrieved from wsClient cache")
+
+	return result, nil
 }
 
 // positionRebalancerWorker monitors position sizes and places reduce-only orders when needed
 func (g *GridManager) positionRebalancerWorker(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Position rebalancer worker goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	g.rebalanceInterval = 5 * time.Second
@@ -4762,6 +5283,12 @@ func (g *GridManager) SetRebalanceAggressiveness(aggressiveness float64) {
 
 // gridLimitEnforcerWorker monitors and cancels excess orders beyond max_orders_per_side
 func (g *GridManager) gridLimitEnforcerWorker(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Error("Grid limit enforcer worker goroutine panic recovered",
+				zap.Any("panic", r))
+		}
+	}()
 	defer g.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Second)

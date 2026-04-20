@@ -3,6 +3,7 @@ package agentic
 import (
 	"encoding/json"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"go.uber.org/zap"
@@ -35,6 +36,13 @@ func (s *StatusServer) Start() error {
 
 	s.logger.Info("Starting status server", zap.Int("port", s.port))
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Status server goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		if err := http.ListenAndServe(":8082", mux); err != nil {
 			s.logger.Error("Status server error", zap.Error(err))
 		}
@@ -57,11 +65,11 @@ func (s *StatusServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleStatus returns detailed engine status
 func (s *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]interface{}{
-		"running":          s.engine.IsRunning(),
-		"last_detection":   s.engine.GetLastDetection(),
-		"detection_count":  s.engine.GetDetectionCount(),
-		"circuit_breaker":  s.engine.GetCircuitBreakerStatus(),
-		"timestamp":        time.Now().Unix(),
+		"running":         s.engine.IsRunning(),
+		"last_detection":  s.engine.GetLastDetection(),
+		"detection_count": s.engine.GetDetectionCount(),
+		"circuit_breaker": s.engine.GetCircuitBreakerStatus(),
+		"timestamp":       time.Now().Unix(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

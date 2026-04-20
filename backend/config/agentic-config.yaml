@@ -73,7 +73,7 @@ agent:
 
   logging:
     retention_days: 90
-    log_level: "info"
+    log_level: "warn"  # debug/info/warn/error - warn chỉ log warning và error
     log_decisions: true
 
   alerting:

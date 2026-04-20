@@ -250,5 +250,5 @@ api:
 # LOGGING CONFIGURATION
 # ---------------------------------------------------------------------------
 log:
-  level: "info"   # debug/info/warn/error
+  level: "warn"   # debug/info/warn/error - warn chỉ log warning và error
   format: "json"  # json/text

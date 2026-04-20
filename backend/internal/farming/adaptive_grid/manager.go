@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -552,6 +553,13 @@ func (a *AdaptiveGridManager) GetRiskMonitor() *RiskMonitor {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.riskMonitor
+}
+
+// GetRiskConfig returns the risk configuration
+func (a *AdaptiveGridManager) GetRiskConfig() *RiskConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.riskConfig
 }
 
 // SetDynamicTimeoutConfig sets the dynamic timeout configuration
@@ -2200,6 +2208,18 @@ func (a *AdaptiveGridManager) AutoRecovery() {
 							zap.Int("data_points", dataPoints))
 					}
 				}
+
+			case GridStateEnterGrid:
+				// NEW: Force transition to TRADING if stuck > 2 minutes
+				// This provides additional safety net for stuck ENTER_GRID state
+				if timeInState > 2*time.Minute {
+					a.logger.Warn("Auto-recovery: Force ENTER_GRID -> TRADING (stuck too long)",
+						zap.String("symbol", symbol),
+						zap.Duration("time_in_state", timeInState))
+					if a.stateMachine.CanTransition(symbol, EventEntryPlaced) {
+						a.stateMachine.Transition(symbol, EventEntryPlaced)
+					}
+				}
 			}
 		}
 
@@ -2751,16 +2771,35 @@ func (a *AdaptiveGridManager) pauseTrading(symbol string) {
 		zap.String("symbol", symbol),
 		zap.Duration("auto_resume_after", stabilizationPeriod))
 
-	// Schedule auto-resume
+	// Schedule auto-resume with full logic
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				a.logger.Error("Auto-resume goroutine panic recovered",
+					zap.String("symbol", symbol),
+					zap.Any("panic", r))
+			}
+		}()
+
 		time.Sleep(stabilizationPeriod)
 		a.mu.Lock()
 		if paused, exists := a.tradingPaused[symbol]; exists && paused {
 			delete(a.tradingPaused, symbol)
+			a.mu.Unlock()
 			a.logger.Info("Auto-resuming trading after stabilization period",
 				zap.String("symbol", symbol))
+
+			// NEW: Trigger full resume logic including state transitions and grid rebuild
+			if a.TryResumeTrading(symbol) {
+				a.logger.Info("Auto-resume with state transition successful",
+					zap.String("symbol", symbol))
+			} else {
+				a.logger.Warn("Auto-resume failed, will retry via CheckAndResumeAll",
+					zap.String("symbol", symbol))
+			}
+		} else {
+			a.mu.Unlock()
 		}
-		a.mu.Unlock()
 	}()
 }
 
@@ -2937,6 +2976,16 @@ func (a *AdaptiveGridManager) OnRegimeChange(symbol string, oldRegime, newRegime
 	// CRITICAL: Automatically trigger HandleRegimeTransition for parameter switching
 	// Run in goroutine to avoid blocking the price update loop
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				a.logger.Error("Regime transition goroutine panic recovered",
+					zap.String("symbol", symbol),
+					zap.String("from", string(oldRegime)),
+					zap.String("to", string(newRegime)),
+					zap.Any("panic", r))
+			}
+		}()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -3125,6 +3174,13 @@ func (a *AdaptiveGridManager) Stop(ctx context.Context) error {
 
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				a.logger.Error("AdaptiveGridManager WaitGroup goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		a.wg.Wait()
 		close(done)
 	}()
@@ -4080,7 +4136,7 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 		return
 	}
 
-	a.logger.Info("UpdatePriceForRange: feeding to detector",
+	a.logger.Warn("UpdatePriceForRange: feeding to detector",
 		zap.String("symbol", symbol),
 		zap.Float64("high", high),
 		zap.Float64("low", low),
@@ -4150,7 +4206,7 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 
 	if stateMachine != nil {
 		currentState := stateMachine.GetState(symbol)
-		a.logger.Info("State machine transition check",
+		a.logger.Warn("State machine transition check",
 			zap.String("symbol", symbol),
 			zap.String("current_state", currentState.String()))
 
@@ -4160,19 +4216,19 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 		case GridStateIdle:
 			readyForRegrid := a.isReadyForRegrid(symbol)
 			canTransition := stateMachine.CanTransition(symbol, EventRangeConfirmed)
-			a.logger.Info("IDLE -> ENTER_GRID transition check",
+			a.logger.Warn("IDLE -> ENTER_GRID transition check",
 				zap.String("symbol", symbol),
 				zap.Bool("ready_for_regrid", readyForRegrid),
 				zap.Bool("can_transition", canTransition))
 			if readyForRegrid && canTransition {
 				ok := stateMachine.Transition(symbol, EventRangeConfirmed)
-				a.logger.Info("IDLE -> ENTER_GRID transition result",
+				a.logger.Warn("IDLE -> ENTER_GRID transition result",
 					zap.String("symbol", symbol),
 					zap.Bool("success", ok))
 				if ok {
 					// Record ENTER_GRID transition time for breakout cooldown
 					a.enterGridTime[symbol] = time.Now()
-					a.logger.Info("ENTER_GRID transition time recorded",
+					a.logger.Warn("ENTER_GRID transition time recorded",
 						zap.String("symbol", symbol),
 						zap.Time("transition_time", a.enterGridTime[symbol]))
 				}
@@ -4180,24 +4236,27 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 		case GridStateWaitNewRange:
 			readyForRegrid := a.isReadyForRegrid(symbol)
 			canTransition := stateMachine.CanTransition(symbol, EventNewRangeReady)
-			a.logger.Info("WAIT_NEW_RANGE -> ENTER_GRID transition check",
+			a.logger.Warn("WAIT_NEW_RANGE -> ENTER_GRID transition check",
 				zap.String("symbol", symbol),
 				zap.Bool("ready_for_regrid", readyForRegrid),
 				zap.Bool("can_transition", canTransition))
 			if readyForRegrid && canTransition {
 				ok := stateMachine.Transition(symbol, EventNewRangeReady)
 				// Removed ClearRegridCooldown - cooldown disabled
-				a.logger.Info("WAIT_NEW_RANGE -> ENTER_GRID transition result",
+				a.logger.Warn("WAIT_NEW_RANGE -> ENTER_GRID transition result",
 					zap.String("symbol", symbol),
 					zap.Bool("success", ok))
 				if ok {
 					// Record ENTER_GRID transition time for breakout cooldown
 					a.enterGridTime[symbol] = time.Now()
-					a.logger.Info("ENTER_GRID transition time recorded",
+					a.logger.Warn("ENTER_GRID transition time recorded",
 						zap.String("symbol", symbol),
 						zap.Time("transition_time", a.enterGridTime[symbol]))
 				}
 			}
+		case GridStateEnterGrid:
+			// No special handling - transition happens via order placement in grid_manager
+			// Root cause fix: canPlaceForSymbol bypasses gates when stuck > 30s
 		case GridStateExitAll:
 			// FAIL-SAFE TIMEOUT: Force transition after 15s regardless of position status
 			// This ensures bot never gets stuck in EXIT_ALL state
@@ -4376,7 +4435,7 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 	if detector.IsBreakout() {
 		enterTime, hasEnterTime := a.enterGridTime[symbol]
 		timeSinceEnter := time.Since(enterTime)
-		cooldown := 30 * time.Second // 30 second cooldown after ENTER_GRID
+		cooldown := 120 * time.Second // 2 minute cooldown after ENTER_GRID (tăng từ 30s để tránh false breakout)
 
 		if hasEnterTime && timeSinceEnter < cooldown {
 			a.logger.Info("Breakout detected but in cooldown period, skipping",
@@ -4386,8 +4445,23 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 			return
 		}
 
-		a.logger.Info("Breakout detected, triggering exit",
+		// NEW: ADX filter - chỉ breakout khi có trend mạnh (ADX > 25)
+		// Tránh false breakout trong sideways market
+		currentADX := detector.GetCurrentADX()
+		adxThreshold := 25.0 // ADX > 25 = trend mạnh (tương ứng với DefaultRangeConfig)
+		if currentADX < adxThreshold && currentADX > 0 {
+			a.logger.Info("Breakout detected but ADX too low (sideways market), skipping",
+				zap.String("symbol", symbol),
+				zap.Float64("current_adx", currentADX),
+				zap.Float64("adx_threshold", adxThreshold),
+				zap.Duration("time_since_enter_grid", timeSinceEnter))
+			return
+		}
+
+		a.logger.Info("Breakout detected with strong trend, triggering exit",
 			zap.String("symbol", symbol),
+			zap.Float64("adx", currentADX),
+			zap.Float64("adx_threshold", adxThreshold),
 			zap.Duration("time_since_enter_grid", timeSinceEnter))
 		a.handleBreakout(context.Background(), symbol, closePrice)
 		return
@@ -4395,6 +4469,17 @@ func (a *AdaptiveGridManager) UpdatePriceForRange(symbol string, high, low, clos
 
 	// Strong trend is now governed by ADX/range-state, not RSI-first.
 	if detector.ShouldExitForTrend() {
+		// NEW: ADX filter - chỉ exit cho strong trend khi ADX > 25 (trend mạnh)
+		currentADX := detector.GetCurrentADX()
+		adxThreshold := 25.0
+		if currentADX < adxThreshold && currentADX > 0 {
+			a.logger.Info("Strong trend detected but ADX too low (sideways market), skipping exit",
+				zap.String("symbol", symbol),
+				zap.Float64("current_adx", currentADX),
+				zap.Float64("adx_threshold", adxThreshold))
+			return
+		}
+
 		state := TrendStateNeutral
 		if a.trendDetector != nil {
 			state = a.trendDetector.GetTrendState()
@@ -5364,10 +5449,14 @@ func (a *AdaptiveGridManager) isReadyForRegrid(symbol string) bool {
 
 // canRegridStandard checks standard regrid conditions for IDLE/WAIT_NEW_RANGE
 func (a *AdaptiveGridManager) canRegridStandard(symbol string, state GridState) bool {
+	a.logger.Warn("Standard regrid check START",
+		zap.String("symbol", symbol),
+		zap.String("state", state.String()))
+
 	// Must have zero or negligible position before re-entry
 	if position, exists := a.positions[symbol]; exists && position != nil {
 		if math.Abs(position.PositionAmt) > 0 && position.NotionalValue >= 10.0 {
-			a.logger.Debug("Standard regrid check: position not zero",
+			a.logger.Warn("Standard regrid check FAILED: position not zero",
 				zap.String("symbol", symbol),
 				zap.String("state", state.String()),
 				zap.Float64("position_amt", position.PositionAmt),
@@ -5381,9 +5470,47 @@ func (a *AdaptiveGridManager) canRegridStandard(symbol string, state GridState) 
 				zap.Float64("position_amt", position.PositionAmt),
 				zap.Float64("notional", position.NotionalValue))
 		}
+	} else {
+		a.logger.Info("Standard regrid check: no position found (OK)",
+			zap.String("symbol", symbol),
+			zap.String("state", state.String()))
 	}
 
-	return a.checkMarketConditionsForRegrid(symbol, state)
+	result := a.checkMarketConditionsForRegrid(symbol, state)
+
+	// NEW: If market conditions fail, check if we've been stuck long enough to force regrid anyway
+	// This prevents getting stuck indefinitely when range detector has no data
+	if !result && state == GridStateWaitNewRange {
+		if a.stateMachine != nil {
+			stateTime := a.stateMachine.GetStateTime(symbol)
+			if !stateTime.IsZero() {
+				timeInState := time.Since(stateTime)
+				// REDUCED: 5 minutes -> 2 minutes for faster recovery
+				if timeInState > 2*time.Minute {
+					a.logger.Warn("Standard regrid check: forcing regrid due to timeout fallback",
+						zap.String("symbol", symbol),
+						zap.String("state", state.String()),
+						zap.Duration("time_in_state", timeInState))
+					return true
+				}
+				a.logger.Info("Standard regrid check: market conditions failed, waiting for timeout fallback",
+					zap.String("symbol", symbol),
+					zap.String("state", state.String()),
+					zap.Duration("time_in_state", timeInState),
+					zap.Duration("fallback_timeout", 2*time.Minute))
+			} else {
+				a.logger.Warn("Standard regrid check: state time is zero, skipping fallback check",
+					zap.String("symbol", symbol),
+					zap.String("state", state.String()))
+			}
+		}
+	}
+
+	a.logger.Warn("Standard regrid check RESULT",
+		zap.String("symbol", symbol),
+		zap.String("state", state.String()),
+		zap.Bool("passed", result))
+	return result
 }
 
 // canRegridFromOverSize checks if regrid is allowed from OVER_SIZE state
@@ -5556,16 +5683,27 @@ func (a *AdaptiveGridManager) canRegridFromTrading(symbol string) bool {
 
 // checkMarketConditionsForRegrid checks common market conditions for regrid
 func (a *AdaptiveGridManager) checkMarketConditionsForRegrid(symbol string, state GridState) bool {
+	a.logger.Warn("Market condition check START",
+		zap.String("symbol", symbol),
+		zap.String("state", state.String()))
+
 	detector, exists := a.rangeDetectors[symbol]
 	if !exists {
-		a.logger.Debug("Market condition check: no range detector", zap.String("symbol", symbol))
+		a.logger.Error("Market condition check FAILED: no range detector",
+			zap.String("symbol", symbol),
+			zap.String("state", state.String()))
 		return false
 	}
 
 	// ADX < 70 (relaxed for faster reentry after breakout)
 	avgADX := detector.averageADXLocked()
+	a.logger.Warn("Market condition check: ADX",
+		zap.String("symbol", symbol),
+		zap.String("state", state.String()),
+		zap.Float64("avg_adx", avgADX),
+		zap.Float64("threshold", 70.0))
 	if avgADX >= 70.0 {
-		a.logger.Debug("Market condition check: ADX too high",
+		a.logger.Warn("Market condition check FAILED: ADX too high",
 			zap.String("symbol", symbol),
 			zap.String("state", state.String()),
 			zap.Float64("avg_adx", avgADX))
@@ -5576,7 +5714,7 @@ func (a *AdaptiveGridManager) checkMarketConditionsForRegrid(symbol string, stat
 	currentRange := detector.currentRange
 	lastAccepted := detector.lastAcceptedRange
 	if currentRange == nil || lastAccepted == nil {
-		a.logger.Debug("Market condition check: no range data",
+		a.logger.Error("Market condition check FAILED: no range data",
 			zap.String("symbol", symbol),
 			zap.String("state", state.String()),
 			zap.Bool("has_current", currentRange != nil),
@@ -5586,14 +5724,24 @@ func (a *AdaptiveGridManager) checkMarketConditionsForRegrid(symbol string, stat
 
 	// Check BB width contraction (current width < 10x last accepted) - very relaxed
 	widthRatio := currentRange.WidthPct / lastAccepted.WidthPct
+	a.logger.Warn("Market condition check: BB width ratio",
+		zap.String("symbol", symbol),
+		zap.String("state", state.String()),
+		zap.Float64("width_ratio", widthRatio),
+		zap.Float64("threshold", 10.0),
+		zap.Float64("current_width_pct", currentRange.WidthPct),
+		zap.Float64("last_width_pct", lastAccepted.WidthPct))
 	if widthRatio >= 10.0 {
-		a.logger.Debug("Market condition check: BB width not contracted enough",
+		a.logger.Warn("Market condition check FAILED: BB width not contracted enough",
 			zap.String("symbol", symbol),
 			zap.String("state", state.String()),
 			zap.Float64("width_ratio", widthRatio))
 		return false
 	}
 
+	a.logger.Warn("Market condition check PASSED",
+		zap.String("symbol", symbol),
+		zap.String("state", state.String()))
 	return true
 }
 

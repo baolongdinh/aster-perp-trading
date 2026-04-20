@@ -47,6 +47,14 @@ func (m *OrderLockManager) LockOrderProcessing(symbol string, owner string) bool
 	// Try to acquire lock with timeout
 	done := make(chan bool, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error("Lock acquisition goroutine panic recovered",
+					zap.String("symbol", symbol),
+					zap.Any("panic", r))
+				done <- false
+			}
+		}()
 		lock.mu.Lock()
 		if !lock.locked {
 			lock.locked = true
@@ -167,9 +175,9 @@ func (m *OrderLockManager) GetLockInfo(symbol string) map[string]interface{} {
 
 	if !exists {
 		return map[string]interface{}{
-			"symbol":  symbol,
-			"exists":  false,
-			"locked":  false,
+			"symbol": symbol,
+			"exists": false,
+			"locked": false,
 		}
 	}
 

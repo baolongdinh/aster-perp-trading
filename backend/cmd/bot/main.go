@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -152,6 +153,13 @@ func main() {
 		WriteTimeout: 15 * time.Second,
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("API server goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		log.Info("API server listening", zap.String("addr", addr))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("API server error", zap.Error(err))

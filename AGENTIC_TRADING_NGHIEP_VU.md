@@ -95,24 +95,55 @@ graph TD
 
 ### 1.3 Các Chế Độ Thị Trường (Regime) & State Machine
 
-Hệ thống sử dụng **Unified State Machine** với 5 states:
+Hệ thống sử dụng **Unified State Machine** với 9 states (Updated Phase 8):
 
 ```mermaid
 stateDiagram
     [*] --> IDLE: Khoi dong bot
     IDLE --> ENTER_GRID: Range confirmed hoac MICRO mode active
+    IDLE --> TRENDING: Trend detected ADX > 25
+
     ENTER_GRID --> TRADING: Orders placed
-    TRADING --> EXIT_ALL: Breakout/Trend ADX > 25/Emergency
+    ENTER_GRID --> TRENDING: Trend detected
+
+    TRADING --> EXIT_HALF: Partial loss
+    TRADING --> EXIT_ALL: Full loss/Breakout/Trend exit/Emergency
+    TRADING --> OVER_SIZE: Position > 80% max
+    TRADING --> DEFENSIVE: Extreme volatility
+    TRADING --> RECOVERY: Recovery start
     TRADING --> TRADING: Rebalancing Price move
+
+    EXIT_HALF --> RECOVERY: Recovery start
+    EXIT_HALF --> EXIT_ALL: Full loss
+
     EXIT_ALL --> WAIT_NEW_RANGE: Positions closed
+    EXIT_ALL --> RECOVERY: Recovery start
+
     WAIT_NEW_RANGE --> ENTER_GRID: New range ready Re-grid conditions met
+    WAIT_NEW_RANGE --> TRENDING: Trend detected
     WAIT_NEW_RANGE --> WAIT_NEW_RANGE: Cho stabilizing
+
+    OVER_SIZE --> TRADING: Size normalized
+    OVER_SIZE --> EXIT_ALL: Full loss
+
+    DEFENSIVE --> TRADING: Volatility normalized
+    DEFENSIVE --> EXIT_ALL: Emergency exit
+
+    RECOVERY --> TRADING: Recovery complete
+    RECOVERY --> EXIT_HALF: Partial loss
+
+    TRENDING --> EXIT_ALL: Trend exit
 
     note right of IDLE: Cho phat hien range tu Agentic
     note right of ENTER_GRID: Dat lenh entry theo micro grid
     note right of TRADING: Dang trading co the rebalancing
+    note right of EXIT_HALF: Thoat 50% vi tri
     note right of EXIT_ALL: Dang thoat toan bo vi the
     note right of WAIT_NEW_RANGE: Cho dieu kien re-grid
+    note right of OVER_SIZE: Position qua lon giam size
+    note right of DEFENSIVE: Volatility cao phong thu
+    note right of RECOVERY: Recovery sau cat lo
+    note right of TRENDING: Trading theo xu huong
 ```
 
 | State | Điều Kiện Vào | Cho Phép Đặt Lệnh | Mô Tả |
@@ -120,8 +151,13 @@ stateDiagram
 | **IDLE** | Khởi động | ❌ | Chờ phát hiện range từ Agentic |
 | **ENTER_GRID** | Range confirmed hoặc MICRO mode active | ✅ | Đặt lệnh entry theo micro grid |
 | **TRADING** | Orders placed | ✅ | Đang trading, có thể rebalancing |
-| **EXIT_ALL** | Breakout/Trend/ADX > 25/Emergency | ❌ | Đang thoát toàn bộ vị thế |
+| **EXIT_HALF** | Partial loss | ❌ | Thoát 50% vị thế |
+| **EXIT_ALL** | Full loss/Breakout/Trend/Emergency | ❌ | Đang thoát toàn bộ vị thế |
 | **WAIT_NEW_RANGE** | Positions closed | ❌ | Chờ điều kiện regrid (shift ≥ 0.5%, BB contract) |
+| **OVER_SIZE** | Position > 80% max | ❌ | Position quá lớn, giảm size |
+| **DEFENSIVE** | Extreme volatility | ❌ | Volatility cao, phòng thủ |
+| **RECOVERY** | Recovery start | ❌ | Recovery sau cắt lỗ |
+| **TRENDING** | Trend detected ADX > 25 | ✅ | Trading theo xu hướng |
 
 | Chế Độ Thị Trường | Đặc Điểm | Chiến Lược Grid |
 |-------------------|----------|-----------------|
@@ -443,7 +479,18 @@ Dynamic Leverage Formula:
 
 ## 9. Logging & Audit
 
-### 9.1 Decision Log
+### 9.1 Log Level Configuration (Updated)
+Log level đã được điều chỉnh để giảm verbosity:
+- **agentic-vf-config.yaml**: `log.level: warn` (từ "info")
+- **volume-farm-config.yaml**: `log.level: warn` (từ "info")
+- **agentic-config.yaml**: `logging.log_level: warn` (từ "info")
+
+**Impact:**
+- Chỉ log WARN và ERROR level
+- Giảm log spam, tập trung vào critical information
+- Debug logs vẫn available nếu cần (change config)
+
+### 9.2 Decision Log
 Mỗi quyết định được ghi nhận:
 - Timestamp
 - Regime hiện tại + confidence
@@ -453,7 +500,15 @@ Mỗi quyết định được ghi nhận:
 - Pattern matches (nếu có)
 - Rationale (lý do quyết định)
 
-### 9.2 Retention
+### 9.3 Regrid Condition Logging (Phase 8.6)
+Detailed logging cho regrid conditions:
+- `Standard regrid check START` - bắt đầu check
+- `Standard regrid check: position not zero` - nếu position > 10
+- `Market condition check: ADX` - giá trị ADX hiện tại
+- `Market condition check: BB width ratio` - ratio BB width
+- `Standard regrid check: forcing regrid due to timeout fallback` - sau 5 phút
+
+### 9.4 Retention
 - File log: `decisions_YYYY-MM-DD.jsonl`
 - Thời gian lưu: 90 ngày
 - Nén file cũ sau 30 ngày
@@ -525,29 +580,62 @@ Chạy mỗi 10s:
 
 **Mục đích:** Force transition nếu stuck quá lâu trong 1 state
 
-**Logic (chạy mỗi 30s):**
+**Logic (chạy mỗi 30s - Continuous State Timeout Checker):**
 ```go
-AutoRecovery():
+Continuous State Timeout Checker (runs for entire bot lifetime):
   1. RangeDetector Unknown/Initializing
      → Force initialize (30s stabilization)
-  
-  2. GridStateExitAll > 2min
-     → Force WAIT_NEW_RANGE
-  
-  3. GridStateWaitNewRange > 2min
-     → Force IDLE
-  
-  4. GridStateIdle > 10min + range ready
-     → Force ENTER_GRID
-  
-  5. tradingPaused in IDLE/WAIT_NEW_RANGE
+
+  2. GridStateExitAll > 10min
+     → Force WAIT_NEW_RANGE (assume positions closed)
+
+  3. GridStateWaitNewRange > 10min
+     → Force ENTER_GRID (assume new range ready)
+
+  4. GridStateOverSize > 15min
+     → Force TRADING (assume size normalized)
+
+  5. GridStateDefensive > 20min
+     → Force TRADING (assume volatility normalized)
+
+  6. GridStateRecovery > 10min
+     → Force TRADING (assume recovery complete)
+
+  7. tradingPaused in IDLE/WAIT_NEW_RANGE
      → Auto resume
 ```
 
-**Timeouts:**
-- EXIT_ALL: 2 phút
-- WAIT_NEW_RANGE: 2 phút (giảm từ 5 phút)
-- IDLE: 10 phút
+**State Timeouts (Phase 8.5 - Continuous Checker):**
+- EXIT_ALL: 10 phút
+- WAIT_NEW_RANGE: 10 phút
+- OVER_SIZE: 15 phút
+- DEFENSIVE: 20 phút
+- RECOVERY: 10 phút
+- IDLE: Không có timeout
+
+**Regrid Fallback Logic (Phase 8.6 - 5 phút fallback):**
+```go
+canRegridStandard() với fallback:
+  1. Check position ≈ 0 (notional < 10.0)
+  2. Check market conditions (ADX < 70, BB width < 10x)
+  3. Nếu market conditions fail:
+     - Check time in state
+     - Nếu > 5 phút trong WAIT_NEW_RANGE:
+       → Force regrid (bypass market conditions)
+     - Log: "forcing regrid due to timeout fallback"
+```
+
+**Multi-Layer Protection:**
+1. **Fallback trong regrid conditions** (5 phút) - allow regrid ngay cả khi market conditions fail
+2. **Continuous state timeout checker** (10 phút) - force transition state
+3. **Emergency force state method** - manual recovery khi cần
+
+**Detailed Logging (Phase 8.6):**
+- `Standard regrid check START` - bắt đầu check
+- `Standard regrid check: position not zero` - nếu position > 10
+- `Market condition check: ADX` - giá trị ADX hiện tại
+- `Market condition check: BB width ratio` - ratio BB width
+- `Standard regrid check: forcing regrid due to timeout fallback` - sau 5 phút
 
 ---
 

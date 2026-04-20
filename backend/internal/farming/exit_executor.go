@@ -195,6 +195,17 @@ func (e *ExitExecutor) cancelAllOrders(ctx context.Context, symbol string) error
 		semaphore <- struct{}{}
 
 		go func(orderID int64) {
+			defer func() {
+				if r := recover(); r != nil {
+					e.logger.Error("Order cancellation goroutine panic recovered",
+						zap.String("symbol", symbol),
+						zap.Int64("order_id", orderID),
+						zap.Any("panic", r))
+					mu.Lock()
+					cancelErrors = append(cancelErrors, fmt.Errorf("panic: %v", r))
+					mu.Unlock()
+				}
+			}()
 			defer wg.Done()
 			defer func() { <-semaphore }()
 
@@ -298,6 +309,16 @@ func (e *ExitExecutor) ExecuteEmergencyExit(ctx context.Context, symbols []strin
 	for _, symbol := range symbols {
 		wg.Add(1)
 		go func(sym string) {
+			defer func() {
+				if r := recover(); r != nil {
+					e.logger.Error("Emergency exit goroutine panic recovered",
+						zap.String("symbol", sym),
+						zap.Any("panic", r))
+					mu.Lock()
+					results[sym] = &ExitSequence{Error: fmt.Errorf("panic: %v", r)}
+					mu.Unlock()
+				}
+			}()
 			defer wg.Done()
 			seq := e.ExecuteFastExit(ctx, sym)
 			mu.Lock()

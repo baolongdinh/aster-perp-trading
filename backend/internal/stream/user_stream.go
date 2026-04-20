@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -13,11 +14,11 @@ import (
 
 // User data event types.
 const (
-	EventAccountUpdate      = "ACCOUNT_UPDATE"
-	EventOrderTradeUpdate   = "ORDER_TRADE_UPDATE"
-	EventAccountConfig      = "ACCOUNT_CONFIG_UPDATE"
-	EventMarginCall         = "MARGIN_CALL"
-	EventListenKeyExpired   = "listenKeyExpired"
+	EventAccountUpdate    = "ACCOUNT_UPDATE"
+	EventOrderTradeUpdate = "ORDER_TRADE_UPDATE"
+	EventAccountConfig    = "ACCOUNT_CONFIG_UPDATE"
+	EventMarginCall       = "MARGIN_CALL"
+	EventListenKeyExpired = "listenKeyExpired"
 )
 
 // WsOrderUpdate is the ORDER_TRADE_UPDATE event.
@@ -59,15 +60,15 @@ type WsAccountUpdate struct {
 			BalanceChange      float64 `json:"bc,string"`
 		} `json:"B"`
 		Positions []struct {
-			Symbol              string  `json:"s"`
-			PositionAmt         float64 `json:"pa,string"`
-			EntryPrice          float64 `json:"ep,string"`
-			BreakevenPrice      float64 `json:"bep,string"`
-			AccumulatedRealPnL  float64 `json:"cr,string"`
-			UnrealizedPnL       float64 `json:"up,string"`
-			MarginType          string  `json:"mt"`
-			IsolatedMargin      float64 `json:"iw,string"`
-			PositionSide        string  `json:"ps"`
+			Symbol             string  `json:"s"`
+			PositionAmt        float64 `json:"pa,string"`
+			EntryPrice         float64 `json:"ep,string"`
+			BreakevenPrice     float64 `json:"bep,string"`
+			AccumulatedRealPnL float64 `json:"cr,string"`
+			UnrealizedPnL      float64 `json:"up,string"`
+			MarginType         string  `json:"mt"`
+			IsolatedMargin     float64 `json:"iw,string"`
+			PositionSide       string  `json:"ps"`
 		} `json:"P"`
 	} `json:"a"`
 }
@@ -81,11 +82,11 @@ type UserStreamHandlers struct {
 
 // UserStream manages the user data WebSocket stream with listenKey keepalive.
 type UserStream struct {
-	wsBase   string
+	wsBase       string
 	getListenKey func(ctx context.Context) (string, error)
 	keepalive    func(ctx context.Context) error
-	handlers UserStreamHandlers
-	log      *zap.Logger
+	handlers     UserStreamHandlers
+	log          *zap.Logger
 }
 
 // NewUserStream creates a user data stream.
@@ -108,6 +109,14 @@ func NewUserStream(
 
 // Run connects user data stream and maintains listenKey. Reconnects on expiry/failure.
 func (us *UserStream) Run(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			us.log.Error("UserStream goroutine panic recovered",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+		}
+	}()
+
 	delay := reconnectDelay
 	for {
 		if ctx.Err() != nil {
@@ -131,6 +140,14 @@ func (us *UserStream) Run(ctx context.Context) {
 }
 
 func (us *UserStream) connect(ctx context.Context) error {
+	defer func() {
+		if r := recover(); r != nil {
+			us.log.Error("UserStream connect panic recovered",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+		}
+	}()
+
 	listenKey, err := us.getListenKey(ctx)
 	if err != nil {
 		return fmt.Errorf("user stream: get listenKey: %w", err)
@@ -147,6 +164,14 @@ func (us *UserStream) connect(ctx context.Context) error {
 
 	// Keepalive goroutine: PUT listenKey every 30 min (server expires at 60 min)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				us.log.Error("UserStream keepalive panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
+
 		ticker := time.NewTicker(30 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -184,26 +209,40 @@ func (us *UserStream) dispatch(raw []byte) {
 		EventType string `json:"e"`
 	}
 	if err := json.Unmarshal(raw, &peek); err != nil {
+		us.log.Debug("Failed to unmarshal user stream message", zap.Error(err))
 		return
 	}
+
+	// Debug log all received event types
+	us.log.Debug("User stream message received", zap.String("event_type", peek.EventType))
+
 	switch peek.EventType {
 	case EventOrderTradeUpdate:
 		var ev WsOrderUpdate
 		if json.Unmarshal(raw, &ev) == nil && us.handlers.OnOrderUpdate != nil {
+			us.log.Debug("Order update dispatched")
 			us.handlers.OnOrderUpdate(ev)
 		}
 	case EventAccountUpdate:
 		var ev WsAccountUpdate
 		if json.Unmarshal(raw, &ev) == nil && us.handlers.OnAccountUpdate != nil {
+			us.log.Info("Account update dispatched",
+				zap.Int("positions", len(ev.Update.Positions)),
+				zap.Int("balances", len(ev.Update.Balances)))
 			us.handlers.OnAccountUpdate(ev)
+		} else {
+			us.log.Warn("Failed to unmarshal account update or handler nil")
 		}
 	case EventMarginCall:
 		if us.handlers.OnMarginCall != nil {
+			us.log.Warn("Margin call received")
 			us.handlers.OnMarginCall(raw)
 		}
 	case EventListenKeyExpired:
 		us.log.Warn("listenKey expired, reconnecting user stream")
 		// Returning error causes reconnect loop to get a new listenKey
 		// We can't directly return from here but the connection will die shortly
+	default:
+		us.log.Debug("Unknown user stream event type", zap.String("event_type", peek.EventType))
 	}
 }

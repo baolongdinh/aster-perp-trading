@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -16,9 +17,9 @@ import (
 )
 
 const (
-	pingInterval    = 3 * time.Minute // send ping before 5min server ping window
-	pongTimeout     = 15 * time.Second
-	reconnectDelay  = 2 * time.Second
+	pingInterval      = 3 * time.Minute // send ping before 5min server ping window
+	pongTimeout       = 15 * time.Second
+	reconnectDelay    = 2 * time.Second
 	maxReconnectDelay = 60 * time.Second
 )
 
@@ -28,17 +29,17 @@ type WsKline struct {
 	EventTime int64  `json:"E"`
 	Symbol    string `json:"s"`
 	Kline     struct {
-		StartTime    int64   `json:"t"`
-		CloseTime    int64   `json:"T"`
-		Interval     string  `json:"i"`
-		Open         float64 `json:"o,string"`
-		High         float64 `json:"h,string"`
-		Low          float64 `json:"l,string"`
-		Close        float64 `json:"c,string"`
-		Volume       float64 `json:"v,string"`
-		IsClosed     bool    `json:"x"`
-		QuoteVolume  float64 `json:"q,string"`
-		TradeCount   int     `json:"n"`
+		StartTime   int64   `json:"t"`
+		CloseTime   int64   `json:"T"`
+		Interval    string  `json:"i"`
+		Open        float64 `json:"o,string"`
+		High        float64 `json:"h,string"`
+		Low         float64 `json:"l,string"`
+		Close       float64 `json:"c,string"`
+		Volume      float64 `json:"v,string"`
+		IsClosed    bool    `json:"x"`
+		QuoteVolume float64 `json:"q,string"`
+		TradeCount  int     `json:"n"`
 	} `json:"k"`
 }
 
@@ -164,7 +165,7 @@ func (ms *MarketStream) connect(ctx context.Context) error {
 		return err
 	}
 	ms.log.Info("market stream connected successfully")
-	
+
 	ms.mu.Lock()
 	ms.conn = conn
 	ms.mu.Unlock()
@@ -178,7 +179,14 @@ func (ms *MarketStream) connect(ctx context.Context) error {
 	// Ping goroutine
 	pingDone := make(chan struct{})
 	go func() {
-		defer close(pingDone)
+		defer func() {
+			if r := recover(); r != nil {
+				ms.log.Error("MarketStream ping goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+			close(pingDone)
+		}()
 		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {

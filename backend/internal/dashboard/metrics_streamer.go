@@ -22,6 +22,7 @@ type Metric struct {
 type MetricsStreamer struct {
 	clients  map[*websocket.Conn]bool
 	mu       sync.RWMutex
+	writeMu  sync.Mutex // Serialize WebSocket writes to prevent concurrent write panic
 	logger   *zap.Logger
 	upgrader websocket.Upgrader
 }
@@ -109,9 +110,12 @@ func (s *MetricsStreamer) writePump(conn *websocket.Conn) {
 		select {
 		case <-ticker.C:
 			// Send ping to keep connection alive
+			s.writeMu.Lock()
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				s.writeMu.Unlock()
 				return
 			}
+			s.writeMu.Unlock()
 		}
 	}
 }
@@ -139,11 +143,13 @@ func (s *MetricsStreamer) BroadcastMetric(metricType string, symbol string, data
 	}
 
 	for conn := range s.clients {
+		s.writeMu.Lock() // Serialize writes to prevent concurrent write panic
 		if err := conn.WriteMessage(websocket.TextMessage, jsonData); err != nil {
 			s.logger.Error("Failed to send metric to client", zap.Error(err))
 			conn.Close()
 			delete(s.clients, conn)
 		}
+		s.writeMu.Unlock()
 	}
 }
 
@@ -155,7 +161,9 @@ func (s *MetricsStreamer) sendToClient(conn *websocket.Conn, metric Metric) {
 		return
 	}
 
+	s.writeMu.Lock()
 	conn.WriteMessage(websocket.TextMessage, data)
+	s.writeMu.Unlock()
 }
 
 // ClientCount returns the number of connected clients

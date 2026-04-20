@@ -80,6 +80,12 @@ func (m *SyncManager) Start() {
 	// Start order sync worker
 	m.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error("Order sync worker goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		defer m.wg.Done()
 		m.orderWorker.Run(m.stopCh)
 	}()
@@ -87,6 +93,12 @@ func (m *SyncManager) Start() {
 	// Start position sync worker
 	m.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error("Position sync worker goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		defer m.wg.Done()
 		m.positionWorker.Run(m.stopCh)
 	}()
@@ -94,6 +106,12 @@ func (m *SyncManager) Start() {
 	// Start balance sync worker
 	m.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error("Balance sync worker goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		defer m.wg.Done()
 		m.balanceWorker.Run(m.stopCh)
 	}()
@@ -150,5 +168,12 @@ func (m *SyncManager) UpdateOrder(symbol string, order client.Order) {
 func (m *SyncManager) UpdatePosition(position client.Position) {
 	if m.positionWorker != nil {
 		m.positionWorker.UpdateInternalPosition(position)
+	}
+}
+
+// RemovePosition removes a position from internal state
+func (m *SyncManager) RemovePosition(symbol string) {
+	if m.positionWorker != nil {
+		m.positionWorker.RemoveInternalPosition(symbol)
 	}
 }

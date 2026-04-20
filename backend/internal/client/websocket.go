@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,7 +111,14 @@ func (ws *WebSocketClient) Connect(ctx context.Context) error {
 
 // realWebSocketHandler handles real WebSocket messages from Aster API
 func (ws *WebSocketClient) realWebSocketHandler(ctx context.Context) {
-	defer ws.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			ws.logger.Error("WebSocket handler goroutine panic recovered",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+		}
+		ws.wg.Done()
+	}()
 
 	// Set read deadline and ping handler
 	ws.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -160,6 +168,14 @@ func (ws *WebSocketClient) realWebSocketHandler(ctx context.Context) {
 
 // pingHandler sends periodic pings to keep connection alive
 func (ws *WebSocketClient) pingHandler(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			ws.logger.Error("WebSocket ping handler panic recovered",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+		}
+	}()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	farmsync "aster-bot/internal/farming/sync"
 	"aster-bot/internal/farming/tradingmode"
 	"aster-bot/internal/farming/volume_optimization"
+	"aster-bot/internal/health"
 	"aster-bot/internal/risk"
 	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
@@ -141,6 +143,7 @@ type VolumeFarmEngine struct {
 	syncManager     *farmsync.SyncManager
 	wsClient        *client.WebSocketClient
 	metricsStreamer *dashboard.MetricsStreamer // Real-time metrics streaming
+	healthMonitor   *health.Monitor            // Worker health monitoring and auto-restart
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -785,14 +788,10 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	adaptiveGridManager.SetExitExecutor(engine.exitExecutor)
 	logger.Info("ExitExecutor wired into AdaptiveGridManager")
 
-	// NEW: Wire onOrderPlaced callback to update SyncManager
-	engine.gridManager.SetOnOrderPlacedCallback(func(symbol string, order client.Order) {
-		if engine.syncManager != nil {
-			engine.syncManager.UpdateOrder(symbol, order)
-		}
-	})
+	// NOTE: onOrderPlaced callback removed - SyncManager no longer updates local state
+	// wsClient cache is single source of truth
 
-	// NEW: Wire ModeManager into AdaptiveGridManager for trading mode evaluation
+	// Register the grid manager with the agentic decision layer for trading mode evaluation
 	adaptiveGridManager.SetModeManager(engine.modeManager)
 	logger.Info("ModeManager wired into AdaptiveGridManager")
 
@@ -829,6 +828,13 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 
 		// Schedule force grid placement after cooldown expires (10s)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("COOLDOWN callback goroutine panic recovered",
+						zap.Any("panic", r),
+						zap.String("stack", string(debug.Stack())))
+				}
+			}()
 			time.Sleep(10 * time.Second)
 			logger.Info("COOLDOWN expired - forcing grid placement for all symbols")
 			symbols := adaptiveGridManager.GetActiveSymbols()
@@ -863,7 +869,69 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	// Store WebSocket client reference
 	engine.wsClient = sharedWSClient
 
+	// Initialize health monitor for worker health monitoring and auto-restart
+	engine.healthMonitor = health.NewMonitor(logger)
+	logger.Info("Health monitor initialized")
+
 	return engine, nil
+}
+
+// registerWorkersForHealthMonitoring registers critical workers for health monitoring
+func (e *VolumeFarmEngine) registerWorkersForHealthMonitoring(ctx context.Context) {
+	// Register SymbolSelector worker
+	e.healthMonitor.RegisterWorker(health.WorkerConfig{
+		Name:                "symbol_selector",
+		HeartbeatInterval:   30 * time.Second,
+		HealthCheckInterval: 30 * time.Second,
+		MaxErrorCount:       5,
+		AutoRestart:         true,
+	}, func(ctx context.Context) error {
+		return e.symbolSelector.Start(ctx)
+	}, func() error {
+		return e.symbolSelector.Stop(ctx)
+	})
+
+	// Register GridManager worker
+	e.healthMonitor.RegisterWorker(health.WorkerConfig{
+		Name:                "grid_manager",
+		HeartbeatInterval:   30 * time.Second,
+		HealthCheckInterval: 30 * time.Second,
+		MaxErrorCount:       5,
+		AutoRestart:         true,
+	}, func(ctx context.Context) error {
+		return e.gridManager.Start(ctx)
+	}, func() error {
+		return e.gridManager.Stop(ctx)
+	})
+
+	// Register PointsTracker worker
+	e.healthMonitor.RegisterWorker(health.WorkerConfig{
+		Name:                "points_tracker",
+		HeartbeatInterval:   60 * time.Second,
+		HealthCheckInterval: 30 * time.Second,
+		MaxErrorCount:       5,
+		AutoRestart:         true,
+	}, func(ctx context.Context) error {
+		return e.pointsTracker.Start(ctx)
+	}, func() error {
+		return e.pointsTracker.Stop(ctx)
+	})
+
+	// Register UserStream worker
+	if e.userStream != nil {
+		e.healthMonitor.RegisterWorker(health.WorkerConfig{
+			Name:                "user_stream",
+			HeartbeatInterval:   30 * time.Second,
+			HealthCheckInterval: 30 * time.Second,
+			MaxErrorCount:       5,
+			AutoRestart:         true,
+		}, func(ctx context.Context) error {
+			e.userStream.Run(ctx)
+			return nil
+		}, nil)
+	}
+
+	e.logger.Info("Workers registered for health monitoring")
 }
 
 // Start starts the volume farming engine.
@@ -878,12 +946,29 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.logger.Info("Starting Volume Farming Engine")
 
+	// Start health monitor
+	if err := e.healthMonitor.Start(); err != nil {
+		e.logger.Error("Failed to start health monitor", zap.Error(err))
+	} else {
+		e.logger.Info("Health monitor started")
+	}
+
+	// Register critical workers for health monitoring
+	e.registerWorkersForHealthMonitoring(ctx)
+
 	// Start WebSocket server for dashboard
 	go e.startWebSocketServer()
 
 	// Bridge context cancellation to stopCh
 	// This ensures that when context is cancelled (e.g., from signal), stopCh is also closed
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("Context bridge goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		select {
 		case <-ctx.Done():
 			select {
@@ -899,6 +984,13 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("SymbolSelector goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		if err := e.symbolSelector.Start(ctx); err != nil {
 			e.logger.Error("Symbol selector error", zap.Error(err))
@@ -913,6 +1005,13 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("Grid sync ticker goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
@@ -931,6 +1030,13 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("GridManager goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		if err := e.gridManager.Start(ctx); err != nil {
 			e.logger.Error("Grid manager error", zap.Error(err))
@@ -939,6 +1045,13 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("AdaptiveGridManager goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		e.logger.Info("Adaptive grid manager goroutine STARTED")
 		e.logger.Info("=== ADAPTIVE GRID MANAGER INITIALIZATION START ===")
@@ -1006,6 +1119,13 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("PointsTracker goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		if err := e.pointsTracker.Start(ctx); err != nil {
 			e.logger.Error("Points tracker error", zap.Error(err))
@@ -1014,6 +1134,13 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("Risk monitor goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		e.monitorRisk(ctx)
 	}()
@@ -1072,6 +1199,9 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 				}
 				// Process all order status updates for proper sync
 				e.gridManager.OnOrderUpdate(orderUpdate)
+
+				// NOTE: wsClient cache is single source of truth, updated by UserStream directly
+				// SyncManager removed local state, only does WebSocket health verification
 			},
 			OnAccountUpdate: func(u stream.WsAccountUpdate) {
 				// Update WebSocket cache with positions and balances
@@ -1079,23 +1209,31 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 					zap.Int("positions", len(u.Update.Positions)),
 					zap.Int("balances", len(u.Update.Balances)))
 
-				// Update GridManager's position cache directly to keep it in sync
+				// Update wsClient cache (single source of truth)
+				for _, pos := range u.Update.Positions {
+					if pos.PositionAmt != 0 {
+						position := client.Position{
+							Symbol:           pos.Symbol,
+							PositionAmt:      pos.PositionAmt,
+							EntryPrice:       pos.EntryPrice,
+							MarkPrice:        pos.EntryPrice, // Use EntryPrice as fallback
+							UnrealizedProfit: pos.UnrealizedPnL,
+							PositionSide:     pos.PositionSide,
+						}
+						e.wsClient.UpdatePositionCache(position)
+					} else {
+						// Position closed - wsClient cache will be updated by next WebSocket update
+						e.logger.Info("Position closed on exchange", zap.String("symbol", pos.Symbol))
+					}
+				}
+
+				// Update GridManager's AdaptiveGridManager position tracking (state machine needs this)
 				if e.gridManager != nil {
 					e.gridManager.OnAccountUpdate(u)
 				}
 
-				// Also update wsClient cache for other consumers
-				for _, pos := range u.Update.Positions {
-					position := client.Position{
-						Symbol:           pos.Symbol,
-						PositionAmt:      pos.PositionAmt,
-						EntryPrice:       pos.EntryPrice,
-						MarkPrice:        pos.EntryPrice, // Use EntryPrice as fallback
-						UnrealizedProfit: pos.UnrealizedPnL,
-						PositionSide:     pos.PositionSide,
-					}
-					e.wsClient.UpdatePositionCache(position)
-				}
+				// NOTE: wsClient cache is single source of truth
+				// SyncManager removed local state, only does WebSocket health verification
 
 				// Update balance cache
 				for _, bal := range u.Update.Balances {
@@ -1118,6 +1256,13 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 	// Start user stream in background
 	e.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("UserStream goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		defer e.wg.Done()
 		e.logger.Info("Starting UserStream for real-time order updates")
 		userStream.Run(ctx)
@@ -1369,6 +1514,14 @@ func (e *VolumeFarmEngine) createWhitelistSymbolsFromList(whitelist []string) []
 	return symbols
 }
 
+// GetHealthStatus returns the health status of all monitored workers
+func (e *VolumeFarmEngine) GetHealthStatus() map[string]health.WorkerHealth {
+	if e.healthMonitor == nil {
+		return nil
+	}
+	return e.healthMonitor.GetAllWorkerHealth()
+}
+
 // Stop stops the volume farming engine.
 func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 	e.isRunningMu.Lock()
@@ -1380,6 +1533,15 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 	e.isRunningMu.Unlock()
 
 	e.logger.Info("Stopping Volume Farming Engine")
+
+	// Stop health monitor
+	if e.healthMonitor != nil {
+		if err := e.healthMonitor.Stop(); err != nil {
+			e.logger.Error("Failed to stop health monitor", zap.Error(err))
+		} else {
+			e.logger.Info("Health monitor stopped")
+		}
+	}
 
 	// Safely close stopCh (may already be closed by bridge goroutine)
 	select {
@@ -1419,6 +1581,13 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.logger.Error("VolumeFarmEngine WaitGroup goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		e.wg.Wait()
 		close(done)
 	}()
@@ -1743,6 +1912,14 @@ func (e *VolumeFarmEngine) TriggerEmergencyExit(reason string) error {
 	for _, symbol := range activeSymbols {
 		wg.Add(1)
 		go func(sym string) {
+			defer func() {
+				if r := recover(); r != nil {
+					e.logger.Error("Emergency exit goroutine panic recovered",
+						zap.String("symbol", sym),
+						zap.Any("panic", r),
+						zap.String("stack", string(debug.Stack())))
+				}
+			}()
 			defer wg.Done()
 			sequence := e.exitExecutor.ExecuteFastExit(ctx, sym)
 			if sequence.Error != nil {

@@ -35,6 +35,7 @@ type RangeConfig struct {
 	EntryConfirmations       int           // Consecutive confirmations before initial entry
 	OutsideBandConfirmations int           // Consecutive closes outside the bands before breakout
 	BBExpansionFactor        float64       // Width expansion factor versus rolling average
+	BreakoutADXThreshold     float64       // ADX threshold for breakout confirmation (default 25.0)
 }
 
 // EnhancedRangeConfig extends RangeConfig with ADX and fast detection support
@@ -60,15 +61,16 @@ func FastRangeConfig() *EnhancedRangeConfig {
 			Periods:                  5, // Ultra-fast: 5 periods instead of 10
 			BBMultiplier:             2.0,
 			ATRMultiplier:            1.5,
-			BreakoutThreshold:        0.01,
+			BreakoutThreshold:        0.10,             // INCREASED: 10% breakout (was 5%) - allow more volatility
 			StabilizationPeriod:      10 * time.Second, // Ultra-fast: 10s instead of 30s
 			MinRangeWidthPct:         0.0001,           // Giảm để dễ tạo range hơn
 			MaterialShiftPct:         0.005,
 			WidthChangePct:           0.0015,
 			ReentryConfirmations:     2, // Giảm từ 3 xuống 2
 			EntryConfirmations:       1,
-			OutsideBandConfirmations: 2,
-			BBExpansionFactor:        1.5,
+			OutsideBandConfirmations: 7,    // REDUCED: 7 confirmations (was 15) - faster response
+			BBExpansionFactor:        2.0,  // REDUCED: 2x volatility expansion (was 3.0)
+			BreakoutADXThreshold:     30.0, // INCREASED: ADX > 30 (was 25) - only strong trends
 		},
 		BBPeriod:         5, // Giảm từ 10 xuống 5
 		ADXPeriod:        7, // Giảm từ 14 xuống 7
@@ -85,16 +87,17 @@ func DefaultRangeConfig() *RangeConfig {
 		Periods:                  5,                // 5 periods (fast warm-up: 5 minutes for 1m klines)
 		BBMultiplier:             2.0,              // 2 sigma cho BB
 		ATRMultiplier:            1.5,              // 1.5x ATR cho range
-		BreakoutThreshold:        0.02,             // 2% vượt range = breakout (tăng từ 1% để ít nhạy cảm hơn)
+		BreakoutThreshold:        0.10,             // INCREASED: 10% breakout (was 5%) - allow more volatility
 		StabilizationPeriod:      10 * time.Second, // Chờ 10s sau breakout để resume siêu nhanh
 		MinRangeWidthPct:         0.0001,           // Tối thiểu 0.01% range width (giảm để dễ tạo range hơn)
 		ADXPeriod:                14,
 		MaterialShiftPct:         0.005,
 		WidthChangePct:           0.0015,
-		ReentryConfirmations:     2, // Giảm từ 3 xuống 2
-		EntryConfirmations:       1, // Giữ nguyên
-		OutsideBandConfirmations: 3, // Tăng từ 2 lên 3 để ít nhạy cảm hơn
-		BBExpansionFactor:        1.5,
+		ReentryConfirmations:     2,    // Giảm từ 3 xuống 2
+		EntryConfirmations:       1,    // Giữ nguyên
+		OutsideBandConfirmations: 7,    // REDUCED: 7 confirmations (was 15) - faster response
+		BBExpansionFactor:        2.0,  // REDUCED: 2x volatility expansion (was 3.0)
+		BreakoutADXThreshold:     30.0, // INCREASED: ADX > 30 (was 25) - only strong trends
 	}
 }
 

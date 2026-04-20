@@ -247,16 +247,16 @@ volume_farming:
   # - order_size_usdt: 3-5 (micro grid), 10-20 (normal)
   # - grid_spread_pct: 0.05-0.1% (micro grid), 0.15-0.2% (normal)
   # - max_orders_per_side: 5 (micro grid), 10 (normal)
-  order_size_usdt: 20.5
+  order_size_usdt: 15.0
 
-  grid_spread_pct: 0.0015
+  grid_spread_pct: 0.006
   
   # max_orders_per_side: Số lệnh tối đa mỗi bên
   # ========================================================
   # TRADE-OFF:
   #   Nhiều (5-10): Bao phủ range rộng, nhiều fill, cần nhiều margin
   #   Ít (3-5): Tập trung, ít margin, có thể miss cơ hội
-  max_orders_per_side: 10
+  max_orders_per_side: 8
   
   max_global_pending_limit_orders: 30
   max_pending_per_side: 15
@@ -272,7 +272,7 @@ volume_farming:
   # TRADE-OFF:
   #   Dài (10-15): Chờ cơ hội tốt hơn, nhưng rủi ro biến động
   #   Ngắn (3-5): Nhanh chóng cắt lỗ, nhưng có thể miss hồi phục
-  position_timeout_minutes: 5
+  position_timeout_minutes: 7
 
   # TIME FILTER - Hạn chế giờ giao dịch
   # ===================================
@@ -412,10 +412,10 @@ volume_farming:
     max_total_positions_usdt: 500          # Max 500 USDT total
     max_open_positions: 3                  # Max 3 positions cùng lúc
 
-    # Loss Limits
-    max_unrealized_loss_usdt: 3.0          # Close nếu unrealized loss > 3 USDT/position
-    per_position_loss_limit_usdt: 1.0       # Close position nếu loss > 1 USDT
-    total_net_loss_limit_usdt: 5.0          # Close ALL nếu total loss > 5 USDT
+    # Loss Limits - INCREASED to allow grid trading to work
+    max_unrealized_loss_usdt: 10.0         # Close nếu unrealized loss > 10 USDT/position (increased from 3)
+    per_position_loss_limit_usdt: 5.0       # Close position nếu loss > 5 USDT (increased from 1)
+    total_net_loss_limit_usdt: 20.0         # Close ALL nếu total loss > 20 USDT (increased from 5)
     daily_loss_limit_usdt: 3               # Lỗ tối đa/ngày
     daily_drawdown_pct: 50.0               # Drawdown tối đa %
 
@@ -423,8 +423,8 @@ volume_farming:
     stop_loss_pct: 0.01                    # 1% stop loss
     trailing_stop_pct: 0.01                # Activate tại 1% profit
     trailing_stop_distance_pct: 0.005      # 0.5% trailing distance
-    per_trade_stop_loss_pct: 2.0           # 2% SL per trade
-    per_trade_take_profit_pct: 1.0         # 1% TP per trade
+    per_trade_stop_loss_pct: 1.0           # 1% SL per trade
+    per_trade_take_profit_pct: 0.6         # 0.6% TP per trade
     take_profit_rratio: 1.5                # 1.5:1 R:R
     min_take_profit_pct: 0.5               # Min 0.5% TP
     max_take_profit_pct: 2.0               # Max 2% TP
@@ -452,20 +452,20 @@ volume_farming:
     correlation_threshold: 0.8             # Correlation > 80% = risky
     maker_priority: true                   # Ưu tiên maker orders
 
-    # PnL Risk Control - Cắt lỗ động dựa trên unrealized PnL
+    # PnL Risk Control - Cắt lỗ động dựa trên unrealized PnL - INCREASED thresholds
     pnl_risk_control:
       enabled: true                        # Bật/tắt PnL risk control
-      partial_loss_usdt: 1.0               # Cắt 50% position khi loss > $1 (TRADING -> EXIT_HALF)
-      full_loss_usdt: 1.0                  # Cắt toàn bộ khi loss > $1 trong EXIT_HALF (EXIT_HALF -> EXIT_ALL)
+      partial_loss_usdt: 5.0               # Cắt 50% position khi loss > $5 (TRADING -> EXIT_HALF) (increased from 1)
+      full_loss_usdt: 8.0                  # Cắt toàn bộ khi loss > $8 trong EXIT_HALF (EXIT_HALF -> EXIT_ALL) (increased from 1)
       recovery_threshold_usdt: 0.0         # Recovery threshold để về TRADING (0 = break even)
       partial_close_pct: 0.5               # Tỷ lệ cắt khi partial loss (0.5 = 50%)
 
-    # Market Condition Evaluator - Đánh giá điều kiện thị trường để chọn state phù hợp
+    # Market Condition Evaluator - Đánh giá điều kiện thị trường để chọn state phù hợp - LESS SENSITIVE
     market_condition_evaluator:
       enabled: true                        # Bật/tắt market condition evaluator (true = enable adaptive states)
       evaluation_interval_sec: 1          # Đánh giá mỗi kline (1 giây)
-      min_confidence_threshold: 0.7       # Confidence tối thiểu để switch state (0.7 = 70%)
-      state_stability_duration: 30         # Thời gian tối thiểu ở state trước khi consider switch (giây)
+      min_confidence_threshold: 0.8       # INCREASED: Confidence tối thiểu (was 0.7) - reduce false switches
+      state_stability_duration: 60         # INCREASED: Thời gian tối thiểu (was 30s) - more stable
 
     # OVER_SIZE State - Khi position size vượt quá giới hạn
     over_size:
@@ -643,7 +643,7 @@ api:
   port: 8081
 
 log:
-  level: "info"
+  level: "warn"  # debug/info/warn/error - warn chỉ log warning và error
   file: "logs/agentic-vf.log"
 
 # =============================================================================

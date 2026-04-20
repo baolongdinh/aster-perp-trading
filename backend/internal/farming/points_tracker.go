@@ -9,6 +9,7 @@ import (
 	"aster-bot/internal/config"
 
 	"github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 // PointsTracker tracks points accumulation and farming efficiency
@@ -95,6 +96,12 @@ func (p *PointsTracker) Start(ctx context.Context) error {
 	// Start metrics calculation loop
 	p.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("Metrics loop goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		defer p.wg.Done()
 		p.metricsLoop(ctx)
 	}()
@@ -102,6 +109,12 @@ func (p *PointsTracker) Start(ctx context.Context) error {
 	// Start hourly stats aggregation
 	p.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("Hourly stats loop goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		defer p.wg.Done()
 		p.hourlyStatsLoop(ctx)
 	}()
@@ -133,6 +146,13 @@ func (p *PointsTracker) Stop(ctx context.Context) error {
 	// Wait for goroutines to finish
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("WaitGroup goroutine panic recovered during stop",
+					zap.Any("panic", r))
+				close(done)
+			}
+		}()
 		p.wg.Wait()
 		close(done)
 	}()

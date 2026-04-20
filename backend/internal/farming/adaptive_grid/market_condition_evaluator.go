@@ -261,9 +261,15 @@ func (e *MarketConditionEvaluator) evaluatePosition(symbol string) float64 {
 	// Calculate position notional value
 	positionNotional := math.Abs(position.PositionAmt * position.MarkPrice)
 
-	// Get max position USDT (default to 100 for now)
-	// TODO: Pass max position config via constructor or setter
-	maxPositionUSDT := 100.0
+	// Get max position USDT from config (default to 300 from config)
+	maxPositionUSDT := 300.0
+
+	// Try to get actual config from AdaptiveGridManager if available
+	if agrid, ok := e.adaptiveGridManager.(interface{ GetRiskConfig() *RiskConfig }); ok {
+		if riskConfig := agrid.GetRiskConfig(); riskConfig != nil {
+			maxPositionUSDT = riskConfig.MaxPositionUSDT
+		}
+	}
 
 	// Calculate position score based on size relative to max
 	// 0% of max = 0, 100% of max = 1
@@ -318,13 +324,77 @@ func (e *MarketConditionEvaluator) evaluateMarket(symbol string) float64 {
 		return 0.5 // Default medium market conditions
 	}
 
-	// For now, return medium score as market conditions are complex
-	// TODO: Implement spread, volume, funding rate evaluation
-	// - Spread: Wider = lower score
-	// - Volume: Higher = higher score
-	// - Funding: Extreme = lower score
-	_ = e.wsClient // Remove unused variable warning
-	marketScore := 0.5
+	// Get ticker data from WebSocket client
+	var bestBid, bestAsk, volume24h float64
+	if ws, ok := e.wsClient.(interface {
+		GetTickerData(symbol string) (bestBid, bestAsk, volume24h float64, err error)
+	}); ok {
+		bestBid, bestAsk, volume24h, _ = ws.GetTickerData(symbol)
+	}
+
+	// Calculate spread score (0-1, higher = tighter spread)
+	spreadScore := 0.5 // Default
+	if bestBid > 0 && bestAsk > 0 && bestBid < bestAsk {
+		spreadPct := (bestAsk - bestBid) / bestBid * 100
+		// Tight spread (<0.05%) = high score (0.8-1.0)
+		// Normal spread (0.05-0.1%) = medium score (0.5-0.8)
+		// Wide spread (>0.1%) = low score (0.0-0.5)
+		if spreadPct < 0.05 {
+			spreadScore = 0.8 + (0.05-spreadPct)/0.05*0.2
+		} else if spreadPct < 0.1 {
+			spreadScore = 0.5 + (0.1-spreadPct)/0.05*0.3
+		} else {
+			spreadScore = 0.5 * (0.1 / spreadPct)
+			if spreadScore < 0 {
+				spreadScore = 0
+			}
+		}
+		e.logger.Debug("Spread evaluation",
+			zap.String("symbol", symbol),
+			zap.Float64("spread_pct", spreadPct),
+			zap.Float64("spread_score", spreadScore))
+	}
+
+	// Calculate volume score (0-1, higher = more volume)
+	volumeScore := 0.5 // Default
+	if volume24h > 0 {
+		// High volume (>$10M) = high score (0.8-1.0)
+		// Normal volume ($1M-$10M) = medium score (0.5-0.8)
+		// Low volume (<$1M) = low score (0.0-0.5)
+		if volume24h > 10000000 {
+			volumeScore = 0.8 + (volume24h-10000000)/90000000*0.2
+			if volumeScore > 1.0 {
+				volumeScore = 1.0
+			}
+		} else if volume24h > 1000000 {
+			volumeScore = 0.5 + (volume24h-1000000)/9000000*0.3
+		} else {
+			volumeScore = 0.5 * (volume24h / 1000000)
+		}
+		e.logger.Debug("Volume evaluation",
+			zap.String("symbol", symbol),
+			zap.Float64("volume_24h", volume24h),
+			zap.Float64("volume_score", volumeScore))
+	}
+
+	// Calculate funding rate score (0-1, higher = more favorable funding)
+	fundingScore := 0.5 // Default
+	// TODO: Get funding rate from WebSocket client or API
+	// For now, use default medium score
+	// - Neutral funding (-0.01% to 0.01%) = high score (0.8-1.0)
+	// - Moderate funding (0.01% to 0.05%) = medium score (0.5-0.8)
+	// - Extreme funding (>0.05% or <-0.05%) = low score (0.0-0.5)
+
+	// Combine scores with weights (spread 40%, volume 40%, funding 20%)
+	marketScore := spreadScore*0.4 + volumeScore*0.4 + fundingScore*0.2
+
+	e.logger.Debug("Market evaluation",
+		zap.String("symbol", symbol),
+		zap.Float64("spread_score", spreadScore),
+		zap.Float64("volume_score", volumeScore),
+		zap.Float64("funding_score", fundingScore),
+		zap.Float64("market_score", marketScore))
+
 	return marketScore
 }
 
@@ -332,14 +402,14 @@ func (e *MarketConditionEvaluator) evaluateMarket(symbol string) float64 {
 func (e *MarketConditionEvaluator) recommendState(conditions MarketCondition, symbol string) *StateRecommendation {
 	// State selection logic (from plan)
 
-	// Get adaptive thresholds if available, otherwise use fixed defaults
+	// Get adaptive thresholds if available, otherwise use fixed defaults - LESS SENSITIVE
 	positionThreshold := 0.8
 	volatilityThreshold := 0.8
 	riskThreshold := 0.6
-	riskThresholdHigh := 0.7
-	riskThresholdCritical := 0.9
-	positionThresholdLow := 0.5
-	positionThresholdHigh := 0.95
+	riskThresholdHigh := 0.8      // INCREASED: 0.8 (was 0.7) - reduce EXIT_HALF triggers
+	riskThresholdCritical := 0.95 // INCREASED: 0.95 (was 0.9) - reduce EXIT_ALL triggers
+	positionThresholdLow := 0.6   // INCREASED: 0.6 (was 0.5) - reduce EXIT_HALF triggers
+	positionThresholdHigh := 0.85 // DECREASED: 0.85 (was 0.95) - allow more position before EXIT_ALL
 
 	if e.adaptiveThresholdManager != nil {
 		positionThreshold = e.adaptiveThresholdManager.GetThreshold(symbol, "position")

@@ -288,6 +288,12 @@ func (m *TakeProfitManager) StartTimeoutChecker(ctx context.Context) {
 	m.mu.Unlock()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error("Timeout checker goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():

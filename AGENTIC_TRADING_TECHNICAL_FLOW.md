@@ -211,21 +211,52 @@ stateDiagram
     note right of Stabilizing: Wait for New Range
 ```
 
-**Grid State Machine:**
+**Grid State Machine (Updated Phase 8 - 9 States):**
 
 ```mermaid
 stateDiagram
     [*] --> IDLE: Start
     IDLE --> ENTER GRID: Range confirmed or MICRO mode
+    IDLE --> TRENDING: Trend detected ADX > 25
+
     ENTER GRID --> TRADING: Orders placed
-    TRADING --> EXIT ALL: Breakout Trend ADX greater than 25
+    ENTER GRID --> TRENDING: Trend detected
+
+    TRADING --> EXIT HALF: Partial loss
+    TRADING --> EXIT ALL: Full loss Breakout Trend Emergency
+    TRADING --> OVER SIZE: Position > 80% max
+    TRADING --> DEFENSIVE: Extreme volatility
+    TRADING --> RECOVERY: Recovery start
     TRADING --> TRADING: Rebalancing
+
+    EXIT HALF --> RECOVERY: Recovery start
+    EXIT HALF --> EXIT ALL: Full loss
+
     EXIT ALL --> WAIT NEW RANGE: Positions closed
+    EXIT ALL --> RECOVERY: Recovery start
+
     WAIT NEW RANGE --> ENTER GRID: Re grid conditions met
+    WAIT NEW RANGE --> TRENDING: Trend detected
+
+    OVER SIZE --> TRADING: Size normalized
+    OVER SIZE --> EXIT ALL: Full loss
+
+    DEFENSIVE --> TRADING: Volatility normalized
+    DEFENSIVE --> EXIT ALL: Emergency exit
+
+    RECOVERY --> TRADING: Recovery complete
+    RECOVERY --> EXIT HALF: Partial loss
+
+    TRENDING --> EXIT ALL: Trend exit
 
     note right of TRADING: Orders active Grid trading
+    note right of EXIT HALF: Exit 50% position
     note right of EXIT ALL: Fast exit sequence
     note right of WAIT NEW RANGE: 6 strict conditions
+    note right of OVER SIZE: Reduce size 60% max
+    note right of DEFENSIVE: High volatility defense
+    note right of RECOVERY: Recovery after loss
+    note right of TRENDING: Trend following mode
 ```
 
 **Classification Logic:**
@@ -519,7 +550,7 @@ graph TB
 
 ---
 
-## 10. Luồng Auto-Recovery - Tự Động Unblock (Mới)
+## 10. Luồng Auto-Recovery - Tự Động Unblock (Updated Phase 8.5/8.6)
 
 ```mermaid
 graph TB
@@ -528,38 +559,77 @@ graph TB
     Check --> RD RangeDetector state
     Check --> GSM GridStateMachine state
     Check --> TP tradingPaused status
+    Check --> RC Regrid Conditions
 
     RD -->|Unknown/Initializing| FI Force initialize
     FI --> RD
 
-    GSM -->|EXIT ALL > 2min| FW1 Force WAIT NEW RANGE
-    GSM -->|WAIT NEW RANGE > 2min| FW2 Force IDLE
-    GSM -->|IDLE > 10min + range ready| FW3 Force ENTER GRID
+    GSM -->|EXIT ALL > 10min| FW1 Force WAIT NEW RANGE
+    GSM -->|WAIT NEW RANGE > 10min| FW2 Force ENTER GRID
+    GSM -->|OVER SIZE > 15min| FW3 Force TRADING
+    GSM -->|DEFENSIVE > 20min| FW4 Force TRADING
+    GSM -->|RECOVERY > 10min| FW5 Force TRADING
+
+    RC -->|Market conditions fail| TIS Time in state
+    TIS -->|> 5min in WAIT NEW RANGE| FB Force regrid fallback
 
     TP -->|Paused in IDLE/WNR| AR Auto resume
 
     FW1 --> GSM
     FW2 --> GSM
     FW3 --> GSM
+    FW4 --> GSM
+    FW5 --> GSM
+    FB --> GSM
     AR --> TP
 ```
 
-**Logic (chạy mỗi 30s):**
+**Logic (Continuous State Timeout Checker - Phase 8.5):**
+Chạy mỗi 30s cho **entire bot lifetime** (không phụ thuộc warm-up):
 1. RangeDetector Unknown/Initializing → Force initialize (30s stabilization)
-2. GridStateExitAll > 2min → Force WAIT_NEW_RANGE
-3. GridStateWaitNewRange > 2min → Force IDLE
-4. GridStateIdle > 10min + range ready → Force ENTER_GRID
-5. tradingPaused in IDLE/WAIT_NEW_RANGE → Auto resume
+2. GridStateExitAll > 10min → Force WAIT_NEW_RANGE (assume positions closed)
+3. GridStateWaitNewRange > 10min → Force ENTER_GRID (assume new range ready)
+4. GridStateOverSize > 15min → Force TRADING (assume size normalized)
+5. GridStateDefensive > 20min → Force TRADING (assume volatility normalized)
+6. GridStateRecovery > 10min → Force TRADING (assume recovery complete)
+7. tradingPaused in IDLE/WAIT_NEW_RANGE → Auto resume
 
-**Timeouts:**
-- EXIT_ALL: 2 phút
-- WAIT_NEW_RANGE: 2 phút
-- IDLE: 10 phút
+**State Timeouts (Phase 8.5):**
+- EXIT_ALL: 10 phút
+- WAIT_NEW_RANGE: 10 phút
+- OVER_SIZE: 15 phút
+- DEFENSIVE: 20 phút
+- RECOVERY: 10 phút
+- IDLE: Không có timeout
+
+**Regrid Fallback Logic (Phase 8.6 - 5 phút fallback):**
+```go
+canRegridStandard() với fallback:
+  1. Check position ≈ 0 (notional < 10.0)
+  2. Check market conditions (ADX < 70, BB width < 10x)
+  3. Nếu market conditions fail:
+     - Check time in state
+     - Nếu > 5 phút trong WAIT_NEW_RANGE:
+       → Force regrid (bypass market conditions)
+     - Log: "forcing regrid due to timeout fallback"
+```
+
+**Multi-Layer Protection:**
+1. **Fallback trong regrid conditions** (5 phút) - allow regrid ngay cả khi market conditions fail
+2. **Continuous state timeout checker** (10 phút) - force transition state
+3. **Emergency force state method** - manual recovery khi cần
+
+**Detailed Logging (Phase 8.6):**
+- `Standard regrid check START` - bắt đầu check
+- `Standard regrid check: position not zero` - nếu position > 10
+- `Market condition check: ADX` - giá trị ADX hiện tại
+- `Market condition check: BB width ratio` - ratio BB width
+- `Standard regrid check: forcing regrid due to timeout fallback` - sau 5 phút
 
 **Implementation:**
-- File: `internal/farming/adaptive_grid/manager.go`
-- Method: `AutoRecovery()`
-- Interval: 30s
+- File: `internal/farming/grid_manager.go`
+- Methods: `stateTimeoutChecker()`, `checkStateTimeouts()`, `canRegridStandard()`, `checkMarketConditionsForRegrid()`
+- Interval: 30s (continuous, independent of warm-up)
 
 ---
 

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -118,6 +119,13 @@ func main() {
 
 	// Start farming engine
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Volume Farm Engine goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		logger.Info("🔄 Starting Volume Farming Engine")
 		if err := engine.Start(ctx); err != nil {
 			logger.Error("Volume farming engine error", zap.Error(err))

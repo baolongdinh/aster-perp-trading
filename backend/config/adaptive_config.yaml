@@ -77,13 +77,13 @@ regimes:
     # order_size_usdt: TĂNG để farm nhiều khi ranging
     #   - $2-3: Nhanh farm (KHUYẾN NGHĨ)
     #   - $5+: Rất nhanh nhưng risk fakeout
-    order_size_usdt: 2.0
+    order_size_usdt: 1.5
 
     # grid_spread_pct: Tăng để phù hợp với high leverage (100x)
     #   - 0.06%: Wider, giảm liquidation risk (KHUYẾN NGHĨ)
     grid_spread_pct: 0.06
 
-    max_orders_per_side: 10
+    max_orders_per_side: 8
     max_daily_loss_usdt: 2.0
     position_timeout_minutes: 3
 
@@ -92,15 +92,15 @@ regimes:
   # ---------------------------------------------------------------------------
   volatile:
     # order_size_usdt: GIẢM MẠNH để tránh liq
-    #   - $0.3-0.5: Cực nhỏ (KHUYẾN NGHỊ)
+    #   - $0.3-0.5: Cực nhỏ (KHUYẾN NGHĨ)
     #   - $1+: Risk liquidation
-    order_size_usdt: 0.5
+    order_size_usdt: 0.3
 
     # grid_spread_pct: Tăng để phù hợp với high leverage
     #   - 0.15%: Rộng, ít orders (KHUYẾN NGHĨ volatile)
     grid_spread_pct: 0.15
 
-    max_orders_per_side: 4
+    max_orders_per_side: 3
     max_daily_loss_usdt: 1.0
     position_timeout_minutes: 2
 

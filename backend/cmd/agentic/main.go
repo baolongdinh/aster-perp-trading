@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -95,6 +96,13 @@ func main() {
 
 	// Start Volume Farm Engine with delay to prevent API rate limiting
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Volume Farm Engine (delayed) goroutine panic recovered",
+					zap.Any("panic", r),
+					zap.String("stack", string(debug.Stack())))
+			}
+		}()
 		logger.Info("⏳ Waiting 3s before starting Volume Farm Engine to avoid API burst...")
 		time.Sleep(3 * time.Second)
 		logger.Info("🔔 Sleep completed, about to call vfEngine.Start()")
@@ -137,6 +145,13 @@ func main() {
 
 		// Start Agentic Engine
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("Agentic Engine goroutine panic recovered",
+						zap.Any("panic", r),
+						zap.String("stack", string(debug.Stack())))
+				}
+			}()
 			logger.Info("▶️ Starting Agentic Engine")
 			if err := agenticEngine.Start(ctx); err != nil {
 				logger.Error("Agentic Engine error", zap.Error(err))

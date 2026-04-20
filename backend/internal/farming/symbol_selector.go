@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,6 +93,12 @@ func (s *SymbolSelector) Start(ctx context.Context) error {
 
 	s.wg.Add(1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Periodic update goroutine panic recovered",
+					zap.Any("panic", r))
+			}
+		}()
 		defer s.wg.Done()
 		s.periodicUpdate(ctx)
 	}()
@@ -102,6 +109,13 @@ func (s *SymbolSelector) Start(ctx context.Context) error {
 
 // websocketProcessor processes real-time WebSocket ticker data.
 func (s *SymbolSelector) websocketProcessor(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("WebSocket processor goroutine panic recovered",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+		}
+	}()
 	defer s.wg.Done()
 
 	tickerCh := s.wsClient.GetTickerChannel()
@@ -451,6 +465,13 @@ func (s *SymbolSelector) Stop(ctx context.Context) error {
 
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("WaitGroup goroutine panic recovered during stop",
+					zap.Any("panic", r))
+				close(done)
+			}
+		}()
 		s.wg.Wait()
 		close(done)
 	}()
