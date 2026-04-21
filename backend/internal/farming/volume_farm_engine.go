@@ -22,6 +22,7 @@ import (
 	"aster-bot/internal/farming/tradingmode"
 	"aster-bot/internal/farming/volume_optimization"
 	"aster-bot/internal/health"
+	"aster-bot/internal/realtime"
 	"aster-bot/internal/risk"
 	"aster-bot/internal/strategy/regime"
 	"aster-bot/internal/stream"
@@ -135,6 +136,9 @@ type VolumeFarmEngine struct {
 	configManager       *adaptive_config.AdaptiveConfigManager
 	pointsTracker       *PointsTracker
 	userStream          *stream.UserStream
+	stateEventBus       *agentic.StateEventBus
+	symbolSyncReady     bool
+	readyMu             sync.RWMutex
 
 	// NEW: Continuous Volume Farming components
 	modeManager     *tradingmode.ModeManager
@@ -142,6 +146,7 @@ type VolumeFarmEngine struct {
 	exitExecutor    *ExitExecutor
 	syncManager     *farmsync.SyncManager
 	wsClient        *client.WebSocketClient
+	runtimeHub      *realtime.Hub
 	metricsStreamer *dashboard.MetricsStreamer // Real-time metrics streaming
 	healthMonitor   *health.Monitor            // Worker health monitoring and auto-restart
 
@@ -240,6 +245,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 
 	engine.futuresClient = client.NewFuturesClient(httpClient, volumeConfig.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
 	engine.riskManager = risk.NewManager(volumeConfig.Risk, logger, engine.futuresClient)
+	runtimeMarketClient := client.NewMarketClient(httpClient)
 
 	// NEW: Initialize and inject CorrelationTracker for correlation-based risk checks
 	corrThreshold := volumeConfig.Risk.CorrelationThreshold
@@ -260,6 +266,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		wsURL = "wss://fstream.asterdex.com/ws/!ticker@arr"
 	}
 	sharedWSClient := client.NewWebSocketClient(wsURL, zapLogger)
+	engine.runtimeHub = realtime.NewHub(sharedWSClient, runtimeMarketClient, logger)
 
 	engine.symbolSelector = NewSymbolSelector(engine.futuresClient, logrusEntry.WithField("component", "symbol_selector"), volumeConfig)
 	engine.symbolSelector.SetWebSocketClient(sharedWSClient)
@@ -286,7 +293,8 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 		configManager,
 		regimeDetector,
 		engine.futuresClient,
-		engine.gridManager,                    // GridManager implements PositionProvider interface
+		engine.gridManager, // GridManager implements PositionProvider interface
+		engine.runtimeHub,
 		volumeConfig.Exchange.FuturesRESTBase, // API base URL for historical data fetch
 		logger,
 	)
@@ -781,7 +789,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	}
 
 	// ExitExecutor - handles fast exit on breakouts
-	engine.exitExecutor = NewExitExecutor(engine.futuresClient, sharedWSClient, 5*time.Second, logger)
+	engine.exitExecutor = NewExitExecutor(engine.futuresClient, engine.runtimeHub, 5*time.Second, logger)
 	logger.Info("ExitExecutor initialized", zap.Duration("timeout", 5*time.Second))
 
 	// NEW: Wire ExitExecutor into AdaptiveGridManager for breakout handling
@@ -1001,6 +1009,9 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 	// to ensure activeGrids is populated before rebalancer worker starts
 	e.logger.Info("Initial symbol sync before starting grid manager...")
 	e.syncGridSymbols()
+	e.readyMu.Lock()
+	e.symbolSyncReady = true
+	e.readyMu.Unlock()
 	e.logger.Info("Initial symbol sync complete - starting grid manager")
 
 	e.wg.Add(1)
@@ -2060,21 +2071,83 @@ func (e *VolumeFarmEngine) GetPostOnlyHandler() interface{} {
 
 // GetCurrentPrice returns the current price for a symbol
 func (e *VolumeFarmEngine) GetCurrentPrice(symbol string) float64 {
-	// For now return 0 - price will be fetched by grid manager itself
-	// In future: can add price cache from websocket
-	e.logger.Debug("GetCurrentPrice called", zap.String("symbol", symbol))
-	return 0
+	if e.runtimeHub == nil {
+		return 0
+	}
+	price, ok := e.runtimeHub.GetLastPrice(symbol)
+	if !ok {
+		return 0
+	}
+	return price
+}
+
+// GetRuntimeSnapshotProvider returns the shared runtime snapshot provider for Agentic.
+func (e *VolumeFarmEngine) GetRuntimeSnapshotProvider() realtime.RuntimeSnapshotProvider {
+	return e.runtimeHub
+}
+
+// GetMarketStateProvider returns the shared market state provider for Agentic.
+func (e *VolumeFarmEngine) GetMarketStateProvider() realtime.MarketStateProvider {
+	return e.runtimeHub
+}
+
+// GetRuntimeHub returns the shared runtime hub owned by the VF runtime.
+func (e *VolumeFarmEngine) GetRuntimeHub() *realtime.Hub {
+	return e.runtimeHub
 }
 
 // GetStateEventBus returns the state event bus for agentic integration
 func (e *VolumeFarmEngine) GetStateEventBus() *agentic.StateEventBus {
-	return nil // Will be set via setter
+	return e.stateEventBus
 }
 
 // SetStateEventBus sets the state event bus for agentic integration
 func (e *VolumeFarmEngine) SetStateEventBus(bus *agentic.StateEventBus) {
-	// Store for later use
+	e.stateEventBus = bus
 	e.logger.Info("StateEventBus set for hybrid integration")
+}
+
+// WaitUntilReady blocks until the websocket-first runtime is ready for Agentic to start.
+func (e *VolumeFarmEngine) WaitUntilReady(ctx context.Context, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if e.isRuntimeReady() {
+			e.logger.Info("Volume Farm runtime ready for Agentic start")
+			return nil
+		}
+
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("volume farm runtime not ready within %s", timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (e *VolumeFarmEngine) isRuntimeReady() bool {
+	e.readyMu.RLock()
+	symbolSyncReady := e.symbolSyncReady
+	e.readyMu.RUnlock()
+
+	if e.runtimeHub == nil || e.wsClient == nil || !e.wsClient.IsRunning() {
+		return false
+	}
+	if !symbolSyncReady {
+		return false
+	}
+	if e.userStream == nil || !e.userStream.IsConnected() {
+		return false
+	}
+	return true
 }
 
 // ExecuteGridEntry enables grid trading for a symbol based on Agentic decision

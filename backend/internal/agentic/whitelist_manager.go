@@ -39,6 +39,9 @@ func NewWhitelistManager(
 	vfController VFWhitelistController,
 	logger *zap.Logger,
 ) *WhitelistManager {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &WhitelistManager{
 		config:          cfg,
 		vfController:    vfController,

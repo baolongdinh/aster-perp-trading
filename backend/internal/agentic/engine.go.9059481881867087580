@@ -511,7 +511,7 @@ func (ae *AgenticEngine) runDetectionCycle(ctx context.Context) error {
 	for symbol, regime := range detectionResults {
 		volatility := regime.ATR14
 		trend := float64(regime.ADX) / 100.0
-
+		
 		var spread, volume float64
 		snap := ae.runtimeProvider.GetSymbolSnapshot(ctx, symbol)
 		if snap.BestAsk > 0 {
@@ -1260,7 +1260,7 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 			if ae.recoveryHandler != nil {
 				exitPnL := snapshot.UnrealizedPnL
 				exitReason := string(snapshot.BlockReason)
-
+				
 				// T012: Lấy consecutiveLosses từ state thật
 				consecutiveLosses := 0
 				if currentState := ae.decisionEngine.GetSymbolTradingState(symbol); currentState != nil {

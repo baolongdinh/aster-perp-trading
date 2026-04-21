@@ -35,6 +35,9 @@ func (e *APIError) IsRateLimit() bool { return e.Code == -1003 }
 // IsSignatureError returns true if the error is an auth/signature error.
 func (e *APIError) IsSignatureError() bool { return e.Code == -1022 }
 
+// IsTimestampError returns true if the error is a timestamp mismatch error (-1000).
+func (e *APIError) IsTimestampError() bool { return e.Code == -1000 }
+
 // IsLeverageError returns true if the error is a leverage exceeds maximum error (-2027).
 func (e *APIError) IsLeverageError() bool { return e.Code == -2027 }
 

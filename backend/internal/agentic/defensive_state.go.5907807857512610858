@@ -12,13 +12,13 @@ import (
 type DefensiveStateHandler struct {
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
-
+	
 	// Exit tracking
-	exitStage    map[string]DefensiveExitStage
-	entryPrice   map[string]float64
-	exitTime     map[string]time.Time
-	breakevenHit map[string]bool
-
+	exitStage      map[string]DefensiveExitStage
+	entryPrice     map[string]float64
+	exitTime       map[string]time.Time
+	breakevenHit   map[string]bool
+	
 	// Parameters
 	breakevenThreshold float64
 	exitHalfPnL        float64
@@ -51,7 +51,7 @@ func NewDefensiveStateHandler(
 		exitStage:          make(map[string]DefensiveExitStage),
 		entryPrice:         make(map[string]float64),
 		exitTime:           make(map[string]time.Time),
-		breakevenHit:       make(map[string]bool),
+		breakevenHit:      make(map[string]bool),
 		breakevenThreshold: 0.005, // 0.5% breakeven
 		exitHalfPnL:        0.01,  // 1% profit for half exit
 		exitAllPnL:         0.02,  // 2% profit for all exit
@@ -73,40 +73,40 @@ func (h *DefensiveStateHandler) HandleState(
 		zap.Float64("price", currentPrice),
 		zap.Float64("pnl", unrealizedPnL),
 	)
-
+	
 	// Initialize if new
 	if _, ok := h.exitTime[symbol]; !ok {
 		h.exitTime[symbol] = time.Now()
 		h.exitStage[symbol] = ExitStageInitial
 		h.entryPrice[symbol] = currentPrice
 	}
-
+	
 	// 1. Check for breakeven
 	if unrealizedPnL > h.breakevenThreshold && !h.breakevenHit[symbol] {
 		h.breakevenHit[symbol] = true
 		h.exitStage[symbol] = ExitStageBreakeven
-
+		
 		h.logger.Info("Breakeven hit, setting breakeven stop",
 			zap.String("symbol", symbol),
 			zap.Float64("pnl", unrealizedPnL),
 		)
-
+		
 		// Would set breakeven stop here
 	}
-
+	
 	// 2. Execute graduated exit based on PnL
 	if unrealizedPnL >= h.exitHalfPnL && h.exitStage[symbol] == ExitStageBreakeven {
 		h.exitStage[symbol] = ExitStageHalf
-
+		
 		h.logger.Info("EXIT_HALF executed",
 			zap.String("symbol", symbol),
 			zap.Float64("pnl", unrealizedPnL),
 		)
-
+		
 		// Execute half exit
 		h.executeHalfExit(symbol, positionSize)
 	}
-
+	
 	// 3. Check for recovery opportunity before a full exit.
 	// In a strong recovery regime we prefer to hand control back to TRENDING
 	// instead of flattening immediately after the first defensive scale-out.
@@ -114,11 +114,11 @@ func (h *DefensiveStateHandler) HandleState(
 		if (regimeSnapshot.Regime == RegimeTrending || regimeSnapshot.Regime == RegimeRecovery) &&
 			h.isRecoveryOpportunity(symbol, currentPrice, unrealizedPnL) {
 			h.exitStage[symbol] = ExitStageRecovery
-
+			
 			h.logger.Info("Recovery opportunity detected",
 				zap.String("symbol", symbol),
 			)
-
+			
 			return &StateTransition{
 				FromState:         TradingModeDefensive,
 				ToState:           TradingModeTrending,
@@ -148,14 +148,14 @@ func (h *DefensiveStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// 4. Check for max loss (emergency exit)
 	if unrealizedPnL < -0.02 { // -2% max loss in defensive
 		h.logger.Warn("Max loss in defensive mode, emergency exit",
 			zap.String("symbol", symbol),
 			zap.Float64("pnl", unrealizedPnL),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeDefensive,
 			ToState:           TradingModeIdle,
@@ -165,13 +165,13 @@ func (h *DefensiveStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// 5. Check for time limit (force exit after 30 min in defensive)
 	if time.Since(h.exitTime[symbol]) > 30*time.Minute {
 		h.logger.Info("Max time in defensive reached, forcing exit",
 			zap.String("symbol", symbol),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeDefensive,
 			ToState:           TradingModeIdle,
@@ -181,7 +181,7 @@ func (h *DefensiveStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// Default: stay in DEFENSIVE
 	return nil, nil
 }
@@ -209,7 +209,7 @@ func (h *DefensiveStateHandler) isRecoveryOpportunity(
 	if unrealizedPnL > 0 && currentPrice >= entryPrice*(1+h.breakevenThreshold*2) {
 		return true
 	}
-
+	
 	return false
 }
 

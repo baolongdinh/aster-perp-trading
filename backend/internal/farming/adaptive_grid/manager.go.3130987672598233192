@@ -66,7 +66,7 @@ type AdaptiveGridManager struct {
 	futuresClient    FuturesClientInterface
 	positionProvider PositionProvider // NEW: WebSocket position provider
 	marketProvider   realtime.MarketStateProvider
-	apiBaseURL       string // API base URL for historical data fetch
+	apiBaseURL       string           // API base URL for historical data fetch
 	logger           *zap.Logger
 	mu               sync.RWMutex
 
@@ -429,7 +429,7 @@ func NewAdaptiveGridManager(
 		futuresClient:         futuresClient,
 		positionProvider:      positionProvider, // NEW: WebSocket position provider
 		marketProvider:        marketProvider,
-		apiBaseURL:            apiBaseURL, // API base URL
+		apiBaseURL:            apiBaseURL,       // API base URL
 		logger:                logger,
 		currentRegime:         make(map[string]market_regime.MarketRegime),
 		lastRegimeChange:      make(map[string]time.Time),

@@ -6,19 +6,19 @@ import (
 	"sync"
 	"time"
 
-	"aster-bot/internal/client"
 	"aster-bot/internal/config"
+	"aster-bot/internal/realtime"
 
 	"go.uber.org/zap"
 )
 
 // RegimeDetector detects market regime for a single symbol
 type RegimeDetector struct {
-	symbol       string
-	config       config.RegimeDetectionConfig
-	calculator   *IndicatorCalculator
-	marketClient *client.MarketClient
-	logger       *zap.Logger
+	symbol     string
+	config     config.RegimeDetectionConfig
+	calculator *IndicatorCalculator
+	marketData realtime.MarketStateProvider
+	logger     *zap.Logger
 
 	mu           sync.RWMutex
 	candleBuffer []Candle
@@ -31,14 +31,14 @@ type RegimeDetector struct {
 func NewRegimeDetector(
 	symbol string,
 	cfg config.RegimeDetectionConfig,
-	marketClient *client.MarketClient,
+	marketData realtime.MarketStateProvider,
 	logger *zap.Logger,
 ) *RegimeDetector {
 	return &RegimeDetector{
 		symbol:       symbol,
 		config:       cfg,
 		calculator:   NewIndicatorCalculator(cfg.ADXPeriod, cfg.BBPeriod, cfg.ATRPeriod),
-		marketClient: marketClient,
+		marketData:   marketData,
 		logger:       logger.With(zap.String("component", "regime_detector"), zap.String("symbol", symbol)),
 		candleBuffer: make([]Candle, 0, 100),
 		atrHistory:   make([]float64, 0, 20),
@@ -112,6 +112,10 @@ func (rd *RegimeDetector) Detect(ctx context.Context) (RegimeSnapshot, error) {
 
 // fetchCandles fetches candle data from the exchange
 func (rd *RegimeDetector) fetchCandles(ctx context.Context) ([]Candle, error) {
+	if rd.marketData == nil {
+		return nil, fmt.Errorf("market state provider is nil")
+	}
+
 	// Convert interval string to client interval
 	interval := rd.config.CandleInterval
 	if interval == "" {
@@ -124,8 +128,14 @@ func (rd *RegimeDetector) fetchCandles(ctx context.Context) ([]Candle, error) {
 		limit = 50
 	}
 
-	// Fetch from exchange using MarketClient
-	exchangeCandles, err := rd.marketClient.Klines(ctx, rd.symbol, interval, limit)
+	if err := rd.marketData.EnsureKlineSubscription(rd.symbol, interval); err != nil {
+		rd.logger.Debug("Failed to ensure kline subscription",
+			zap.Error(err),
+			zap.String("interval", interval),
+		)
+	}
+
+	exchangeCandles, err := rd.marketData.GetKlines(ctx, rd.symbol, interval, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +150,7 @@ func (rd *RegimeDetector) fetchCandles(ctx context.Context) ([]Candle, error) {
 			Low:       c.Low,
 			Close:     c.Close,
 			Volume:    c.Volume,
-			Timestamp: time.Unix(c.CloseTime/1000, 0),
+			Timestamp: time.Unix(c.EndTime/1000, 0),
 		}
 	}
 

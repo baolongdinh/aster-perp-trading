@@ -1,0 +1,98 @@
+# AGENTIC STATE HANDLER THRESHOLDS
+# ================================
+# Các ngưỡng hardcoded cần chuyển vào config
+
+idle_state:
+  trend_threshold: 0.40        # Ngưỡng vào TREND (đã có từ score_engine)
+  grid_threshold: 0.45         # Ngưỡng vào GRID (đã có từ score_engine)
+  low_boundary_pct: 0.8        # 80% của threshold = "too low"
+  max_time_idle_sec: 300       # 5 phút max ở IDLE
+
+wait_range_state:
+  trend_transition_threshold: 0.75   # Chuyển sang TRENDING
+  range_quality_threshold: 0.70    # Range đủ tốt để vào GRID
+  atr_volatility_threshold: 0.01   # ATR > 0.01 = extreme volatility
+  
+  # Range width scoring
+  width_optimal_min: 0.005         # < 0.5% = too tight
+  width_optimal_max: 0.05          # > 5% = too wide
+  
+  # Volatility scoring  
+  vol_high_threshold: 0.01         # ATR > 1% = high vol
+  vol_low_threshold: 0.001         # ATR < 0.1% = too calm
+  
+  # Compression detection
+  compression_bb_width: 0.02        # BB < 2%
+  compression_atr: 0.003            # ATR < 0.3%
+  compression_bb_tight: 0.015       # BB < 1.5% (tight)
+  
+  # Timing
+  max_wait_time_sec: 120           # 2 phút max chờ range
+
+trending_state:
+  max_loss_pct: -0.03              # -3% max loss
+  trailing_atr_mult: 2.5           # 2.5x ATR trailing stop
+  micro_profit_pct: 0.25           # 25% take profit
+  max_time_in_trend_hours: 4       # 4 giờ max ở trend
+  
+  # Score hybrid
+  breakout_default: 0.5            # Giá trị mặc định breakout
+  momentum_default: 0.5            # Giá trị mặc định momentum
+  agreement_threshold: 0.2         # |breakout - momentum| < 0.2 = agree
+  
+  # Switch back to grid
+  grid_score_threshold: 0.7        # Grid > 0.7 để quay lại
+  hybrid_low_threshold: 0.5        # Hybrid < 0.5 để quay lại
+
+trading_grid_state:
+  # Entropy thresholds
+  low_entropy_threshold: 0.3       # < 0.3 = increase intensity
+  high_entropy_threshold: 0.7      # > 0.7 = decrease intensity
+  
+  # Trend emergence
+  trend_emergence_threshold: 0.8   # Trend > 0.8 để chuyển state
+  trend_vs_grid_ratio: 1.2         # Trend > Grid * 1.2
+  
+  # Volatility
+  atr_extreme_threshold: 0.01      # ATR > 1% = extreme
+  
+  # Rebalancing
+  rebalance_fill_ratio: 0.5        # 50% filled = rebalance
+  
+  # Position limits
+  max_grid_loss_pct: -0.03         # -3% max
+  max_position_size_pct: 0.05      # 5% max
+
+vf_bridge:
+  # Position multipliers by mode
+  idle_mult: 0.0
+  micro_mult: 1.0
+  standard_mult: 1.0
+  trend_mult: 0.8
+  accumulation_mult: 0.5
+  defensive_mult: 0.0
+  oversize_mult: 0.5
+  recovery_mult: 0.6
+  
+  # Accumulation
+  accumulation_target_pct: 0.03    # 3% target
+  
+  # OverSize
+  oversize_exit_pct: 0.5           # 50% exit
+  
+  # Priority scores
+  priority_strong_trend: 0.85      # > 0.85 = high priority
+  priority_good_grid: 0.75         # > 0.75 = normal priority
+
+signal_aggregator:
+  # Liquidity distance
+  at_liquidity_dist: 0.02          # < 2% = at level (0.85)
+  near_liquidity_dist: 0.1         # < 10% = near (0.7)
+  
+  # Breakout distance
+  near_breakout_dist: 0.05         # < 5% = near (0.75)
+  
+  # Momentum normalization
+  momentum_norm_base: 0.5          # Base 0.5
+  momentum_norm_mult: 5.0          # Multiply by 5
+  momentum_range: 0.1              # Typical range ±0.1

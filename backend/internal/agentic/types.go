@@ -158,10 +158,20 @@ type SymbolTradingState struct {
 	ModeScores           map[TradingMode]*TradingModeScore
 	TransitionConfidence float64
 	LastTransition       time.Time
+	StateEnteredAt       time.Time // When current state was entered (for watchdog)
 	TransitionHistory    []StateTransition
 	IsTransitioning      bool
 	TargetMode           TradingMode // During transition
 	BlendWeight          float64     // 0-1 for smooth transition
+
+	// Recovery & loss tracking
+	ConsecutiveLosses  int
+	LastExitPnL        float64
+	LastExitReason     string
+	LastExecutionAckAt time.Time
+
+	// Watchdog metrics
+	StateStuckCount int
 }
 
 // ScoreComponents breaks down how scores are calculated

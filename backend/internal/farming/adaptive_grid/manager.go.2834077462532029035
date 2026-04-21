@@ -12,7 +12,6 @@ import (
 	"aster-bot/internal/config"
 	"aster-bot/internal/farming/adaptive_config"
 	"aster-bot/internal/farming/market_regime"
-	"aster-bot/internal/realtime"
 
 	"go.uber.org/zap"
 )
@@ -65,8 +64,7 @@ type AdaptiveGridManager struct {
 	regimeDetector   *market_regime.RegimeDetector
 	futuresClient    FuturesClientInterface
 	positionProvider PositionProvider // NEW: WebSocket position provider
-	marketProvider   realtime.MarketStateProvider
-	apiBaseURL       string // API base URL for historical data fetch
+	apiBaseURL       string           // API base URL for historical data fetch
 	logger           *zap.Logger
 	mu               sync.RWMutex
 
@@ -418,7 +416,6 @@ func NewAdaptiveGridManager(
 	regimeDetector *market_regime.RegimeDetector,
 	futuresClient FuturesClientInterface,
 	positionProvider PositionProvider, // NEW: WebSocket position provider
-	marketProvider realtime.MarketStateProvider,
 	apiBaseURL string, // API base URL for historical data fetch
 	logger *zap.Logger,
 ) *AdaptiveGridManager {
@@ -428,8 +425,7 @@ func NewAdaptiveGridManager(
 		regimeDetector:        regimeDetector,
 		futuresClient:         futuresClient,
 		positionProvider:      positionProvider, // NEW: WebSocket position provider
-		marketProvider:        marketProvider,
-		apiBaseURL:            apiBaseURL, // API base URL
+		apiBaseURL:            apiBaseURL,       // API base URL
 		logger:                logger,
 		currentRegime:         make(map[string]market_regime.MarketRegime),
 		lastRegimeChange:      make(map[string]time.Time),
@@ -4109,19 +4105,13 @@ func (a *AdaptiveGridManager) fetchHistoricalKlinesAndFeedDetector(symbol string
 		zap.String("symbol", symbol),
 		zap.Int("periods", periods))
 
-	if a.marketProvider == nil {
-		a.logger.Warn("Market provider unavailable for historical klines bootstrap",
-			zap.String("symbol", symbol))
-		return
-	}
+	// Create HTTPClient for API calls (no auth needed for public endpoints)
+	// Use base URL from config
+	httpClient := client.NewHTTPClient(a.apiBaseURL, nil, a.logger, 30)
+	marketClient := client.NewMarketClient(httpClient)
 
-	if err := a.marketProvider.EnsureKlineSubscription(symbol, "1m"); err != nil {
-		a.logger.Debug("Failed to ensure kline subscription for range detector bootstrap",
-			zap.String("symbol", symbol),
-			zap.Error(err))
-	}
-
-	klines, err := a.marketProvider.GetKlines(context.Background(), symbol, "1m", periods)
+	// Fetch historical klines from API
+	klines, err := marketClient.Klines(context.Background(), symbol, "1m", periods)
 	if err != nil {
 		a.logger.Error("Failed to fetch historical klines",
 			zap.String("symbol", symbol),

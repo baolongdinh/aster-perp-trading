@@ -13,12 +13,12 @@ import (
 type TradingGridStateHandler struct {
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
-	
+
 	// Position tracking
-	positionPnL     map[string]float64
-	gridFillLevels  map[string]int
-	entryTime       map[string]time.Time
-	
+	positionPnL    map[string]float64
+	gridFillLevels map[string]int
+	entryTime      map[string]time.Time
+
 	// Risk parameters
 	maxGridLoss     float64 // -3%
 	maxPositionSize float64 // 5%
@@ -27,14 +27,14 @@ type TradingGridStateHandler struct {
 
 // GridStatus tracks the current state of grid trading
 type GridStatus struct {
-	Symbol           string
-	FilledLevels     int
-	TotalLevels      int
-	UnrealizedPnL    float64
-	RunningTime      time.Duration
-	SignalBlend      float64 // 0-1 entropy-weighted
-	TrendScore       float64
-	LastRebalance    time.Time
+	Symbol        string
+	FilledLevels  int
+	TotalLevels   int
+	UnrealizedPnL float64
+	RunningTime   time.Duration
+	SignalBlend   float64 // 0-1 entropy-weighted
+	TrendScore    float64
+	LastRebalance time.Time
 }
 
 // NewTradingGridStateHandler creates a new TRADING (GRID) state handler
@@ -42,6 +42,9 @@ func NewTradingGridStateHandler(
 	scoreEngine *ScoreCalculationEngine,
 	logger *zap.Logger,
 ) *TradingGridStateHandler {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &TradingGridStateHandler{
 		logger:          logger.With(zap.String("state_handler", "TRADING_GRID")),
 		scoreEngine:     scoreEngine,
@@ -68,19 +71,19 @@ func (h *TradingGridStateHandler) HandleState(
 		zap.Float64("price", currentPrice),
 		zap.Float64("position_size", positionSize),
 	)
-	
+
 	// Initialize tracking if new
 	if _, ok := h.entryTime[symbol]; !ok {
 		h.entryTime[symbol] = time.Now()
 	}
-	
+
 	// 1. Calculate grid status
 	status := h.calculateGridStatus(symbol, currentPrice, blendedSignal)
-	
+
 	// 2. Continuous signal blending - adjust intensity
 	if blendedSignal != nil {
 		entropy := h.calculateSignalEntropy(blendedSignal)
-		
+
 		if entropy < 0.3 {
 			// Strong agreement - increase intensity
 			h.adjustGridIntensity(symbol, 1.2)
@@ -97,32 +100,55 @@ func (h *TradingGridStateHandler) HandleState(
 			)
 		}
 	}
-	
+
 	// 3. Check for rebalancing (50% levels filled)
 	if h.shouldRebalance(symbol, status) {
 		h.rebalanceGrid(symbol, status)
 	}
-	
+
 	// 4. Check for trend emergence (switch to TRENDING)
+	trendSignal := regimeSnapshot.Confidence
+	if regimeSnapshot.ADX >= 35 {
+		trendSignal += 0.1
+	}
+	if regimeSnapshot.BBWidth >= 0.07 {
+		trendSignal += 0.05
+	}
+	trendSignal = math.Min(1, trendSignal)
+
+	volumeConfirm := 0.6
+	if regimeSnapshot.Volume24h >= 2_000_000 {
+		volumeConfirm = 0.9
+	} else if regimeSnapshot.Volume24h >= 1_000_000 {
+		volumeConfirm = 0.75
+	} else if regimeSnapshot.Regime == RegimeTrending {
+		volumeConfirm = 0.75
+	}
+
 	trendScore := h.scoreEngine.CalculateTrendScore(&ScoreInputs{
 		Symbol:         symbol,
 		RegimeSnapshot: regimeSnapshot,
-		BreakoutSignal: 0.5,
-		MomentumSignal: 0.5,
+		BreakoutSignal: trendSignal,
+		MomentumSignal: math.Max(0.5, trendSignal*0.95),
+		VolumeConfirm:  volumeConfirm,
 	})
-	
+
 	gridScore := h.scoreEngine.CalculateGridScore(&ScoreInputs{
-		Symbol:         symbol,
-		RegimeSnapshot: regimeSnapshot,
+		Symbol:               symbol,
+		RegimeSnapshot:       regimeSnapshot,
+		MeanReversionSignals: math.Max(0.1, 1-trendSignal),
+		FVGSignal:            math.Max(0.1, 0.9-trendSignal),
+		LiquiditySignal:      math.Max(0.1, 0.85-trendSignal),
+		Volatility:           regimeSnapshot.ATR14,
 	})
-	
+
 	if trendScore.Score > 0.8 && trendScore.Score > gridScore.Score*1.2 {
 		h.logger.Info("Strong trend emerging, initiating graceful exit to TRENDING",
 			zap.String("symbol", symbol),
 			zap.Float64("trend_score", trendScore.Score),
 			zap.Float64("grid_score", gridScore.Score),
 		)
-		
+
 		// Initiate graceful exit
 		return &StateTransition{
 			FromState:         TradingModeGrid,
@@ -133,34 +159,16 @@ func (h *TradingGridStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// 5. Risk checks
-	
-	// Check max loss (-3%)
-	unrealizedPnL := h.getUnrealizedPnL(symbol)
-	if unrealizedPnL < h.maxGridLoss {
-		h.logger.Warn("Max grid loss reached, exiting to EXIT_HALF",
-			zap.String("symbol", symbol),
-			zap.Float64("pnl", unrealizedPnL),
-		)
-		
-		return &StateTransition{
-			FromState:         TradingModeGrid,
-			ToState:           TradingModeDefensive, // EXIT_HALF mapped to DEFENSIVE
-			Trigger:           "max_loss_reached",
-			Score:             0.9,
-			SmoothingDuration: 3 * time.Second,
-			Timestamp:         time.Now(),
-		}, nil
-	}
-	
+
 	// Check position size (5%)
 	if positionSize > h.maxPositionSize {
 		h.logger.Warn("Position size limit reached, going to OVER_SIZE",
 			zap.String("symbol", symbol),
 			zap.Float64("size", positionSize),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeGrid,
 			ToState:           TradingModeDefensive, // OVER_SIZE mapped to DEFENSIVE
@@ -170,14 +178,32 @@ func (h *TradingGridStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
+	// Check max loss (-3%)
+	unrealizedPnL := h.getUnrealizedPnL(symbol)
+	if unrealizedPnL < h.maxGridLoss {
+		h.logger.Warn("Max grid loss reached, exiting to EXIT_HALF",
+			zap.String("symbol", symbol),
+			zap.Float64("pnl", unrealizedPnL),
+		)
+
+		return &StateTransition{
+			FromState:         TradingModeGrid,
+			ToState:           TradingModeDefensive, // EXIT_HALF mapped to DEFENSIVE
+			Trigger:           "max_loss_reached",
+			Score:             0.9,
+			SmoothingDuration: 3 * time.Second,
+			Timestamp:         time.Now(),
+		}, nil
+	}
+
 	// Check extreme volatility
 	if regimeSnapshot.ATR14 > 0.01 || regimeSnapshot.Regime == RegimeVolatile {
 		h.logger.Warn("Extreme volatility detected, going DEFENSIVE",
 			zap.String("symbol", symbol),
 			zap.Float64("atr", regimeSnapshot.ATR14),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeGrid,
 			ToState:           TradingModeDefensive,
@@ -187,14 +213,14 @@ func (h *TradingGridStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// 6. Check range broken
 	if h.isRangeBroken(symbol, currentPrice) {
 		h.logger.Info("Range broken, exiting grid",
 			zap.String("symbol", symbol),
 			zap.Float64("price", currentPrice),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeGrid,
 			ToState:           TradingModeDefensive, // EXIT_ALL mapped to DEFENSIVE
@@ -204,7 +230,7 @@ func (h *TradingGridStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// Default: stay in TRADING_GRID
 	return nil, nil
 }
@@ -220,15 +246,15 @@ func (h *TradingGridStateHandler) calculateGridStatus(
 		FilledLevels:  h.gridFillLevels[symbol],
 		UnrealizedPnL: h.positionPnL[symbol],
 	}
-	
+
 	if entryTime, ok := h.entryTime[symbol]; ok {
 		status.RunningTime = time.Since(entryTime)
 	}
-	
+
 	if signals != nil {
 		status.SignalBlend = signals.OverallStrength
 	}
-	
+
 	return status
 }
 
@@ -237,7 +263,7 @@ func (h *TradingGridStateHandler) calculateSignalEntropy(signals *SignalBundle) 
 	if signals == nil {
 		return 0.5
 	}
-	
+
 	// Collect all signals
 	signalValues := []float64{
 		signals.FVGSignal,
@@ -245,20 +271,20 @@ func (h *TradingGridStateHandler) calculateSignalEntropy(signals *SignalBundle) 
 		signals.MeanReversion,
 		signals.BreakoutSignal,
 	}
-	
+
 	// Calculate variance
 	mean := 0.0
 	for _, v := range signalValues {
 		mean += v
 	}
 	mean /= float64(len(signalValues))
-	
+
 	variance := 0.0
 	for _, v := range signalValues {
 		variance += math.Pow(v-mean, 2)
 	}
 	variance /= float64(len(signalValues))
-	
+
 	// Normalize to 0-1
 	entropy := math.Sqrt(variance) * 2 // Scale up
 	return math.Max(0, math.Min(1, entropy))
@@ -278,7 +304,7 @@ func (h *TradingGridStateHandler) shouldRebalance(symbol string, status *GridSta
 	if status.TotalLevels == 0 {
 		return false
 	}
-	
+
 	// Rebalance when 50% levels filled
 	fillRatio := float64(status.FilledLevels) / float64(status.TotalLevels)
 	return fillRatio >= 0.5
@@ -290,7 +316,7 @@ func (h *TradingGridStateHandler) rebalanceGrid(symbol string, status *GridStatu
 		zap.String("symbol", symbol),
 		zap.Int("filled_levels", status.FilledLevels),
 	)
-	
+
 	// Update last rebalance time
 	status.LastRebalance = time.Now()
 }

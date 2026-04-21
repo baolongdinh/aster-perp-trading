@@ -41,6 +41,29 @@ type WebSocketClient struct {
 	lastOrderUpdate time.Time
 	lastPosUpdate   time.Time
 	lastBalUpdate   time.Time
+
+	// Runtime data hub additions
+	lastMarketUpdate time.Time
+	klineBuffer      map[string][]KlineMessage // symbol:interval -> klines (ring buffer)
+	tickerCache      map[string]tickerData     // symbol -> ticker data
+}
+
+type tickerData struct {
+	BestBid    float64
+	BestAsk    float64
+	Volume24h  float64
+	LastPrice  float64
+	UpdateTime time.Time
+}
+
+// TickerSnapshot is an exported helper type for tests and runtime bootstrap.
+type TickerSnapshot struct {
+	Symbol    string
+	LastPrice float64
+	BidPrice  float64
+	AskPrice  float64
+	Volume24h float64
+	EventTime int64
 }
 
 // KlineMessage represents a kline/candlestick message from WebSocket
@@ -68,6 +91,8 @@ func NewWebSocketClient(baseURL string, logger *zap.Logger) *WebSocketClient {
 		subscribedSymbols: make(map[string]bool),
 		orderCache:        make(map[string]map[int64]Order),
 		positionCache:     make(map[string]Position),
+		klineBuffer:       make(map[string][]KlineMessage),
+		tickerCache:       make(map[string]tickerData),
 	}
 }
 
@@ -358,6 +383,9 @@ func (ws *WebSocketClient) processKlineMessage(msg map[string]interface{}) bool 
 		EndTime:   endTime,
 	}
 
+	// Store in kline buffer for runtime hub access
+	ws.storeKlineInBuffer(klineMsg)
+
 	// Circular buffer: when full, drop oldest and insert new
 	// For trading, we want the MOST RECENT data, not stale old data
 	select {
@@ -458,6 +486,8 @@ func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 	if stream, ok := msg["stream"].(string); ok {
 		// Look for @ticker streams
 		if len(stream) > 7 && stream[len(stream)-7:] == "@ticker" {
+			// Update ticker cache
+			ws.updateTickerCacheFromStream(msg)
 			// Circular buffer: when full, drop oldest and insert new
 			select {
 			case ws.tickerCh <- msg:
@@ -704,9 +734,25 @@ func (ws *WebSocketClient) IsRunning() bool {
 }
 
 // GetCachedOrders returns cached orders for a symbol
+// If symbol is empty, returns all cached orders across all symbols
 func (ws *WebSocketClient) GetCachedOrders(symbol string) []Order {
 	ws.mu.RLock()
 	defer ws.mu.RUnlock()
+
+	// If no symbol specified, aggregate all orders
+	if symbol == "" {
+		totalOrders := 0
+		for _, symbolOrders := range ws.orderCache {
+			totalOrders += len(symbolOrders)
+		}
+		orders := make([]Order, 0, totalOrders)
+		for _, symbolOrders := range ws.orderCache {
+			for _, order := range symbolOrders {
+				orders = append(orders, order)
+			}
+		}
+		return orders
+	}
 
 	symbolOrders, exists := ws.orderCache[symbol]
 	if !exists {
@@ -781,6 +827,7 @@ func (ws *WebSocketClient) UpdateBalanceCache(balance Balance) {
 }
 
 // IsCacheStale checks if cache data is stale (> 5 seconds old)
+// Supports both singular and plural aliases: order/orders, position/positions, balance/balances
 func (ws *WebSocketClient) IsCacheStale(cacheType string) bool {
 	ws.mu.RLock()
 	defer ws.mu.RUnlock()
@@ -789,13 +836,162 @@ func (ws *WebSocketClient) IsCacheStale(cacheType string) bool {
 	now := time.Now()
 
 	switch cacheType {
-	case "orders":
+	case "orders", "order":
 		return now.Sub(ws.lastOrderUpdate) > threshold
-	case "positions":
+	case "positions", "position":
 		return now.Sub(ws.lastPosUpdate) > threshold
-	case "balance":
+	case "balance", "balances":
 		return now.Sub(ws.lastBalUpdate) > threshold
+	case "ticker", "market":
+		return now.Sub(ws.lastMarketUpdate) > threshold
 	default:
 		return true
 	}
+}
+
+// GetLastEventTimes returns the last update times for market, account, and order events
+func (ws *WebSocketClient) GetLastEventTimes() (market, account, order time.Time) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	accountUpdate := ws.lastBalUpdate
+	if ws.lastPosUpdate.After(accountUpdate) {
+		accountUpdate = ws.lastPosUpdate
+	}
+	return ws.lastMarketUpdate, accountUpdate, ws.lastOrderUpdate
+}
+
+// updateTickerCacheFromStream updates the ticker cache from a WebSocket stream message
+func (ws *WebSocketClient) updateTickerCacheFromStream(msg map[string]interface{}) {
+	data, ok := msg["data"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	symbol := strings.ToUpper(getString(data, "s"))
+	if symbol == "" {
+		return
+	}
+
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	ws.tickerCache[symbol] = tickerData{
+		BestBid:    getFloat64(data, "b"),
+		BestAsk:    getFloat64(data, "a"),
+		Volume24h:  getFloat64(data, "v"),
+		LastPrice:  getFloat64(data, "c"),
+		UpdateTime: time.Now(),
+	}
+	ws.lastMarketUpdate = time.Now()
+}
+
+// GetTickerData returns best bid, best ask, and 24h volume for a symbol
+func (ws *WebSocketClient) GetTickerData(symbol string) (bestBid, bestAsk, volume24h float64, err error) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	ticker, exists := ws.tickerCache[strings.ToUpper(symbol)]
+	if !exists {
+		return 0, 0, 0, fmt.Errorf("no ticker data for symbol %s", symbol)
+	}
+	return ticker.BestBid, ticker.BestAsk, ticker.Volume24h, nil
+}
+
+// GetLastPrice returns the last known price for a symbol
+func (ws *WebSocketClient) GetLastPrice(symbol string) (float64, bool) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	ticker, exists := ws.tickerCache[strings.ToUpper(symbol)]
+	if !exists {
+		return 0, false
+	}
+	return ticker.LastPrice, true
+}
+
+// UpsertTickerSnapshot injects or updates ticker cache state.
+func (ws *WebSocketClient) UpsertTickerSnapshot(snapshot TickerSnapshot) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	updateTime := time.Now()
+	if snapshot.EventTime > 0 {
+		updateTime = time.UnixMilli(snapshot.EventTime)
+	}
+
+	ws.tickerCache[strings.ToUpper(snapshot.Symbol)] = tickerData{
+		BestBid:    snapshot.BidPrice,
+		BestAsk:    snapshot.AskPrice,
+		Volume24h:  snapshot.Volume24h,
+		LastPrice:  snapshot.LastPrice,
+		UpdateTime: updateTime,
+	}
+	ws.lastMarketUpdate = updateTime
+}
+
+// BootstrapKlines seeds the kline buffer with historical data from REST API
+func (ws *WebSocketClient) BootstrapKlines(symbol, interval string, klines []KlineMessage) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	key := strings.ToUpper(symbol) + ":" + interval
+	ws.klineBuffer[key] = klines
+	ws.logger.Info("Bootstrapped kline buffer",
+		zap.String("symbol", symbol),
+		zap.String("interval", interval),
+		zap.Int("count", len(klines)))
+}
+
+// GetRecentKlines returns the most recent klines from the buffer for a symbol
+func (ws *WebSocketClient) GetRecentKlines(symbol, interval string, limit int) []KlineMessage {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+
+	key := strings.ToUpper(symbol) + ":" + interval
+	history, exists := ws.klineBuffer[key]
+	if !exists {
+		return nil
+	}
+
+	if len(history) <= limit {
+		result := make([]KlineMessage, len(history))
+		copy(result, history)
+		return result
+	}
+
+	// Return the most recent 'limit' klines
+	start := len(history) - limit
+	result := make([]KlineMessage, limit)
+	copy(result, history[start:])
+	return result
+}
+
+// storeKlineInBuffer stores a kline in the internal ring buffer
+func (ws *WebSocketClient) storeKlineInBuffer(kline KlineMessage) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	key := strings.ToUpper(kline.Symbol) + ":" + kline.Interval
+	history := ws.klineBuffer[key]
+
+	// Check if we already have this kline (by start time)
+	for i, existing := range history {
+		if existing.StartTime == kline.StartTime {
+			// Update existing kline with new data
+			history[i] = kline
+			ws.klineBuffer[key] = history
+			return
+		}
+	}
+
+	// Add new kline
+	history = append(history, kline)
+
+	// Keep only the most recent 500 klines (ring buffer)
+	maxKlines := 500
+	if len(history) > maxKlines {
+		history = history[len(history)-maxKlines:]
+	}
+
+	ws.klineBuffer[key] = history
 }

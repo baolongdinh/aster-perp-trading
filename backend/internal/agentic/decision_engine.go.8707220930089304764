@@ -137,14 +137,10 @@ func (de *DecisionEngine) determineBestMode(
 	currentMode TradingMode,
 	scores map[TradingMode]*TradingModeScore,
 ) (TradingMode, float64, bool) {
-	bestMode := TradingModeIdle
+	var bestMode TradingMode
 	var bestScore float64
 
 	for mode, score := range scores {
-		if mode == currentMode {
-			continue
-		}
-
 		// Skip if below threshold
 		if score.Score < score.Threshold {
 			continue
@@ -294,7 +290,7 @@ func (de *DecisionEngine) isFlipFlop(symbol string, currentMode, proposedMode Tr
 	defer de.stateMu.RUnlock()
 
 	state, ok := de.symbolStates[symbol]
-	if !ok || len(state.TransitionHistory) < 1 {
+	if !ok || len(state.TransitionHistory) < 2 {
 		return false
 	}
 

@@ -12,16 +12,16 @@ import (
 type AccumulationStateHandler struct {
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
-
+	
 	// Position tracking
 	positionSize     map[string]float64
 	accumulationTime map[string]time.Time
 	entryPrice       map[string]float64
-
+	
 	// Wyckoff pattern tracking
-	wyckoffPhase  map[string]WyckoffPhase
-	volumeProfile map[string]*VolumeProfile
-
+	wyckoffPhase     map[string]WyckoffPhase
+	volumeProfile    map[string]*VolumeProfile
+	
 	// Parameters
 	maxAccumulationTime time.Duration
 	maxPositionSize     float64
@@ -54,20 +54,17 @@ func NewAccumulationStateHandler(
 	scoreEngine *ScoreCalculationEngine,
 	logger *zap.Logger,
 ) *AccumulationStateHandler {
-	if logger == nil {
-		logger = zap.NewNop()
-	}
 	return &AccumulationStateHandler{
-		logger:              logger.With(zap.String("state_handler", "ACCUMULATION")),
-		scoreEngine:         scoreEngine,
-		positionSize:        make(map[string]float64),
-		accumulationTime:    make(map[string]time.Time),
-		entryPrice:          make(map[string]float64),
-		wyckoffPhase:        make(map[string]WyckoffPhase),
-		volumeProfile:       make(map[string]*VolumeProfile),
+		logger:            logger.With(zap.String("state_handler", "ACCUMULATION")),
+		scoreEngine:       scoreEngine,
+		positionSize:      make(map[string]float64),
+		accumulationTime:  make(map[string]time.Time),
+		entryPrice:        make(map[string]float64),
+		wyckoffPhase:      make(map[string]WyckoffPhase),
+		volumeProfile:     make(map[string]*VolumeProfile),
 		maxAccumulationTime: 8 * time.Hour,
-		maxPositionSize:     0.03, // 3% max position
-		breakoutThreshold:   0.02, // 2% breakout
+		maxPositionSize:      0.03, // 3% max position
+		breakoutThreshold:    0.02, // 2% breakout
 	}
 }
 
@@ -83,7 +80,7 @@ func (h *AccumulationStateHandler) HandleState(
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
 	)
-
+	
 	// Initialize if new
 	if _, ok := h.accumulationTime[symbol]; !ok {
 		h.accumulationTime[symbol] = time.Now()
@@ -91,20 +88,20 @@ func (h *AccumulationStateHandler) HandleState(
 		h.wyckoffPhase[symbol] = PhasePreliminarySupport
 		h.volumeProfile[symbol] = &VolumeProfile{}
 	}
-
+	
 	// 1. Detect Wyckoff phase
 	h.detectWyckoffPhase(symbol, regimeSnapshot, currentPrice)
-
+	
 	// 2. Build position gradually based on phase
 	h.buildPosition(symbol, currentPrice, regimeSnapshot)
-
+	
 	// 3. Check for breakout
 	if h.isBreakoutDetected(symbol, currentPrice, regimeSnapshot) {
 		h.logger.Info("Breakout detected from accumulation",
 			zap.String("symbol", symbol),
 			zap.String("phase", h.getPhaseName(h.wyckoffPhase[symbol])),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeAccumulation,
 			ToState:           TradingModeTrending,
@@ -114,13 +111,13 @@ func (h *AccumulationStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// 4. Check for Sign of Strength
 	if h.isSignOfStrength(symbol, regimeSnapshot) {
 		h.logger.Info("Sign of Strength detected",
 			zap.String("symbol", symbol),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeAccumulation,
 			ToState:           TradingModeTrending,
@@ -130,15 +127,15 @@ func (h *AccumulationStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// 5. Risk checks
-
+	
 	// Time limit
 	if time.Since(h.accumulationTime[symbol]) > h.maxAccumulationTime {
 		h.logger.Warn("Max accumulation time reached, exiting",
 			zap.String("symbol", symbol),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeAccumulation,
 			ToState:           TradingModeDefensive,
@@ -148,14 +145,14 @@ func (h *AccumulationStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// Position size limit
 	if h.positionSize[symbol] > h.maxPositionSize {
 		h.logger.Warn("Max position size reached in accumulation",
 			zap.String("symbol", symbol),
 			zap.Float64("size", h.positionSize[symbol]),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeAccumulation,
 			ToState:           TradingModeDefensive,
@@ -165,14 +162,14 @@ func (h *AccumulationStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// Volatility spike - abort accumulation
 	if regimeSnapshot.ATR14 > 0.01 || regimeSnapshot.Regime == RegimeVolatile {
 		h.logger.Warn("Volatility spike during accumulation, exiting",
 			zap.String("symbol", symbol),
 			zap.Float64("atr", regimeSnapshot.ATR14),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeAccumulation,
 			ToState:           TradingModeDefensive,
@@ -182,13 +179,13 @@ func (h *AccumulationStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// 6. Check for failed accumulation (range broken without volume)
 	if h.isFailedAccumulation(symbol, currentPrice, regimeSnapshot) {
 		h.logger.Warn("Accumulation failed, exiting",
 			zap.String("symbol", symbol),
 		)
-
+		
 		return &StateTransition{
 			FromState:         TradingModeAccumulation,
 			ToState:           TradingModeDefensive,
@@ -198,7 +195,7 @@ func (h *AccumulationStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-
+	
 	// Default: stay in ACCUMULATION
 	return nil, nil
 }
@@ -217,43 +214,43 @@ func (h *AccumulationStateHandler) detectWyckoffPhase(
 	if entryPrice > 0 {
 		priceChangePct = (currentPrice - entryPrice) / entryPrice
 	}
-
+	
 	// Simple phase detection based on indicators
 	currentPhase := h.wyckoffPhase[symbol]
-
+	
 	switch currentPhase {
 	case PhasePreliminarySupport:
 		// Stay in preliminary support until enough time has passed and price compresses lower.
 		if elapsed > 20*time.Minute && bbWidth < 0.018 && adx < 18 && priceChangePct <= -0.01 {
 			h.wyckoffPhase[symbol] = PhaseSellingClimax
 		}
-
+		
 	case PhaseSellingClimax:
 		if elapsed > 45*time.Minute && priceChangePct > -0.015 {
 			h.wyckoffPhase[symbol] = PhaseAutomaticRally
 		}
-
+		
 	case PhaseAutomaticRally:
 		if currentPrice >= entryPrice*0.99 {
 			h.wyckoffPhase[symbol] = PhaseSecondaryTest
 		}
-
+		
 	case PhaseSecondaryTest:
 		if currentPrice < entryPrice*0.98 && bbWidth < 0.025 {
 			h.wyckoffPhase[symbol] = PhaseSpring
 		}
-
+		
 	case PhaseSpring:
 		if bbWidth < 0.015 && adx > 18 {
 			h.wyckoffPhase[symbol] = PhaseBreakout
 		}
-
+		
 	case PhaseBreakout:
-		if currentPrice > entryPrice*(1+h.breakoutThreshold) && adx > 30 {
+		if currentPrice > entryPrice*(1+h.breakoutThreshold*0.75) && adx > 30 {
 			h.wyckoffPhase[symbol] = PhaseSignOfStrength
 		}
 	}
-
+	
 	h.logger.Debug("Wyckoff phase",
 		zap.String("symbol", symbol),
 		zap.String("phase", h.getPhaseName(h.wyckoffPhase[symbol])),
@@ -267,7 +264,7 @@ func (h *AccumulationStateHandler) buildPosition(
 	regimeSnapshot RegimeSnapshot,
 ) {
 	phase := h.wyckoffPhase[symbol]
-
+	
 	// Position sizing based on phase
 	var buildRate float64
 	switch phase {
@@ -284,10 +281,10 @@ func (h *AccumulationStateHandler) buildPosition(
 	default:
 		buildRate = 0
 	}
-
+	
 	// Increment position
 	h.positionSize[symbol] += buildRate * 0.01 // Base unit
-
+	
 	h.logger.Debug("Building position in accumulation",
 		zap.String("symbol", symbol),
 		zap.String("phase", h.getPhaseName(phase)),
@@ -303,12 +300,20 @@ func (h *AccumulationStateHandler) isBreakoutDetected(
 	regimeSnapshot RegimeSnapshot,
 ) bool {
 	entryPrice := h.entryPrice[symbol]
-
+	
 	// Breakout: price > entry + threshold
-	if currentPrice >= entryPrice*(1+h.breakoutThreshold) {
+	if currentPrice > entryPrice*(1+h.breakoutThreshold) {
 		return true
 	}
-
+	
+	// Secondary breakout confirmation requires both price expansion and strong trend confirmation.
+	if currentPrice > entryPrice*(1+h.breakoutThreshold*0.75) &&
+		regimeSnapshot.ADX > 38 &&
+		regimeSnapshot.BBWidth > 0.055 &&
+		regimeSnapshot.Regime == RegimeTrending {
+		return true
+	}
+	
 	return false
 }
 
@@ -322,7 +327,7 @@ func (h *AccumulationStateHandler) isSignOfStrength(
 	if regimeSnapshot.ADX >= 40 && regimeSnapshot.BBWidth >= 0.06 && regimeSnapshot.Confidence >= 0.75 {
 		return true
 	}
-
+	
 	return false
 }
 
@@ -333,12 +338,12 @@ func (h *AccumulationStateHandler) isFailedAccumulation(
 	regimeSnapshot RegimeSnapshot,
 ) bool {
 	entryPrice := h.entryPrice[symbol]
-
+	
 	// Failed: price drops significantly below entry without volume confirmation
 	if currentPrice < entryPrice*0.95 && regimeSnapshot.ADX < 15 {
 		return true
 	}
-
+	
 	return false
 }
 

@@ -2121,14 +2121,8 @@ func (g *GridManager) executeExitAll(symbol, reason string) {
 
 // cancelOppositeSideGridOrders cancels grid orders on the opposite side, keeps TP/SL and reduce-only
 func (g *GridManager) cancelOppositeSideGridOrders(ctx context.Context, symbol, positionSide string) {
-	orders, err := g.futuresClient.GetOpenOrders(ctx, symbol)
-	if err != nil {
-		g.logger.WithFields(logrus.Fields{
-			"symbol": symbol,
-			"error":  err,
-		}).Error("Failed to get open orders for opposite side cancellation")
-		return
-	}
+	_ = ctx
+	orders := g.wsClient.GetCachedOrders(symbol)
 
 	cancelledCount := 0
 	for _, order := range orders {
@@ -4057,12 +4051,8 @@ func (g *GridManager) exchangeDataReporter(ctx context.Context) {
 
 // logExchangeData queries exchange for real open orders and positions
 func (g *GridManager) logExchangeData(ctx context.Context) {
-	// Get real open orders from exchange
-	openOrders, err := g.futuresClient.GetOpenOrders(ctx, "")
-	if err != nil {
-		g.logger.WithError(err).Debug("Failed to get open orders for dashboard")
-		return
-	}
+	_ = ctx
+	openOrders := g.wsClient.GetCachedOrders("")
 
 	// Count orders per symbol
 	orderCountBySymbol := make(map[string]int)
@@ -4261,25 +4251,16 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 	g.logger.WithField("symbol", symbol).Info("Starting placement process for symbol")
 	placementStart := time.Now()
 
-	// Use wsClient.GetCachedOrders (single source of truth)
-	// Fallback to API if cache stale (> 5s)
+	// Use wsClient.GetCachedOrders as the single source of truth in steady-state.
+	// Do not fall back to signed REST here, otherwise stale cache causes signature/time failures
+	// and defeats the websocket-first runtime path.
 	exchangeOrders := g.wsClient.GetCachedOrders(symbol)
-	if g.wsClient.IsCacheStale("order") || len(exchangeOrders) == 0 {
-		// Cache stale or empty - fetch with timeout
-		fetchCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		defer cancel()
-
-		orders, err := g.fetchExchangeDataAsync(fetchCtx, symbol)
-		if err != nil {
-			// Fallback - skip exchange check on timeout/error, proceed with placement
-			g.logger.WithError(err).WithFields(logrus.Fields{
-				"symbol":   symbol,
-				"duration": time.Since(placementStart).Milliseconds(),
-			}).Warn("[PLACEMENT] Exchange fetch failed/timeout, proceeding without exchange check")
-			exchangeOrders = []client.Order{} // Use empty slice
-		} else {
-			exchangeOrders = orders
-		}
+	if g.wsClient.IsCacheStale("orders") {
+		g.logger.WithFields(logrus.Fields{
+			"symbol":   symbol,
+			"duration": time.Since(placementStart).Milliseconds(),
+			"cached":   len(exchangeOrders),
+		}).Warn("[PLACEMENT] Order cache is stale, using last known WebSocket snapshot without REST fallback")
 	} else {
 		g.logger.WithField("symbol", symbol).Debug("[PLACEMENT] Using wsClient cached orders")
 	}
@@ -4417,7 +4398,8 @@ func (g *GridManager) processPlacement(ctx context.Context, symbol string) {
 
 // T015: fetchExchangeDataAsync fetches exchange orders with context timeout support
 func (g *GridManager) fetchExchangeDataAsync(ctx context.Context, symbol string) ([]client.Order, error) {
-	return g.futuresClient.GetOpenOrders(ctx, symbol)
+	_ = ctx
+	return g.wsClient.GetCachedOrders(symbol), nil
 }
 
 // NOTE: getCachedExchangeOrders and cacheExchangeOrders removed - using wsClient.GetCachedOrders() as single source of truth
@@ -4717,12 +4699,7 @@ func (g *GridManager) checkForFilledOrders(ctx context.Context) {
 		return // No active orders to check
 	}
 
-	// Get all open orders from exchange
-	openOrders, err := g.futuresClient.GetOpenOrders(ctx, "")
-	if err != nil {
-		g.logger.WithError(err).Warn("Failed to get open orders for fill detection")
-		return
-	}
+	openOrders := g.wsClient.GetCachedOrders("")
 
 	// Build map of open order IDs from exchange
 	openOrderIDs := make(map[string]bool)
@@ -5109,19 +5086,13 @@ func (g *GridManager) OnAccountUpdate(accountUpdate stream.WsAccountUpdate) {
 	g.logger.Info("AdaptiveGridManager position tracking updated from WebSocket")
 }
 
-// GetCachedPositions returns positions from wsClient cache (single source of truth)
-// WebSocket updates wsClient cache directly. Fallback to API if cache stale.
+// GetCachedPositions returns positions from wsClient cache (single source of truth).
+// No steady-state REST fallback is allowed here.
 func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position, error) {
+	_ = ctx
+
 	// Read from wsClient cache (single source of truth)
 	positions := g.wsClient.GetCachedPositions()
-
-	// Fallback to API if wsClient cache stale (> 5s)
-	if g.wsClient.IsCacheStale("position") {
-		g.logger.WithFields(logrus.Fields{
-			"stale": true,
-		}).Warn("wsClient position cache stale, falling back to API call")
-		return g.futuresClient.GetPositions(ctx)
-	}
 
 	// Convert map to slice
 	result := make([]client.Position, 0, len(positions))
@@ -5133,6 +5104,13 @@ func (g *GridManager) GetCachedPositions(ctx context.Context) ([]client.Position
 		"count":  len(result),
 		"source": "wsClient",
 	}).Debug("Positions retrieved from wsClient cache")
+
+	if g.wsClient.IsCacheStale("positions") {
+		g.logger.WithFields(logrus.Fields{
+			"stale": true,
+			"count": len(result),
+		}).Warn("wsClient position cache stale, returning last known WebSocket snapshot")
+	}
 
 	return result, nil
 }

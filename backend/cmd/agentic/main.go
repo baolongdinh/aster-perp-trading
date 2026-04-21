@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"aster-bot/internal/agentic"
-	"aster-bot/internal/auth"
-	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/farming"
 
@@ -67,11 +65,11 @@ func main() {
 		mergeRiskConfig(cfg, volumeCfg)
 	}
 
-	// Override dry-run if flag is set
-	if *dryRun {
-		cfg.Bot.DryRun = true
-		logger.Info("🧪 Running in DRY-RUN mode")
-	}
+	// // Override dry-run if flag is set
+	// if *dryRun {
+	// 	cfg.Bot.DryRun = true
+	// 	logger.Info("🧪 Running in DRY-RUN mode")
+	// }
 
 	// Override API port
 	cfg.API.Port = *port
@@ -84,9 +82,6 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Create HTTP client for authentication
-	httpClient := createHTTPClient(cfg, logger)
-
 	// Initialize Volume Farm Engine (Execution Layer)
 	logger.Info("🔧 Initializing Volume Farm Engine...")
 	vfEngine, err := farming.NewVolumeFarmEngine(cfg, logger)
@@ -94,18 +89,15 @@ func main() {
 		logger.Fatal("Failed to initialize Volume Farm Engine", zap.Error(err))
 	}
 
-	// Start Volume Farm Engine with delay to prevent API rate limiting
+	// Start Volume Farm Engine
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Error("Volume Farm Engine (delayed) goroutine panic recovered",
+				logger.Error("Volume Farm Engine goroutine panic recovered",
 					zap.Any("panic", r),
 					zap.String("stack", string(debug.Stack())))
 			}
 		}()
-		logger.Info("⏳ Waiting 3s before starting Volume Farm Engine to avoid API burst...")
-		time.Sleep(3 * time.Second)
-		logger.Info("🔔 Sleep completed, about to call vfEngine.Start()")
 		logger.Info("▶️ Starting Volume Farm Engine")
 		if err := vfEngine.Start(ctx); err != nil {
 			logger.Error("Volume Farm Engine error", zap.Error(err))
@@ -117,11 +109,15 @@ func main() {
 	// Initialize and start Agentic Engine (Decision Layer) if enabled
 	var agenticEngine *agentic.AgenticEngine
 	if !*vfOnly && cfg.Agentic != nil && cfg.Agentic.Enabled {
+		if err := vfEngine.WaitUntilReady(ctx, 45*time.Second); err != nil {
+			logger.Fatal("Volume Farm runtime was not ready for Agentic startup", zap.Error(err))
+		}
 		logger.Info("🧠 Initializing Agentic Engine...")
 
 		agenticEngine, err = agentic.NewAgenticEngine(
 			cfg.Agentic,
-			httpClient,
+			vfEngine.GetMarketStateProvider(),
+			vfEngine.GetRuntimeSnapshotProvider(),
 			vfEngine,
 			logger,
 		)
@@ -190,35 +186,6 @@ func main() {
 	cancel()
 
 	logger.Info("✅ Bot stopped gracefully")
-}
-
-// createHTTPClient creates an HTTP client based on configuration
-func createHTTPClient(cfg *config.Config, logger *zap.Logger) *client.HTTPClient {
-	// V3 Authentication
-	if cfg.Exchange.UserWallet != "" && cfg.Exchange.APISigner != "" && cfg.Exchange.APISignerKey != "" {
-		v3Signer, err := auth.NewV3Signer(
-			cfg.Exchange.UserWallet,
-			cfg.Exchange.APISigner,
-			cfg.Exchange.APISignerKey,
-			int64(cfg.Exchange.RecvWindow),
-		)
-		if err != nil {
-			logger.Fatal("Failed to create V3 signer", zap.Error(err))
-		}
-		return client.NewHTTPClientV3(cfg.Exchange.FuturesRESTBase, v3Signer, logger, cfg.Exchange.RequestsPerSecond)
-	}
-
-	// V1 Authentication (deprecated)
-	if cfg.Exchange.APIKey != "" {
-		v1Signer, err := auth.NewSigner(cfg.Exchange.APIKey, cfg.Exchange.APISecret, cfg.Exchange.RecvWindow)
-		if err != nil {
-			logger.Fatal("Failed to create V1 signer", zap.Error(err))
-		}
-		return client.NewHTTPClient(cfg.Exchange.FuturesRESTBase, v1Signer, logger, cfg.Exchange.RequestsPerSecond)
-	}
-
-	logger.Fatal("No valid authentication credentials found")
-	return nil
 }
 
 // mergeRiskConfig merges volume farming risk config into main config

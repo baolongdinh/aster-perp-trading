@@ -70,10 +70,9 @@ func (s *V3Signer) SignRequest(params map[string]string) (map[string]string, err
 		signedParams[k] = v
 	}
 
-	// Generate nonce (microseconds)
-	nonce := time.Now().UnixNano() / 1000
-	// Add timestamp milliseconds, adjusted by a small offset
-	timestamp := time.Now().UnixMilli() + s.TimeOffset
+	// Generate nonce (microseconds) and timestamp (milliseconds)
+	nonce := s.GetNonce()
+	timestamp := s.GetTimestamp()
 
 	// Add required authentication parameters
 	signedParams["user"] = s.UserWallet

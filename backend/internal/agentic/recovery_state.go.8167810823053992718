@@ -12,25 +12,25 @@ import (
 type RecoveryStateHandler struct {
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
-
+	
 	// Recovery tracking
-	exitPnL       map[string]float64
-	exitReason    map[string]string
-	recoveryStart map[string]time.Time
-	adjustments   map[string]*ParameterAdjustments
-
+	exitPnL        map[string]float64
+	exitReason     map[string]string
+	recoveryStart  map[string]time.Time
+	adjustments    map[string]*ParameterAdjustments
+	
 	// Parameters
-	maxRecoveryTime      time.Duration
-	minCooldownTime      time.Duration
+	maxRecoveryTime     time.Duration
+	minCooldownTime     time.Duration
 	maxConsecutiveLosses int
 }
 
 // ParameterAdjustments stores adjusted parameters based on loss analysis
 type ParameterAdjustments struct {
-	GridSizeMultiplier float64
-	TrendThresholdAdj  float64
-	PositionSizeAdj    float64
-	StopLossAdj        float64
+	GridSizeMultiplier   float64
+	TrendThresholdAdj    float64
+	PositionSizeAdj      float64
+	StopLossAdj          float64
 }
 
 // NewRecoveryStateHandler creates a new RECOVERY state handler
@@ -68,16 +68,16 @@ func (h *RecoveryStateHandler) HandleState(
 		zap.Float64("exit_pnl", exitPnL),
 		zap.String("reason", exitReason),
 	)
-
+	
 	// Initialize if new
 	if _, ok := h.recoveryStart[symbol]; !ok {
 		h.recoveryStart[symbol] = time.Now()
 		h.exitPnL[symbol] = exitPnL
 		h.exitReason[symbol] = exitReason
-
+		
 		// Calculate parameter adjustments based on loss analysis
 		h.adjustments[symbol] = h.calculateAdjustments(exitPnL, exitReason, consecutiveLosses)
-
+		
 		h.logger.Info("Recovery mode started",
 			zap.String("symbol", symbol),
 			zap.Float64("exit_pnl", exitPnL),
@@ -85,7 +85,7 @@ func (h *RecoveryStateHandler) HandleState(
 			zap.Int("consecutive_losses", consecutiveLosses),
 		)
 	}
-
+	
 	// 1. Check cooldown period
 	if time.Since(h.recoveryStart[symbol]) < h.minCooldownTime {
 		h.logger.Debug("In cooldown period",
@@ -120,7 +120,7 @@ func (h *RecoveryStateHandler) HandleState(
 
 	// 4. Determine severity and next state
 	severity := h.assessLossSeverity(exitPnL, exitReason, consecutiveLosses)
-
+	
 	switch severity {
 	case "minor":
 		// Minor loss - can re-enter with adjusted parameters
@@ -129,9 +129,9 @@ func (h *RecoveryStateHandler) HandleState(
 				zap.String("symbol", symbol),
 				zap.Float64("adjusted_grid_size", h.adjustments[symbol].GridSizeMultiplier),
 			)
-
+			
 			h.clearRecoveryData(symbol)
-
+			
 			return &StateTransition{
 				FromState:         TradingModeDefensive, // RECOVERY mapped
 				ToState:           TradingModeGrid,
@@ -141,16 +141,16 @@ func (h *RecoveryStateHandler) HandleState(
 				Timestamp:         time.Now(),
 			}, nil
 		}
-
+		
 	case "moderate":
 		// Moderate loss - go to IDLE first, wait for better conditions
 		if marketReady && time.Since(h.recoveryStart[symbol]) > h.maxRecoveryTime/2 {
 			h.logger.Info("Moderate loss recovery, going to IDLE",
 				zap.String("symbol", symbol),
 			)
-
+			
 			h.clearRecoveryData(symbol)
-
+			
 			return &StateTransition{
 				FromState:         TradingModeDefensive,
 				ToState:           TradingModeIdle,
@@ -160,16 +160,16 @@ func (h *RecoveryStateHandler) HandleState(
 				Timestamp:         time.Now(),
 			}, nil
 		}
-
+		
 	case "severe":
 		// Severe loss - stay in recovery, maybe skip this symbol
 		if time.Since(h.recoveryStart[symbol]) > h.maxRecoveryTime {
 			h.logger.Warn("Severe loss, max recovery time reached",
 				zap.String("symbol", symbol),
 			)
-
+			
 			h.clearRecoveryData(symbol)
-
+			
 			return &StateTransition{
 				FromState:         TradingModeDefensive,
 				ToState:           TradingModeIdle,
@@ -180,7 +180,7 @@ func (h *RecoveryStateHandler) HandleState(
 			}, nil
 		}
 	}
-
+	
 	// Default: stay in RECOVERY
 	return nil, nil
 }
@@ -197,16 +197,16 @@ func (h *RecoveryStateHandler) calculateAdjustments(
 		PositionSizeAdj:    1.0,
 		StopLossAdj:        1.0,
 	}
-
+	
 	// Reduce position size based on loss magnitude
-	if exitPnL < -0.02 { // > 2% loss
+	if exitPnL <= -0.02 { // 2%+ loss
 		adj.PositionSizeAdj = 0.6 // Reduce to 60%
 		adj.GridSizeMultiplier = 0.8
 	} else if exitPnL < -0.01 { // 1-2% loss
 		adj.PositionSizeAdj = 0.8
 		adj.GridSizeMultiplier = 0.9
 	}
-
+	
 	// Adjust based on exit reason
 	switch exitReason {
 	case "stop_loss":
@@ -216,15 +216,15 @@ func (h *RecoveryStateHandler) calculateAdjustments(
 	case "volatility_spike":
 		adj.TrendThresholdAdj = 1.2 // Require stronger trend signal
 	}
-
+	
 	// Reduce based on consecutive losses
 	if consecutiveLosses >= h.maxConsecutiveLosses {
 		adj.PositionSizeAdj *= 0.5 // Halve position size
 		adj.GridSizeMultiplier *= 0.7
 	} else if consecutiveLosses >= 2 {
-		adj.PositionSizeAdj *= 0.9
+		adj.PositionSizeAdj *= 0.8
 	}
-
+	
 	return adj
 }
 
@@ -237,17 +237,17 @@ func (h *RecoveryStateHandler) isMarketReadyForReentry(
 	if regimeSnapshot.ATR14 > 0.01 {
 		return false
 	}
-
+	
 	// Wait for clear regime (not volatile/uncertain)
 	if regimeSnapshot.Regime == RegimeVolatile || regimeSnapshot.Confidence < 0.5 {
 		return false
 	}
-
+	
 	// Good ADX for trend detection
 	if regimeSnapshot.ADX < 15 {
 		return false
 	}
-
+	
 	return true
 }
 
@@ -261,7 +261,7 @@ func (h *RecoveryStateHandler) assessLossSeverity(
 	if consecutiveLosses >= h.maxConsecutiveLosses {
 		return "severe"
 	}
-
+	
 	// Check PnL
 	if exitPnL < -0.03 { // > 3% loss
 		return "severe"
@@ -269,12 +269,12 @@ func (h *RecoveryStateHandler) assessLossSeverity(
 	if exitPnL < -0.02 { // 2-3% loss
 		return "moderate"
 	}
-
+	
 	// Check exit reason
 	if exitReason == "emergency_exit" || exitReason == "flash_crash" {
 		return "severe"
 	}
-
+	
 	return "minor"
 }
 

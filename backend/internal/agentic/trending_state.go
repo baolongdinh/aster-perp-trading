@@ -13,15 +13,15 @@ import (
 type TrendingStateHandler struct {
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
-	
+
 	// Trade tracking
-	entryPrice      map[string]float64
-	positionSize    map[string]float64
-	stopLoss        map[string]float64
-	trailingStop    map[string]float64
-	direction       map[string]TrendDirection
-	entryTime       map[string]time.Time
-	
+	entryPrice   map[string]float64
+	positionSize map[string]float64
+	stopLoss     map[string]float64
+	trailingStop map[string]float64
+	direction    map[string]TrendDirection
+	entryTime    map[string]time.Time
+
 	// Parameters
 	maxTrendLoss    float64 // -3%
 	maxTimeInTrend  time.Duration
@@ -38,15 +38,15 @@ const (
 
 // TrendStatus tracks current trend trade status
 type TrendStatus struct {
-	Symbol           string
-	Direction        TrendDirection
-	EntryPrice       float64
-	CurrentPrice     float64
-	UnrealizedPnL    float64
-	StopLoss         float64
-	TrailingStop     float64
-	RunningTime      time.Duration
-	BreakoutLevel    float64
+	Symbol        string
+	Direction     TrendDirection
+	EntryPrice    float64
+	CurrentPrice  float64
+	UnrealizedPnL float64
+	StopLoss      float64
+	TrailingStop  float64
+	RunningTime   time.Duration
+	BreakoutLevel float64
 }
 
 // NewTrendingStateHandler creates a new TRENDING state handler
@@ -54,6 +54,9 @@ func NewTrendingStateHandler(
 	scoreEngine *ScoreCalculationEngine,
 	logger *zap.Logger,
 ) *TrendingStateHandler {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &TrendingStateHandler{
 		logger:          logger.With(zap.String("state_handler", "TRENDING")),
 		scoreEngine:     scoreEngine,
@@ -63,9 +66,9 @@ func NewTrendingStateHandler(
 		trailingStop:    make(map[string]float64),
 		direction:       make(map[string]TrendDirection),
 		entryTime:       make(map[string]time.Time),
-		maxTrendLoss:    -0.03,  // -3% max loss
+		maxTrendLoss:    -0.03, // -3% max loss
 		maxTimeInTrend:  4 * time.Hour,
-		trailingATRMult: 2.5,    // 2.5x ATR trailing stop
+		trailingATRMult: 2.5, // 2.5x ATR trailing stop
 	}
 }
 
@@ -82,33 +85,40 @@ func (h *TrendingStateHandler) HandleState(
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
 	)
-	
+
 	// Initialize if new trend trade
 	if _, ok := h.entryTime[symbol]; !ok {
 		h.entryTime[symbol] = time.Now()
-		h.entryPrice[symbol] = currentPrice
-		
-		// Determine direction from breakout level
-		if currentPrice > breakoutLevel {
-			h.direction[symbol] = TrendUp
-		} else {
-			h.direction[symbol] = TrendDown
+		if _, ok := h.entryPrice[symbol]; !ok {
+			h.entryPrice[symbol] = currentPrice
 		}
-		
+
+		// Determine direction from breakout level
+		if _, ok := h.direction[symbol]; !ok {
+			if currentPrice > breakoutLevel {
+				h.direction[symbol] = TrendUp
+			} else {
+				h.direction[symbol] = TrendDown
+			}
+		}
+
 		// Set initial stop loss
 		atr := regimeSnapshot.ATR14
-		if h.direction[symbol] == TrendUp {
-			h.stopLoss[symbol] = breakoutLevel - atr*2
-			h.trailingStop[symbol] = h.stopLoss[symbol]
-		} else {
-			h.stopLoss[symbol] = breakoutLevel + atr*2
+		if _, ok := h.stopLoss[symbol]; !ok {
+			if h.direction[symbol] == TrendUp {
+				h.stopLoss[symbol] = breakoutLevel - atr*2
+			} else {
+				h.stopLoss[symbol] = breakoutLevel + atr*2
+			}
+		}
+		if _, ok := h.trailingStop[symbol]; !ok {
 			h.trailingStop[symbol] = h.stopLoss[symbol]
 		}
 	}
-	
+
 	// 1. Hybrid Trend Detection (already in trend, but check continuation)
 	hybridScore := h.calculateHybridTrendScore(regimeSnapshot, currentPrice, breakoutLevel)
-	
+
 	// 2. Micro-profit taking at FVG zones
 	if len(fvgZones) > 0 {
 		for _, zone := range fvgZones {
@@ -123,39 +133,27 @@ func (h *TrendingStateHandler) HandleState(
 			}
 		}
 	}
-	
+
 	// 3. Update trailing stop
 	h.updateTrailingStop(symbol, currentPrice, regimeSnapshot.ATR14)
-	
-	// 4. Trend exhaustion detection
-	if h.isTrendExhausted(symbol, regimeSnapshot) {
-		h.logger.Info("Trend exhausted, exiting",
-			zap.String("symbol", symbol),
-		)
-		
-		return &StateTransition{
-			FromState:         TradingModeTrending,
-			ToState:           TradingModeDefensive, // EXIT_ALL
-			Trigger:           "trend_exhaustion",
-			Score:             0.85,
-			SmoothingDuration: 5 * time.Second,
-			Timestamp:         time.Now(),
-		}, nil
-	}
-	
-	// 5. Check for grid opportunity (sideways returning)
+
+	// 4. Check for grid opportunity (sideways returning)
 	gridScore := h.scoreEngine.CalculateGridScore(&ScoreInputs{
-		Symbol:         symbol,
-		RegimeSnapshot: regimeSnapshot,
+		Symbol:               symbol,
+		RegimeSnapshot:       regimeSnapshot,
+		MeanReversionSignals: regimeSnapshot.Confidence,
+		FVGSignal:            regimeSnapshot.Confidence * 0.8,
+		LiquiditySignal:      regimeSnapshot.Confidence * 0.75,
+		Volatility:           regimeSnapshot.ATR14,
 	})
-	
+
 	if gridScore.Score > 0.7 && hybridScore < 0.5 {
 		h.logger.Info("Sideways returning, switching to GRID",
 			zap.String("symbol", symbol),
 			zap.Float64("grid_score", gridScore.Score),
 			zap.Float64("hybrid_score", hybridScore),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeTrending,
 			ToState:           TradingModeGrid,
@@ -165,9 +163,25 @@ func (h *TrendingStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
+	// 5. Trend exhaustion detection
+	if h.isTrendExhausted(symbol, regimeSnapshot) {
+		h.logger.Info("Trend exhausted, exiting",
+			zap.String("symbol", symbol),
+		)
+
+		return &StateTransition{
+			FromState:         TradingModeTrending,
+			ToState:           TradingModeDefensive, // EXIT_ALL
+			Trigger:           "trend_exhaustion",
+			Score:             0.85,
+			SmoothingDuration: 5 * time.Second,
+			Timestamp:         time.Now(),
+		}, nil
+	}
+
 	// 6. Risk checks
-	
+
 	// Stop loss hit
 	if h.isStopLossHit(symbol, currentPrice) {
 		h.logger.Warn("Stop loss hit",
@@ -176,7 +190,7 @@ func (h *TrendingStateHandler) HandleState(
 			zap.Float64("trailing", h.trailingStop[symbol]),
 			zap.Float64("current", currentPrice),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeTrending,
 			ToState:           TradingModeDefensive, // EXIT_ALL
@@ -186,7 +200,7 @@ func (h *TrendingStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// Trailing stop hit
 	if h.isTrailingStopHit(symbol, currentPrice) {
 		h.logger.Info("Trailing stop hit - taking profit",
@@ -194,7 +208,7 @@ func (h *TrendingStateHandler) HandleState(
 			zap.Float64("trailing_stop", h.trailingStop[symbol]),
 			zap.Float64("current", currentPrice),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeTrending,
 			ToState:           TradingModeDefensive, // EXIT_ALL
@@ -204,7 +218,7 @@ func (h *TrendingStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// Max loss check
 	unrealizedPnL := h.calculateUnrealizedPnL(symbol, currentPrice)
 	if unrealizedPnL < h.maxTrendLoss {
@@ -212,7 +226,7 @@ func (h *TrendingStateHandler) HandleState(
 			zap.String("symbol", symbol),
 			zap.Float64("pnl", unrealizedPnL),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeTrending,
 			ToState:           TradingModeDefensive, // EXIT_ALL
@@ -222,14 +236,14 @@ func (h *TrendingStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// Time limit
 	if time.Since(h.entryTime[symbol]) > h.maxTimeInTrend {
 		h.logger.Info("Max time in trend reached",
 			zap.String("symbol", symbol),
 			zap.Duration("time_in_trend", time.Since(h.entryTime[symbol])),
 		)
-		
+
 		return &StateTransition{
 			FromState:         TradingModeTrending,
 			ToState:           TradingModeDefensive, // EXIT_ALL
@@ -239,10 +253,10 @@ func (h *TrendingStateHandler) HandleState(
 			Timestamp:         time.Now(),
 		}, nil
 	}
-	
+
 	// Update PnL tracking
 	h.updatePnL(symbol, unrealizedPnL)
-	
+
 	// Default: stay in TRENDING
 	return nil, nil
 }
@@ -252,29 +266,39 @@ func (h *TrendingStateHandler) calculateHybridTrendScore(
 	regimeSnapshot RegimeSnapshot,
 	currentPrice, breakoutLevel float64,
 ) float64 {
-	// Breakout strength
-	breakoutSignal := 0.5
+	// Breakout strength should decay aggressively once the regime is no longer trending.
+	breakoutSignal := 0.15
 	if regimeSnapshot.Regime == RegimeTrending {
 		breakoutSignal = regimeSnapshot.Confidence
+	} else if regimeSnapshot.Regime == RegimeVolatile {
+		breakoutSignal = regimeSnapshot.Confidence * 0.4
+	} else if regimeSnapshot.Regime == RegimeRecovery {
+		breakoutSignal = regimeSnapshot.Confidence * 0.3
 	}
-	
+	if breakoutLevel > 0 {
+		expansion := math.Abs(currentPrice-breakoutLevel) / breakoutLevel
+		if expansion > 0.01 {
+			breakoutSignal = math.Min(1.0, breakoutSignal+math.Min(0.2, expansion*2))
+		}
+	}
+
 	// Momentum (ROC + velocity)
-	momentumSignal := 0.5
+	momentumSignal := math.Min(0.25, regimeSnapshot.ADX/100)
 	if regimeSnapshot.ADX > 25 {
 		momentumSignal = math.Min(1.0, regimeSnapshot.ADX/50)
 	}
-	
+
 	// Calculate hybrid
 	maxSignal := math.Max(breakoutSignal, momentumSignal)
 	minSignal := math.Min(breakoutSignal, momentumSignal)
-	
+
 	hybrid := maxSignal*0.6 + minSignal*0.4
-	
+
 	// Agreement bonus
 	if math.Abs(breakoutSignal-momentumSignal) < 0.2 {
 		hybrid *= 1.15
 	}
-	
+
 	return math.Min(1.0, hybrid)
 }
 
@@ -306,10 +330,10 @@ func (h *TrendingStateHandler) updateTrailingStop(
 	if _, ok := h.trailingStop[symbol]; !ok {
 		return
 	}
-	
+
 	currentTrailing := h.trailingStop[symbol]
 	atrDistance := atr * h.trailingATRMult
-	
+
 	if h.direction[symbol] == TrendUp {
 		// For long: trail below price
 		newStop := currentPrice - atrDistance
@@ -338,11 +362,15 @@ func (h *TrendingStateHandler) isTrendExhausted(
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
 ) bool {
+	if regimeSnapshot.Regime == RegimeSideways || regimeSnapshot.Regime == RegimeRecovery {
+		return false
+	}
+
 	// Check momentum divergence
-	if regimeSnapshot.ADX < 20 {
+	if regimeSnapshot.ADX < 18 {
 		return true
 	}
-	
+
 	// Check for volume decrease (would need volume data)
 	return false
 }
@@ -353,7 +381,7 @@ func (h *TrendingStateHandler) isStopLossHit(symbol string, currentPrice float64
 	if !ok {
 		return false
 	}
-	
+
 	if h.direction[symbol] == TrendUp {
 		return currentPrice < stopLoss
 	}
@@ -366,7 +394,7 @@ func (h *TrendingStateHandler) isTrailingStopHit(symbol string, currentPrice flo
 	if !ok {
 		return false
 	}
-	
+
 	if h.direction[symbol] == TrendUp {
 		return currentPrice < trailingStop
 	}
@@ -382,7 +410,7 @@ func (h *TrendingStateHandler) calculateUnrealizedPnL(
 	if !ok || entryPrice == 0 {
 		return 0
 	}
-	
+
 	if h.direction[symbol] == TrendUp {
 		return (currentPrice - entryPrice) / entryPrice
 	}
@@ -397,13 +425,13 @@ func (h *TrendingStateHandler) updatePnL(symbol string, pnl float64) {
 // GetTrendStatus returns current trend status
 func (h *TrendingStateHandler) GetTrendStatus(symbol string, currentPrice float64) *TrendStatus {
 	return &TrendStatus{
-		Symbol:        symbol,
-		Direction:     h.direction[symbol],
-		EntryPrice:    h.entryPrice[symbol],
-		CurrentPrice:  currentPrice,
-		StopLoss:      h.stopLoss[symbol],
-		TrailingStop:  h.trailingStop[symbol],
-		RunningTime:   time.Since(h.entryTime[symbol]),
+		Symbol:       symbol,
+		Direction:    h.direction[symbol],
+		EntryPrice:   h.entryPrice[symbol],
+		CurrentPrice: currentPrice,
+		StopLoss:     h.stopLoss[symbol],
+		TrailingStop: h.trailingStop[symbol],
+		RunningTime:  time.Since(h.entryTime[symbol]),
 	}
 }
 

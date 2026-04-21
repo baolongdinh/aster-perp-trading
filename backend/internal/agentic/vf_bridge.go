@@ -12,11 +12,13 @@ import (
 // AgenticVFBridge connects AgenticEngine (decision) with VolumeFarmEngine (execution)
 // Implements the hybrid approach: Agentic decides WHAT to do, VF decides HOW to do it
 type AgenticVFBridge struct {
-	eventBus     *StateEventBus
-	stateTracker *StateTracker
-	logger       *zap.Logger
+	eventBus       *StateEventBus
+	stateTracker   *StateTracker
+	decisionEngine *DecisionEngine
+	logger         *zap.Logger
 
-	// Execution status tracking
+	// Execution status tracking (protected by mu)
+	mu                   sync.Mutex
 	pendingTransitions   map[string]StateTransitionEvent
 	completedTransitions map[string]ExecutionResult
 }
@@ -28,10 +30,11 @@ type StateTracker struct {
 }
 
 // NewAgenticVFBridge creates a new bridge between Agentic and VF
-func NewAgenticVFBridge(eventBus *StateEventBus, logger *zap.Logger) *AgenticVFBridge {
+func NewAgenticVFBridge(eventBus *StateEventBus, decisionEngine *DecisionEngine, logger *zap.Logger) *AgenticVFBridge {
 	bridge := &AgenticVFBridge{
 		eventBus:             eventBus,
 		stateTracker:         NewStateTracker(),
+		decisionEngine:       decisionEngine,
 		logger:               logger.With(zap.String("component", "agentic_vf_bridge")),
 		pendingTransitions:   make(map[string]StateTransitionEvent),
 		completedTransitions: make(map[string]ExecutionResult),
@@ -88,11 +91,15 @@ func (bridge *AgenticVFBridge) RequestStateTransition(
 	}
 
 	// Track pending transition
+	bridge.mu.Lock()
 	bridge.pendingTransitions[symbol] = event
+	bridge.mu.Unlock()
 
 	// Publish to VolumeFarmEngine
 	if err := bridge.eventBus.GetPublisher().Publish(ctx, event); err != nil {
+		bridge.mu.Lock()
 		delete(bridge.pendingTransitions, symbol)
+		bridge.mu.Unlock()
 		return fmt.Errorf("failed to publish state transition: %w", err)
 	}
 
@@ -217,15 +224,23 @@ func (bridge *AgenticVFBridge) HandleExecutionResult(ctx context.Context, result
 		zap.Bool("success", result.Success),
 	)
 
+	bridge.mu.Lock()
 	// Remove from pending
 	delete(bridge.pendingTransitions, result.Symbol)
-
 	// Store result
 	bridge.completedTransitions[result.Symbol] = result
+	bridge.mu.Unlock()
 
 	// Update state tracker
 	if result.Success {
 		bridge.stateTracker.UpdateState(result.Symbol, TradingMode(result.ToState))
+	}
+
+	if bridge.decisionEngine != nil {
+		bridge.decisionEngine.RecordExecutionResult(result.Symbol, result.Success, result.ExitReason)
+		if !result.Success {
+			bridge.decisionEngine.IncrementConsecutiveLosses(result.Symbol)
+		}
 	}
 
 	return nil
@@ -238,6 +253,8 @@ func (bridge *AgenticVFBridge) GetCurrentState(symbol string) (SymbolTradingStat
 
 // GetPendingTransitions returns transitions waiting for execution
 func (bridge *AgenticVFBridge) GetPendingTransitions() map[string]StateTransitionEvent {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
 	result := make(map[string]StateTransitionEvent)
 	for k, v := range bridge.pendingTransitions {
 		result[k] = v
@@ -247,6 +264,8 @@ func (bridge *AgenticVFBridge) GetPendingTransitions() map[string]StateTransitio
 
 // IsTransitionPending checks if a symbol has a pending transition
 func (bridge *AgenticVFBridge) IsTransitionPending(symbol string) bool {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
 	_, exists := bridge.pendingTransitions[symbol]
 	return exists
 }

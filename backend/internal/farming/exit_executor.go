@@ -8,16 +8,17 @@ import (
 	"time"
 
 	"aster-bot/internal/client"
+	"aster-bot/internal/realtime"
 
 	"go.uber.org/zap"
 )
 
 // ExitExecutor handles fast exit sequences for breakouts/trends
 type ExitExecutor struct {
-	futuresClient *client.FuturesClient
-	wsClient      *client.WebSocketClient
-	timeout       time.Duration
-	logger        *zap.Logger
+	futuresClient   *client.FuturesClient
+	accountProvider realtime.AccountStateProvider
+	timeout         time.Duration
+	logger          *zap.Logger
 }
 
 // ExitSequence tracks the exit operation timing and results
@@ -44,7 +45,7 @@ type ExitStep struct {
 // NewExitExecutor creates a new exit executor
 func NewExitExecutor(
 	futuresClient *client.FuturesClient,
-	wsClient *client.WebSocketClient,
+	accountProvider realtime.AccountStateProvider,
 	timeout time.Duration,
 	logger *zap.Logger,
 ) *ExitExecutor {
@@ -53,10 +54,10 @@ func NewExitExecutor(
 	}
 
 	return &ExitExecutor{
-		futuresClient: futuresClient,
-		wsClient:      wsClient,
-		timeout:       timeout,
-		logger:        logger.With(zap.String("component", "exit_executor")),
+		futuresClient:   futuresClient,
+		accountProvider: accountProvider,
+		timeout:         timeout,
+		logger:          logger.With(zap.String("component", "exit_executor")),
 	}
 }
 
@@ -160,12 +161,11 @@ func (e *ExitExecutor) executeStep(name string, fn func() error) ExitStep {
 
 // cancelAllOrders cancels all pending orders for a symbol
 func (e *ExitExecutor) cancelAllOrders(ctx context.Context, symbol string) error {
-	// TODO: Replace with WebSocket cache when available
-	// For now, use REST API to get open orders
-	orders, err := e.futuresClient.GetOpenOrders(ctx, symbol)
-	if err != nil {
-		e.logger.Warn("Failed to get open orders", zap.Error(err))
-		return nil
+	// T025: Use WebSocket cache via AccountStateProvider
+	var orders []client.Order
+	if e.accountProvider != nil {
+		orders = e.accountProvider.GetOpenOrders(symbol)
+		e.logger.Debug("Using WebSocket cache for open orders", zap.String("symbol", symbol), zap.Int("count", len(orders)))
 	}
 
 	if len(orders) == 0 {
@@ -237,21 +237,14 @@ func (e *ExitExecutor) cancelAllOrders(ctx context.Context, symbol string) error
 
 // closePositionsMarket closes open positions with market orders
 func (e *ExitExecutor) closePositionsMarket(ctx context.Context, symbol string) (int, error) {
-	// TODO: Replace with WebSocket cache when available
-	// For now, use REST API to get positions
-	positions, err := e.futuresClient.GetPositions(ctx)
-	if err != nil {
-		e.logger.Warn("Failed to get positions", zap.Error(err))
-		return 0, err
-	}
-
-	// Find position for symbol
+	// T026: Use WebSocket cache via AccountStateProvider
 	var position *client.Position
-	for i := range positions {
-		if positions[i].Symbol == symbol {
-			position = &positions[i]
-			break
+	if e.accountProvider != nil {
+		positions := e.accountProvider.GetPositions()
+		if pos, ok := positions[symbol]; ok {
+			position = &pos
 		}
+		e.logger.Debug("Using WebSocket cache for positions", zap.String("symbol", symbol))
 	}
 
 	if position == nil || position.PositionAmt == 0 {
@@ -278,7 +271,7 @@ func (e *ExitExecutor) closePositionsMarket(ctx context.Context, symbol string) 
 		Quantity: fmt.Sprintf("%f", math.Abs(position.PositionAmt)),
 	}
 
-	_, err = e.futuresClient.PlaceOrder(ctx, orderReq)
+	_, err := e.futuresClient.PlaceOrder(ctx, orderReq)
 	if err != nil {
 		return 0, fmt.Errorf("failed to place close order: %w", err)
 	}
@@ -288,8 +281,11 @@ func (e *ExitExecutor) closePositionsMarket(ctx context.Context, symbol string) 
 
 // verifyPositionsClosed verifies all positions are closed
 func (e *ExitExecutor) verifyPositionsClosed(ctx context.Context, symbol string) error {
-	// Check position via WebSocket cache
-	positions := e.wsClient.GetCachedPositions()
+	// T026: Check position via WebSocket cache
+	if e.accountProvider == nil {
+		return fmt.Errorf("account provider missing for verification")
+	}
+	positions := e.accountProvider.GetPositions()
 
 	position, exists := positions[symbol]
 	if !exists || position.PositionAmt == 0 {

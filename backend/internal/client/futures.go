@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -350,40 +351,153 @@ func (f *FuturesClient) GetPositions(ctx context.Context) ([]Position, error) {
 // StartListenKey creates a new listen key for user data stream
 // POST /fapi/v3/listenKey (signed) → { "listenKey": "..." }
 func (f *FuturesClient) StartListenKey(ctx context.Context) (string, error) {
-	if err := f.rateLimiter.Wait(ctx); err != nil {
-		return "", fmt.Errorf("rate limit wait: %w", err)
+	// Always sync server time first to ensure accurate timestamp
+	f.log.Info("Syncing server time before creating listen key")
+	if err := f.syncServerTimeForV3(ctx); err != nil {
+		f.log.Warn("Failed to sync server time, proceeding with current offset", zap.Error(err))
 	}
 
-	data, err := f.http.PostSigned(ctx, f.apiPath("/fapi/v3/listenKey"), nil)
-	if err != nil {
-		return "", fmt.Errorf("start listen key: %w", err)
+	// Try up to 3 times with time sync on each attempt if needed
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := f.rateLimiter.Wait(ctx); err != nil {
+			return "", fmt.Errorf("rate limit wait: %w", err)
+		}
+
+		data, err := f.http.PostSigned(ctx, f.apiPath("/fapi/v3/listenKey"), nil)
+		if err != nil {
+			lastErr = err
+
+			// Check if this is a timestamp error (-1000) and we haven't exhausted retries
+			var apiErr *APIError
+			if attempt < maxRetries && errors.As(err, &apiErr) && apiErr.IsTimestampError() {
+				f.log.Warn("Timestamp error detected, re-syncing server time and retrying",
+					zap.Int("attempt", attempt),
+					zap.Error(err))
+
+				// Re-sync server time for V3 signer
+				if err := f.syncServerTimeForV3(ctx); err != nil {
+					f.log.Warn("Failed to re-sync server time for V3 signer", zap.Error(err))
+					// Continue to next attempt anyway
+				}
+				continue
+			}
+
+			// Not a timestamp error or exhausted retries
+			return "", fmt.Errorf("start listen key: %w", err)
+		}
+
+		var result struct {
+			ListenKey string `json:"listenKey"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return "", fmt.Errorf("parse listen key: %w", err)
+		}
+
+		f.log.Info("User data stream listen key created",
+			zap.String("listenKey", result.ListenKey[:10]+"..."),
+			zap.Int("attempt", attempt))
+		return result.ListenKey, nil
 	}
 
-	var result struct {
-		ListenKey string `json:"listenKey"`
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return "", fmt.Errorf("parse listen key: %w", err)
+	return "", fmt.Errorf("start listen key failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// syncServerTimeForV3 syncs server time offset for V3 signer to fix timestamp drift
+func (f *FuturesClient) syncServerTimeForV3(ctx context.Context) error {
+	marketClient := NewMarketClient(f.http)
+
+	// Get multiple server time samples to account for network latency
+	const numSamples = 5
+	var totalOffset int64
+
+	for i := 0; i < numSamples; i++ {
+		localTimeBefore := time.Now().UnixMilli()
+		serverTime, err := marketClient.ServerTime(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get server time sample %d: %w", i+1, err)
+		}
+		localTimeAfter := time.Now().UnixMilli()
+
+		// Estimate local time at the moment server responded
+		localTimeEstimated := localTimeBefore + (localTimeAfter-localTimeBefore)/2
+		offset := serverTime - localTimeEstimated
+		totalOffset += offset
+
+		f.log.Debug("Time sync sample",
+			zap.Int("sample", i+1),
+			zap.Int64("offset_ms", offset),
+			zap.Int64("server_time", serverTime),
+			zap.Int64("local_estimated", localTimeEstimated))
 	}
 
-	f.log.Info("User data stream listen key created", zap.String("listenKey", result.ListenKey[:10]+"..."))
-	return result.ListenKey, nil
+	// Use average offset
+	avgOffset := totalOffset / numSamples
+
+	f.log.Info("Time sync completed with average offset",
+		zap.Int("samples", numSamples),
+		zap.Int64("avg_offset_ms", avgOffset))
+
+	// Apply offset to V3 signer if available
+	if f.http.v3Signer != nil {
+		f.http.v3Signer.SetTimeOffset(avgOffset)
+		f.log.Info("V3 server time synced",
+			zap.Int64("offset_ms", avgOffset))
+	} else {
+		f.log.Warn("V3 signer not available for time sync")
+	}
+
+	return nil
 }
 
 // KeepaliveListenKey extends the validity of a listen key
 // PUT /fapi/v3/listenKey (signed) - call every 30 min
 func (f *FuturesClient) KeepaliveListenKey(ctx context.Context) error {
-	if err := f.rateLimiter.Wait(ctx); err != nil {
-		return fmt.Errorf("rate limit wait: %w", err)
+	// Always sync server time first to ensure accurate timestamp
+	f.log.Debug("Syncing server time before keepalive")
+	if err := f.syncServerTimeForV3(ctx); err != nil {
+		f.log.Warn("Failed to sync server time for keepalive, proceeding with current offset", zap.Error(err))
 	}
 
-	_, err := f.http.PutSigned(ctx, f.apiPath("/fapi/v3/listenKey"), nil)
-	if err != nil {
-		return fmt.Errorf("keepalive listen key: %w", err)
+	// Try up to 3 times with time sync on each attempt if needed
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := f.rateLimiter.Wait(ctx); err != nil {
+			return fmt.Errorf("rate limit wait: %w", err)
+		}
+
+		_, err := f.http.PutSigned(ctx, f.apiPath("/fapi/v3/listenKey"), nil)
+		if err != nil {
+			lastErr = err
+
+			// Check if this is a timestamp error (-1000) and we haven't exhausted retries
+			var apiErr *APIError
+			if attempt < maxRetries && errors.As(err, &apiErr) && apiErr.IsTimestampError() {
+				f.log.Warn("Timestamp error in keepalive, re-syncing server time and retrying",
+					zap.Int("attempt", attempt),
+					zap.Error(err))
+
+				// Re-sync server time for V3 signer
+				if err := f.syncServerTimeForV3(ctx); err != nil {
+					f.log.Warn("Failed to re-sync server time for V3 signer", zap.Error(err))
+					// Continue to next attempt anyway
+				}
+				continue
+			}
+
+			// Not a timestamp error or exhausted retries
+			return fmt.Errorf("keepalive listen key: %w", err)
+		}
+
+		f.log.Debug("User data stream listen key keepalive success", zap.Int("attempt", attempt))
+		return nil
 	}
 
-	f.log.Debug("User data stream listen key keepalive success")
-	return nil
+	return fmt.Errorf("keepalive listen key failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // SetLeverage sets the leverage for a symbol

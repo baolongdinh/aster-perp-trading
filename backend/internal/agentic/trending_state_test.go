@@ -206,7 +206,7 @@ func TestGetTrendStatus(t *testing.T) {
 	assert.NotNil(t, status)
 	assert.Equal(t, symbol, status.Symbol)
 	assert.Equal(t, TrendUp, status.Direction)
-	assert.Equal(t, 50000, status.EntryPrice)
+	assert.Equal(t, 50000.0, status.EntryPrice)
 }
 
 func TestTrendingHybridStrategyIntegration(t *testing.T) {
