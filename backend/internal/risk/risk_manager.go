@@ -36,6 +36,8 @@ type Manager struct {
 	pendingOrders       map[string]float64 // symbol -> total pending notional (NEW/PARTIALLY_FILLED)
 	pendingMargin       float64            // total initial margin of pending orders (NEW/PARTIALLY_FILLED)
 	availableBalance    float64            // current exchange available USDT balance
+	balanceLastFetch    time.Time          // last time balance was fetched from API
+	balanceCacheTTL     time.Duration      // cache TTL for balance
 	paused              bool               // true when daily loss limit hit
 	corrTracker         *regime.CorrelationTracker
 }
@@ -465,27 +467,42 @@ func (m *Manager) GetDailyStartingEquity() float64 {
 	return m.dailyStartingEquity
 }
 
-// GetAvailableBalance returns the current available USDT balance by fetching directly from exchange.
+// GetAvailableBalance returns the current available USDT balance.
+// Uses cached value with TTL to avoid excessive API calls.
 func (m *Manager) GetAvailableBalance() float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Fetch directly from exchange instead of using cached value
+	// Check if cache is still valid (TTL: 60 seconds)
+	if m.balanceCacheTTL == 0 {
+		m.balanceCacheTTL = 60 * time.Second
+	}
+
+	if time.Since(m.balanceLastFetch) < m.balanceCacheTTL && m.availableBalance > 0 {
+		m.log.Debug("Using cached available balance",
+			zap.Float64("available_balance", m.availableBalance),
+			zap.Duration("cache_age", time.Since(m.balanceLastFetch)))
+		return m.availableBalance
+	}
+
+	// Cache expired or empty - fetch from exchange
 	if m.exchangeClient != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		account, err := m.exchangeClient.GetAccountInfo(ctx)
 		if err != nil {
-			m.log.Error("Failed to fetch available balance from exchange",
-				zap.Error(err))
+			m.log.Warn("Failed to fetch available balance from exchange, using cached",
+				zap.Error(err),
+				zap.Float64("cached_balance", m.availableBalance))
 			// Return cached value as fallback
 			return m.availableBalance
 		}
 
 		// Update cache
 		m.availableBalance = account.AvailableBalance
-		m.log.Debug("Fetched available balance from exchange",
+		m.balanceLastFetch = time.Now()
+		m.log.Debug("Fetched and cached available balance from exchange",
 			zap.Float64("available_balance", account.AvailableBalance))
 
 		return account.AvailableBalance

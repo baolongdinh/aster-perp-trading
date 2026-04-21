@@ -14,8 +14,9 @@ type SyncManager struct {
 	positionWorker *PositionSyncWorker
 	balanceWorker  *BalanceSyncWorker
 
-	wsClient *client.WebSocketClient
-	logger   *zap.Logger
+	wsClient      *client.WebSocketClient
+	futuresClient *client.FuturesClient
+	logger        *zap.Logger
 
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
@@ -26,19 +27,21 @@ type SyncManager struct {
 // NewSyncManager creates a new sync manager
 func NewSyncManager(
 	wsClient *client.WebSocketClient,
+	futuresClient *client.FuturesClient,
 	logger *zap.Logger,
 ) *SyncManager {
 	return &SyncManager{
-		wsClient: wsClient,
-		logger:   logger.With(zap.String("component", "sync_manager")),
-		stopCh:   make(chan struct{}),
+		wsClient:      wsClient,
+		futuresClient: futuresClient,
+		logger:        logger.With(zap.String("component", "sync_manager")),
+		stopCh:        make(chan struct{}),
 	}
 }
 
 // Initialize creates and initializes all sync workers
 func (m *SyncManager) Initialize() {
 	// Create order sync worker
-	m.orderWorker = NewOrderSyncWorker(m.wsClient, 0, m.logger)
+	m.orderWorker = NewOrderSyncWorker(m.wsClient, m.futuresClient, 0, m.logger)
 	m.orderWorker.SetOnMismatchCallback(func(symbol string, mismatches []OrderMismatch) {
 		m.logger.Warn("Order mismatches detected",
 			zap.String("symbol", symbol),

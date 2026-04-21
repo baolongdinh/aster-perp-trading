@@ -1245,8 +1245,10 @@ func (a *AdaptiveGridManager) cleanupNonTradingSymbols(ctx context.Context) {
 			shouldClean = true
 			reason = "EXIT_ALL state"
 		case GridStateWaitNewRange:
-			shouldClean = true
-			reason = "WAIT_NEW_RANGE state"
+			// Don't cancel orders in WAIT_NEW_RANGE - this is a waiting state
+			// Orders should be allowed to remain while waiting for range to establish
+			shouldClean = false
+			reason = "WAIT_NEW_RANGE state - keeping orders"
 		}
 
 		if !shouldClean {

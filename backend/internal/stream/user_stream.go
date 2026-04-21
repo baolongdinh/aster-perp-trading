@@ -152,11 +152,18 @@ func (us *UserStream) connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("user stream: get listenKey: %w", err)
 	}
+	us.log.Info("listenKey obtained successfully",
+		zap.String("listen_key", listenKey))
 	u := fmt.Sprintf("%s/ws/%s", us.wsBase, listenKey)
-	us.log.Info("connecting user data stream")
+	us.log.Info("connecting user data stream",
+		zap.String("ws_url", u),
+		zap.String("listen_key", listenKey))
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u, nil)
 	if err != nil {
+		us.log.Error("failed to connect user data stream",
+			zap.String("ws_url", u),
+			zap.Error(err))
 		return err
 	}
 	us.log.Info("user data stream connected successfully")
@@ -190,6 +197,25 @@ func (us *UserStream) connect(ctx context.Context) error {
 
 	conn.SetReadDeadline(time.Now().Add(70 * time.Minute))
 
+	messageCount := 0
+	lastMessageTime := time.Now()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				sinceLastMsg := time.Since(lastMessageTime).Seconds()
+				us.log.Info("UserStream heartbeat",
+					zap.Int("total_messages", messageCount),
+					zap.Float64("seconds_since_last_message", sinceLastMsg))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -200,6 +226,8 @@ func (us *UserStream) connect(ctx context.Context) error {
 		}
 		// Reset deadline on any message
 		conn.SetReadDeadline(time.Now().Add(70 * time.Minute))
+		messageCount++
+		lastMessageTime = time.Now()
 		us.dispatch(msg)
 	}
 }
@@ -231,7 +259,8 @@ func (us *UserStream) dispatch(raw []byte) {
 				zap.Int("balances", len(ev.Update.Balances)))
 			us.handlers.OnAccountUpdate(ev)
 		} else {
-			us.log.Warn("Failed to unmarshal account update or handler nil")
+			us.log.Warn("Failed to unmarshal account update or handler nil",
+				zap.String("raw", string(raw)))
 		}
 	case EventMarginCall:
 		if us.handlers.OnMarginCall != nil {

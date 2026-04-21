@@ -1,7 +1,10 @@
 package sync
 
 import (
+	"context"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 // OrderSyncWorker syncs order state between internal and exchange
 type OrderSyncWorker struct {
 	wsClient          *client.WebSocketClient
+	futuresClient     *client.FuturesClient
 	internalOrders    map[string]map[int64]client.Order // symbol -> orderID -> order
 	mu                sync.RWMutex
 	interval          time.Duration
@@ -20,6 +24,13 @@ type OrderSyncWorker struct {
 	logger            *zap.Logger
 	onMismatch        func(symbol string, mismatches []OrderMismatch)
 	onOrderMissing    func(symbol string, orderID int64) // Callback when order is missing (filled/cancelled)
+
+	// Rate limiting protection
+	lastErrorTime     time.Time
+	consecutiveErrors int
+	backoffDuration   time.Duration
+	circuitOpen       bool
+	circuitMu         sync.RWMutex
 }
 
 // OrderMismatch represents an order state mismatch
@@ -34,19 +45,22 @@ type OrderMismatch struct {
 // NewOrderSyncWorker creates a new order sync worker
 func NewOrderSyncWorker(
 	wsClient *client.WebSocketClient,
+	futuresClient *client.FuturesClient,
 	interval time.Duration,
 	logger *zap.Logger,
 ) *OrderSyncWorker {
 	if interval == 0 {
-		interval = 5 * time.Second
+		interval = 30 * time.Second // INCREASED: from 5s to 30s to avoid rate limits
 	}
 
 	return &OrderSyncWorker{
 		wsClient:          wsClient,
+		futuresClient:     futuresClient,
 		internalOrders:    make(map[string]map[int64]client.Order),
 		interval:          interval,
 		mismatchThreshold: 10 * time.Second,
 		logger:            logger.With(zap.String("worker", "order_sync")),
+		backoffDuration:   time.Second,
 	}
 }
 
@@ -89,7 +103,7 @@ func (w *OrderSyncWorker) Run(stopCh <-chan struct{}) {
 	for {
 		select {
 		case <-ticker.C:
-			w.sync()
+			w.syncOrders()
 		case <-stopCh:
 			w.logger.Info("Order sync worker stopped")
 			return
@@ -97,8 +111,107 @@ func (w *OrderSyncWorker) Run(stopCh <-chan struct{}) {
 	}
 }
 
-// sync performs one sync iteration
-func (w *OrderSyncWorker) sync() {
+// syncOrders syncs orders between internal state and exchange
+func (w *OrderSyncWorker) syncOrders() {
+	// CRITICAL: Only use API fallback when WebSocket is DISCONNECTED
+	// NOT when cache is "stale" - no messages is normal when no order changes!
+	if !w.wsClient.IsRunning() && w.futuresClient != nil {
+		w.logger.Warn("WebSocket disconnected, fetching from API as fallback")
+		w.syncOrdersFromAPI()
+		return
+	}
+
+	// WebSocket is connected - trust the WebSocket cache
+	// ORDER_TRADE_UPDATE events provide real-time order updates
+	w.syncWithWebSocketCache()
+}
+
+// syncOrdersFromAPI fetches orders directly from exchange API
+func (w *OrderSyncWorker) syncOrdersFromAPI() {
+	// Check if circuit breaker is open (rate limit hit)
+	w.circuitMu.RLock()
+	if w.circuitOpen {
+		// Check if we should close circuit (30s cooldown)
+		if time.Since(w.lastErrorTime) < 30*time.Second {
+			w.circuitMu.RUnlock()
+			w.logger.Warn("Circuit breaker open - skipping API sync due to recent rate limit")
+			return
+		}
+		// Reset circuit
+		w.circuitMu.RUnlock()
+		w.circuitMu.Lock()
+		w.circuitOpen = false
+		w.consecutiveErrors = 0
+		w.backoffDuration = time.Second
+		w.circuitMu.Unlock()
+		w.logger.Info("Circuit breaker closed - resuming API sync")
+	} else {
+		w.circuitMu.RUnlock()
+	}
+
+	// Apply exponential backoff
+	w.circuitMu.RLock()
+	backoff := w.backoffDuration
+	w.circuitMu.RUnlock()
+
+	if backoff > time.Second && time.Since(w.lastErrorTime) < backoff {
+		w.logger.Info("Backing off from API sync", zap.Duration("backoff", backoff))
+		return
+	}
+
+	ctx := context.Background()
+
+	// Get all open orders from exchange
+	orders, err := w.futuresClient.GetOpenOrders(ctx, "")
+	if err != nil {
+		w.handleAPIError(err)
+		return
+	}
+
+	// Success - reset error tracking
+	w.circuitMu.Lock()
+	w.consecutiveErrors = 0
+	w.backoffDuration = time.Second
+	w.circuitMu.Unlock()
+
+	w.logger.Info("Fetched orders from API", zap.Int("count", len(orders)))
+
+	// Update wsClient cache with API data
+	for _, order := range orders {
+		w.wsClient.UpdateOrderCache(order)
+	}
+}
+
+// handleAPIError tracks errors and implements exponential backoff
+func (w *OrderSyncWorker) handleAPIError(err error) {
+	w.circuitMu.Lock()
+	defer w.circuitMu.Unlock()
+
+	w.consecutiveErrors++
+	w.lastErrorTime = time.Now()
+
+	// Check if rate limit error (code -1003)
+	errStr := err.Error()
+	if strings.Contains(errStr, "-1003") || strings.Contains(errStr, "Too many requests") ||
+		strings.Contains(errStr, "banned") || strings.Contains(errStr, "Way too many requests") {
+		// Open circuit breaker
+		w.circuitOpen = true
+		w.logger.Error("RATE LIMIT HIT - Opening circuit breaker for 30s", zap.Error(err))
+	}
+
+	// Exponential backoff: double the wait time, max 5 minutes
+	w.backoffDuration = time.Duration(math.Min(float64(w.backoffDuration)*2, float64(5*time.Minute)))
+
+	if w.consecutiveErrors <= 3 {
+		w.logger.Error("Failed to fetch orders from API", zap.Error(err), zap.Int("consecutive_errors", w.consecutiveErrors))
+	} else {
+		// Reduce log spam after many errors
+		w.logger.Debug("API error (suppressed)", zap.Error(err), zap.Int("consecutive_errors", w.consecutiveErrors))
+	}
+}
+
+// syncWithWebSocketCache syncs orders with wsClient cache
+func (w *OrderSyncWorker) syncWithWebSocketCache() {
 	// Get all symbols with internal orders
 	w.mu.RLock()
 	symbols := make([]string, 0, len(w.internalOrders))

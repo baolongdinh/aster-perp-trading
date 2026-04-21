@@ -4168,6 +4168,33 @@ func (g *GridManager) ordersResetWorker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			g.resetStaleOrders()
+			g.triggerRegularPlacement()
+		}
+	}
+}
+
+// triggerRegularPlacement checks and triggers placement for active grids
+func (g *GridManager) triggerRegularPlacement() {
+	g.gridsMu.RLock()
+	defer g.gridsMu.RUnlock()
+
+	for symbol, grid := range g.activeGrids {
+		// Skip if already placing
+		if grid.PlacementBusy {
+			continue
+		}
+
+		// Check if we need to place orders (not placed or stale)
+		if !grid.OrdersPlaced || time.Since(grid.LastAttempt) > 5*time.Second {
+			// Check if symbol can place orders via AdaptiveGridManager
+			if g.adaptiveMgr != nil && g.adaptiveMgr.CanPlaceOrder(symbol) {
+				g.logger.WithFields(logrus.Fields{
+					"symbol":       symbol,
+					"ordersPlaced": grid.OrdersPlaced,
+					"lastAttempt":  time.Since(grid.LastAttempt).Seconds(),
+				}).Info("Triggering regular placement check")
+				go g.enqueuePlacement(symbol)
+			}
 		}
 	}
 }

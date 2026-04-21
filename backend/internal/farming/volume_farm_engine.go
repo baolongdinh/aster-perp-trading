@@ -848,7 +848,7 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	logger.Info("COOLDOWN callback registered to trigger exit sequence and force placement after expiry")
 
 	// SyncManager - coordinates order/position/balance sync workers
-	engine.syncManager = farmsync.NewSyncManager(sharedWSClient, logger)
+	engine.syncManager = farmsync.NewSyncManager(sharedWSClient, engine.futuresClient, logger)
 	engine.syncManager.Initialize()
 
 	// Wire up order missing callback to trigger GridManager handleOrderFill
@@ -1643,7 +1643,8 @@ func (e *VolumeFarmEngine) monitorRegimeChanges(ctx context.Context) {
 
 // monitorRisk monitors risk levels and takes action.
 func (e *VolumeFarmEngine) monitorRisk(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	// INCREASED: from 10s to 60s to avoid rate limits
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for {
