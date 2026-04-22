@@ -1089,6 +1089,7 @@ func loadYAML(path string, target interface{}) error {
 // AgenticConfig holds the agentic decision layer configuration
 type AgenticConfig struct {
 	Enabled             bool                        `mapstructure:"enabled" yaml:"enabled"`
+	AgenticV2           AgenticV2Config             `mapstructure:"agentic_v2" yaml:"agentic_v2"`
 	Universe            UniverseConfig              `mapstructure:"universe" yaml:"universe"`
 	RegimeDetection     RegimeDetectionConfig       `mapstructure:"regime_detection" yaml:"regime_detection"`
 	Scoring             ScoringConfig               `mapstructure:"scoring" yaml:"scoring"`
@@ -1096,6 +1097,33 @@ type AgenticConfig struct {
 	WhitelistManagement WhitelistConfig             `mapstructure:"whitelist_management" yaml:"whitelist_management"`
 	CircuitBreakers     AgenticCircuitBreakerConfig `mapstructure:"circuit_breakers" yaml:"circuit_breakers"`
 	ScoreEngine         ScoreEngineConfig           `mapstructure:"score_engine" yaml:"score_engine"` // NEW: Adaptive state scoring
+	DecisionEngine      DecisionEngineConfig        `mapstructure:"decision_engine" yaml:"decision_engine"`
+}
+
+type AgenticV2Config struct {
+	Enabled              bool                   `mapstructure:"enabled" yaml:"enabled"`
+	ShadowMode           bool                   `mapstructure:"shadow_mode" yaml:"shadow_mode"`
+	CanarySymbols        []string               `mapstructure:"canary_symbols" yaml:"canary_symbols"`
+	PositionAgeTargetSec int64                  `mapstructure:"position_age_target_sec" yaml:"position_age_target_sec"`
+	ObjectiveWeights     ObjectiveWeightsConfig `mapstructure:"objective_weights" yaml:"objective_weights"`
+	FeeGuardrails        FeeGuardrailsConfig    `mapstructure:"fee_guardrails" yaml:"fee_guardrails"`
+	HardKillSwitch       bool                   `mapstructure:"hard_kill_switch" yaml:"hard_kill_switch"`
+	PerSymbolLossCapUSDT float64                `mapstructure:"per_symbol_loss_cap_usdt" yaml:"per_symbol_loss_cap_usdt"`
+	MaxTransitionsPerMin int                    `mapstructure:"max_transitions_per_min" yaml:"max_transitions_per_min"`
+	AckTimeoutSec        int64                  `mapstructure:"ack_timeout_sec" yaml:"ack_timeout_sec"`
+}
+
+type ObjectiveWeightsConfig struct {
+	VolumeWeight float64 `mapstructure:"volume_weight" yaml:"volume_weight"`
+	ProfitWeight float64 `mapstructure:"profit_weight" yaml:"profit_weight"`
+	RiskWeight   float64 `mapstructure:"risk_weight" yaml:"risk_weight"`
+}
+
+type FeeGuardrailsConfig struct {
+	MaxFeeBudgetBps  float64 `mapstructure:"max_fee_budget_bps" yaml:"max_fee_budget_bps"`
+	DefaultTPBps     float64 `mapstructure:"default_tp_bps" yaml:"default_tp_bps"`
+	DefaultHardSLBps float64 `mapstructure:"default_hard_sl_bps" yaml:"default_hard_sl_bps"`
+	MinRangeQuality  float64 `mapstructure:"min_range_quality" yaml:"min_range_quality"`
 }
 
 // UniverseConfig defines the symbol universe for monitoring

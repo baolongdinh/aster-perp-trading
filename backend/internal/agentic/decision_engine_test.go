@@ -13,7 +13,7 @@ func TestNewDecisionEngine(t *testing.T) {
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 
 	// Test with nil config
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 	assert.NotNil(t, engine)
 	assert.NotNil(t, engine.config)
 	assert.True(t, engine.config.Enabled)
@@ -23,7 +23,7 @@ func TestNewDecisionEngine(t *testing.T) {
 func TestGetCurrentState(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Test default state for new symbol
 	state := engine.getCurrentState("BTCUSD1")
@@ -33,7 +33,7 @@ func TestGetCurrentState(t *testing.T) {
 func TestDetermineBestMode(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Test 1: GRID wins
 	scores := map[TradingMode]*TradingModeScore{
@@ -65,7 +65,7 @@ func TestDetermineBestMode(t *testing.T) {
 func TestIsFlipFlop(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Setup state with transition history
 	engine.symbolStates["BTCUSD1"] = &SymbolTradingState{
@@ -97,7 +97,7 @@ func TestIsFlipFlop(t *testing.T) {
 func TestEventPublishing(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Create subscriber channel
 	ch := make(chan StateTransition, 10)
@@ -129,7 +129,7 @@ func TestEventPublishing(t *testing.T) {
 func TestGetSymbolState(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Test non-existent symbol
 	state, ok := engine.GetSymbolState("NONEXISTENT")
@@ -151,8 +151,7 @@ func TestGetSymbolState(t *testing.T) {
 func TestGetMetrics(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
-
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 	// Record some transitions
 	engine.recordSuccessfulTransition("BTCUSD1", TradingModeGrid)
 	engine.recordSuccessfulTransition("BTCUSD1", TradingModeTrending)
@@ -167,7 +166,7 @@ func TestGetMetrics(t *testing.T) {
 func TestForceTransition(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Create subscriber to verify event is published
 	ch := make(chan StateTransition, 1)
@@ -195,7 +194,7 @@ func TestForceTransition(t *testing.T) {
 func TestFlipFlopPrevention(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	engine := NewDecisionEngine(nil, scoreEngine, logger)
+	engine := NewDecisionEngine(nil, nil, scoreEngine, logger)
 
 	// Setup initial state
 	engine.symbolStates["BTCUSD1"] = &SymbolTradingState{

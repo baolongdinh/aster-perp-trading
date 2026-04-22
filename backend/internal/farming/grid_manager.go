@@ -482,6 +482,11 @@ func (g *GridManager) InitializeEquityTracking(initialBalance float64) {
 	g.logger.WithField("initial_equity", initialBalance).Info("Equity tracking initialized")
 }
 
+// GetBaseOrderSize returns the base notional size in USD
+func (g *GridManager) GetBaseOrderSize() float64 {
+	return g.baseNotionalUSD
+}
+
 // UpdateEquity updates equity after a position close
 func (g *GridManager) UpdateEquity(realizedPnL float64, isWin bool) {
 	g.equityMu.Lock()
@@ -865,6 +870,13 @@ func (g *GridManager) Start(ctx context.Context) error {
 	// NEW: Start take profit timeout checker
 	if g.takeProfitMgr != nil {
 		g.takeProfitMgr.SetGridManager(g)
+		// CRITICAL: Wire FuturesClient to enable real order placement
+		if g.futuresClient != nil {
+			g.takeProfitMgr.SetFuturesClient(g.futuresClient)
+			g.logger.Info("TakeProfitManager wired with FuturesClient")
+		} else {
+			g.logger.Error("FuturesClient is nil - TakeProfitManager cannot place real orders!")
+		}
 		g.takeProfitMgr.StartTimeoutChecker(ctx)
 		g.logger.Info("Take profit timeout checker started")
 	}

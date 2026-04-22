@@ -144,6 +144,7 @@ func NewAgenticEngine(
 
 	// NEW: State Watchdog Timeouts (Phase 3)
 	engine.stateTimeouts = map[TradingMode]time.Duration{
+		TradingModeEnterGrid:    2 * time.Minute,
 		TradingModeGrid:         24 * time.Hour,
 		TradingModeTrending:     4 * time.Hour,
 		TradingModeAccumulation: 8 * time.Hour,
@@ -155,7 +156,7 @@ func NewAgenticEngine(
 	// NEW: Initialize adaptive state management components (Phase 2-10)
 	if cfg.ScoreEngine.Enabled {
 		engine.scoreEngine = NewScoreCalculationEngine(&cfg.ScoreEngine, logger)
-		engine.decisionEngine = NewDecisionEngine(nil, engine.scoreEngine, logger)
+		engine.decisionEngine = NewDecisionEngine(&cfg.DecisionEngine, &cfg.AgenticV2, engine.scoreEngine, logger)
 		engine.idleHandler = NewIdleStateHandler(engine.scoreEngine, logger)
 		engine.waitRangeHandler = NewWaitRangeStateHandler(engine.scoreEngine, logger)
 		engine.enterGridHandler = NewEnterGridStateHandler(engine.scoreEngine, logger)
@@ -849,8 +850,230 @@ func (ae *AgenticEngine) buildSignalBundle(snapshot realtime.SymbolRuntimeSnapsh
 	if snapshot.BlockReason != "" {
 		overall = 0.2
 	}
+	meanReversion := 0.2
+	breakout := 0.2
+	liquidity := max(0.1, 1.0-min(1.0, snapshot.SpreadBps/25.0))
+	fvg := 0.2
+	if regime.Regime == RegimeSideways || regime.Regime == RegimeRecovery {
+		meanReversion = min(1.0, regime.Confidence+0.2)
+		fvg = min(1.0, meanReversion*0.85)
+	} else if regime.Regime == RegimeTrending {
+		breakout = min(1.0, regime.Confidence+0.15)
+		fvg = min(1.0, breakout*0.75)
+	}
 	return &SignalBundle{
+		FVGSignal:       fvg,
+		LiquiditySignal: liquidity,
+		BreakoutSignal:  breakout,
+		MeanReversion:   meanReversion,
 		OverallStrength: overall,
+	}
+}
+
+func (ae *AgenticEngine) buildMarketStateVector(snapshot realtime.SymbolRuntimeSnapshot, regime RegimeSnapshot) MarketStateVector {
+	liquidityQuality := 1.0
+	if snapshot.SpreadBps > 0 {
+		liquidityQuality = 1.0 - min(1.0, snapshot.SpreadBps/20.0)
+	}
+
+	rangeQuality := 0.25
+	if regime.Regime == RegimeSideways {
+		rangeQuality = min(1.0, regime.Confidence+0.2)
+	} else if regime.Regime == RegimeRecovery {
+		rangeQuality = min(1.0, regime.Confidence+0.1)
+	}
+
+	trendStrength := min(1.0, regime.ADX/45.0)
+	if regime.Regime != RegimeTrending {
+		trendStrength *= 0.6
+	}
+
+	volatilityState := min(1.0, regime.ATR14*100)
+	breakoutPersistence := min(1.0, trendStrength*(0.6+regime.Confidence*0.4))
+
+	// Phase 1: Enhanced Vector
+	trendPersistence := 0.0
+	if regime.Regime == RegimeTrending {
+		trendPersistence = regime.Confidence
+	}
+
+	spreadStress := snapshot.SpreadBps / 20.0 // Normalized to 20bps
+
+	return MarketStateVector{
+		Regime:              regime.Regime,
+		TrendStrength:       trendStrength,
+		RangeQuality:        rangeQuality,
+		VolatilityState:     volatilityState,
+		LiquidityQuality:    liquidityQuality,
+		BreakoutPersistence: breakoutPersistence,
+		TrendPersistence:    trendPersistence,
+		OrderflowImbalance:  0.5, // Placeholder for Phase 2
+		SpreadStress:        spreadStress,
+	}
+}
+
+func (ae *AgenticEngine) buildExecutionContext(snapshot realtime.SymbolRuntimeSnapshot, regime RegimeSnapshot) ExecutionContext {
+	return ExecutionContext{
+		CurrentPrice:      snapshot.CurrentPrice,
+		BestBid:           snapshot.BestBid,
+		BestAsk:           snapshot.BestAsk,
+		SpreadBps:         snapshot.SpreadBps,
+		SlippageEstBps:    snapshot.SlippageEstBps,
+		FundingImpactBps:  snapshot.FundingImpact,
+		PositionSize:      snapshot.PositionSize,
+		InventoryNotional: snapshot.InventoryNotional,
+		PositionAgeSec:    snapshot.PositionAgeSec,
+		PendingOrders:     snapshot.PendingOrders,
+		RealizedPnL:       snapshot.RealizedPnL,
+		UnrealizedPnL:     snapshot.UnrealizedPnL,
+		MakerFillRatio:    snapshot.MakerFillRatio,
+		Regime:            regime.Regime,
+	}
+}
+
+func (ae *AgenticEngine) defaultLifecyclePolicy(vector MarketStateVector, snapshot realtime.SymbolRuntimeSnapshot) TradeLifecyclePolicy {
+	targetAgeSec := int64(480)
+	feeBudget := 8.0
+	minRangeQuality := 0.55
+	volumeWeight := 0.8
+	profitWeight := 0.45
+	riskWeight := 0.7
+
+	if ae.config.AgenticV2.PositionAgeTargetSec > 0 {
+		targetAgeSec = ae.config.AgenticV2.PositionAgeTargetSec
+	}
+	if ae.config.AgenticV2.FeeGuardrails.MaxFeeBudgetBps > 0 {
+		feeBudget = ae.config.AgenticV2.FeeGuardrails.MaxFeeBudgetBps
+	}
+	if ae.config.AgenticV2.FeeGuardrails.MinRangeQuality > 0 {
+		minRangeQuality = ae.config.AgenticV2.FeeGuardrails.MinRangeQuality
+	}
+	if ae.config.AgenticV2.ObjectiveWeights.VolumeWeight > 0 {
+		volumeWeight = ae.config.AgenticV2.ObjectiveWeights.VolumeWeight
+	}
+	if ae.config.AgenticV2.ObjectiveWeights.ProfitWeight > 0 {
+		profitWeight = ae.config.AgenticV2.ObjectiveWeights.ProfitWeight
+	}
+	if ae.config.AgenticV2.ObjectiveWeights.RiskWeight > 0 {
+		riskWeight = ae.config.AgenticV2.ObjectiveWeights.RiskWeight
+	}
+
+	tpTarget := 12.0
+	if ae.config.AgenticV2.FeeGuardrails.DefaultTPBps > 0 {
+		tpTarget = ae.config.AgenticV2.FeeGuardrails.DefaultTPBps
+	}
+	hardSL := 28.0
+	if ae.config.AgenticV2.FeeGuardrails.DefaultHardSLBps > 0 {
+		hardSL = ae.config.AgenticV2.FeeGuardrails.DefaultHardSLBps
+	}
+
+	inventorySkew := 0.0
+	if snapshot.InventoryNotional > 0 && snapshot.CurrentPrice > 0 {
+		inventorySkew = min(1.0, snapshot.InventoryNotional/(snapshot.CurrentPrice*0.1))
+	}
+
+	return TradeLifecyclePolicy{
+		TPBands: []TPBand{
+			{TargetBps: tpTarget, CloseRatio: 0.5, MakerOnly: true},
+			{TargetBps: tpTarget * 1.5, CloseRatio: 0.3, MakerOnly: true},
+			{TargetBps: tpTarget * 2.0, CloseRatio: 0.2, MakerOnly: true},
+		},
+		SLPolicy: SLPolicy{
+			SoftATRMultiplier: 1.6,
+			HardLossBps:       hardSL,
+			TimeStopSec:       targetAgeSec,
+		},
+		RegridPolicy: RegridPolicy{
+			AllowImmediate:  vector.RangeQuality >= minRangeQuality,
+			MinRangeQuality: minRangeQuality,
+			FlattenFirst:    true,
+		},
+		MakerOnly:         true,
+		MaxPositionAgeSec: targetAgeSec,
+		FeeBudgetBps:      feeBudget,
+		InventorySkew:     inventorySkew,
+		Objective: ModeObjective{
+			VolumeWeight: volumeWeight,
+			ProfitWeight: profitWeight,
+			RiskWeight:   riskWeight,
+		},
+	}
+}
+
+func (ae *AgenticEngine) commitHandlerTransition(
+	ctx context.Context,
+	symbol string,
+	regime RegimeSnapshot,
+	snapshot realtime.SymbolRuntimeSnapshot,
+	transition *StateTransition,
+) {
+	if transition == nil || ae.decisionEngine == nil {
+		return
+	}
+
+	// Phase 0: Guardrails - Hard Kill Switch
+	if ae.config.AgenticV2.Enabled && ae.config.AgenticV2.HardKillSwitch {
+		ae.logger.Warn("Hard kill switch active, rejecting transition", zap.String("symbol", symbol))
+		return
+	}
+
+	// Phase 0: Guardrails - Per-symbol Loss Cap
+	if ae.config.AgenticV2.Enabled && ae.config.AgenticV2.PerSymbolLossCapUSDT > 0 {
+		if snapshot.RealizedPnL < -ae.config.AgenticV2.PerSymbolLossCapUSDT {
+			ae.logger.Error("Per-symbol loss cap reached, forcing IDLE",
+				zap.String("symbol", symbol),
+				zap.Float64("realized_pnl", snapshot.RealizedPnL),
+				zap.Float64("cap", ae.config.AgenticV2.PerSymbolLossCapUSDT))
+			transition.ToState = TradingModeIdle
+			transition.Trigger = "loss_cap_reached"
+		}
+	}
+
+	vector := ae.buildMarketStateVector(snapshot, regime)
+	executionContext := ae.buildExecutionContext(snapshot, regime)
+	policy := ae.defaultLifecyclePolicy(vector, snapshot)
+	intent := TransitionIntent{
+		Symbol:           symbol,
+		FromState:        transition.FromState,
+		ToState:          transition.ToState,
+		Trigger:          transition.Trigger,
+		Score:            transition.Score,
+		MarketState:      vector,
+		ExecutionContext: executionContext,
+		LifecyclePolicy:  policy,
+		Timestamp:        transition.Timestamp,
+	}
+
+	committed, err := ae.decisionEngine.CommitTransition(intent)
+	if err != nil {
+		ae.logger.Error("State transition commit failed",
+			zap.String("symbol", symbol),
+			zap.Error(err),
+		)
+		return
+	}
+	if committed == nil {
+		return
+	}
+
+	ae.recordExitContext(symbol, committed, snapshot)
+
+	// Phase 0: Shadow Mode
+	if ae.config.AgenticV2.Enabled && ae.config.AgenticV2.ShadowMode {
+		ae.logger.Info("SHADOW MODE: Transition committed but execution skipped",
+			zap.String("symbol", symbol),
+			zap.String("from", string(committed.FromState)),
+			zap.String("to", string(committed.ToState)))
+		return
+	}
+
+	if ae.vfBridge != nil {
+		if err := ae.vfBridge.RequestStateTransition(ctx, symbol, intent); err != nil {
+			ae.logger.Error("Failed to request VF execution",
+				zap.String("symbol", symbol),
+				zap.Error(err),
+			)
+		}
 	}
 }
 
@@ -909,17 +1132,23 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 						sink.IncrementStateStuckCount(symbol)
 					}
 
-					// Force transition to IDLE as safety measure
-					ae.decisionEngine.ForceTransition(symbol, TradingModeIdle, "watchdog_timeout")
-
-					// Ensure bridge is notified
-					if ae.vfBridge != nil {
-						ae.vfBridge.RequestStateTransition(ctx, symbol,
-							currentStateObj.CurrentMode, TradingModeIdle,
-							"watchdog_timeout", 1.0, regime)
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, &StateTransition{
+						FromState: currentStateObj.CurrentMode,
+						ToState:   TradingModeIdle,
+						Trigger:   "watchdog_timeout",
+						Score:     1.0,
+						Timestamp: time.Now(),
+					})
 					continue // Skip normal processing for this cycle
 				}
+			}
+
+			if ae.config.AgenticV2.AckTimeoutSec > 0 &&
+				ae.decisionEngine.HasPendingExecutionAck(symbol, time.Duration(ae.config.AgenticV2.AckTimeoutSec)*time.Second) {
+				ae.logger.Warn("Execution acknowledgement timed out",
+					zap.String("symbol", symbol),
+					zap.String("mode", string(currentStateObj.CurrentMode)),
+				)
 			}
 		}
 
@@ -936,7 +1165,7 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 		switch currentState.CurrentMode {
 		case TradingModeIdle:
 			// Handle IDLE state
-			transition, err := ae.idleHandler.HandleState(ctx, symbol, regime)
+			transition, err := ae.idleHandler.HandleState(ctx, symbol, regime, snapshot)
 			if err != nil {
 				ae.logger.Error("IDLE state handler failed",
 					zap.String("symbol", symbol),
@@ -946,45 +1175,13 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 			}
 
 			if transition != nil {
-				ae.recordExitContext(symbol, transition, snapshot)
-				// Execute the transition through decision engine
-				_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-					Symbol:         symbol,
-					RegimeSnapshot: regime,
-				})
-				if err != nil {
-					ae.logger.Error("State transition failed",
-						zap.String("symbol", symbol),
-						zap.Error(err),
-					)
-				} else {
-					ae.logger.Info("State transition executed",
-						zap.String("symbol", symbol),
-						zap.String("from", string(transition.FromState)),
-						zap.String("to", string(transition.ToState)),
-						zap.Float64("score", transition.Score),
-					)
-
-					// NEW: Request execution via VF Bridge (Hybrid Integration)
-					if ae.vfBridge != nil {
-						if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-							transition.FromState, transition.ToState,
-							transition.Trigger, transition.Score, regime); err != nil {
-							ae.logger.Error("Failed to request VF execution",
-								zap.String("symbol", symbol),
-								zap.Error(err),
-							)
-						}
-					}
-				}
+				ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 			}
 
 		case TradingModeWaitNewRange:
 			// Handle WAIT_NEW_RANGE state
 			if ae.waitRangeHandler != nil {
-				currentPrice := snapshot.CurrentPrice
-
-				transition, err := ae.waitRangeHandler.HandleState(ctx, symbol, regime, currentPrice)
+				transition, err := ae.waitRangeHandler.HandleState(ctx, symbol, regime, snapshot)
 				if err != nil {
 					ae.logger.Error("WAIT_NEW_RANGE state handler failed",
 						zap.String("symbol", symbol),
@@ -994,41 +1191,40 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T015: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
+				}
+			}
+
+		case TradingModeEnterGrid:
+			if ae.enterGridHandler != nil {
+				signals := ae.buildSignalBundle(snapshot, regime)
+				var rangeBoundaries *RangeBoundaries
+				if ae.waitRangeHandler != nil {
+					rangeBoundaries, _ = ae.waitRangeHandler.GetRangeBoundaries(symbol)
+				}
+
+				transition, err := ae.enterGridHandler.HandleState(
+					ctx, symbol, regime, snapshot, rangeBoundaries, signals,
+				)
+				if err != nil {
+					ae.logger.Error("ENTER_GRID state handler failed",
+						zap.String("symbol", symbol),
+						zap.Error(err),
+					)
+					continue
+				}
+				if transition != nil {
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 
 		case TradingModeGrid:
 			// Handle active GRID trading state (Phase 6)
 			if ae.tradingGridHandler != nil {
-				currentPrice := snapshot.CurrentPrice
-				positionSize := snapshot.PositionSize
 				signals := ae.buildSignalBundle(snapshot, regime)
 
 				transition, err := ae.tradingGridHandler.HandleState(
-					ctx, symbol, regime, currentPrice, positionSize, signals,
+					ctx, symbol, regime, snapshot, signals,
 				)
 				if err != nil {
 					ae.logger.Error("TRADING_GRID state handler failed",
@@ -1039,29 +1235,7 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T016: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 
@@ -1076,10 +1250,10 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				if breakoutLevel <= 0 {
 					breakoutLevel = currentPrice
 				}
-				fvgZones := []FVGZone{}
+				vector := ae.buildMarketStateVector(snapshot, regime)
 
 				transition, err := ae.trendingHandler.HandleState(
-					ctx, symbol, regime, currentPrice, breakoutLevel, fvgZones,
+					ctx, symbol, regime, snapshot, vector, breakoutLevel,
 				)
 				if err != nil {
 					ae.logger.Error("TRENDING state handler failed",
@@ -1090,43 +1264,15 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T017: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 
 		case TradingModeAccumulation:
 			// Handle ACCUMULATION state (Phase 8)
 			if ae.accumulationHandler != nil {
-				currentPrice := snapshot.CurrentPrice
-				volume24h := snapshot.Volume24h
-				if volume24h <= 0 {
-					volume24h = regime.Volume24h
-				}
-
 				transition, err := ae.accumulationHandler.HandleState(
-					ctx, symbol, regime, currentPrice, volume24h,
+					ctx, symbol, regime, snapshot,
 				)
 				if err != nil {
 					ae.logger.Error("ACCUMULATION state handler failed",
@@ -1137,41 +1283,15 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T018: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 
 		case TradingModeDefensive:
 			// Handle DEFENSIVE state (Phase 9)
 			if ae.defensiveHandler != nil {
-				currentPrice := snapshot.CurrentPrice
-				positionSize := snapshot.PositionSize
-				unrealizedPnL := snapshot.UnrealizedPnL
-
 				transition, err := ae.defensiveHandler.HandleState(
-					ctx, symbol, regime, currentPrice, positionSize, unrealizedPnL,
+					ctx, symbol, regime, snapshot,
 				)
 				if err != nil {
 					ae.logger.Error("DEFENSIVE state handler failed",
@@ -1182,43 +1302,15 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T019: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 
 		case TradingModeOverSize:
 			// Handle OVER_SIZE state (Phase 10)
 			if ae.overSizeHandler != nil {
-				currentPrice := snapshot.CurrentPrice
-				positionSize := snapshot.PositionNotional
-				if positionSize <= 0 {
-					positionSize = snapshot.PositionSize
-				}
-
 				transition, err := ae.overSizeHandler.HandleState(
-					ctx, symbol, regime, currentPrice, positionSize,
+					ctx, symbol, regime, snapshot,
 				)
 				if err != nil {
 					ae.logger.Error("OVER_SIZE state handler failed",
@@ -1229,29 +1321,7 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T020: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 
@@ -1274,7 +1344,7 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				transition, err := ae.recoveryHandler.HandleState(
-					ctx, symbol, regime, exitPnL, exitReason, consecutiveLosses,
+					ctx, symbol, regime, snapshot, exitPnL, exitReason, consecutiveLosses,
 				)
 				if err != nil {
 					ae.logger.Error("RECOVERY state handler failed",
@@ -1285,29 +1355,7 @@ func (ae *AgenticEngine) runStateManagement(ctx context.Context, detections map[
 				}
 
 				if transition != nil {
-					ae.recordExitContext(symbol, transition, snapshot)
-					_, err := ae.decisionEngine.EvaluateAndDecide(symbol, &ScoreInputs{
-						Symbol:         symbol,
-						RegimeSnapshot: regime,
-					})
-					if err != nil {
-						ae.logger.Error("State transition failed",
-							zap.String("symbol", symbol),
-							zap.Error(err),
-						)
-					} else {
-						// T021: Request execution via VF Bridge
-						if ae.vfBridge != nil {
-							if err := ae.vfBridge.RequestStateTransition(ctx, symbol,
-								transition.FromState, transition.ToState,
-								transition.Trigger, transition.Score, regime); err != nil {
-								ae.logger.Error("Failed to request VF execution",
-									zap.String("symbol", symbol),
-									zap.Error(err),
-								)
-							}
-						}
-					}
+					ae.commitHandlerTransition(ctx, symbol, regime, snapshot, transition)
 				}
 			}
 

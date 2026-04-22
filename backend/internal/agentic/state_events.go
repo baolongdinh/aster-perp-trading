@@ -20,6 +20,7 @@ type StateTransitionEvent struct {
 	Priority  EventPriority   `json:"priority"`
 	Params    ExecutionParams `json:"params"` // Parameters for execution
 	Regime    RegimeSnapshot  `json:"regime"` // Current market regime
+	IntentID  string          `json:"intent_id,omitempty"`
 }
 
 // EventPriority defines the urgency of state transition
@@ -58,6 +59,17 @@ type ExecutionParams struct {
 	// Position sizing adjustments
 	PositionSizeMultiplier float64 `json:"position_size_multiplier,omitempty"`
 	MaxPositionUSDT        float64 `json:"max_position_usdt,omitempty"`
+
+	// Volume-first lifecycle controls
+	TPBands           []TPBand         `json:"tp_bands,omitempty"`
+	SLPolicy          SLPolicy         `json:"sl_policy,omitempty"`
+	TimeStopSec       int64            `json:"time_stop_sec,omitempty"`
+	MaxPositionAgeSec int64            `json:"max_position_age_sec,omitempty"`
+	RegridPolicy      RegridPolicy     `json:"regrid_policy,omitempty"`
+	InventorySkew     float64          `json:"inventory_skew,omitempty"`
+	MakerOnly         bool             `json:"maker_only,omitempty"`
+	FeeBudgetBps      float64          `json:"fee_budget_bps,omitempty"`
+	ExecutionContext  ExecutionContext `json:"execution_context,omitempty"`
 }
 
 // StateEventPublisher publishes state transition events to subscribers
@@ -157,6 +169,7 @@ type ExecutionResult struct {
 	Timestamp   time.Time `json:"timestamp"`
 	Trigger     string    `json:"trigger,omitempty"`
 	ExitReason  string    `json:"exit_reason,omitempty"`
+	IntentID    string    `json:"intent_id,omitempty"`
 
 	// Execution details
 	OrdersPlaced    int     `json:"orders_placed,omitempty"`

@@ -1211,6 +1211,19 @@ func (e *VolumeFarmEngine) initUserStream(ctx context.Context) {
 				// Process all order status updates for proper sync
 				e.gridManager.OnOrderUpdate(orderUpdate)
 
+				// NEW: Record trade in runtime hub for metrics
+				if u.Order.ExecType == "TRADE" && u.Order.FilledQty > 0 {
+					if e.runtimeHub != nil {
+						e.runtimeHub.RecordTrade(
+							u.Order.Symbol,
+							u.Order.FilledQty,
+							u.Order.Price,
+							u.Order.Commission,
+							u.Order.IsMaker,
+						)
+					}
+				}
+
 				// NOTE: wsClient cache is single source of truth, updated by UserStream directly
 				// SyncManager removed local state, only does WebSocket health verification
 			},
@@ -2157,7 +2170,11 @@ func (e *VolumeFarmEngine) ExecuteGridEntry(ctx context.Context, symbol string, 
 		zap.Float64("range_low", params.RangeLow),
 		zap.Float64("range_high", params.RangeHigh),
 		zap.Int("grid_levels", params.GridLevels),
+		zap.Float64("size_mult", params.PositionSizeMultiplier),
 	)
+
+	// Phase 5: Audit Log
+	e.logTransitionAudit(symbol, "GRID_ENTRY", params)
 
 	// Use the existing UpdateWhitelist method to add symbol
 	whitelist := e.symbolSelector.GetWhitelist()
@@ -2175,7 +2192,105 @@ func (e *VolumeFarmEngine) ExecuteGridEntry(ctx context.Context, symbol string, 
 		}
 	}
 
+	if e.adaptiveGridManager != nil {
+		// Apply inventory skew and position size multiplier
+		if params.InventorySkew != 0 {
+			e.logger.Debug("Applying inventory skew to grid", zap.Float64("skew", params.InventorySkew))
+			// TODO: Implement SetInventorySkew in adaptiveGridManager
+		}
+
+		if sm := e.adaptiveGridManager.GetStateMachine(); sm != nil {
+			currentState := sm.GetState(symbol)
+			switch currentState {
+			case adaptive_grid.GridStateWaitNewRange:
+				if sm.CanTransition(symbol, adaptive_grid.EventNewRangeReady) {
+					sm.Transition(symbol, adaptive_grid.EventNewRangeReady)
+				} else {
+					sm.ForceState(symbol, adaptive_grid.GridStateEnterGrid)
+				}
+			case adaptive_grid.GridStateIdle, adaptive_grid.GridStateExitAll, adaptive_grid.GridStateDefensive:
+				sm.ForceState(symbol, adaptive_grid.GridStateEnterGrid)
+			}
+		}
+	}
+
+	if e.gridManager != nil {
+		// Phase 5: Apply execution parameters from Agentic to grid manager
+
+		// 1. Apply position size multiplier
+		if params.PositionSizeMultiplier > 0 {
+			e.gridManager.SetOrderSize(params.PositionSizeMultiplier * e.gridManager.GetBaseOrderSize())
+			e.logger.Info("Applied position size multiplier",
+				zap.String("symbol", symbol),
+				zap.Float64("multiplier", params.PositionSizeMultiplier))
+		}
+
+		// 2. Apply grid spread if specified (for micro-profit optimization)
+		// Calculate spread from ATR in execution context or use default
+		if params.ExecutionContext.SpreadBps > 0 {
+			// Convert bps to percentage (e.g., 6 bps = 0.06%)
+			spreadPct := params.ExecutionContext.SpreadBps / 10000.0
+			e.gridManager.SetGridSpread(spreadPct)
+			e.logger.Info("Applied grid spread from Agentic",
+				zap.String("symbol", symbol),
+				zap.Float64("spread_bps", params.ExecutionContext.SpreadBps),
+				zap.Float64("spread_pct", spreadPct))
+		}
+
+		// 3. Update micro-profit config with TP bands from Agentic if available
+		if len(params.TPBands) > 0 && e.gridManager.takeProfitMgr != nil {
+			// Update take profit config based on Agentic TP bands
+			// Use the first band's target as the spread percentage
+			firstBand := params.TPBands[0]
+			if firstBand.TargetBps > 0 {
+				spreadPct := firstBand.TargetBps / 10000.0
+				microProfitConfig := &adaptive_grid.MicroProfitConfig{
+					Enabled:        true,
+					SpreadPct:      spreadPct,
+					TimeoutSeconds: int(params.TimeStopSec),
+					MinProfitUSDT:  0.01,
+				}
+				e.gridManager.takeProfitMgr.UpdateConfig(microProfitConfig)
+				e.logger.Info("Updated micro-profit config from Agentic TP bands",
+					zap.String("symbol", symbol),
+					zap.Float64("spread_pct", spreadPct),
+					zap.Int64("timeout_sec", params.TimeStopSec))
+			}
+		}
+
+		// 4. Log SL policy if specified
+		if params.SLPolicy.HardLossBps > 0 {
+			e.logger.Info("SL policy from Agentic",
+				zap.String("symbol", symbol),
+				zap.Float64("hard_loss_bps", params.SLPolicy.HardLossBps),
+				zap.Float64("soft_atr_mult", params.SLPolicy.SoftATRMultiplier),
+				zap.Int64("time_stop_sec", params.SLPolicy.TimeStopSec))
+		}
+
+		// 5. Log regrid policy
+		if params.RegridPolicy.AllowImmediate {
+			e.logger.Info("Regrid policy from Agentic",
+				zap.String("symbol", symbol),
+				zap.Bool("allow_immediate", params.RegridPolicy.AllowImmediate),
+				zap.Float64("min_range_quality", params.RegridPolicy.MinRangeQuality))
+		}
+
+		// 6. Trigger grid placement
+		e.gridManager.enqueuePlacement(symbol)
+	}
+
 	return nil
+}
+
+func (e *VolumeFarmEngine) logTransitionAudit(symbol string, action string, params agentic.ExecutionParams) {
+	e.logger.Info("AUDIT_TRANSITION",
+		zap.String("symbol", symbol),
+		zap.String("action", action),
+		zap.Time("timestamp", time.Now()),
+		zap.Float64("pnl_realized", params.ExecutionContext.RealizedPnL),
+		zap.Float64("inventory", params.ExecutionContext.InventoryNotional),
+		zap.String("regime", string(params.ExecutionContext.Regime)),
+	)
 }
 
 // ExecuteGridExit disables grid trading for a symbol
@@ -2213,6 +2328,13 @@ func (e *VolumeFarmEngine) ExecuteTrendEntry(ctx context.Context, symbol string,
 	// First exit grid mode by removing from whitelist
 	if err := e.ExecuteGridExit(ctx, symbol, "switch_to_trend"); err != nil {
 		e.logger.Warn("Failed to exit grid for trend entry", zap.Error(err))
+	}
+
+	if e.adaptiveGridManager != nil {
+		e.adaptiveGridManager.ExitAll(ctx, symbol, adaptive_grid.EventTrendExit, "switch_to_trend")
+		if sm := e.adaptiveGridManager.GetStateMachine(); sm != nil {
+			sm.ForceState(symbol, adaptive_grid.GridStateTrending)
+		}
 	}
 
 	// Log trend parameters - VF decides how to implement trend following
@@ -2257,7 +2379,67 @@ func (e *VolumeFarmEngine) ExecuteDefensive(ctx context.Context, symbol string, 
 		}
 	}
 
-	// If full exit, trigger emergency exit
+	if e.adaptiveGridManager != nil {
+		if exitPct >= 1.0 {
+			e.adaptiveGridManager.ExitAll(ctx, symbol, adaptive_grid.EventEmergencyExit, reason)
+			if sm := e.adaptiveGridManager.GetStateMachine(); sm != nil {
+				sm.ForceState(symbol, adaptive_grid.GridStateWaitNewRange)
+			}
+			return nil
+		}
+
+		// Partial exit: reduce position by exitPct (e.g., 0.5 = reduce 50%)
+		if exitPct > 0 && exitPct < 1.0 {
+			// Get current position from WebSocket cache
+			if e.wsClient != nil {
+				positions := e.wsClient.GetCachedPositions()
+				if pos, exists := positions[symbol]; exists && pos.PositionAmt != 0 {
+					positionAmt := pos.PositionAmt
+					reduceQty := math.Abs(positionAmt) * exitPct
+
+					e.logger.Info("Executing partial position reduction",
+						zap.String("symbol", symbol),
+						zap.Float64("position_amt", positionAmt),
+						zap.Float64("exit_pct", exitPct),
+						zap.Float64("reduce_qty", reduceQty))
+
+					// Determine side for reducing order (opposite of position side)
+					reduceSide := "SELL"
+					if positionAmt < 0 { // Short position
+						reduceSide = "BUY"
+					}
+
+					// Place market order to reduce position
+					if e.futuresClient != nil {
+						orderReq := client.PlaceOrderRequest{
+							Symbol:     symbol,
+							Side:       reduceSide,
+							Type:       "MARKET",
+							Quantity:   fmt.Sprintf("%.6f", reduceQty),
+							ReduceOnly: true,
+						}
+						_, err := e.futuresClient.PlaceOrder(ctx, orderReq)
+						if err != nil {
+							e.logger.Error("Failed to place partial exit order",
+								zap.String("symbol", symbol),
+								zap.Error(err))
+						} else {
+							e.logger.Info("Partial exit order placed successfully",
+								zap.String("symbol", symbol),
+								zap.String("side", reduceSide),
+								zap.Float64("qty", reduceQty))
+						}
+					}
+				}
+			}
+		}
+
+		if sm := e.adaptiveGridManager.GetStateMachine(); sm != nil {
+			sm.ForceState(symbol, adaptive_grid.GridStateDefensive)
+		}
+	}
+
+	// If full exit and no adaptive manager is available, fall back to emergency exit.
 	if exitPct >= 1.0 {
 		return e.TriggerEmergencyExit(reason)
 	}
@@ -2276,6 +2458,12 @@ func (e *VolumeFarmEngine) ExecuteAccumulation(ctx context.Context, symbol strin
 	accParams := params
 	accParams.PositionSizeMultiplier = 0.3 // 30% of normal size for gradual building
 
+	if e.adaptiveGridManager != nil {
+		if sm := e.adaptiveGridManager.GetStateMachine(); sm != nil {
+			sm.ForceState(symbol, adaptive_grid.GridStateEnterGrid)
+		}
+	}
+
 	return e.ExecuteGridEntry(ctx, symbol, accParams)
 }
 
@@ -2288,6 +2476,12 @@ func (e *VolumeFarmEngine) ExecuteRecovery(ctx context.Context, symbol string, p
 	// Ensure we're in a safe state
 	if err := e.ExecuteDefensive(ctx, symbol, 0.5, "recovery_init"); err != nil {
 		e.logger.Warn("Recovery: partial exit failed", zap.Error(err))
+	}
+
+	if e.adaptiveGridManager != nil {
+		if sm := e.adaptiveGridManager.GetStateMachine(); sm != nil {
+			sm.ForceState(symbol, adaptive_grid.GridStateRecovery)
+		}
 	}
 
 	// Wait for cooldown (handled by recovery state handler)

@@ -1,6 +1,7 @@
 package agentic
 
 import (
+	"aster-bot/internal/realtime"
 	"context"
 	"math"
 	"time"
@@ -41,7 +42,9 @@ func (h *IdleStateHandler) HandleState(
 	ctx context.Context,
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
+	snapshot realtime.SymbolRuntimeSnapshot,
 ) (*StateTransition, error) {
+	_ = snapshot // Reserved for Phase 2+ validation (e.g. liquidity/spread check)
 	h.logger.Debug("Executing IDLE state strategy",
 		zap.String("symbol", symbol),
 	)
@@ -77,9 +80,10 @@ func (h *IdleStateHandler) HandleState(
 		}, nil
 	}
 
-	// Check GRID (threshold 0.6)
-	if gridScore.Score > 0.6 {
-		h.logger.Info("GRID opportunity detected from IDLE",
+	// Phase 2: GRID_FARM as default (threshold 0.5)
+	// Lower threshold for grid to encourage volume farming
+	if gridScore.Score > 0.5 {
+		h.logger.Info("GRID opportunity detected from IDLE (Volume-First)",
 			zap.String("symbol", symbol),
 			zap.Float64("grid_score", gridScore.Score),
 			zap.Float64("trend_score", trendScore.Score),
@@ -96,7 +100,7 @@ func (h *IdleStateHandler) HandleState(
 	}
 
 	// 5. Check if both scores are too low (stay in IDLE)
-	if gridScore.Score < 0.4 && trendScore.Score < 0.4 {
+	if gridScore.Score < 0.3 && trendScore.Score < 0.3 {
 		h.logger.Debug("Scores too low, remaining in IDLE",
 			zap.String("symbol", symbol),
 			zap.Float64("grid_score", gridScore.Score),

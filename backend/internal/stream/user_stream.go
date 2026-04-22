@@ -41,8 +41,11 @@ type WsOrderUpdate struct {
 		OrderID       int64   `json:"i"`
 		FilledQty     float64 `json:"l,string"`
 		CumFilledQty  float64 `json:"z,string"`
+		Commission    float64 `json:"n,string"`
+		CommAsset     string  `json:"N"`
 		TradeID       int64   `json:"t"`
 		RealizedPnL   float64 `json:"rp,string"`
+		IsMaker       bool    `json:"m"`
 		PositionSide  string  `json:"ps"`
 		IsReduceOnly  bool    `json:"R"`
 	} `json:"o"`

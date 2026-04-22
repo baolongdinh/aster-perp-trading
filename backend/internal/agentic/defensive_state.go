@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"go.uber.org/zap"
 )
 
@@ -64,10 +66,11 @@ func (h *DefensiveStateHandler) HandleState(
 	ctx context.Context,
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
-	currentPrice float64,
-	positionSize float64,
-	unrealizedPnL float64,
+	snapshot realtime.SymbolRuntimeSnapshot,
 ) (*StateTransition, error) {
+	currentPrice := snapshot.CurrentPrice
+	unrealizedPnL := snapshot.UnrealizedPnL
+
 	h.logger.Debug("Executing DEFENSIVE state strategy",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
@@ -90,8 +93,6 @@ func (h *DefensiveStateHandler) HandleState(
 			zap.String("symbol", symbol),
 			zap.Float64("pnl", unrealizedPnL),
 		)
-
-		// Would set breakeven stop here
 	}
 
 	// 2. Execute graduated exit based on PnL
@@ -102,15 +103,10 @@ func (h *DefensiveStateHandler) HandleState(
 			zap.String("symbol", symbol),
 			zap.Float64("pnl", unrealizedPnL),
 		)
-
-		// Execute half exit
-		h.executeHalfExit(symbol, positionSize)
 	}
 
 	// 3. Check for recovery opportunity before a full exit.
-	// In a strong recovery regime we prefer to hand control back to TRENDING
-	// instead of flattening immediately after the first defensive scale-out.
-	if h.exitStage[symbol] == ExitStageHalf {
+	if h.exitStage[symbol] == ExitStageHalf || h.exitStage[symbol] == ExitStageInitial {
 		if (regimeSnapshot.Regime == RegimeTrending || regimeSnapshot.Regime == RegimeRecovery) &&
 			h.isRecoveryOpportunity(symbol, currentPrice, unrealizedPnL) {
 			h.exitStage[symbol] = ExitStageRecovery
@@ -138,7 +134,6 @@ func (h *DefensiveStateHandler) HandleState(
 			zap.Float64("pnl", unrealizedPnL),
 		)
 
-		// Exit all and return to IDLE
 		return &StateTransition{
 			FromState:         TradingModeDefensive,
 			ToState:           TradingModeIdle,
@@ -158,7 +153,7 @@ func (h *DefensiveStateHandler) HandleState(
 
 		return &StateTransition{
 			FromState:         TradingModeDefensive,
-			ToState:           TradingModeIdle,
+			ToState:           TradingModeRecovery, // Go to recovery to analyze loss
 			Trigger:           "emergency_exit",
 			Score:             0.95,
 			SmoothingDuration: 2 * time.Second,
@@ -166,8 +161,8 @@ func (h *DefensiveStateHandler) HandleState(
 		}, nil
 	}
 
-	// 5. Check for time limit (force exit after 30 min in defensive)
-	if time.Since(h.exitTime[symbol]) > 30*time.Minute {
+	// 5. Check for time limit (force exit after 15 min in defensive for volume-first)
+	if time.Since(h.exitTime[symbol]) > 15*time.Minute {
 		h.logger.Info("Max time in defensive reached, forcing exit",
 			zap.String("symbol", symbol),
 		)
@@ -182,7 +177,6 @@ func (h *DefensiveStateHandler) HandleState(
 		}, nil
 	}
 
-	// Default: stay in DEFENSIVE
 	return nil, nil
 }
 

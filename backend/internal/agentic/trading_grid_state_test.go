@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"aster-bot/internal/realtime"
+
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
@@ -63,10 +65,15 @@ func TestShouldRebalance(t *testing.T) {
 		TotalLevels:  10,
 	}
 
-	assert.True(t, handler.shouldRebalance("BTCUSD1", status))
+	snapshot := realtime.SymbolRuntimeSnapshot{
+		InventoryNotional: 100,
+		MakerFillRatio:    0.4,
+	}
 
-	status.FilledLevels = 3
-	assert.False(t, handler.shouldRebalance("BTCUSD1", status))
+	assert.True(t, handler.shouldRebalance("BTCUSD1", status, snapshot))
+
+	snapshot.MakerFillRatio = 0.8
+	assert.False(t, handler.shouldRebalance("BTCUSD1", status, snapshot))
 }
 
 func TestTradingGridTransitions(t *testing.T) {
@@ -87,8 +94,10 @@ func TestTradingGridTransitions(t *testing.T) {
 			context.Background(),
 			"BTCUSD1",
 			regime,
-			50000.0,
-			0.03,
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:     50000.0,
+				PositionNotional: 0.03,
+			},
 			nil,
 		)
 
@@ -106,15 +115,15 @@ func TestTradingGridTransitions(t *testing.T) {
 			ATR14:      0.003,
 		}
 
-		// Set PnL below threshold
-		handler.UpdatePnL("BTCUSD1", -0.04) // -4%
-
 		transition, err := handler.HandleState(
 			context.Background(),
 			"BTCUSD1",
 			regime,
-			50000.0,
-			0.03,
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:     50000.0,
+				PositionNotional: 0.03,
+				UnrealizedPnL:    -0.04, // -4%
+			},
 			nil,
 		)
 
@@ -139,14 +148,16 @@ func TestTradingGridTransitions(t *testing.T) {
 			context.Background(),
 			"BTCUSD1",
 			regime,
-			50000.0,
-			positionSize,
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:     50000.0,
+				PositionNotional: positionSize,
+			},
 			nil,
 		)
 
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
-		assert.Equal(t, TradingModeDefensive, transition.ToState)
+		assert.Equal(t, TradingModeOverSize, transition.ToState)
 		assert.Equal(t, "position_size_limit", transition.Trigger)
 	})
 }
@@ -156,14 +167,18 @@ func TestGridStatus(t *testing.T) {
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewTradingGridStateHandler(scoreEngine, logger)
 
-	handler.UpdateFilledLevels("BTCUSD1", 5)
-	handler.UpdatePnL("BTCUSD1", 0.02)
+	status := handler.calculateGridStatus("BTCUSD1", realtime.SymbolRuntimeSnapshot{
+		UnrealizedPnL:     0.02,
+		RealizedPnL:       0.05,
+		PositionAgeSec:    120,
+		InventoryNotional: 500,
+		MakerFillRatio:    0.9,
+	}, nil)
 
-	status := handler.GetGridStatus("BTCUSD1")
 	assert.NotNil(t, status)
 	assert.Equal(t, "BTCUSD1", status.Symbol)
-	assert.Equal(t, 5, status.FilledLevels)
 	assert.Equal(t, 0.02, status.UnrealizedPnL)
+	assert.Equal(t, 500.0, status.InventoryNotional)
 }
 
 func TestTradingGridManagementIntegration(t *testing.T) {
@@ -192,8 +207,10 @@ func TestTradingGridManagementIntegration(t *testing.T) {
 			context.Background(),
 			"BTCUSD1",
 			regime,
-			50000.0,
-			0.02,
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:     50000.0,
+				PositionNotional: 0.02,
+			},
 			lowEntropySignals,
 		)
 

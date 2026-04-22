@@ -1,6 +1,7 @@
 package adaptive_grid
 
 import (
+	"aster-bot/internal/client"
 	"context"
 	"fmt"
 	"sync"
@@ -66,6 +67,9 @@ type TakeProfitManager struct {
 	// Grid manager reference (for rebalancing)
 	gridManager interface{}
 
+	// FuturesClient for placing real orders on exchange
+	futuresClient FuturesClientInterface
+
 	// Ticker for timeout checks
 	timeoutTicker *time.Ticker
 	timeoutDone   chan bool
@@ -91,6 +95,13 @@ func (m *TakeProfitManager) SetGridManager(gridManager interface{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gridManager = gridManager
+}
+
+// SetFuturesClient sets the futures client for placing real orders
+func (m *TakeProfitManager) SetFuturesClient(client FuturesClientInterface) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.futuresClient = client
 }
 
 // PlaceTakeProfitOrder places a take profit order for a filled grid order
@@ -156,7 +167,49 @@ func (m *TakeProfitManager) PlaceTakeProfitOrder(ctx context.Context, symbol, si
 		TimeoutAt:     &timeoutAt,
 	}
 
-	// Store take profit order
+	// CRITICAL: Actually place the take profit order on the exchange
+	if m.futuresClient != nil {
+		// Build order request for exchange using correct type
+		orderReq := client.PlaceOrderRequest{
+			Symbol:        symbol,
+			Side:          tpSide,
+			PositionSide:  "BOTH",
+			Type:          "LIMIT",
+			TimeInForce:   "GTC",
+			Quantity:      fmt.Sprintf("%.6f", size),
+			Price:         fmt.Sprintf("%.8f", tpPrice),
+			ReduceOnly:    true, // IMPORTANT: Reduce only to close position
+			ClientOrderID: orderID,
+		}
+
+		m.logger.Info("Placing take profit order on exchange",
+			zap.String("order_id", orderID),
+			zap.String("symbol", symbol),
+			zap.String("side", tpSide),
+			zap.Float64("price", tpPrice),
+			zap.Float64("size", size))
+
+		resp, err := m.futuresClient.PlaceOrder(ctx, orderReq)
+		if err != nil {
+			m.logger.Error("Failed to place take profit order on exchange",
+				zap.String("order_id", orderID),
+				zap.String("symbol", symbol),
+				zap.Error(err))
+			return "", fmt.Errorf("failed to place take profit order: %w", err)
+		}
+
+		m.logger.Info("Take profit order placed successfully on exchange",
+			zap.String("order_id", orderID),
+			zap.String("symbol", symbol),
+			zap.Any("response", resp))
+	} else {
+		m.logger.Error("FuturesClient not set, cannot place take profit order on exchange",
+			zap.String("order_id", orderID),
+			zap.String("symbol", symbol))
+		return "", fmt.Errorf("futuresClient not set, cannot place order")
+	}
+
+	// Store take profit order locally for tracking
 	m.takeProfitOrders[orderID] = tpOrder
 
 	// Create position mapping
@@ -173,7 +226,7 @@ func (m *TakeProfitManager) PlaceTakeProfitOrder(ctx context.Context, symbol, si
 
 	m.totalOrdersPlaced++
 
-	m.logger.Info("Take profit order placed",
+	m.logger.Info("Take profit order tracked locally",
 		zap.String("order_id", orderID),
 		zap.String("symbol", symbol),
 		zap.String("side", tpSide),
@@ -264,14 +317,48 @@ func (m *TakeProfitManager) CheckTimeouts(ctx context.Context) {
 				}
 			}
 
-			// Close position by market order via grid manager
-			if m.gridManager != nil {
-				// Trigger grid rebalance to close the position
-				// The grid manager will handle the actual position closing
-				m.logger.Info("Triggering grid rebalance for timeout position",
-					zap.String("symbol", tpOrder.Symbol),
-					zap.String("order_id", orderID))
-				// Note: Actual position closing is handled by the grid manager's rebalancing logic
+			// CRITICAL: Immediately close position by market order to prevent liquidation
+			// This is "eat fast, close fast" - if take profit doesn't fill in time, close immediately
+			if m.futuresClient != nil {
+				go func(symbol, side string, size float64, orderID string) {
+					// Determine close side (opposite of position side)
+					closeSide := "SELL"
+					if side == "SELL" {
+						closeSide = "BUY"
+					}
+
+					m.logger.Info("EMERGENCY: Closing position by market order due to timeout",
+						zap.String("symbol", symbol),
+						zap.String("order_id", orderID),
+						zap.String("close_side", closeSide),
+						zap.Float64("size", size))
+
+					// Place market order to close position immediately
+					closeReq := client.PlaceOrderRequest{
+						Symbol:       symbol,
+						Side:         closeSide,
+						PositionSide: "BOTH",
+						Type:         "MARKET",
+						Quantity:     fmt.Sprintf("%.6f", size),
+						ReduceOnly:   true, // IMPORTANT: Reduce only to close position
+					}
+
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+
+					resp, err := m.futuresClient.PlaceOrder(ctx, closeReq)
+					if err != nil {
+						m.logger.Error("FAILED to close position on timeout - RISK OF LIQUIDATION",
+							zap.String("symbol", symbol),
+							zap.String("order_id", orderID),
+							zap.Error(err))
+					} else {
+						m.logger.Info("Position closed successfully by market order on timeout",
+							zap.String("symbol", symbol),
+							zap.String("order_id", orderID),
+							zap.Any("response", resp))
+					}
+				}(tpOrder.Symbol, tpOrder.Side, tpOrder.Size, orderID)
 			}
 		}
 	}

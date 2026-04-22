@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
@@ -59,9 +61,11 @@ func TestDefensiveTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			51000,
-			0.1,
-			0.025, // 2.5% profit - above exit_all threshold
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  51000,
+				PositionSize:  0.1,
+				UnrealizedPnL: 0.025,
+			},
 		)
 
 		assert.NoError(t, err)
@@ -89,9 +93,11 @@ func TestDefensiveTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			3100,
-			0.05,
-			0.03, // 3% profit - recovery opportunity
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  3100,
+				PositionSize:  0.05,
+				UnrealizedPnL: 0.03,
+			},
 		)
 
 		assert.NoError(t, err)
@@ -119,14 +125,16 @@ func TestDefensiveTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			98,
-			0.1,
-			-0.03, // -3% loss - emergency exit
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  98,
+				PositionSize:  0.1,
+				UnrealizedPnL: -0.03,
+			},
 		)
 
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
-		assert.Equal(t, TradingModeIdle, transition.ToState)
+		assert.Equal(t, TradingModeRecovery, transition.ToState)
 		assert.Equal(t, "emergency_exit", transition.Trigger)
 	})
 
@@ -149,9 +157,11 @@ func TestDefensiveTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			30,
-			0.1,
-			0.005, // 0.5% profit - below exit thresholds
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  30,
+				PositionSize:  0.1,
+				UnrealizedPnL: 0.005,
+			},
 		)
 
 		assert.NoError(t, err)
@@ -185,9 +195,11 @@ func TestDefensiveStateProgression(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			50250, // 0.5% profit
-			0.1,
-			0.006, // 0.6% profit
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  50250,
+				PositionSize:  0.1,
+				UnrealizedPnL: 0.006,
+			},
 		)
 
 		assert.True(t, handler.IsBreakevenHit(symbol))
@@ -200,9 +212,11 @@ func TestDefensiveStateProgression(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			50500, // 1% profit
-			0.1,
-			0.012, // 1.2% profit - above exit_half threshold
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  50500,
+				PositionSize:  0.1,
+				UnrealizedPnL: 0.012,
+			},
 		)
 
 		assert.NoError(t, err)
@@ -247,15 +261,15 @@ func TestDefensiveIntegration(t *testing.T) {
 		}
 
 		// Stage 1: Initial → Breakeven
-		_, _ = handler.HandleState(context.Background(), symbol, regime, 50250, 0.1, 0.006)
+		_, _ = handler.HandleState(context.Background(), symbol, regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 50250, PositionSize: 0.1, UnrealizedPnL: 0.006})
 		assert.True(t, handler.IsBreakevenHit(symbol))
 
 		// Stage 2: Breakeven → Half
-		_, _ = handler.HandleState(context.Background(), symbol, regime, 50500, 0.1, 0.012)
+		_, _ = handler.HandleState(context.Background(), symbol, regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 50500, PositionSize: 0.1, UnrealizedPnL: 0.012})
 		assert.Equal(t, ExitStageHalf, handler.GetExitStage(symbol))
 
 		// Stage 3: Half → All (exit to IDLE)
-		transition, err := handler.HandleState(context.Background(), symbol, regime, 51000, 0.05, 0.025)
+		transition, err := handler.HandleState(context.Background(), symbol, regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 51000, PositionSize: 0.05, UnrealizedPnL: 0.025})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
 		assert.Equal(t, TradingModeIdle, transition.ToState)

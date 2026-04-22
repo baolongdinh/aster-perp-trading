@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"go.uber.org/zap"
 )
 
@@ -76,9 +78,9 @@ func (h *AccumulationStateHandler) HandleState(
 	ctx context.Context,
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
-	currentPrice float64,
-	volume24h float64,
+	snapshot realtime.SymbolRuntimeSnapshot,
 ) (*StateTransition, error) {
+	currentPrice := snapshot.CurrentPrice
 	h.logger.Debug("Executing ACCUMULATION state strategy",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),

@@ -104,13 +104,14 @@ type PositionStatus struct {
 type TradingMode string
 
 const (
-	TradingModeGrid         TradingMode = "GRID"           // Volume farming in sideways
+	TradingModeIdle         TradingMode = "IDLE"           // Waiting for opportunity
+	TradingModeWaitNewRange TradingMode = "WAIT_NEW_RANGE" // Detecting range
+	TradingModeEnterGrid    TradingMode = "ENTER_GRID"     // Preparing grid placement
+	TradingModeGrid         TradingMode = "GRID_TRADING"   // Active volume farming / grid trading
 	TradingModeTrending     TradingMode = "TRENDING"       // Trend following
 	TradingModeAccumulation TradingMode = "ACCUMULATION"   // Pre-breakout accumulation
 	TradingModeDefensive    TradingMode = "DEFENSIVE"      // Risk protection mode
 	TradingModeRecovery     TradingMode = "RECOVERY"       // Post-loss recovery
-	TradingModeIdle         TradingMode = "IDLE"           // Waiting for opportunity
-	TradingModeWaitNewRange TradingMode = "WAIT_NEW_RANGE" // Detecting range
 	TradingModeOverSize     TradingMode = "OVER_SIZE"      // Position size too large
 )
 
@@ -119,13 +120,13 @@ type GridState = TradingMode
 
 const (
 	GridStateIdle         = TradingModeIdle
-	GridStateEnterGrid    = TradingModeGrid
+	GridStateEnterGrid    = TradingModeEnterGrid
 	GridStateTrading      = TradingModeGrid
 	GridStateTrending     = TradingModeTrending
 	GridStateExitHalf     = TradingModeDefensive
 	GridStateExitAll      = TradingModeDefensive
 	GridStateWaitNewRange = TradingModeWaitNewRange
-	GridStateOverSize     = TradingModeDefensive
+	GridStateOverSize     = TradingModeOverSize
 	GridStateDefensive    = TradingModeDefensive
 	GridStateRecovery     = TradingModeRecovery
 )
@@ -150,6 +151,20 @@ type StateTransition struct {
 	Timestamp         time.Time
 }
 
+// TransitionIntent is the handler-produced transition request before the
+// decision engine validates and commits it.
+type TransitionIntent struct {
+	Symbol           string
+	FromState        TradingMode
+	ToState          TradingMode
+	Trigger          string
+	Score            float64
+	MarketState      MarketStateVector
+	ExecutionContext ExecutionContext
+	LifecyclePolicy  TradeLifecyclePolicy
+	Timestamp        time.Time
+}
+
 // SymbolTradingState tracks trading state for a specific symbol
 type SymbolTradingState struct {
 	Symbol               string
@@ -169,9 +184,96 @@ type SymbolTradingState struct {
 	LastExitPnL        float64
 	LastExitReason     string
 	LastExecutionAckAt time.Time
+	LastIntentAt       time.Time
+	LastIntentID       string
+	PendingExecution   bool
 
 	// Watchdog metrics
 	StateStuckCount int
+}
+
+// ModeObjective tracks the relative priorities of the execution engine.
+type ModeObjective struct {
+	VolumeWeight float64
+	ProfitWeight float64
+	RiskWeight   float64
+}
+
+// MarketStateVector represents the multidimensional state of the market
+type MarketStateVector struct {
+	Regime              RegimeType
+	TrendStrength       float64
+	RangeQuality        float64
+	VolatilityState     float64
+	LiquidityQuality    float64
+	BreakoutPersistence float64
+	TrendPersistence    float64
+	OrderflowImbalance  float64
+	SpreadStress        float64
+}
+
+func (v MarketStateVector) toRegimeSnapshot(price float64) RegimeSnapshot {
+	return RegimeSnapshot{
+		Regime:     v.Regime,
+		ADX:        v.TrendStrength * 50,
+		ATR14:      v.VolatilityState / 100,
+		BBWidth:    max(0.001, v.RangeQuality*0.05),
+		Volume24h:  max(price, 0),
+		Timestamp:  time.Now(),
+		Confidence: max(v.RangeQuality, v.TrendStrength),
+	}
+}
+
+// ExecutionContext contains live execution-sensitive inputs from the runtime
+// layer that handlers and the VF bridge use to make cost-aware decisions.
+type ExecutionContext struct {
+	CurrentPrice      float64
+	BestBid           float64
+	BestAsk           float64
+	SpreadBps         float64
+	SlippageEstBps    float64
+	FundingImpactBps  float64
+	PositionSize      float64
+	InventoryNotional float64
+	PositionAgeSec    float64
+	PendingOrders     int
+	RealizedPnL       float64
+	UnrealizedPnL     float64
+	MakerFillRatio    float64
+	Regime            RegimeType // Added for Phase 5 audit
+}
+
+// TPBand represents a maker-first take-profit rung.
+type TPBand struct {
+	TargetBps  float64 `json:"target_bps,omitempty"`
+	CloseRatio float64 `json:"close_ratio,omitempty"`
+	MakerOnly  bool    `json:"maker_only,omitempty"`
+}
+
+// SLPolicy defines soft/hard stop behavior.
+type SLPolicy struct {
+	SoftATRMultiplier float64 `json:"soft_atr_multiplier,omitempty"`
+	HardLossBps       float64 `json:"hard_loss_bps,omitempty"`
+	TimeStopSec       int64   `json:"time_stop_sec,omitempty"`
+}
+
+// RegridPolicy defines when the bot is allowed to place a fresh grid.
+type RegridPolicy struct {
+	AllowImmediate  bool    `json:"allow_immediate,omitempty"`
+	MinRangeQuality float64 `json:"min_range_quality,omitempty"`
+	FlattenFirst    bool    `json:"flatten_first,omitempty"`
+}
+
+// TradeLifecyclePolicy captures execution rules shared between Agentic and VF.
+type TradeLifecyclePolicy struct {
+	TPBands           []TPBand
+	SLPolicy          SLPolicy
+	RegridPolicy      RegridPolicy
+	MakerOnly         bool
+	MaxPositionAgeSec int64
+	FeeBudgetBps      float64
+	InventorySkew     float64
+	Objective         ModeObjective
 }
 
 // ScoreComponents breaks down how scores are calculated

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
@@ -86,10 +88,10 @@ func TestWaitRangeTransitions(t *testing.T) {
 			BBWidth:    0.018,
 		}
 
-		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, 50000.0)
+		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 50000.0})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
-		assert.Equal(t, TradingModeGrid, transition.ToState)
+		assert.Equal(t, TradingModeEnterGrid, transition.ToState)
 		assert.Equal(t, "range_confirmed", transition.Trigger)
 	})
 
@@ -102,7 +104,7 @@ func TestWaitRangeTransitions(t *testing.T) {
 			BBWidth:    0.015, // Compression
 		}
 
-		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, 50000.0)
+		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 50000.0})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
 		assert.Equal(t, TradingModeAccumulation, transition.ToState)
@@ -118,7 +120,7 @@ func TestWaitRangeTransitions(t *testing.T) {
 			BBWidth:    0.08,
 		}
 
-		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, 50000.0)
+		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 50000.0})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
 		assert.Equal(t, TradingModeTrending, transition.ToState)
@@ -134,7 +136,7 @@ func TestWaitRangeTransitions(t *testing.T) {
 			BBWidth:    0.08,
 		}
 
-		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, 50000.0)
+		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regime, realtime.SymbolRuntimeSnapshot{CurrentPrice: 50000.0})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
 		assert.Equal(t, TradingModeDefensive, transition.ToState)

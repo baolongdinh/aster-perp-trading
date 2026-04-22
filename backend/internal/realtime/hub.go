@@ -27,10 +27,20 @@ type SymbolRuntimeSnapshot struct {
 	CurrentPrice       float64
 	BestBid            float64
 	BestAsk            float64
+	SpreadBps          float64
+	SlippageEstBps     float64
 	Volume24h          float64
+	VolumePerHour      float64
 	PositionSize       float64
 	PositionNotional   float64
+	InventoryNotional  float64
 	UnrealizedPnL      float64
+	RealizedPnL        float64
+	NetPnLAfterFees    float64
+	MakerFillRatio     float64
+	FundingImpact      float64
+	PositionAgeSec     float64
+	InventoryStuckTime float64
 	Side               string
 	PendingOrders      int
 	LastMarketEventAt  time.Time
@@ -75,6 +85,15 @@ type ExecutionEventSink interface {
 	IncrementStateStuckCount(symbol string)
 }
 
+type TradeRecord struct {
+	Symbol    string
+	Size      float64
+	Price     float64
+	Fee       float64
+	IsMaker   bool
+	Timestamp time.Time
+}
+
 type Hub struct {
 	wsClient     *client.WebSocketClient
 	marketClient *client.MarketClient
@@ -85,6 +104,9 @@ type Hub struct {
 	restFallbacks    uint64
 	wsResyncCount    uint64
 	stateStuckCount  uint64
+
+	// Metrics tracking
+	tradeHistory map[string][]TradeRecord // symbol -> recent trades
 }
 
 func NewHub(wsClient *client.WebSocketClient, marketClient *client.MarketClient, logger *zap.Logger) *Hub {
@@ -93,6 +115,7 @@ func NewHub(wsClient *client.WebSocketClient, marketClient *client.MarketClient,
 		marketClient:     marketClient,
 		logger:           logger.With(zap.String("component", "runtime_hub")),
 		bootstrappedKeys: make(map[string]bool),
+		tradeHistory:     make(map[string][]TradeRecord),
 	}
 }
 
@@ -189,6 +212,32 @@ func (h *Hub) GetBalance() client.Balance {
 	return h.wsClient.GetCachedBalance()
 }
 
+func (h *Hub) RecordTrade(symbol string, size, price, fee float64, isMaker bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	record := TradeRecord{
+		Symbol:    symbol,
+		Size:      size,
+		Price:     price,
+		Fee:       fee,
+		IsMaker:   isMaker,
+		Timestamp: time.Now(),
+	}
+
+	h.tradeHistory[symbol] = append(h.tradeHistory[symbol], record)
+
+	// Keep only last 24 hours of trades
+	cutoff := time.Now().Add(-24 * time.Hour)
+	var filtered []TradeRecord
+	for _, r := range h.tradeHistory[symbol] {
+		if r.Timestamp.After(cutoff) {
+			filtered = append(filtered, r)
+		}
+	}
+	h.tradeHistory[symbol] = filtered
+}
+
 func (h *Hub) GetSymbolSnapshot(ctx context.Context, symbol string) SymbolRuntimeSnapshot {
 	_ = ctx
 
@@ -208,12 +257,19 @@ func (h *Hub) GetSymbolSnapshot(ctx context.Context, symbol string) SymbolRuntim
 		snapshot.BestBid = bid
 		snapshot.BestAsk = ask
 		snapshot.Volume24h = volume
+		if ask > 0 && bid > 0 && ask >= bid {
+			snapshot.SpreadBps = ((ask - bid) / ask) * 10000
+			// Use spread as a conservative slippage proxy until the execution layer
+			// exposes a deeper market impact estimator.
+			snapshot.SlippageEstBps = snapshot.SpreadBps
+		}
 	}
 
 	positions := h.wsClient.GetCachedPositions()
 	if pos, ok := positions[strings.ToUpper(symbol)]; ok {
 		snapshot.PositionSize = math.Abs(pos.PositionAmt)
 		snapshot.PositionNotional = math.Abs(pos.PositionAmt * pos.MarkPrice)
+		snapshot.InventoryNotional = snapshot.PositionNotional
 		snapshot.UnrealizedPnL = pos.UnrealizedProfit
 		if pos.PositionAmt > 0 {
 			snapshot.Side = "LONG"
@@ -223,7 +279,40 @@ func (h *Hub) GetSymbolSnapshot(ctx context.Context, symbol string) SymbolRuntim
 	}
 
 	snapshot.PendingOrders = len(h.wsClient.GetCachedOrders(symbol))
+
+	// Calculate metrics from trade history
+	h.mu.Lock()
+	history := h.tradeHistory[symbol]
+	h.mu.Unlock()
+
+	var volHour, totalFee, makerCount, totalTrades float64
+	hourAgo := time.Now().Add(-1 * time.Hour)
+	for _, r := range history {
+		totalTrades++
+		if r.IsMaker {
+			makerCount++
+		}
+		totalFee += r.Fee
+		if r.Timestamp.After(hourAgo) {
+			volHour += r.Size * r.Price
+		}
+	}
+
+	snapshot.VolumePerHour = volHour
+	if totalTrades > 0 {
+		snapshot.MakerFillRatio = makerCount / totalTrades
+	} else {
+		snapshot.MakerFillRatio = 1.0 // Default to 1.0 if no trades yet
+	}
+	snapshot.NetPnLAfterFees = snapshot.RealizedPnL - totalFee
+
 	snapshot.LastMarketEventAt, snapshot.LastAccountEventAt, snapshot.LastOrderEventAt = h.wsClient.GetLastEventTimes()
+
+	if !snapshot.LastAccountEventAt.IsZero() && snapshot.PositionSize > 0 {
+		snapshot.PositionAgeSec = time.Since(snapshot.LastAccountEventAt).Seconds()
+		// For bot farm, inventory stuck time is roughly position age if not rotating
+		snapshot.InventoryStuckTime = snapshot.PositionAgeSec
+	}
 
 	switch {
 	case snapshot.CurrentPrice <= 0:

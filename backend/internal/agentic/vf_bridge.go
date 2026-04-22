@@ -58,36 +58,33 @@ func NewStateTracker() *StateTracker {
 func (bridge *AgenticVFBridge) RequestStateTransition(
 	ctx context.Context,
 	symbol string,
-	fromState TradingMode,
-	toState TradingMode,
-	trigger string,
-	score float64,
-	regime RegimeSnapshot,
+	intent TransitionIntent,
 ) error {
 	bridge.logger.Info("Requesting state transition",
 		zap.String("symbol", symbol),
-		zap.String("from", string(fromState)),
-		zap.String("to", string(toState)),
-		zap.String("trigger", trigger),
-		zap.Float64("score", score),
+		zap.String("from", string(intent.FromState)),
+		zap.String("to", string(intent.ToState)),
+		zap.String("trigger", intent.Trigger),
+		zap.Float64("score", intent.Score),
 	)
 
 	// Build execution parameters based on target state
-	params := bridge.buildExecutionParams(toState, regime, symbol)
+	params := bridge.buildExecutionParams(intent, symbol)
 
 	// Determine priority
-	priority := bridge.calculatePriority(toState, trigger, score)
+	priority := bridge.calculatePriority(intent.ToState, intent.Trigger, intent.Score)
 
 	event := StateTransitionEvent{
 		Symbol:    symbol,
-		FromState: fromState,
-		ToState:   toState,
-		Trigger:   trigger,
-		Score:     score,
+		FromState: intent.FromState,
+		ToState:   intent.ToState,
+		Trigger:   intent.Trigger,
+		Score:     intent.Score,
 		Timestamp: time.Now(),
 		Priority:  priority,
 		Params:    params,
-		Regime:    regime,
+		Regime:    intent.MarketState.toRegimeSnapshot(intent.ExecutionContext.CurrentPrice),
+		IntentID:  fmt.Sprintf("%s:%d", symbol, intent.Timestamp.UnixNano()),
 	}
 
 	// Track pending transition
@@ -108,16 +105,24 @@ func (bridge *AgenticVFBridge) RequestStateTransition(
 
 // buildExecutionParams creates execution parameters based on state and regime
 func (bridge *AgenticVFBridge) buildExecutionParams(
-	targetState TradingMode,
-	regime RegimeSnapshot,
+	intent TransitionIntent,
 	symbol string,
 ) ExecutionParams {
 	params := ExecutionParams{
 		PositionSizeMultiplier: 1.0,
+		TPBands:                append([]TPBand(nil), intent.LifecyclePolicy.TPBands...),
+		SLPolicy:               intent.LifecyclePolicy.SLPolicy,
+		TimeStopSec:            intent.LifecyclePolicy.SLPolicy.TimeStopSec,
+		MaxPositionAgeSec:      intent.LifecyclePolicy.MaxPositionAgeSec,
+		RegridPolicy:           intent.LifecyclePolicy.RegridPolicy,
+		InventorySkew:          intent.LifecyclePolicy.InventorySkew,
+		MakerOnly:              intent.LifecyclePolicy.MakerOnly,
+		FeeBudgetBps:           intent.LifecyclePolicy.FeeBudgetBps,
+		ExecutionContext:       intent.ExecutionContext,
 	}
 
-	switch targetState {
-	case TradingModeGrid:
+	switch intent.ToState {
+	case TradingModeEnterGrid, TradingModeGrid:
 		// Grid-specific parameters
 		params.RangeLow = 0    // Will be calculated by VF based on current price
 		params.RangeHigh = 0   // Will be calculated by VF
@@ -125,24 +130,28 @@ func (bridge *AgenticVFBridge) buildExecutionParams(
 		params.AsymmetricBias = "neutral"
 
 		// Adjust based on regime
-		if regime.Regime == RegimeSideways {
+		if intent.MarketState.Regime == RegimeSideways {
 			params.GridLevels = 15 // More levels in sideways
 			params.PositionSizeMultiplier = 1.0
 		} else {
 			params.GridLevels = 8 // Fewer levels when less certain
 			params.PositionSizeMultiplier = 0.7
 		}
+		if intent.ExecutionContext.InventoryNotional > 0 {
+			params.AsymmetricBias = "inventory_rebalance"
+		}
 
 	case TradingModeTrending:
 		// Trend-specific parameters
-		params.TrendDirection = "up" // Default, VF should determine
+		params.TrendDirection = "up"
 		params.TrailingStop = true
 		params.PositionSizeMultiplier = 0.8 // Smaller size for trend
 
 		// Stop loss based on ATR
-		if regime.ATR14 > 0 {
-			params.StopLoss = regime.ATR14 * 2.5 // 2.5x ATR
+		if intent.MarketState.TrendStrength < 0.5 {
+			params.PositionSizeMultiplier = 0.35
 		}
+		params.StopLoss = intent.ExecutionContext.CurrentPrice * (intent.LifecyclePolicy.SLPolicy.HardLossBps / 10000)
 
 	case TradingModeAccumulation:
 		// Accumulation parameters

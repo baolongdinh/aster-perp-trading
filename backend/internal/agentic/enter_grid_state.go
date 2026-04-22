@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"go.uber.org/zap"
 )
 
@@ -12,11 +14,11 @@ import (
 type EnterGridStateHandler struct {
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
-	
+
 	// Entry tracking
-	entryAttempts   map[string]int
-	entryStartTime  map[string]time.Time
-	maxEntryTime    time.Duration
+	entryAttempts     map[string]int
+	entryStartTime    map[string]time.Time
+	maxEntryTime      time.Duration
 	minSignalStrength float64
 }
 
@@ -50,7 +52,7 @@ func NewEnterGridStateHandler(
 		entryAttempts:     make(map[string]int),
 		entryStartTime:    make(map[string]time.Time),
 		maxEntryTime:      60 * time.Second, // 60s max to enter
-		minSignalStrength: 0.5,                // Min signal to trigger entry
+		minSignalStrength: 0.5,              // Min signal to trigger entry
 	}
 }
 
@@ -59,33 +61,34 @@ func (h *EnterGridStateHandler) HandleState(
 	ctx context.Context,
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
-	currentPrice float64,
+	snapshot realtime.SymbolRuntimeSnapshot,
 	rangeBoundaries *RangeBoundaries,
 	signals *SignalBundle,
 ) (*StateTransition, error) {
+	currentPrice := snapshot.CurrentPrice
 	h.logger.Debug("Executing ENTER_GRID state strategy",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
 	)
-	
+
 	// Track entry attempt
 	if _, ok := h.entryStartTime[symbol]; !ok {
 		h.entryStartTime[symbol] = time.Now()
 	}
 	h.entryAttempts[symbol]++
-	
+
 	// 1. Calculate optimal grid parameters
 	gridParams := h.calculateGridParameters(symbol, regimeSnapshot, currentPrice)
-	
+
 	// 2. Apply asymmetric spread based on signals
 	if signals != nil {
 		gridParams = h.applyAsymmetricSpread(gridParams, signals)
 	}
-	
+
 	// 3. Signal-triggered entry (hybrid mode)
 	if h.shouldWaitForSignal(symbol) {
 		bestSignal := h.getBestSignal(signals)
-		
+
 		if bestSignal < h.minSignalStrength {
 			// Check for timeout
 			if h.isEntryTimeout(symbol) {
@@ -105,7 +108,7 @@ func (h *EnterGridStateHandler) HandleState(
 			}
 		}
 	}
-	
+
 	// 4. Place grid orders (simulated - would integrate with actual order placement)
 	h.logger.Info("Placing grid orders",
 		zap.String("symbol", symbol),
@@ -114,21 +117,21 @@ func (h *EnterGridStateHandler) HandleState(
 		zap.Float64("sell_spread", gridParams.SellSpread),
 		zap.Float64("size_mult", gridParams.SizeMultiplier),
 	)
-	
+
 	// 5. Transition to TRADING (GRID mode)
 	transition := &StateTransition{
-		FromState:         TradingModeGrid,
+		FromState:         TradingModeEnterGrid,
 		ToState:           TradingModeGrid,
 		Trigger:           "grid_placed",
 		Score:             0.8,
 		SmoothingDuration: 3 * time.Second,
 		Timestamp:         time.Now(),
 	}
-	
+
 	// Clear entry tracking
 	delete(h.entryAttempts, symbol)
 	delete(h.entryStartTime, symbol)
-	
+
 	return transition, nil
 }
 
@@ -143,10 +146,10 @@ func (h *EnterGridStateHandler) calculateGridParameters(
 	if atr <= 0 {
 		atr = currentPrice * 0.005 // Default 0.5%
 	}
-	
+
 	// Calculate spread as ATR * multiplier
 	spread := atr * 1.5 // 1.5x ATR between levels
-	
+
 	// Number of levels based on volatility
 	levels := 5
 	if regimeSnapshot.BBWidth > 0.03 {
@@ -154,7 +157,7 @@ func (h *EnterGridStateHandler) calculateGridParameters(
 	} else if regimeSnapshot.BBWidth < 0.015 {
 		levels = 3 // Fewer levels in tight range
 	}
-	
+
 	// Size multiplier based on regime confidence
 	sizeMult := 1.0
 	if regimeSnapshot.Confidence > 0.7 {
@@ -162,10 +165,10 @@ func (h *EnterGridStateHandler) calculateGridParameters(
 	} else if regimeSnapshot.Confidence < 0.5 {
 		sizeMult = 0.8 // Smaller size when uncertain
 	}
-	
+
 	// Total exposure limit (max 5% of price range)
 	totalExposure := currentPrice * 0.05
-	
+
 	return GridParams{
 		Symbol:         symbol,
 		Levels:         levels,
@@ -184,11 +187,11 @@ func (h *EnterGridStateHandler) applyAsymmetricSpread(
 	if signals == nil {
 		return params
 	}
-	
+
 	// Determine signal bias
 	buySignal := signals.MeanReversion + signals.LiquiditySignal
 	sellSignal := signals.FVGSignal + signals.BreakoutSignal
-	
+
 	if buySignal > sellSignal*1.3 {
 		// Strong buy signals → tighten buy side, widen sell side
 		params.BuySpread *= 0.7  // Tighten 30%
@@ -206,14 +209,14 @@ func (h *EnterGridStateHandler) applyAsymmetricSpread(
 			zap.Float64("sell_spread", params.SellSpread),
 		)
 	}
-	
+
 	// Adjust size based on overall signal strength
 	if signals.OverallStrength > 0.8 {
 		params.SizeMultiplier *= 1.3 // 30% larger on strong signals
 	} else if signals.OverallStrength < 0.3 {
 		params.SizeMultiplier *= 0.7 // 30% smaller on weak signals
 	}
-	
+
 	return params
 }
 
@@ -229,7 +232,7 @@ func (h *EnterGridStateHandler) getBestSignal(signals *SignalBundle) float64 {
 	if signals == nil {
 		return 0
 	}
-	
+
 	best := signals.FVGSignal
 	if signals.LiquiditySignal > best {
 		best = signals.LiquiditySignal
@@ -240,7 +243,7 @@ func (h *EnterGridStateHandler) getBestSignal(signals *SignalBundle) float64 {
 	if signals.BreakoutSignal > best {
 		best = signals.BreakoutSignal
 	}
-	
+
 	return best
 }
 

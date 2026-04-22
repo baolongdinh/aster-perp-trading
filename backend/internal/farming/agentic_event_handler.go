@@ -49,6 +49,9 @@ func (h *AgenticEventHandler) HandleStateTransition(ctx context.Context, event a
 
 	// Execute based on target state
 	switch event.ToState {
+	case agentic.TradingModeEnterGrid:
+		err = h.engine.ExecuteGridEntry(ctx, event.Symbol, event.Params)
+
 	case agentic.TradingModeGrid:
 		err = h.engine.ExecuteGridEntry(ctx, event.Symbol, event.Params)
 
@@ -91,6 +94,7 @@ func (h *AgenticEventHandler) HandleStateTransition(ctx context.Context, event a
 		Success:     err == nil,
 		Trigger:     event.Trigger,
 		ExitReason:  event.Params.ExitReason,
+		IntentID:    event.IntentID,
 	}
 
 	if err != nil {

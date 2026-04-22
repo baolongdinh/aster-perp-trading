@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"go.uber.org/zap"
 )
 
@@ -59,6 +61,7 @@ func (h *RecoveryStateHandler) HandleState(
 	ctx context.Context,
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
+	snapshot realtime.SymbolRuntimeSnapshot,
 	exitPnL float64,
 	exitReason string,
 	consecutiveLosses int,
@@ -86,27 +89,21 @@ func (h *RecoveryStateHandler) HandleState(
 		)
 	}
 
-	// 1. Check cooldown period
-	if time.Since(h.recoveryStart[symbol]) < h.minCooldownTime {
-		h.logger.Debug("In cooldown period",
-			zap.String("symbol", symbol),
-			zap.Duration("elapsed", time.Since(h.recoveryStart[symbol])),
-			zap.Duration("remaining", h.minCooldownTime-time.Since(h.recoveryStart[symbol])),
-		)
+	// 1. Check cooldown period (Phase 4: Smart Cooldown)
+	cooldown := h.minCooldownTime
+	if regimeSnapshot.ATR14 > 0.005 {
+		cooldown *= 2 // Double cooldown in high volatility
+	}
+
+	if time.Since(h.recoveryStart[symbol]) < cooldown {
 		return nil, nil
 	}
 
-	// 2. Hard timeout wins over re-entry. Once recovery has dragged on too long
-	// we fall back to IDLE and wait for a clean setup rather than forcing a trade.
+	// 2. Hard timeout
 	if time.Since(h.recoveryStart[symbol]) > h.maxRecoveryTime {
-		h.logger.Info("Max recovery time reached, returning to IDLE",
-			zap.String("symbol", symbol),
-		)
-
 		h.clearRecoveryData(symbol)
-
 		return &StateTransition{
-			FromState:         TradingModeDefensive,
+			FromState:         TradingModeRecovery,
 			ToState:           TradingModeIdle,
 			Trigger:           "recovery_timeout",
 			Score:             0.6,
@@ -115,7 +112,7 @@ func (h *RecoveryStateHandler) HandleState(
 		}, nil
 	}
 
-	// 3. Check market conditions for re-entry
+	// 3. Check market readiness
 	marketReady := h.isMarketReadyForReentry(symbol, regimeSnapshot)
 
 	// 4. Determine severity and next state
@@ -125,16 +122,10 @@ func (h *RecoveryStateHandler) HandleState(
 	case "minor":
 		// Minor loss - can re-enter with adjusted parameters
 		if marketReady {
-			h.logger.Info("Minor loss recovery complete, entering grid",
-				zap.String("symbol", symbol),
-				zap.Float64("adjusted_grid_size", h.adjustments[symbol].GridSizeMultiplier),
-			)
-
 			h.clearRecoveryData(symbol)
-
 			return &StateTransition{
-				FromState:         TradingModeDefensive, // RECOVERY mapped
-				ToState:           TradingModeGrid,
+				FromState:         TradingModeRecovery,
+				ToState:           TradingModeEnterGrid,
 				Trigger:           "recovery_complete",
 				Score:             0.7,
 				SmoothingDuration: 5 * time.Second,
@@ -145,14 +136,9 @@ func (h *RecoveryStateHandler) HandleState(
 	case "moderate":
 		// Moderate loss - go to IDLE first, wait for better conditions
 		if marketReady && time.Since(h.recoveryStart[symbol]) > h.maxRecoveryTime/2 {
-			h.logger.Info("Moderate loss recovery, going to IDLE",
-				zap.String("symbol", symbol),
-			)
-
 			h.clearRecoveryData(symbol)
-
 			return &StateTransition{
-				FromState:         TradingModeDefensive,
+				FromState:         TradingModeRecovery,
 				ToState:           TradingModeIdle,
 				Trigger:           "recovery_to_idle",
 				Score:             0.6,
@@ -164,14 +150,9 @@ func (h *RecoveryStateHandler) HandleState(
 	case "severe":
 		// Severe loss - stay in recovery, maybe skip this symbol
 		if time.Since(h.recoveryStart[symbol]) > h.maxRecoveryTime {
-			h.logger.Warn("Severe loss, max recovery time reached",
-				zap.String("symbol", symbol),
-			)
-
 			h.clearRecoveryData(symbol)
-
 			return &StateTransition{
-				FromState:         TradingModeDefensive,
+				FromState:         TradingModeRecovery,
 				ToState:           TradingModeIdle,
 				Trigger:           "recovery_timeout",
 				Score:             0.5,
@@ -181,7 +162,6 @@ func (h *RecoveryStateHandler) HandleState(
 		}
 	}
 
-	// Default: stay in RECOVERY
 	return nil, nil
 }
 

@@ -3,15 +3,15 @@
 
 micro_profit:
   # Enable or disable micro profit feature
-  enabled: false
+  enabled: true
   
   # Spread percentage for take profit orders (0.001% to 0.01%)
   # Default: 0.005% (0.005)
-  spread_pct: 0.005
+  spread_pct: 0.0005
   
   # Timeout duration for take profit orders in seconds (10 to 300)
   # Default: 30 seconds
-  timeout_seconds: 30
+  timeout_seconds: 60
   
   # Minimum profit threshold in USDT to place take profit order (0.001 to 1.0)
   # Default: $0.01

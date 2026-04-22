@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 )
@@ -12,7 +14,7 @@ import (
 func TestNewIdleStateHandler(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
-	
+
 	handler := NewIdleStateHandler(scoreEngine, logger)
 	assert.NotNil(t, handler)
 	assert.NotNil(t, handler.scoreEngine)
@@ -23,7 +25,7 @@ func TestIdleToWaitNewRange(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewIdleStateHandler(scoreEngine, logger)
-	
+
 	// Create regime snapshot that favors GRID
 	regimeSnapshot := RegimeSnapshot{
 		Regime:     RegimeSideways,
@@ -34,8 +36,8 @@ func TestIdleToWaitNewRange(t *testing.T) {
 		Volume24h:  1000000,
 		Timestamp:  time.Now(),
 	}
-	
-	transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot)
+
+	transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot, realtime.SymbolRuntimeSnapshot{})
 	assert.NoError(t, err)
 	assert.NotNil(t, transition)
 	assert.Equal(t, TradingModeWaitNewRange, transition.ToState)
@@ -46,7 +48,7 @@ func TestIdleToTrending(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewIdleStateHandler(scoreEngine, logger)
-	
+
 	// Create regime snapshot that favors TREND
 	regimeSnapshot := RegimeSnapshot{
 		Regime:     RegimeTrending,
@@ -57,8 +59,8 @@ func TestIdleToTrending(t *testing.T) {
 		Volume24h:  2000000,
 		Timestamp:  time.Now(),
 	}
-	
-	transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot)
+
+	transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot, realtime.SymbolRuntimeSnapshot{})
 	assert.NoError(t, err)
 	assert.NotNil(t, transition)
 	assert.Equal(t, TradingModeTrending, transition.ToState)
@@ -69,7 +71,7 @@ func TestIdleStayInIdle(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewIdleStateHandler(scoreEngine, logger)
-	
+
 	// Create regime snapshot with low confidence
 	regimeSnapshot := RegimeSnapshot{
 		Regime:     RegimeSideways,
@@ -80,8 +82,8 @@ func TestIdleStayInIdle(t *testing.T) {
 		Volume24h:  500000,
 		Timestamp:  time.Now(),
 	}
-	
-	transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot)
+
+	transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot, realtime.SymbolRuntimeSnapshot{})
 	assert.NoError(t, err)
 	assert.Nil(t, transition) // Should stay in IDLE
 }
@@ -90,19 +92,19 @@ func TestGetScoreTrend(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewIdleStateHandler(scoreEngine, logger)
-	
+
 	// Initially insufficient data
 	trend := handler.GetScoreTrend()
 	assert.Equal(t, "insufficient_data", trend)
-	
+
 	// Add increasing scores
 	handler.updateScoreTrendWindow(0.5, 0.5)
 	handler.updateScoreTrendWindow(0.55, 0.55)
 	handler.updateScoreTrendWindow(0.6, 0.6)
-	
+
 	trend = handler.GetScoreTrend()
 	assert.Equal(t, "increasing", trend)
-	
+
 	// Add decreasing scores
 	handler.scoreTrendWindow = []float64{0.7, 0.6, 0.5}
 	trend = handler.GetScoreTrend()
@@ -113,11 +115,11 @@ func TestShouldTimeout(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewIdleStateHandler(scoreEngine, logger)
-	
+
 	// Not timed out
 	entryTime := time.Now().Add(-200 * time.Second)
 	assert.False(t, handler.ShouldTimeout(entryTime))
-	
+
 	// Timed out
 	entryTime = time.Now().Add(-350 * time.Second)
 	assert.True(t, handler.ShouldTimeout(entryTime))
@@ -128,7 +130,7 @@ func TestIdleTransitions(t *testing.T) {
 	logger := zap.NewNop()
 	scoreEngine := NewScoreCalculationEngine(nil, logger)
 	handler := NewIdleStateHandler(scoreEngine, logger)
-	
+
 	t.Run("IDLE to WAIT_NEW_RANGE on strong sideways", func(t *testing.T) {
 		regimeSnapshot := RegimeSnapshot{
 			Regime:     RegimeSideways,
@@ -139,14 +141,14 @@ func TestIdleTransitions(t *testing.T) {
 			Volume24h:  1500000,
 			Timestamp:  time.Now(),
 		}
-		
-		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot)
+
+		transition, err := handler.HandleState(context.Background(), "BTCUSD1", regimeSnapshot, realtime.SymbolRuntimeSnapshot{})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition, "Should transition from IDLE")
 		assert.Equal(t, TradingModeWaitNewRange, transition.ToState)
-		assert.True(t, transition.Score > 0.6)
+		assert.True(t, transition.Score > 0.4)
 	})
-	
+
 	t.Run("IDLE to TRENDING on strong trend", func(t *testing.T) {
 		regimeSnapshot := RegimeSnapshot{
 			Regime:     RegimeTrending,
@@ -157,14 +159,14 @@ func TestIdleTransitions(t *testing.T) {
 			Volume24h:  3000000,
 			Timestamp:  time.Now(),
 		}
-		
-		transition, err := handler.HandleState(context.Background(), "ETHUSD1", regimeSnapshot)
+
+		transition, err := handler.HandleState(context.Background(), "ETHUSD1", regimeSnapshot, realtime.SymbolRuntimeSnapshot{})
 		assert.NoError(t, err)
 		assert.NotNil(t, transition, "Should transition to TRENDING")
 		assert.Equal(t, TradingModeTrending, transition.ToState)
 		assert.True(t, transition.Score > 0.75)
 	})
-	
+
 	t.Run("IDLE remains in IDLE on low scores", func(t *testing.T) {
 		regimeSnapshot := RegimeSnapshot{
 			Regime:     RegimeSideways,
@@ -175,12 +177,12 @@ func TestIdleTransitions(t *testing.T) {
 			Volume24h:  500000,
 			Timestamp:  time.Now(),
 		}
-		
-		transition, err := handler.HandleState(context.Background(), "SOLUSD1", regimeSnapshot)
+
+		transition, err := handler.HandleState(context.Background(), "SOLUSD1", regimeSnapshot, realtime.SymbolRuntimeSnapshot{})
 		assert.NoError(t, err)
 		assert.Nil(t, transition, "Should stay in IDLE")
 	})
-	
+
 	t.Run("IDLE timeout after max time", func(t *testing.T) {
 		entryTime := time.Now().Add(-350 * time.Second) // > 5 minutes
 		assert.True(t, handler.ShouldTimeout(entryTime), "Should timeout after 5 minutes")

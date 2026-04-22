@@ -3,6 +3,9 @@ package agentic
 import (
 	"context"
 	"testing"
+	"time"
+
+	"aster-bot/internal/realtime"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
@@ -107,6 +110,7 @@ func TestTrendingTransitions(t *testing.T) {
 
 	t.Run("TRENDING to DEFENSIVE on stop loss", func(t *testing.T) {
 		symbol := "BTCUSD1"
+		handler.entryTime[symbol] = time.Now().Add(-10 * time.Minute)
 		handler.entryPrice[symbol] = 50000
 		handler.direction[symbol] = TrendUp
 		handler.stopLoss[symbol] = 49000
@@ -123,19 +127,22 @@ func TestTrendingTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			48500, // Below stop loss
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice: 48500,
+			},
+			MarketStateVector{},
 			48000,
-			[]FVGZone{},
 		)
 
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
 		assert.Equal(t, TradingModeDefensive, transition.ToState)
-		assert.Equal(t, "stop_loss", transition.Trigger)
+		assert.Equal(t, "stop_loss_or_trailing", transition.Trigger)
 	})
 
 	t.Run("TRENDING to GRID on sideways return", func(t *testing.T) {
 		symbol := "ETHUSD1"
+		handler.entryTime[symbol] = time.Now().Add(-5 * time.Minute)
 		handler.entryPrice[symbol] = 3000
 		handler.direction[symbol] = TrendUp
 
@@ -151,19 +158,22 @@ func TestTrendingTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			3050,
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice: 3050,
+			},
+			MarketStateVector{},
 			2800,
-			[]FVGZone{},
 		)
 
 		assert.NoError(t, err)
 		assert.NotNil(t, transition)
-		assert.Equal(t, TradingModeGrid, transition.ToState)
+		assert.Equal(t, TradingModeEnterGrid, transition.ToState)
 		assert.Equal(t, "sideways_return", transition.Trigger)
 	})
 
 	t.Run("TRENDING to DEFENSIVE on max loss", func(t *testing.T) {
 		symbol := "SOLUSD1"
+		handler.entryTime[symbol] = time.Now().Add(-5 * time.Minute)
 		handler.entryPrice[symbol] = 100
 		handler.direction[symbol] = TrendUp
 
@@ -179,9 +189,12 @@ func TestTrendingTransitions(t *testing.T) {
 			context.Background(),
 			symbol,
 			regime,
-			96, // -4% loss
+			realtime.SymbolRuntimeSnapshot{
+				CurrentPrice:  96, // -4% loss
+				UnrealizedPnL: -0.04,
+			},
+			MarketStateVector{},
 			90,
-			[]FVGZone{},
 		)
 
 		assert.NoError(t, err)

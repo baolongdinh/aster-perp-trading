@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"aster-bot/internal/realtime"
+
 	"go.uber.org/zap"
 )
 
@@ -49,8 +51,9 @@ func (h *WaitRangeStateHandler) HandleState(
 	ctx context.Context,
 	symbol string,
 	regimeSnapshot RegimeSnapshot,
-	currentPrice float64,
+	snapshot realtime.SymbolRuntimeSnapshot,
 ) (*StateTransition, error) {
+	currentPrice := snapshot.CurrentPrice
 	h.logger.Debug("Executing WAIT_NEW_RANGE state strategy",
 		zap.String("symbol", symbol),
 		zap.Float64("price", currentPrice),
@@ -128,7 +131,7 @@ func (h *WaitRangeStateHandler) HandleState(
 
 		return &StateTransition{
 			FromState:         TradingModeWaitNewRange,
-			ToState:           TradingModeGrid,
+			ToState:           TradingModeEnterGrid,
 			Trigger:           "range_confirmed",
 			Score:             rangeScore,
 			SmoothingDuration: 5 * time.Second,

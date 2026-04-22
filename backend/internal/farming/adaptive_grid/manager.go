@@ -3241,10 +3241,12 @@ func (a *AdaptiveGridManager) CanPlaceOrder(symbol string) bool {
 	// Check 3: Grid State - REMOVED state-based blocking
 	// Replaced with ConditionBlocker for graduated blocking (see GetOrderSizeMultiplier)
 	// State transitions still tracked for logging and other purposes
-	currentState := a.stateMachine.GetState(symbol)
-	a.logger.Debug("Check 3: State-based blocking removed, using ConditionBlocker for graduated blocking",
-		zap.String("symbol", symbol),
-		zap.String("state", currentState.String()))
+	if a.stateMachine != nil {
+		currentState := a.stateMachine.GetState(symbol)
+		a.logger.Debug("Check 3: State-based blocking removed, using ConditionBlocker for graduated blocking",
+			zap.String("symbol", symbol),
+			zap.String("state", currentState.String()))
+	}
 
 	// Check 3.5: ConditionBlocker - graduated blocking based on conditions
 	if a.conditionBlocker != nil {

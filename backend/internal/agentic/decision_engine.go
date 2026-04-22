@@ -15,6 +15,7 @@ import (
 // It collects signals from all workers and makes unified state transition decisions
 type DecisionEngine struct {
 	config      *config.DecisionEngineConfig
+	v2Config    *config.AgenticV2Config // Phase 0: AgenticV2 config
 	logger      *zap.Logger
 	scoreEngine *ScoreCalculationEngine
 
@@ -34,11 +35,15 @@ type DecisionEngine struct {
 	// Flip-flop prevention
 	lastTransitions map[string]time.Time
 	flipFlopCount   map[string]int
+
+	// Phase 0: Rate limiting
+	transitionHistory map[string][]time.Time // symbol -> timestamps of recent transitions
 }
 
 // NewDecisionEngine creates a new centralized decision engine
 func NewDecisionEngine(
 	cfg *config.DecisionEngineConfig,
+	v2Cfg *config.AgenticV2Config,
 	scoreEngine *ScoreCalculationEngine,
 	logger *zap.Logger,
 ) *DecisionEngine {
@@ -50,9 +55,22 @@ func NewDecisionEngine(
 			MaxFlipFlopsPerHour: 3,
 		}
 	}
+	if !cfg.Enabled {
+		cfg.Enabled = true
+	}
+	if cfg.TransitionTimeout <= 0 {
+		cfg.TransitionTimeout = 5 * time.Second
+	}
+	if cfg.SmoothingDuration <= 0 {
+		cfg.SmoothingDuration = 5 * time.Second
+	}
+	if cfg.MaxFlipFlopsPerHour <= 0 {
+		cfg.MaxFlipFlopsPerHour = 3
+	}
 
 	return &DecisionEngine{
 		config:           cfg,
+		v2Config:         v2Cfg,
 		logger:           logger.With(zap.String("component", "decision_engine")),
 		scoreEngine:      scoreEngine,
 		stateVersion:     0,
@@ -61,8 +79,9 @@ func NewDecisionEngine(
 		metrics: &StateManagerMetrics{
 			SuccessfulModes: make(map[TradingMode]int),
 		},
-		lastTransitions: make(map[string]time.Time),
-		flipFlopCount:   make(map[string]int),
+		lastTransitions:   make(map[string]time.Time),
+		flipFlopCount:     make(map[string]int),
+		transitionHistory: make(map[string][]time.Time),
 	}
 }
 
@@ -100,22 +119,126 @@ func (de *DecisionEngine) EvaluateAndDecide(
 
 	// 5. Execute transition if needed
 	if shouldTransition {
-		transition, err := de.executeTransition(symbol, currentState, bestMode, bestScore)
+		intent := TransitionIntent{
+			Symbol:    symbol,
+			FromState: currentState,
+			ToState:   bestMode,
+			Trigger:   "score_evaluation",
+			Score:     bestScore,
+			Timestamp: time.Now(),
+		}
+		transition, err := de.CommitTransition(intent)
 		if err != nil {
 			return nil, fmt.Errorf("transition execution failed: %w", err)
 		}
-
-		// Publish event
-		de.publishTransition(*transition)
-
-		// Update metrics
-		de.recordSuccessfulTransition(symbol, bestMode)
 
 		return transition, nil
 	}
 
 	// No transition needed
 	return nil, nil
+}
+
+// CommitTransition validates a handler-produced intent and commits it as the
+// single source of truth for state changes.
+func (de *DecisionEngine) CommitTransition(intent TransitionIntent) (*StateTransition, error) {
+	if !de.config.Enabled {
+		return nil, fmt.Errorf("decision engine is disabled")
+	}
+	if intent.Symbol == "" {
+		return nil, fmt.Errorf("transition intent missing symbol")
+	}
+	if intent.ToState == "" {
+		return nil, fmt.Errorf("transition intent missing target state")
+	}
+	if intent.Timestamp.IsZero() {
+		intent.Timestamp = time.Now()
+	}
+
+	// Phase 0: Rate Limiting
+	if de.v2Config != nil && de.v2Config.MaxTransitionsPerMin > 0 {
+		if de.isRateLimited(intent.Symbol) {
+			de.logger.Warn("Transition rate limited",
+				zap.String("symbol", intent.Symbol),
+				zap.Int("max_per_min", de.v2Config.MaxTransitionsPerMin))
+			return nil, nil
+		}
+	}
+
+	currentState := de.getCurrentState(intent.Symbol)
+	if intent.FromState == "" {
+		intent.FromState = currentState
+	}
+	if currentState != intent.FromState {
+		de.logger.Warn("Transition intent using stale source state",
+			zap.String("symbol", intent.Symbol),
+			zap.String("expected", string(currentState)),
+			zap.String("intent_from", string(intent.FromState)),
+		)
+		intent.FromState = currentState
+	}
+	if intent.ToState == intent.FromState {
+		return nil, nil
+	}
+	if de.isFlipFlop(intent.Symbol, intent.FromState, intent.ToState) {
+		de.logger.Warn("Flip-flop detected, rejecting transition intent",
+			zap.String("symbol", intent.Symbol),
+			zap.String("from", string(intent.FromState)),
+			zap.String("to", string(intent.ToState)),
+		)
+		de.recordFlipFlop(intent.Symbol)
+		return nil, nil
+	}
+
+	transition, err := de.executeTransition(intent)
+	if err != nil {
+		return nil, err
+	}
+
+	// Record for rate limiting
+	de.recordTransition(intent.Symbol, intent.Timestamp)
+
+	de.publishTransition(*transition)
+	de.recordSuccessfulTransition(intent.Symbol, intent.ToState)
+	return transition, nil
+}
+
+func (de *DecisionEngine) isRateLimited(symbol string) bool {
+	de.stateMu.RLock()
+	defer de.stateMu.RUnlock()
+
+	history := de.transitionHistory[symbol]
+	if len(history) < de.v2Config.MaxTransitionsPerMin {
+		return false
+	}
+
+	// Check how many transitions in last minute
+	cutoff := time.Now().Add(-1 * time.Minute)
+	count := 0
+	for _, t := range history {
+		if t.After(cutoff) {
+			count++
+		}
+	}
+
+	return count >= de.v2Config.MaxTransitionsPerMin
+}
+
+func (de *DecisionEngine) recordTransition(symbol string, timestamp time.Time) {
+	de.stateMu.Lock()
+	defer de.stateMu.Unlock()
+
+	de.transitionHistory[symbol] = append(de.transitionHistory[symbol], timestamp)
+
+	// Keep only last 5 minutes of history for rate limiting
+	cutoff := time.Now().Add(-5 * time.Minute)
+	var filtered []time.Time
+	for _, t := range de.transitionHistory[symbol] {
+		if t.After(cutoff) {
+			filtered = append(filtered, t)
+		}
+	}
+	de.transitionHistory[symbol] = filtered
 }
 
 // getCurrentState returns the current trading mode for a symbol
@@ -169,11 +292,7 @@ func (de *DecisionEngine) determineBestMode(
 }
 
 // executeTransition performs the state transition with atomic CAS
-func (de *DecisionEngine) executeTransition(
-	symbol string,
-	fromMode, toMode TradingMode,
-	score float64,
-) (*StateTransition, error) {
+func (de *DecisionEngine) executeTransition(intent TransitionIntent) (*StateTransition, error) {
 	// CAS operation: increment version and swap state atomically
 	newVersion := atomic.AddUint64(&de.stateVersion, 1)
 
@@ -181,49 +300,52 @@ func (de *DecisionEngine) executeTransition(
 	defer de.stateMu.Unlock()
 
 	// Get or create symbol state
-	state, ok := de.symbolStates[symbol]
+	state, ok := de.symbolStates[intent.Symbol]
 	if !ok {
 		state = &SymbolTradingState{
-			Symbol:            symbol,
-			CurrentMode:       fromMode,
+			Symbol:            intent.Symbol,
+			CurrentMode:       intent.FromState,
 			ModeScores:        make(map[TradingMode]*TradingModeScore),
 			TransitionHistory: make([]StateTransition, 0),
 			StateEnteredAt:    time.Now(),
 		}
-		de.symbolStates[symbol] = state
+		de.symbolStates[intent.Symbol] = state
 	}
 
 	// Verify we haven't raced (optional check)
-	if state.CurrentMode != fromMode {
+	if state.CurrentMode != intent.FromState {
 		de.logger.Warn("State changed during transition evaluation",
-			zap.String("symbol", symbol),
-			zap.String("expected", string(fromMode)),
+			zap.String("symbol", intent.Symbol),
+			zap.String("expected", string(intent.FromState)),
 			zap.String("actual", string(state.CurrentMode)),
 		)
 	}
 
 	// T013: Reset losses if transitioning out of RECOVERY
-	if fromMode == TradingModeRecovery {
+	if intent.FromState == TradingModeRecovery {
 		state.ConsecutiveLosses = 0
 	}
 
 	// Create transition record
 	transition := StateTransition{
-		FromState:         fromMode,
-		ToState:           toMode,
-		Trigger:           "score_evaluation",
-		Score:             score,
+		FromState:         intent.FromState,
+		ToState:           intent.ToState,
+		Trigger:           intent.Trigger,
+		Score:             intent.Score,
 		SmoothingDuration: de.config.SmoothingDuration,
-		Timestamp:         time.Now(),
+		Timestamp:         intent.Timestamp,
 	}
 
 	// Update state
 	state.PreviousMode = state.CurrentMode
-	state.CurrentMode = toMode
-	state.TransitionConfidence = score
-	state.LastTransition = time.Now()
-	state.StateEnteredAt = time.Now() // T013: Track when new state was entered
+	state.CurrentMode = intent.ToState
+	state.TransitionConfidence = intent.Score
+	state.LastTransition = intent.Timestamp
+	state.StateEnteredAt = intent.Timestamp
 	state.TransitionHistory = append(state.TransitionHistory, transition)
+	state.LastIntentAt = intent.Timestamp
+	state.LastIntentID = fmt.Sprintf("%s:%d", intent.Symbol, intent.Timestamp.UnixNano())
+	state.PendingExecution = true
 
 	// Keep only last 10 transitions
 	if len(state.TransitionHistory) > 10 {
@@ -233,18 +355,18 @@ func (de *DecisionEngine) executeTransition(
 	// Start transition smoothing
 	if de.config.SmoothingDuration > 0 {
 		state.IsTransitioning = true
-		state.TargetMode = toMode
+		state.TargetMode = intent.ToState
 		state.BlendWeight = 0.0
 
 		// Start smoothing goroutine
-		go de.smoothTransition(symbol, fromMode, toMode, de.config.SmoothingDuration)
+		go de.smoothTransition(intent.Symbol, intent.FromState, intent.ToState, de.config.SmoothingDuration)
 	}
 
 	de.logger.Info("State transition executed",
-		zap.String("symbol", symbol),
-		zap.String("from", string(fromMode)),
-		zap.String("to", string(toMode)),
-		zap.Float64("score", score),
+		zap.String("symbol", intent.Symbol),
+		zap.String("from", string(intent.FromState)),
+		zap.String("to", string(intent.ToState)),
+		zap.Float64("score", intent.Score),
 		zap.Uint64("version", newVersion),
 	)
 
@@ -464,6 +586,7 @@ func (de *DecisionEngine) RecordExecutionResult(symbol string, success bool, rea
 	}
 
 	state.LastExecutionAckAt = time.Now()
+	state.PendingExecution = false
 	if reason != "" {
 		state.LastExitReason = reason
 	}
@@ -488,12 +611,17 @@ func (de *DecisionEngine) IncrementStateStuckCount(symbol string) {
 func (de *DecisionEngine) ForceTransition(symbol string, toMode TradingMode, reason string) error {
 	currentState := de.getCurrentState(symbol)
 
-	transition, err := de.executeTransition(symbol, currentState, toMode, 1.0)
+	transition, err := de.executeTransition(TransitionIntent{
+		Symbol:    symbol,
+		FromState: currentState,
+		ToState:   toMode,
+		Trigger:   "forced: " + reason,
+		Score:     1.0,
+		Timestamp: time.Now(),
+	})
 	if err != nil {
 		return fmt.Errorf("force transition failed: %w", err)
 	}
-
-	transition.Trigger = "forced: " + reason
 	de.publishTransition(*transition)
 
 	de.logger.Warn("Forced state transition",
@@ -503,4 +631,17 @@ func (de *DecisionEngine) ForceTransition(symbol string, toMode TradingMode, rea
 	)
 
 	return nil
+}
+
+// HasPendingExecutionAck reports whether the execution acknowledgement for the
+// latest committed transition is overdue.
+func (de *DecisionEngine) HasPendingExecutionAck(symbol string, timeout time.Duration) bool {
+	de.stateMu.RLock()
+	defer de.stateMu.RUnlock()
+
+	state, ok := de.symbolStates[symbol]
+	if !ok || !state.PendingExecution || timeout <= 0 {
+		return false
+	}
+	return time.Since(state.LastIntentAt) > timeout
 }
