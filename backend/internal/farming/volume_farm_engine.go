@@ -17,6 +17,7 @@ import (
 	"aster-bot/internal/dashboard"
 	"aster-bot/internal/farming/adaptive_config"
 	"aster-bot/internal/farming/adaptive_grid"
+	"aster-bot/internal/farming/maker"
 	"aster-bot/internal/farming/market_regime"
 	farmsync "aster-bot/internal/farming/sync"
 	"aster-bot/internal/farming/tradingmode"
@@ -149,6 +150,9 @@ type VolumeFarmEngine struct {
 	runtimeHub      *realtime.Hub
 	metricsStreamer *dashboard.MetricsStreamer // Real-time metrics streaming
 	healthMonitor   *health.Monitor            // Worker health monitoring and auto-restart
+
+	// NEW: Maker Strategy for Volume Farm + Micro Profit
+	makerStrategy *maker.MakerStrategyImpl
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -877,6 +881,15 @@ func NewVolumeFarmEngine(cfg *config.Config, logger *zap.Logger) (*VolumeFarmEng
 	// Store WebSocket client reference
 	engine.wsClient = sharedWSClient
 
+	// NEW: Initialize Maker Strategy for Volume Farm + Micro Profit
+	// Use default config - can be extended with YAML config later
+	makerConfig := maker.DefaultConfig()
+	engine.makerStrategy = maker.NewMakerStrategy(engine.futuresClient, sharedWSClient, makerConfig, logger)
+	logger.Info("Maker Strategy initialized",
+		zap.Strings("symbols", makerConfig.Symbols),
+		zap.Int("max_leverage", makerConfig.MaxLeverage),
+		zap.Float64("spread_bps", makerConfig.DefaultSpreadBps))
+
 	// Initialize health monitor for worker health monitoring and auto-restart
 	engine.healthMonitor = health.NewMonitor(logger)
 	logger.Info("Health monitor initialized")
@@ -959,6 +972,15 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		e.logger.Error("Failed to start health monitor", zap.Error(err))
 	} else {
 		e.logger.Info("Health monitor started")
+	}
+
+	// Start Maker Strategy for Volume Farm + Micro Profit
+	if e.makerStrategy != nil {
+		if err := e.makerStrategy.Start(ctx); err != nil {
+			e.logger.Error("Failed to start Maker Strategy", zap.Error(err))
+		} else {
+			e.logger.Info("Maker Strategy started")
+		}
 	}
 
 	// Register critical workers for health monitoring
@@ -1100,6 +1122,14 @@ func (e *VolumeFarmEngine) Start(ctx context.Context) error {
 		// Pass config to adaptive grid manager BEFORE Initialize
 		if optConfig != nil {
 			e.adaptiveGridManager.SetOptimizationConfig(optConfig)
+		}
+
+		// CRITICAL: Set WebSocket client for WebSocket-based data providers (avoids REST API rate limiting)
+		if e.wsClient != nil {
+			e.adaptiveGridManager.SetWebSocketClient(e.wsClient)
+			e.logger.Info("WebSocket client set on AdaptiveGridManager for real-time data")
+		} else {
+			e.logger.Warn("WebSocket client NOT available - RiskMonitor will use REST API (may cause rate limiting)")
 		}
 
 		e.adaptiveGridManager.InitializeDynamicLeverage(nil)
@@ -1551,6 +1581,15 @@ func (e *VolumeFarmEngine) Stop(ctx context.Context) error {
 			e.logger.Error("Failed to stop health monitor", zap.Error(err))
 		} else {
 			e.logger.Info("Health monitor stopped")
+		}
+	}
+
+	// Stop Maker Strategy
+	if e.makerStrategy != nil {
+		if err := e.makerStrategy.Stop(ctx); err != nil {
+			e.logger.Error("Failed to stop Maker Strategy", zap.Error(err))
+		} else {
+			e.logger.Info("Maker Strategy stopped")
 		}
 	}
 

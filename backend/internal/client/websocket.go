@@ -170,6 +170,8 @@ func (ws *WebSocketClient) realWebSocketHandler(ctx context.Context) {
 				return
 			}
 
+			ws.logger.Info("WebSocket message received", zap.Int("size", len(rawMsg)))
+
 			// Try to parse as object first (for individual streams)
 			var msgObj map[string]interface{}
 			if err := json.Unmarshal(rawMsg, &msgObj); err == nil {
@@ -182,11 +184,12 @@ func (ws *WebSocketClient) realWebSocketHandler(ctx context.Context) {
 			var msgArray []interface{}
 			if err := json.Unmarshal(rawMsg, &msgArray); err == nil {
 				// This is an array format (e.g., !ticker@arr)
+				ws.logger.Info("Processing as array message", zap.Int("count", len(msgArray)))
 				ws.processArrayMessage(msgArray)
 				continue
 			}
 
-			ws.logger.Debug("Unknown WebSocket message format", zap.String("raw", string(rawMsg)))
+			ws.logger.Warn("Unknown WebSocket message format", zap.String("raw", string(rawMsg)[:min(200, len(rawMsg))]))
 		}
 	}
 }
@@ -502,19 +505,86 @@ func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 			}
 			return
 		}
+		// Look for @bookTicker streams (best bid/ask)
+		if strings.Contains(stream, "@bookTicker") {
+			ws.logger.Info("BookTicker stream message", zap.String("stream", stream), zap.Any("msg", msg))
+			data, ok := msg["data"].(map[string]interface{})
+			if ok {
+				symbol := strings.ToUpper(getString(data, "s"))
+				bid := getFloat64(data, "b")
+				ask := getFloat64(data, "a")
+				ws.logger.Info("BookTicker data", zap.String("symbol", symbol), zap.Float64("bid", bid), zap.Float64("ask", ask))
+				if symbol != "" && bid > 0 && ask > 0 {
+					ws.mu.Lock()
+					ws.tickerCache[symbol] = tickerData{
+						BestBid:    bid,
+						BestAsk:    ask,
+						UpdateTime: time.Now(),
+					}
+					ws.lastMarketUpdate = time.Now()
+					ws.mu.Unlock()
+				}
+			}
+			return
+		}
 	}
 
-	// Handle user data events (ACCOUNT_UPDATE, ORDER_TRADE_UPDATE)
+	// Handle user data events (ACCOUNT_UPDATE, ORDER_TRADE_UPDATE, bookTicker)
 	if eventType, ok := msg["e"].(string); ok {
 		switch eventType {
 		case "ACCOUNT_UPDATE":
 			ws.processAccountUpdate(msg)
 		case "ORDER_TRADE_UPDATE":
 			ws.processOrderTradeUpdate(msg)
+		case "bookTicker":
+			// Handle bookTicker event - has "s", "b", "a" fields directly
+			symbol := strings.ToUpper(getString(msg, "s"))
+			bid := getFloat64(msg, "b")
+			ask := getFloat64(msg, "a")
+			if symbol != "" && bid > 0 && ask > 0 {
+				ws.mu.Lock()
+				ws.tickerCache[symbol] = tickerData{
+					BestBid:    bid,
+					BestAsk:    ask,
+					UpdateTime: time.Now(),
+				}
+				ws.lastMarketUpdate = time.Now()
+				ws.mu.Unlock()
+
+			}
 		default:
 			ws.logger.Debug("Unknown user data event", zap.String("event", eventType))
 		}
 		return
+	}
+
+	// Handle raw ticker stream messages (e.g., from !ticker@arr)
+	// Raw format has "s" (symbol), "b" (bid), "a" (ask) directly without "stream" wrapper
+	if symbol := getString(msg, "s"); symbol != "" {
+		if bid := getFloat64(msg, "b"); bid > 0 {
+			if ask := getFloat64(msg, "a"); ask > 0 {
+				// This is a raw ticker message
+				ws.mu.Lock()
+				ws.tickerCache[strings.ToUpper(symbol)] = tickerData{
+					BestBid:    bid,
+					BestAsk:    ask,
+					Volume24h:  getFloat64(msg, "v"),
+					LastPrice:  getFloat64(msg, "c"),
+					UpdateTime: time.Now(),
+				}
+				ws.lastMarketUpdate = time.Now()
+				ws.mu.Unlock()
+
+				select {
+				case ws.tickerCh <- msg:
+					ws.logger.Debug("Raw ticker message processed", zap.String("symbol", symbol))
+				default:
+					<-ws.tickerCh
+					ws.tickerCh <- msg
+				}
+				return
+			}
+		}
 	}
 
 	// Handle subscription responses
@@ -674,8 +744,76 @@ func getInt64(m map[string]interface{}, key string) int64 {
 	return 0
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // processArrayMessage handles array format messages (e.g., !ticker@arr)
 func (ws *WebSocketClient) processArrayMessage(msgArray []interface{}) {
+	ws.logger.Info("Processing array message", zap.Int("count", len(msgArray)))
+
+	// Log first item structure to debug
+	if len(msgArray) > 0 {
+		ws.logger.Info("First item in array", zap.Any("item", msgArray[0]))
+	}
+
+	// Update ticker cache for each symbol in the array
+	ws.mu.Lock()
+	count := 0
+	btcusdFound := false
+	ethusdFound := false
+	for i, item := range msgArray {
+		ticker, ok := item.(map[string]interface{})
+		if !ok {
+			ws.logger.Info("Item is not map", zap.Int("index", i), zap.String("type", fmt.Sprintf("%T", item)))
+			continue
+		}
+		rawSymbol := getString(ticker, "s")
+		symbol := strings.ToUpper(rawSymbol)
+		if symbol == "" {
+			ws.logger.Info("Empty symbol", zap.Int("index", i), zap.Any("ticker", ticker))
+			continue
+		}
+		if symbol == "BTCUSD1" {
+			btcusdFound = true
+		}
+		if symbol == "ETHUSD1" {
+			ethusdFound = true
+		}
+		bid := getFloat64(ticker, "b")
+		ask := getFloat64(ticker, "a")
+		if bid <= 0 || ask <= 0 {
+			ws.logger.Info("Invalid bid/ask", zap.String("symbol", symbol), zap.Float64("bid", bid), zap.Float64("ask", ask))
+			continue
+		}
+		ws.tickerCache[symbol] = tickerData{
+			BestBid:    bid,
+			BestAsk:    ask,
+			Volume24h:  getFloat64(ticker, "v"),
+			LastPrice:  getFloat64(ticker, "c"),
+			UpdateTime: time.Now(),
+		}
+		count++
+		// Log first few symbols for debugging
+		if count <= 3 {
+			ws.logger.Info("Updated ticker cache",
+				zap.String("raw_symbol", rawSymbol),
+				zap.String("cache_key", symbol),
+				zap.Float64("bid", bid),
+				zap.Float64("ask", ask))
+		}
+	}
+	ws.lastMarketUpdate = time.Now()
+	ws.mu.Unlock()
+
+	ws.logger.Info("Updated ticker cache from array",
+		zap.Int("symbols_updated", count),
+		zap.Bool("btcusd1_found", btcusdFound),
+		zap.Bool("ethusd1_found", ethusdFound))
+
 	// Create a wrapper message for array format
 	wrapperMsg := map[string]interface{}{
 		"stream": "!ticker@arr",
@@ -685,7 +823,7 @@ func (ws *WebSocketClient) processArrayMessage(msgArray []interface{}) {
 	// Circular buffer: when full, drop oldest and insert new
 	select {
 	case ws.tickerCh <- wrapperMsg:
-		// ws.logger.Debug("Array ticker message processed", zap.Int("count", len(msgArray)))
+		ws.logger.Debug("Array ticker message processed", zap.Int("count", len(msgArray)))
 	default:
 		<-ws.tickerCh             // Drop oldest
 		ws.tickerCh <- wrapperMsg // Insert new
@@ -890,8 +1028,19 @@ func (ws *WebSocketClient) GetTickerData(symbol string) (bestBid, bestAsk, volum
 	ws.mu.RLock()
 	defer ws.mu.RUnlock()
 
-	ticker, exists := ws.tickerCache[strings.ToUpper(symbol)]
+	cacheKey := strings.ToUpper(symbol)
+	ticker, exists := ws.tickerCache[cacheKey]
 	if !exists {
+		// Debug: list available symbols in cache
+		available := make([]string, 0, len(ws.tickerCache))
+		for k := range ws.tickerCache {
+			available = append(available, k)
+		}
+		ws.logger.Info("Ticker cache miss",
+			zap.String("requested", symbol),
+			zap.String("cache_key", cacheKey),
+			zap.Int("cache_size", len(ws.tickerCache)),
+			zap.Strings("available_first_10", available[:min(10, len(available))]))
 		return 0, 0, 0, fmt.Errorf("no ticker data for symbol %s", symbol)
 	}
 	return ticker.BestBid, ticker.BestAsk, ticker.Volume24h, nil

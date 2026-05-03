@@ -886,6 +886,13 @@ func (a *AdaptiveGridManager) SetCircuitBreaker(cb interface{}) {
 	a.circuitBreaker = cb
 }
 
+// SetWebSocketClient sets the WebSocket client for real-time data
+func (a *AdaptiveGridManager) SetWebSocketClient(ws *client.WebSocketClient) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.wsClient = ws
+}
+
 // SetOptimizationConfig sets the optimization config from YAML files
 func (a *AdaptiveGridManager) SetOptimizationConfig(optConfig *config.OptimizationConfig) {
 	a.mu.Lock()
@@ -1021,8 +1028,16 @@ func (a *AdaptiveGridManager) Initialize(ctx context.Context) error {
 	}
 
 	// NEW: Initialize RiskMonitor for dynamic sizing
+	// CRITICAL: Use WebSocket-based provider to avoid REST API rate limiting
 	enhancedConfig := DefaultEnhancedRiskConfig()
-	a.riskMonitor = NewRiskMonitor(a.futuresClient, enhancedConfig, a.logger)
+	if a.wsClient != nil {
+		wsAccountProvider := NewWSAccountInfoProvider(a.wsClient, a.logger)
+		a.riskMonitor = NewRiskMonitor(wsAccountProvider, enhancedConfig, a.logger)
+		a.logger.Info("RiskMonitor initialized with WebSocket provider (no REST API spam)")
+	} else {
+		a.riskMonitor = NewRiskMonitor(a.futuresClient, enhancedConfig, a.logger)
+		a.logger.Warn("RiskMonitor initialized with REST provider (fallback - may cause rate limiting)")
+	}
 	a.riskMonitor.Start(ctx)
 	a.logger.Info("RiskMonitor started with dynamic sizing",
 		zap.Float64("base_notional", enhancedConfig.BaseOrderNotional),

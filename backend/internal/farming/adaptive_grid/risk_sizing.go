@@ -912,6 +912,41 @@ type PositionProvider interface {
 	GetCachedPositions(ctx context.Context) ([]client.Position, error)
 }
 
+// WSAccountInfoProvider is a WebSocket-based implementation of AccountInfoProvider
+// Uses WebSocket cache instead of REST API to avoid rate limiting
+type WSAccountInfoProvider struct {
+	wsClient *client.WebSocketClient
+	logger   *zap.Logger
+}
+
+// NewWSAccountInfoProvider creates a new WebSocket-based account info provider
+func NewWSAccountInfoProvider(wsClient *client.WebSocketClient, logger *zap.Logger) *WSAccountInfoProvider {
+	return &WSAccountInfoProvider{
+		wsClient: wsClient,
+		logger:   logger,
+	}
+}
+
+// GetAccountInfo returns account info from WebSocket cache
+func (w *WSAccountInfoProvider) GetAccountInfo(ctx context.Context) (*client.AccountInfo, error) {
+	balance := w.wsClient.GetCachedBalance()
+	return &client.AccountInfo{
+		TotalWalletBalance:    balance.WalletBalance,
+		TotalMarginBalance:    balance.MarginBalance,
+		TotalUnrealizedProfit: 0, // Not available from WebSocket cache
+	}, nil
+}
+
+// GetPositions returns positions from WebSocket cache
+func (w *WSAccountInfoProvider) GetPositions(ctx context.Context) ([]client.Position, error) {
+	positions := w.wsClient.GetCachedPositions()
+	result := make([]client.Position, 0, len(positions))
+	for _, pos := range positions {
+		result = append(result, pos)
+	}
+	return result, nil
+}
+
 // RiskMonitor monitors and manages risk in real-time
 
 type RiskMonitor struct {
