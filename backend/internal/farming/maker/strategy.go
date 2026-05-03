@@ -371,8 +371,73 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 			zap.String("risk_level", riskLevel))
 	}
 
+	// MINIMUM ORDER SIZE PROTECTION: Ensure notional >= 5.0 USD
+	minNotionalUSD := 5.0
+	minQtyPerOrder := minNotionalUSD / midPrice
+
+	// Reduce grid levels if total capital insufficient (BEFORE calculating quantities)
+	maxAffordableLevels := int(buyQty / minQtyPerOrder)
+	if maxAffordableLevels < gridLevels {
+		oldLevels := gridLevels
+		gridLevels = maxAffordableLevels
+		if gridLevels < 5 {
+			gridLevels = 5 // Minimum 5 levels each side
+		}
+		s.logger.Info("🔧 Reduced grid levels for minimum notional",
+			zap.Int("old_levels", oldLevels),
+			zap.Int("new_levels", gridLevels),
+			zap.Float64("min_qty_per_level", minQtyPerOrder))
+	}
+
 	perLevelBuyQty := buyQty * capitalAllocation / float64(gridLevels)
 	perLevelSellQty := sellQty * capitalAllocation / float64(gridLevels)
+
+	// DEBUG: Log actual calculations
+	buyNotional := perLevelBuyQty * midPrice
+	sellNotional := perLevelSellQty * midPrice
+	s.logger.Info("🔍 Order Size Debug",
+		zap.Float64("mid_price", midPrice),
+		zap.Float64("min_qty_required", minQtyPerOrder),
+		zap.Float64("buy_qty", perLevelBuyQty),
+		zap.Float64("sell_qty", perLevelSellQty),
+		zap.Float64("buy_notional_usd", buyNotional),
+		zap.Float64("sell_notional_usd", sellNotional),
+		zap.Int("grid_levels", gridLevels))
+
+	// EMERGENCY FIX: Force minimum quantity regardless of calculations
+	if perLevelBuyQty < minQtyPerOrder {
+		perLevelBuyQty = minQtyPerOrder * 1.1 // Add 10% buffer
+		s.logger.Info("🔧 EMERGENCY: Adjusted buy quantity for minimum notional",
+			zap.Float64("old_qty", buyQty*capitalAllocation/float64(gridLevels)),
+			zap.Float64("new_qty", perLevelBuyQty),
+			zap.Float64("min_notional_usd", minNotionalUSD),
+			zap.Float64("price", midPrice))
+	}
+
+	if perLevelSellQty < minQtyPerOrder {
+		perLevelSellQty = minQtyPerOrder * 1.1 // Add 10% buffer
+		s.logger.Info("🔧 EMERGENCY: Adjusted sell quantity for minimum notional",
+			zap.Float64("old_qty", sellQty*capitalAllocation/float64(gridLevels)),
+			zap.Float64("new_qty", perLevelSellQty),
+			zap.Float64("min_notional_usd", minNotionalUSD),
+			zap.Float64("price", midPrice))
+	}
+
+	// FINAL SAFETY: Force minimum quantity if still too small
+	finalMinQty := minQtyPerOrder * 1.2 // 20% buffer for safety
+	if perLevelBuyQty < finalMinQty {
+		perLevelBuyQty = finalMinQty
+		s.logger.Warn("🚨 FINAL SAFETY: Forced minimum buy quantity",
+			zap.Float64("forced_qty", perLevelBuyQty),
+			zap.Float64("min_required", minQtyPerOrder))
+	}
+
+	if perLevelSellQty < finalMinQty {
+		perLevelSellQty = finalMinQty
+		s.logger.Warn("🚨 FINAL SAFETY: Forced minimum sell quantity",
+			zap.Float64("forced_qty", perLevelSellQty),
+			zap.Float64("min_required", minQtyPerOrder))
+	}
 
 	// Use wait group for concurrent order placement
 	var wg sync.WaitGroup

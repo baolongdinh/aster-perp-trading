@@ -43,7 +43,7 @@ volume_farming:
   enabled: true # ENABLED WITH REAL API DATA
   max_daily_loss_usdt: 50
   max_total_drawdown_pct: 5.0
-  order_size_usdt: 100 # Increased for better volume farming efficiency
+  order_size_usdt: 444 # Increased for better volume farming efficiency
   grid_spread_pct: 0.12 # Wider maker grid reduces churn and request pressure
   max_orders_per_side: 1 # Seed only 1 passive order per side
   replace_immediately: false # Do not chase immediate replacement
@@ -84,7 +84,7 @@ volume_farming:
     requests_per_second: 1
 
   risk:
-    max_position_usdt: 500
+    max_position_usdt: 1000
     max_open_positions: 2
     max_global_pending_limit_orders: 4
     max_pending_per_side: 1
