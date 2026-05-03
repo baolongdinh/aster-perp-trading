@@ -12,6 +12,7 @@ import (
 	"aster-bot/internal/client"
 
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
 type OrderManagerImpl struct {
@@ -19,17 +20,29 @@ type OrderManagerImpl struct {
 	logger        *zap.Logger
 	openOrders    map[string]map[int64]*Order
 	mu            sync.RWMutex
+	rateLimiter   *rate.Limiter
 }
 
 func NewOrderManager(futuresClient FuturesClientInterface, logger *zap.Logger) *OrderManagerImpl {
+	// Initialize rate limiter: 10 requests per second to avoid spam/ban
+	limiter := rate.NewLimiter(10, 1) // 10 requests per second with burst of 1
+
 	return &OrderManagerImpl{
 		futuresClient: futuresClient,
 		logger:        logger,
 		openOrders:    make(map[string]map[int64]*Order),
+		rateLimiter:   limiter,
 	}
 }
 
 func (m *OrderManagerImpl) PlaceLimitOrder(ctx context.Context, req LimitOrderRequest) (*Order, error) {
+	// Apply rate limiting to avoid spam/ban
+	err := m.rateLimiter.Wait(ctx)
+	if err != nil {
+		m.logger.Warn("Rate limit reached, backing off", zap.Error(err))
+		return nil, fmt.Errorf("rate limit reached: %w", err)
+	}
+
 	// Round to correct precision for the symbol
 	priceStr := formatPrice(req.Symbol, req.Price)
 	qtyStr := formatQuantity(req.Symbol, req.Quantity)
@@ -92,7 +105,14 @@ func (m *OrderManagerImpl) PlaceLimitOrder(ctx context.Context, req LimitOrderRe
 }
 
 func (m *OrderManagerImpl) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
-	_, err := m.futuresClient.CancelOrder(ctx, client.CancelOrderRequest{
+	// Apply rate limiting to avoid spam/ban
+	err := m.rateLimiter.Wait(ctx)
+	if err != nil {
+		m.logger.Warn("Rate limit reached, backing off", zap.Error(err))
+		return fmt.Errorf("rate limit reached: %w", err)
+	}
+
+	_, err = m.futuresClient.CancelOrder(ctx, client.CancelOrderRequest{
 		Symbol:  symbol,
 		OrderID: orderID,
 	})

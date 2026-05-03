@@ -19,9 +19,9 @@ func DefaultConfig() *Config {
 	return &Config{
 		Symbols:              []string{"btcusd1", "ethusd1"},
 		DefaultSpreadBps:     2,
-		MaxLeverage:          100,   // High leverage for volume farming
-		MaxPositionUSDT:      2000,  // Increase position size
-		MaxTotalExposureUSDT: 10000, // More exposure for volume
+		MaxLeverage:          150,   // Ultra-high leverage for maximum volume
+		MaxPositionUSDT:      3000,  // Larger position size
+		MaxTotalExposureUSDT: 15000, // Maximum exposure for volume
 		RebalanceThreshold:   0.2,
 		LiquidationBuffer:    0.05,
 		DailyLossLimitPct:    0.02,
