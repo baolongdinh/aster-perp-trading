@@ -1,4 +1,4 @@
-.PHONY: all build run agentic-run agentic-test-run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test
+.PHONY: all build run agentic-run agentic-test-run test test-unit test-integration test-market test-account test-order test-workflow test-run test-place-limit test-place-market test-order-lifecycle test-cancel-order test-order-complete test-workflow-complete test-public-market test-aster-all setup-tests test-help clean deps termux-start termux-stop termux-status termux-logs termux-restart termux-daemon dashboard dashboard-script agentic-start agentic-stop agentic-status agentic-logs agentic-restart agentic-daemon agentic-test volume-maker-start volume-maker-stop volume-maker-status volume-maker-logs volume-maker-restart volume-maker-build
 
 # The name of our output binary
 APP_NAME := aster-bot
@@ -508,3 +508,56 @@ agentic-setup:
 	@cp config/agentic-vf-config.yaml.example config/agentic-vf-config.yaml 2>/dev/null || echo "Config already exists"
 	@echo ""
 	@echo "Setup complete! Use 'make agentic-start' to run"
+
+# ============================================================================
+# Volume Farm Maker (Micro Profit Engine)
+# ============================================================================
+
+# Build volume-maker binary
+volume-maker-build:
+	@echo "Building Volume Maker binary..."
+	@go build -o bin/volume-maker ./cmd/volume-farm-maker
+	@echo "Binary built: bin/volume-maker"
+
+# Start volume maker bot
+volume-maker-start:
+	@echo "============================================"
+	@echo "Starting Volume Farm Maker (Micro Profit)"
+	@echo "============================================"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Maker strategy only (place limit orders)"
+	@echo "  • ETHUSD1 trading"
+	@echo "  • Default spread: 5 bps"
+	@echo "  • Default leverage: 50x"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make volume-maker-start           # Default settings"
+	@echo "  make volume-maker-start SPREAD=10 # Custom spread (bps)"
+	@echo "  make volume-maker-start LEVERAGE=100 # Custom leverage"
+	@echo ""
+	@chmod +x run-volume-maker.sh 2>/dev/null || true
+	@./run-volume-maker.sh start ./config/volume-farm-config.yaml
+
+# Stop volume maker bot
+volume-maker-stop:
+	@echo "Stopping Volume Farm Maker..."
+	@chmod +x run-volume-maker.sh 2>/dev/null || true
+	@./run-volume-maker.sh stop
+
+# Check volume maker status
+volume-maker-status:
+	@chmod +x run-volume-maker.sh 2>/dev/null || true
+	@./run-volume-maker.sh status
+
+# View volume maker logs
+volume-maker-logs:
+	@echo "Viewing logs (Ctrl+C to exit)..."
+	@chmod +x run-volume-maker.sh 2>/dev/null || true
+	@./run-volume-maker.sh logs
+
+# Restart volume maker bot
+volume-maker-restart:
+	@echo "Restarting Volume Farm Maker..."
+	@chmod +x run-volume-maker.sh 2>/dev/null || true
+	@./run-volume-maker.sh restart ./config/volume-farm-config.yaml

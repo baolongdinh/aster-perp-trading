@@ -25,7 +25,7 @@ func main() {
 	maxLeverage := flag.Int("leverage", 50, "Max leverage (default: 50)")
 	flag.Parse()
 
-	logger, err := zap.NewDevelopment()
+	logger, err := zap.NewProduction()
 	if err != nil {
 		panic("failed to initialize logger")
 	}

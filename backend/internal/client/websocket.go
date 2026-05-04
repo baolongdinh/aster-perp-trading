@@ -170,8 +170,6 @@ func (ws *WebSocketClient) realWebSocketHandler(ctx context.Context) {
 				return
 			}
 
-			ws.logger.Info("WebSocket message received", zap.Int("size", len(rawMsg)))
-
 			// Try to parse as object first (for individual streams)
 			var msgObj map[string]interface{}
 			if err := json.Unmarshal(rawMsg, &msgObj); err == nil {
@@ -1036,11 +1034,6 @@ func (ws *WebSocketClient) GetTickerData(symbol string) (bestBid, bestAsk, volum
 		for k := range ws.tickerCache {
 			available = append(available, k)
 		}
-		ws.logger.Info("Ticker cache miss",
-			zap.String("requested", symbol),
-			zap.String("cache_key", cacheKey),
-			zap.Int("cache_size", len(ws.tickerCache)),
-			zap.Strings("available_first_10", available[:min(10, len(available))]))
 		return 0, 0, 0, fmt.Errorf("no ticker data for symbol %s", symbol)
 	}
 	return ticker.BestBid, ticker.BestAsk, ticker.Volume24h, nil
@@ -1085,10 +1078,6 @@ func (ws *WebSocketClient) BootstrapKlines(symbol, interval string, klines []Kli
 
 	key := strings.ToUpper(symbol) + ":" + interval
 	ws.klineBuffer[key] = klines
-	ws.logger.Info("Bootstrapped kline buffer",
-		zap.String("symbol", symbol),
-		zap.String("interval", interval),
-		zap.Int("count", len(klines)))
 }
 
 // GetRecentKlines returns the most recent klines from the buffer for a symbol
