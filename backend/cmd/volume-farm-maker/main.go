@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -14,6 +15,7 @@ import (
 	"aster-bot/internal/client"
 	"aster-bot/internal/config"
 	"aster-bot/internal/farming/maker"
+	"aster-bot/internal/notifier"
 
 	"go.uber.org/zap"
 )
@@ -107,12 +109,45 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// === NEW: TELEGRAM NOTIFIER SETUP ===
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+	telegramEnabled := os.Getenv("TELEGRAM_ENABLED")
+
+	var noti *notifier.Notifier
+
+	if telegramEnabled != "false" && botToken != "" && chatID != "" {
+		notiConfig := notifier.Config{
+			BotToken:    botToken,
+			ChatID:      chatID,
+			AlertConfig: notifier.DefaultAlertConfig,
+			ReportEvery: 30 * time.Minute,
+			CheckEvery:  1 * time.Minute,
+		}
+		noti = notifier.NewNotifier(notiConfig, makerStrategy)
+		go noti.Start(ctx)
+
+		// Send initial startup
+		go func() {
+			time.Sleep(5 * time.Second) // wait for first websocket ticks
+			mtx := makerStrategy.GetCurrentMetrics()
+			noti.SendStartup(ctx, mtx.Symbol, mtx.GridMinPrice, mtx.GridMaxPrice, mtx.TotalGrids)
+		}()
+		logger.Info("📲 Telegram Notifier started")
+	} else {
+		logger.Warn("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set. Notifier disabled.")
+	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				logger.Error("Maker Strategy goroutine panic recovered",
 					zap.Any("panic", r),
 					zap.String("stack", string(debug.Stack())))
+
+				if noti != nil {
+					noti.SendError(context.Background(), fmt.Errorf("Panic: %v\n\n%s", r, string(debug.Stack())))
+				}
 			}
 		}()
 		logger.Info("🔄 Starting Maker Strategy")
@@ -131,6 +166,11 @@ func main() {
 	<-sigChan
 
 	logger.Info("🛑 Shutting down...")
+
+	if noti != nil {
+		noti.SendShutdown(context.Background())
+		noti.Stop()
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()

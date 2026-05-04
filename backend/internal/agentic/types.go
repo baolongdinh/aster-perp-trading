@@ -112,6 +112,7 @@ const (
 	TradingModeIdle         TradingMode = "IDLE"           // Waiting for opportunity
 	TradingModeWaitNewRange TradingMode = "WAIT_NEW_RANGE" // Detecting range
 	TradingModeOverSize     TradingMode = "OVER_SIZE"      // Position size too large
+	TradingModeGridWinding  TradingMode = "GRID_WINDING"   // Winding down grid, letting orders fill naturally
 )
 
 // GridState represents the state machine state (alias for backward compatibility)

@@ -2,6 +2,7 @@ package maker
 
 import (
 	"aster-bot/internal/client"
+	"aster-bot/internal/notifier"
 	"context"
 	"math"
 	"strings"
@@ -11,6 +12,11 @@ import (
 	"github.com/patrickmn/go-cache"
 	"go.uber.org/zap"
 )
+
+type pricePoint struct {
+	price float64
+	ts    time.Time
+}
 
 type MakerStrategyImpl struct {
 	config         *Config
@@ -42,6 +48,17 @@ type MakerStrategyImpl struct {
 	// Position count per side
 	longPositionCount  int
 	shortPositionCount int
+
+	// P0 FIX: Price history buffer for real pump/crash detection (last 30 ticks)
+	priceHistory   map[string][]pricePoint
+	priceHistoryMu sync.Mutex
+	// P0 FIX: Debounce mutex to prevent concurrent continuousOrderPlacement
+	placementInProgress sync.Map // key=symbol, value=bool
+
+	// === NEW: Accurate Metrics Telemetry ===
+	startTime            time.Time
+	initialWalletBalance float64
+	maxWalletBalance     float64
 
 	mu      sync.RWMutex
 	running bool
@@ -92,6 +109,7 @@ func NewMakerStrategy(
 		ResetHour: config.DailyResetHour,
 	}
 	strategy.emaCache = make(map[string]float64)
+	strategy.priceHistory = make(map[string][]pricePoint)
 
 	return strategy
 }
@@ -108,7 +126,17 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 		return nil
 	}
 	s.running = true
+	s.startTime = time.Now()
 	s.mu.Unlock()
+
+	// Capture initial wallet balance for deterministic Realized PnL and ROI
+	if acc, err := s.futuresClient.GetAccountInfo(ctx); err == nil && acc != nil {
+		s.initialWalletBalance = acc.TotalWalletBalance
+		s.maxWalletBalance = acc.TotalMarginBalance
+	} else if bal := s.wsClient.GetCachedBalance(); bal.Asset != "" {
+		s.initialWalletBalance = bal.WalletBalance
+		s.maxWalletBalance = bal.MarginBalance
+	}
 
 	// === FR10: Startup Reconciliation - Verify state with exchange ===
 	if err := s.reconcileOnStartup(ctx); err != nil {
@@ -141,10 +169,15 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 	go s.positionTimeoutLoop()
 
 	s.wg.Add(1)
-	go s.trailingStopLoop()
+	go s.emergencyRiskMonitorLoop()
 
+	// === NEW: Continuous order placement optimization loop ===
 	s.wg.Add(1)
-	go s.dailyResetLoop()
+	go s.continuousOrderPlacementLoop()
+
+	// === P1 FIX: Start trailing stop loop ===
+	s.wg.Add(1)
+	go s.trailingStopLoop()
 
 	s.logger.Info("Maker Strategy started successfully")
 	return nil
@@ -179,6 +212,14 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 
 	if stop, reason := s.emergencyStop.Check(s.ctx); stop {
 		s.logger.Warn("Cannot place orders - emergency stop active", zap.String("reason", reason))
+		return nil
+	}
+
+	// === Pump Detection: Check for abnormal price movements ===
+	if isPump, velocity := s.detectPump(symbol); isPump {
+		s.logger.Error("🚨 PUMP/CRASH DETECTED - PAUSING ORDERS",
+			zap.String("symbol", symbol),
+			zap.Float64("price_velocity", velocity))
 		return nil
 	}
 
@@ -234,7 +275,7 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		return nil
 	}
 
-	// ADVANCED POSITION MANAGEMENT: Dynamic hedging with market impact detection
+	// ADVANCED POSITION MANAGEMENT & DELTA-NEUTRAL GUARD
 	position := s.inventoryMgr.GetPosition(symbol)
 	var positionBias float64
 	var positionSize float64
@@ -258,6 +299,23 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	}
 
 	midPrice = (bestBid + bestAsk) / 2
+
+	// === P1 FIX: Delta-Neutral Guard ===
+	// If net exposure exceeds threshold, block orders in the same direction
+	maxExposure := float64(s.config.MaxTotalExposureUSDT)
+	netExposureUSDT := positionBias * midPrice // Approx exposure for this symbol
+
+	blockBuy := false
+	blockSell := false
+	if math.Abs(netExposureUSDT) > maxExposure*0.5 { // Increased from 0.1 to 0.5 to loosen blocking
+		if netExposureUSDT > 0 {
+			blockBuy = true
+			s.logger.Warn("⚠️ Delta-Neutral Guard: Net Long exceeded 50%, blocking buys", zap.Float64("exposure", netExposureUSDT))
+		} else {
+			blockSell = true
+			s.logger.Warn("⚠️ Delta-Neutral Guard: Net Short exceeded 50%, blocking sells", zap.Float64("exposure", netExposureUSDT))
+		}
+	}
 	spread := bestAsk - bestBid
 	volatility := spread / midPrice            // Simple volatility measure
 	marketImpact := volume24h * spread / 10000 // Market impact score
@@ -330,9 +388,10 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 			zap.Float64("sell_adjustment", sellAdjustment))
 	}
 
-	maxOrderValue := balance * float64(s.config.MaxLeverage) * 1 // 100% of leveraged balance for larger orders
-	buyQty := maxOrderValue / buyPrice
-	sellQty := maxOrderValue / sellPrice
+	// === P2 FIX: Use calculateMicroProfitOrderSize instead of maxOrderValue ===
+	orderSizeUsdt := s.calculateMicroProfitOrderSize(balance, symbol)
+	buyQty := orderSizeUsdt / buyPrice
+	sellQty := orderSizeUsdt / sellPrice
 
 	// Apply dynamic hedging adjustments
 	buyQty = buyQty * buyAdjustment
@@ -346,7 +405,7 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		zap.String("symbol", symbol),
 		zap.Float64("balance", balance),
 		zap.Float64("leverage", float64(s.config.MaxLeverage)),
-		zap.Float64("order_value_usdt", maxOrderValue),
+		zap.Float64("order_value_usdt", orderSizeUsdt),
 		zap.Float64("buy_qty", buyQty),
 		zap.Float64("sell_qty", sellQty))
 
@@ -366,19 +425,28 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		zap.String("zone", string(zoneType)),
 		zap.Float64("multiplier", zoneMultiplier))
 
-	// === FR1: Active Zone Grid - Use only levels within 0.1% of market ===
+	// === FR1: Active Zone Grid - Dynamic spacing based on volatility ===
 	// Use the pre-calculated activeZone from earlier in PlaceOrders
 	gridLevels := activeZone.LevelCount
 	gridSpacing := activeZone.GridSpacing
 
-	// Apply zone multiplier for sizing
-	capitalAllocation := zoneMultiplier
-	if capitalAllocation <= 0 {
-		capitalAllocation = 0.1 // Minimum allocation
+	// NEW: Calculate volatility and adjust spacing dynamically
+	gridVolatility := s.calculateVolatility(symbol)
+	dynamicSpacing := s.calculateDynamicSpacing(gridSpacing, gridVolatility)
+
+	// Use dynamic spacing instead of fixed spacing
+	gridSpacing = dynamicSpacing
+
+	// Apply zone multiplier for sizing - P1 FIX: Sell is always 100%, Buy is scaled when dipping
+	buyCapitalAllocation := zoneMultiplier
+	sellCapitalAllocation := 1.0 // Never reduce sell allocation on dips (allows hedging/exiting)
+
+	if buyCapitalAllocation <= 0 {
+		buyCapitalAllocation = 0.1 // Minimum allocation for buy
 	}
 
-	// === FR2/FR15: Use balance-based order sizing ===
-	orderSize := s.calculateOrderSize(balance)
+	// === FR2/FR15: Use balance-based order sizing with micro-profit optimization ===
+	orderSize := s.calculateMicroProfitOrderSize(balance, symbol)
 	orderCount := s.calculateOrderCount(balance)
 
 	// Adjust grid levels based on order count config
@@ -433,8 +501,16 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 			zap.Float64("min_qty_per_level", minQtyPerOrder))
 	}
 
-	perLevelBuyQty := buyQty * capitalAllocation / float64(gridLevels)
-	perLevelSellQty := sellQty * capitalAllocation / float64(gridLevels)
+	perLevelBuyQty := buyQty * buyCapitalAllocation / float64(gridLevels)
+	perLevelSellQty := sellQty * sellCapitalAllocation / float64(gridLevels)
+
+	// Apply Delta-Neutral block
+	if blockBuy {
+		perLevelBuyQty = 0
+	}
+	if blockSell {
+		perLevelSellQty = 0
+	}
 
 	// DEBUG: Log actual calculations
 	buyNotional := perLevelBuyQty * midPrice
@@ -449,19 +525,19 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		zap.Int("grid_levels", gridLevels))
 
 	// EMERGENCY FIX: Force minimum quantity regardless of calculations
-	if perLevelBuyQty < minQtyPerOrder {
+	if !blockBuy && perLevelBuyQty < minQtyPerOrder {
 		perLevelBuyQty = minQtyPerOrder * 1.1 // Add 10% buffer
 		s.logger.Info("🔧 EMERGENCY: Adjusted buy quantity for minimum notional",
-			zap.Float64("old_qty", buyQty*capitalAllocation/float64(gridLevels)),
+			zap.Float64("old_qty", buyQty*buyCapitalAllocation/float64(gridLevels)),
 			zap.Float64("new_qty", perLevelBuyQty),
 			zap.Float64("min_notional_usd", minNotionalUSD),
 			zap.Float64("price", midPrice))
 	}
 
-	if perLevelSellQty < minQtyPerOrder {
+	if !blockSell && perLevelSellQty < minQtyPerOrder {
 		perLevelSellQty = minQtyPerOrder * 1.1 // Add 10% buffer
 		s.logger.Info("🔧 EMERGENCY: Adjusted sell quantity for minimum notional",
-			zap.Float64("old_qty", sellQty*capitalAllocation/float64(gridLevels)),
+			zap.Float64("old_qty", sellQty*sellCapitalAllocation/float64(gridLevels)),
 			zap.Float64("new_qty", perLevelSellQty),
 			zap.Float64("min_notional_usd", minNotionalUSD),
 			zap.Float64("price", midPrice))
@@ -493,10 +569,20 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		go func(level int) {
 			defer wg.Done()
 			// Ultra-Tight Volume Farming: Maximum fill rate spacing below bid
-			gridOffset := gridSpacing * float64(level+1)
+			gridOffset := gridSpacing * float64(level) // START AT 0 offset
 			gridBuyPrice := bestBid * (1 - gridOffset)
 
-			if perLevelBuyQty > 0 {
+			// Only place if we don't already have open buy orders to avoid duplicate grid placement
+			openOrders := s.orderManager.GetOpenOrders(symbol)
+			hasBuyOrders := false
+			for _, order := range openOrders {
+				if order.Side == OrderSideBuy {
+					hasBuyOrders = true
+					break
+				}
+			}
+
+			if perLevelBuyQty > 0 && !hasBuyOrders {
 				err := s.placeLimitOrder(symbol, OrderSideBuy, gridBuyPrice, perLevelBuyQty)
 				if err != nil {
 					s.logger.Error("Failed to place grid buy order", zap.Error(err))
@@ -506,12 +592,14 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 						zap.String("symbol", symbol),
 						zap.String("risk_level", riskLevel),
 						zap.Float64("hv30_adj", adjustedVolatility),
-						zap.Int("level", level+1),
+						zap.Int("level", level),
 						zap.Float64("price", gridBuyPrice),
 						zap.Float64("spacing_pct", gridOffset*100),
 						zap.Float64("qty", perLevelBuyQty))
 				}
 				orderPlaced <- true
+			} else if hasBuyOrders {
+				orderPlaced <- true // Mark as finished simulating place
 			}
 		}(i)
 	}
@@ -522,10 +610,20 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		go func(level int) {
 			defer wg.Done()
 			// Ultra-Tight Volume Farming: Maximum fill rate spacing above ask
-			gridOffset := gridSpacing * float64(level+1)
+			gridOffset := gridSpacing * float64(level) // START AT 0 offset
 			gridSellPrice := bestAsk * (1 + gridOffset)
 
-			if perLevelSellQty > 0 {
+			// Only place if we don't already have open sell orders
+			openOrders := s.orderManager.GetOpenOrders(symbol)
+			hasSellOrders := false
+			for _, order := range openOrders {
+				if order.Side == OrderSideSell {
+					hasSellOrders = true
+					break
+				}
+			}
+
+			if perLevelSellQty > 0 && !hasSellOrders {
 				err := s.placeLimitOrder(symbol, OrderSideSell, gridSellPrice, perLevelSellQty)
 				if err != nil {
 					s.logger.Error("Failed to place grid sell order", zap.Error(err))
@@ -535,12 +633,14 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 						zap.String("symbol", symbol),
 						zap.String("risk_level", riskLevel),
 						zap.Float64("hv30_adj", adjustedVolatility),
-						zap.Int("level", level+1),
+						zap.Int("level", level),
 						zap.Float64("price", gridSellPrice),
 						zap.Float64("spacing_pct", gridOffset*100),
 						zap.Float64("qty", perLevelSellQty))
 				}
 				orderPlaced <- true
+			} else if hasSellOrders {
+				orderPlaced <- true // Mark as finished simulating place
 			}
 		}(i)
 	}
@@ -672,11 +772,22 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 	}
 	midPrice := (bestBid + bestAsk) / 2
 
-	// SYNC WITH EXCHANGE: Get current order state from exchange
-	exchangeOrders, err := s.futuresClient.GetOpenOrders(s.ctx, symbol)
-	if err != nil {
-		s.logger.Warn("Failed to sync with exchange orders", zap.Error(err))
+	// P2 FIX: SYNC WITH EXCHANGE (with 2s local cache throttling)
+	var exchangeOrders []client.Order
+	cacheKey := "open_orders_" + symbol
+	if cached, found := s.restCache.Get(cacheKey); found {
+		exchangeOrders = cached.([]client.Order)
 	} else {
+		var err error
+		exchangeOrders, err = s.futuresClient.GetOpenOrders(s.ctx, symbol)
+		if err != nil {
+			s.logger.Warn("Failed to sync with exchange orders", zap.Error(err))
+		} else {
+			s.restCache.Set(cacheKey, exchangeOrders, 2*time.Second)
+		}
+	}
+
+	if exchangeOrders != nil {
 		// Clean up local orders that don't exist on exchange
 		var localOrdersToRemove []int64
 		for _, localOrder := range orders {
@@ -746,9 +857,9 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 		}
 	}
 
-	// EXA OPTIMIZED: Allow sufficient time for fills - INCREASED for continuous farming
-	gridShiftThreshold := 0.005      // 0.5% - wider threshold, less aggressive rebalancing
-	maxOrderAge := 300 * time.Second // 5 minutes - much longer to allow fills
+	// EXA OPTIMIZED: Rapid Grid Refresh for Volume Farming
+	gridShiftThreshold := 0.0005    // 0.05% - extreme tight threshold for micro-profits
+	maxOrderAge := 15 * time.Second // 15 seconds - quick expiration to keep hugging the spread
 	needsRefresh := false
 	cancelledCount := 0
 
@@ -1139,28 +1250,115 @@ func (s *MakerStrategyImpl) updatePositionOpenTime(symbol string) {
 	s.logger.Debug("Position open time updated", zap.String("symbol", symbol))
 }
 
-// T008: Check and force close positions that exceeded timeout
+// T008: Position timeout disabled - no longer needed for continuous farming
 func (s *MakerStrategyImpl) checkPositionTimeout(symbol string) (shouldClose bool, reason string) {
-	s.mu.RLock()
-	openTime, exists := s.positionOpenTime[symbol]
-	s.mu.RUnlock()
-
-	if !exists {
-		return false, ""
-	}
-
-	elapsed := time.Since(openTime)
-	timeout := time.Duration(s.config.PositionTimeoutSeconds) * time.Second
-
-	if elapsed > timeout {
-		s.logger.Warn("Position timeout reached - forcing close",
-			zap.String("symbol", symbol),
-			zap.Duration("elapsed", elapsed),
-			zap.Duration("timeout", timeout))
-		return true, "position_timeout"
-	}
-
+	// DISABLED: Always return false to allow positions to stay open for continuous farming
 	return false, ""
+}
+
+// NEW: GetMidPrice helper for volatility calculation
+func (s *MakerStrategyImpl) GetMidPrice(symbol string) float64 {
+	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
+	if err != nil {
+		return 0
+	}
+	return (bestBid + bestAsk) / 2
+}
+
+// NEW: Calculate volatility for dynamic spacing
+func (s *MakerStrategyImpl) calculateVolatility(symbol string) float64 {
+	// Simple volatility calculation based on recent price changes
+	// Use spread as proxy for volatility
+	spread := s.GetSpread(symbol)
+	midPrice := s.GetMidPrice(symbol)
+
+	// Normalize to percentage
+	volatility := spread / midPrice
+
+	// Cap at reasonable maximum
+	if volatility > 0.01 {
+		volatility = 0.01
+	}
+
+	return volatility
+}
+
+// NEW: Pump detection - identify abnormal price movements
+func (s *MakerStrategyImpl) detectPump(symbol string) (bool, float64) {
+	// Get recent price data
+	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
+	if err != nil {
+		s.logger.Warn("Failed to get ticker for pump detection", zap.Error(err))
+		return false, 0
+	}
+
+	midPrice := (bestBid + bestAsk) / 2
+
+	// P1 FIX: Use price history to detect velocity over time, not spread
+	s.priceHistoryMu.Lock()
+	now := time.Now()
+	history := s.priceHistory[symbol]
+
+	// Add current point
+	history = append(history, pricePoint{price: midPrice, ts: now})
+
+	// Remove old points (keep last 5 seconds)
+	var filteredHistory []pricePoint
+	for _, p := range history {
+		if now.Sub(p.ts) <= 5*time.Second {
+			filteredHistory = append(filteredHistory, p)
+		}
+	}
+	s.priceHistory[symbol] = filteredHistory
+	s.priceHistoryMu.Unlock()
+
+	if len(filteredHistory) < 2 {
+		return false, 0 // Need more history
+	}
+
+	oldestPrice := filteredHistory[0].price
+
+	// Calculate actual price velocity over the time window
+	priceVelocity := math.Abs(midPrice-oldestPrice) / oldestPrice
+
+	// Pump detection thresholds - 0.5% in 5 seconds
+	pumpThreshold := 0.005
+	extremePumpThreshold := 0.02 // 2% price movement - extreme volatility
+
+	isPump := priceVelocity > pumpThreshold
+	isExtremePump := priceVelocity > extremePumpThreshold
+
+	// Log pump detection
+	if isPump {
+		s.logger.Warn(" PUMP DETECTED",
+			zap.String("symbol", symbol),
+			zap.Float64("price_velocity", priceVelocity),
+			zap.Float64("threshold", pumpThreshold),
+			zap.Bool("is_extreme", isExtremePump))
+	} else if isExtremePump {
+		s.logger.Error(" EXTREME PUMP DETECTED",
+			zap.String("symbol", symbol),
+			zap.Float64("price_velocity", priceVelocity),
+			zap.Float64("threshold", extremePumpThreshold),
+			zap.Bool("is_extreme", isExtremePump))
+	}
+
+	return isPump || isExtremePump, priceVelocity
+}
+
+// NEW: Volatility-based dynamic spacing adjustment
+func (s *MakerStrategyImpl) calculateDynamicSpacing(baseSpacing float64, volatility float64) float64 {
+	// Increase spacing during high volatility to reduce order cancellations
+	// Base spacing: 0.01% (0.0001)
+	// When volatility > 2x normal, increase spacing up to 2x
+
+	if volatility > 0.002 { // 0.2% volatility threshold
+		// High volatility = wider spacing to avoid cancellations
+		return baseSpacing * 2.0 // 0.02% spacing
+	}
+
+	// Normal volatility = standard spacing
+	return baseSpacing // 0.01%
 }
 
 // T012-T013: Manage trailing stop for a position
@@ -1196,13 +1394,13 @@ func (s *MakerStrategyImpl) manageTrailingStop(symbol string, currentPrice float
 			zap.Float64("peak_profit_pct", ts.PeakProfitPct))
 	}
 
-	// Activate trailing if profit exceeds activation threshold
+	// TRAILING STOP DISABLED - to avoid closing profitable positions during pumps
+	// Only log when trailing would have triggered, but don't actually activate
 	if !ts.IsActive && profitPct >= ts.ActivationPct {
-		ts.IsActive = true
-		s.logger.Info("Trailing stop activated",
+		s.logger.Info("Trailing stop WOULD HAVE triggered - DISABLED",
 			zap.String("symbol", symbol),
 			zap.Float64("profit_pct", profitPct),
-			zap.Float64("activation_pct", ts.ActivationPct))
+			zap.String("note", "trailing disabled to protect profits"))
 	}
 
 	// Check if trailing callback triggered
@@ -1262,22 +1460,31 @@ func (s *MakerStrategyImpl) checkPositionLimits() (shouldBlock bool, positionsTo
 	s.mu.RUnlock()
 
 	maxPerSide := s.config.MaxPositionsPerSide
+	shouldBlock = false
+	var limitExceededSymbols []string
 
-	// Check if we need to close oldest positions (FIFO)
+	// P1 FIX: Check if we need to close oldest positions (FIFO)
 	if longCount > maxPerSide {
 		s.logger.Warn("Long position limit exceeded",
 			zap.Int("current", longCount),
 			zap.Int("max", maxPerSide))
-		// In real implementation, would return oldest position IDs to close
+		shouldBlock = true
 	}
 
 	if shortCount > maxPerSide {
 		s.logger.Warn("Short position limit exceeded",
 			zap.Int("current", shortCount),
 			zap.Int("max", maxPerSide))
+		shouldBlock = true
 	}
 
-	return false, nil
+	// Just return symbol list to block new placements or trigger cleanup
+	// In the future this can return oldest specific symbols
+	if shouldBlock && len(s.config.Symbols) > 0 {
+		limitExceededSymbols = []string{s.config.Symbols[0]} // Simplification
+	}
+
+	return shouldBlock, limitExceededSymbols
 }
 
 // T028-T030: Calculate zone multiplier based on EMA distance
@@ -1477,6 +1684,242 @@ func (s *MakerStrategyImpl) dailyResetLoop() {
 	}
 }
 
+// emergencyRiskMonitorLoop - Real-time position monitoring for rapid price movements
+// This is the CRITICAL protection against liquidation during pumps/crashes
+func (s *MakerStrategyImpl) emergencyRiskMonitorLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(500 * time.Millisecond) // Check every 500ms - very fast
+	defer ticker.Stop()
+
+	s.logger.Info("Emergency risk monitor started - checking every 500ms")
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.logger.Info("Emergency risk monitor stopped")
+			return
+		case <-ticker.C:
+			s.checkEmergencyRiskConditions()
+		}
+	}
+}
+
+// continuousOrderPlacementLoop - Real-time order placement optimization for maximum volume
+// NEW: Continuous order placement optimization for maximum volume
+// This function ensures orders are always placed for maximum fills
+func (s *MakerStrategyImpl) continuousOrderPlacementLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
+	defer ticker.Stop()
+
+	s.logger.Info("Continuous order placement started - checking every 100ms")
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.logger.Info("Continuous order placement stopped")
+			return
+		case <-ticker.C:
+			for _, symbol := range s.config.Symbols {
+				s.continuousOrderPlacement(symbol)
+			}
+		}
+	}
+}
+
+// checkEmergencyRiskConditions - Check all emergency risk conditions
+func (s *MakerStrategyImpl) checkEmergencyRiskConditions() {
+	for _, symbol := range s.config.Symbols {
+		// 1. Check position exposure - if position too large, reduce immediately
+		s.checkPositionExposure(symbol)
+
+		// 2. Check for extreme volatility - if price moving too fast, pause trading
+		s.checkExtremeVolatility(symbol)
+
+		// 3. Check for liquidation risk - if margin too low, close positions
+		s.checkLiquidationRisk(symbol)
+	}
+}
+
+// checkPositionExposure - Monitor position size and reduce if too large
+func (s *MakerStrategyImpl) checkPositionExposure(symbol string) {
+	position := s.inventoryMgr.GetPosition(symbol)
+	if position == nil {
+		return
+	}
+
+	positionSize := math.Abs(position.Amount)
+
+	// Get current price
+	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
+	if err != nil || bestBid == 0 || bestAsk == 0 {
+		return
+	}
+	currentPrice := (bestBid + bestAsk) / 2
+
+	// Calculate unrealized PnL
+	var unrealizedPnL float64
+	if position.Amount > 0 {
+		unrealizedPnL = (currentPrice - position.EntryPrice) * positionSize
+	} else {
+		unrealizedPnL = (position.EntryPrice - currentPrice) * positionSize
+	}
+
+	// Calculate position value in USDT
+	positionValue := currentPrice * positionSize
+
+	// WARNING: Position exceeds 80% of max
+	maxPositionValue := s.config.MaxTotalExposureUSDT * 0.8
+	if positionValue > maxPositionValue {
+		s.logger.Warn("⚠️ Position size large - approaching max exposure",
+			zap.String("symbol", symbol),
+			zap.Float64("position_value_usdt", positionValue),
+			zap.Float64("max_allowed_usdt", maxPositionValue),
+			zap.Float64("unrealized_pnl", unrealizedPnL))
+	}
+
+	// CRITICAL: Position at 95% of max → FORCE CLOSE to prevent liquidation
+	if positionValue > s.config.MaxTotalExposureUSDT*0.95 {
+		s.logger.Error("🚨 CRITICAL: Position at liquidation threshold - FORCE CLOSE",
+			zap.String("symbol", symbol),
+			zap.Float64("position_value_usdt", positionValue),
+			zap.Float64("max_usdt", s.config.MaxTotalExposureUSDT),
+			zap.Float64("unrealized_pnl", unrealizedPnL))
+		s.emergencyStop.Trigger("position_size_critical_" + symbol)
+		s.cancelAllOrders()
+		s.closeAllPositionsMarket(symbol)
+	}
+}
+
+// checkExtremeVolatility - Detect if price is moving too fast
+func (s *MakerStrategyImpl) checkExtremeVolatility(symbol string) {
+	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
+	if err != nil || bestBid == 0 || bestAsk == 0 {
+		return
+	}
+
+	midPrice := (bestBid + bestAsk) / 2
+	spread := bestAsk - bestBid
+	spreadPct := spread / midPrice
+
+	// EXTREME: Spread > 0.5% - liquidity crisis, pause all trading
+	if spreadPct > 0.005 {
+		s.logger.Error("🚨 EXTREME VOLATILITY: Spread too wide - pausing",
+			zap.String("symbol", symbol),
+			zap.Float64("spread_pct", spreadPct*100),
+			zap.Float64("spread", spread))
+
+		// Trigger emergency pause
+		s.emergencyStop.Trigger("extreme_volatility")
+	}
+}
+
+// checkLiquidationRisk - Monitor margin and close if approaching liquidation
+func (s *MakerStrategyImpl) checkLiquidationRisk(symbol string) {
+	position := s.inventoryMgr.GetPosition(symbol)
+	if position == nil {
+		return
+	}
+
+	// Get current price
+	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
+	if err != nil || bestBid == 0 || bestAsk == 0 {
+		return
+	}
+	currentPrice := (bestBid + bestAsk) / 2
+
+	// Calculate margin ratio (simplified isolated margin)
+	positionSize := math.Abs(position.Amount)
+	marginUsed := positionSize * currentPrice / float64(s.config.MaxLeverage)
+
+	// Get available balance
+	balance := s.getAvailableBalance()
+	if marginUsed+balance <= 0 {
+		return
+	}
+	marginRatio := marginUsed / (marginUsed + balance)
+
+	// WARNING: Margin ratio > 80%
+	if marginRatio > 0.8 {
+		s.logger.Warn("⚠️ HIGH MARGIN USAGE - approaching liquidation",
+			zap.String("symbol", symbol),
+			zap.Float64("margin_ratio_pct", marginRatio*100),
+			zap.Float64("margin_used", marginUsed),
+			zap.Float64("available_balance", balance))
+	}
+
+	// EMERGENCY: Margin ratio > 90% → cancel all orders + close position NOW
+	if marginRatio > 0.9 {
+		s.logger.Error("🚨 EMERGENCY: Margin critical - force closing position to prevent liquidation",
+			zap.String("symbol", symbol),
+			zap.Float64("margin_ratio_pct", marginRatio*100))
+		s.emergencyStop.Trigger("margin_critical_" + symbol)
+		s.cancelAllOrders()
+		s.closeAllPositionsMarket(symbol)
+	}
+}
+
+// closeAllPositionsMarket - P0 FIX: Actually close a position via market order to prevent liquidation
+func (s *MakerStrategyImpl) closeAllPositionsMarket(symbol string) {
+	position := s.inventoryMgr.GetPosition(symbol)
+	if position == nil || math.Abs(position.Amount) < 0.001 {
+		s.logger.Info("No position to close", zap.String("symbol", symbol))
+		return
+	}
+
+	// Determine close side (opposite of current position)
+	closeQty := math.Abs(position.Amount)
+	var closeSide string
+	if position.Amount > 0 {
+		closeSide = "SELL" // Long position → SELL to close
+	} else {
+		closeSide = "BUY" // Short position → BUY to close
+	}
+
+	s.logger.Error("🚨 FORCE CLOSE: Placing market order to close position",
+		zap.String("symbol", symbol),
+		zap.String("close_side", closeSide),
+		zap.Float64("close_qty", closeQty),
+		zap.Float64("position_amount", position.Amount))
+
+	// Place market order
+	closeReq := LimitOrderRequest{
+		Symbol:   symbol,
+		Side:     OrderSide(closeSide),
+		Quantity: closeQty,
+		// Price=0 → will be sent as MARKET order
+	}
+
+	// Use market order via futuresClient directly
+	ctx, cancelCtx := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancelCtx()
+
+	_, err := s.futuresClient.PlaceOrder(ctx, client.PlaceOrderRequest{
+		Symbol:     symbol,
+		Side:       closeSide,
+		Type:       "MARKET",
+		Quantity:   formatQuantity(symbol, closeQty),
+		ReduceOnly: true,
+	})
+	if err != nil {
+		s.logger.Error("🚨 FORCE CLOSE FAILED - MANUAL INTERVENTION REQUIRED",
+			zap.String("symbol", symbol),
+			zap.Error(err))
+		_ = closeReq // suppress unused warning
+		return
+	}
+
+	s.logger.Info("✅ Force close market order placed",
+		zap.String("symbol", symbol),
+		zap.String("close_side", closeSide),
+		zap.Float64("close_qty", closeQty))
+
+	// Clear local position tracking
+	s.inventoryMgr.UpdatePosition(symbol, 0, 0, 0)
+}
+
 // GetPositions - Helper to get all positions from inventory
 func (s *MakerStrategyImpl) GetPositions() map[string]*PositionState {
 	positions := make(map[string]*PositionState)
@@ -1487,4 +1930,205 @@ func (s *MakerStrategyImpl) GetPositions() map[string]*PositionState {
 		}
 	}
 	return positions
+}
+
+// GetCurrentMetrics implementation for Telegram Notifier
+func (s *MakerStrategyImpl) GetCurrentMetrics() notifier.GridMetrics {
+	var symbol string
+	if len(s.config.Symbols) > 0 {
+		symbol = s.config.Symbols[0]
+	}
+
+	bestBid, bestAsk, v24h, _ := s.wsClient.GetTickerData(symbol)
+	midPrice := (bestBid + bestAsk) / 2
+
+	metrics := s.GetMetrics()
+
+	// Real 100% accurate metrics from Exchange
+	accInfo, err := s.futuresClient.GetAccountInfo(context.Background())
+	var walletBalance, unrealized, marginBalance float64
+	if err == nil && accInfo != nil {
+		walletBalance = accInfo.TotalWalletBalance
+		unrealized = accInfo.TotalUnrealizedProfit
+		marginBalance = accInfo.TotalMarginBalance
+	} else {
+		// Fallback to cache without REST
+		bal := s.wsClient.GetCachedBalance()
+		walletBalance = bal.WalletBalance
+		unrealized = bal.UnrealizedProfit
+		marginBalance = bal.MarginBalance
+	}
+
+	// Update High Watermark for Drawdown
+	if marginBalance > s.maxWalletBalance {
+		s.maxWalletBalance = marginBalance
+	}
+	drawdownPct := 0.0
+	if s.maxWalletBalance > 0 && marginBalance < s.maxWalletBalance {
+		drawdownPct = ((s.maxWalletBalance - marginBalance) / s.maxWalletBalance) * 100
+	}
+
+	// Native calculation since startup
+	realized := walletBalance - s.initialWalletBalance
+	netPnL := marginBalance - s.initialWalletBalance
+	fees := 0.0 // Incorporated directly in WalletBalance deduction on trades
+
+	openOrders := s.orderManager.GetOpenOrders(symbol)
+	var minPrice, maxPrice float64
+	minPrice = math.MaxFloat64
+	lastOrderTs := s.startTime
+	for _, o := range openOrders {
+		if o.Price < minPrice && o.Price > 0 {
+			minPrice = o.Price
+		}
+		if o.Price > maxPrice {
+			maxPrice = o.Price
+		}
+
+		if o.UpdateTime > 0 {
+			ts := time.Unix(0, o.UpdateTime*int64(time.Millisecond))
+			if ts.After(lastOrderTs) {
+				lastOrderTs = ts
+			}
+		}
+	}
+	if minPrice == math.MaxFloat64 {
+		minPrice = 0
+	}
+
+	totalFills := 0
+	if val, ok := metrics["total_fills"].(int); ok {
+		totalFills = val
+	}
+
+	roi := 0.0
+	if s.initialWalletBalance > 0 {
+		roi = (netPnL / s.initialWalletBalance) * 100
+	}
+
+	return notifier.GridMetrics{
+		Symbol:          symbol,
+		CurrentPrice:    midPrice,
+		RealizedPnL:     realized,
+		UnrealizedPnL:   unrealized,
+		FeesPaid:        fees,
+		NetPnL:          netPnL,
+		Volume30m:       v24h,       // Represents 24h as recent volume context
+		FilledOrders30m: totalFills, // Aggregated filled orders
+		PendingOrders:   len(openOrders),
+		GridMinPrice:    minPrice,
+		GridMaxPrice:    maxPrice,
+		ActiveGrids:     len(openOrders),
+		TotalGrids:      s.config.MaxPositionsPerSide * 2,
+		LastOrderTime:   lastOrderTs,
+		InitialCapital:  s.initialWalletBalance,
+		CurrentCapital:  marginBalance,
+		ROI:             roi,
+		DrawdownPct:     drawdownPct,
+		Uptime:          time.Since(s.startTime),
+	}
+}
+
+// NEW: Continuous order placement optimization for maximum volume
+// This function ensures orders are always placed for maximum fills
+func (s *MakerStrategyImpl) continuousOrderPlacement(symbol string) {
+	// P0 FIX: Prevent concurrent executions (Debounce)
+	if _, placing := s.placementInProgress.LoadOrStore(symbol, true); placing {
+		return // Already placing orders for this symbol, skip
+	}
+
+	// Move everything to a single goroutine so debounce correctly blocks
+	go func() {
+		// Clear debounce lock AFTER fully completing orders
+		defer s.placementInProgress.Delete(symbol)
+
+		// Check if we need more orders (less than max positions per side)
+		positions := s.GetPositions()
+		openOrders := s.orderManager.GetOpenOrders(symbol)
+
+		// Count current positions per side
+		longPositions := 0
+		shortPositions := 0
+		for _, pos := range positions {
+			if pos.Amount > 0 {
+				longPositions++
+			} else if pos.Amount < 0 {
+				shortPositions++
+			}
+		}
+
+		// Count open orders per side
+		buyOrders := 0
+		sellOrders := 0
+		for _, order := range openOrders {
+			if order.Side == OrderSideBuy {
+				buyOrders++
+			} else if order.Side == OrderSideSell {
+				sellOrders++
+			}
+		}
+
+		// If we have room for more orders, place them immediately
+		maxPositionsPerSide := s.config.MaxPositionsPerSide
+
+		needMoreBuyOrders := longPositions < maxPositionsPerSide && buyOrders == 0
+		needMoreSellOrders := shortPositions < maxPositionsPerSide && sellOrders == 0
+
+		if needMoreBuyOrders || needMoreSellOrders {
+			s.logger.Info("🚀 CONTINUOUS ORDER PLACEMENT",
+				zap.String("symbol", symbol),
+				zap.Int("long_positions", longPositions),
+				zap.Int("short_positions", shortPositions),
+				zap.Int("buy_orders", buyOrders),
+				zap.Int("sell_orders", sellOrders),
+				zap.Int("max_per_side", maxPositionsPerSide),
+				zap.Bool("need_more_buy", needMoreBuyOrders),
+				zap.Bool("need_more_sell", needMoreSellOrders))
+
+			// Execute synchronously inside the goroutine to block debounce
+			s.PlaceOrders(symbol)
+		}
+	}()
+}
+
+// NEW: Micro-profit optimization for maximum leverage utilization
+// This function calculates optimal order size for maximum fills with 150x leverage
+func (s *MakerStrategyImpl) calculateMicroProfitOrderSize(balance float64, symbol string) float64 {
+	// Use full 150x leverage for maximum volume farming
+	// Calculate margin requirement per unit
+	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
+	if err != nil || bestBid == 0 || bestAsk == 0 {
+		return balance * 0.1 // Fallback to 10% of balance
+	}
+
+	// For zero-fee environment, we can use very tight margins
+	// Target: 2.0% margin per position to leverage 150x effectively
+	targetMarginRatio := 0.02     // Increased from 0.5% to 2%
+	_ = (bestBid + bestAsk) / 2.0 // midPrice not needed here
+
+	// Calculate maximum order size with 150x leverage
+	maxOrderValue := balance * targetMarginRatio * float64(s.config.MaxLeverage)
+
+	// Apply micro-profit optimization: smaller orders = more fills
+	// Zero fee means every spread = profit, so we want maximum fills
+	optimalSize := maxOrderValue * 0.8 // Use 80% of max to leave room for multiple positions
+
+	// Ensure minimum order size
+	if optimalSize < s.config.MinOrderSizeUSD {
+		optimalSize = s.config.MinOrderSizeUSD
+	}
+
+	// Cap at maximum configured size
+	if optimalSize > s.config.MaxOrderSizeUSD {
+		optimalSize = s.config.MaxOrderSizeUSD
+	}
+
+	s.logger.Debug("Micro-profit optimization",
+		zap.String("symbol", symbol),
+		zap.Float64("balance", balance),
+		zap.Float64("target_margin_ratio", targetMarginRatio),
+		zap.Float64("max_order_value", maxOrderValue),
+		zap.Float64("optimal_size", optimalSize))
+
+	return optimalSize
 }

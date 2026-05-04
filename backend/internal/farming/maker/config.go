@@ -60,18 +60,18 @@ func DefaultConfig() *Config {
 		Symbols:              []string{"btcusd1", "ethusd1"},
 		DefaultSpreadBps:     2,
 		MaxLeverage:          150,   // Ultra-high leverage for maximum volume
-		MaxPositionUSDT:      3000,  // Larger position size
-		MaxTotalExposureUSDT: 15000, // Maximum exposure for volume
+		MaxPositionUSDT:      10000, // Increased for larger volume
+		MaxTotalExposureUSDT: 50000, // Increased for volume farming
 		RebalanceThreshold:   0.2,
-		LiquidationBuffer:    0.05,
+		LiquidationBuffer:    0.002, // 0.2% for 150x leverage
 		DailyLossLimitPct:    0.02,
 		OrderToTradeLimit:    10,
 		CheckInterval:        5 * time.Second,
 
-		// === NEW: Active Zone Grid (FR1) ===
-		ActiveZoneRange: 0.001,  // 0.1%
-		GridSpacingMin:  0.0005, // 0.05%
-		GridLevels:      8,      // 5-10 levels
+		// === NEW: Active Zone Grid (FR1) - Optimized for zero fee + micro profit ===
+		ActiveZoneRange: 0.002,  // 0.2% - wider for more fills
+		GridSpacingMin:  0.0002, // 0.02% - ultra-tight for zero fee
+		GridLevels:      25,     // Increased to 25 levels per side
 
 		// === NEW: Position Timeout (FR4) - DISABLED for continuous farming ===
 		PositionTimeoutSeconds: 0, // 0 = disabled, no force close
@@ -89,9 +89,9 @@ func DefaultConfig() *Config {
 		// === NEW: Margin Buffer (FR14) ===
 		MarginEquityRatio: 0.75, // 75% equity for trading
 
-		// === NEW: Order Size (FR2, FR15) ===
-		MinOrderSizeUSD: 2.0,  // Minimum $2
-		MaxOrderSizeUSD: 10.0, // Maximum $10
+		// === NEW: Order Size (FR2, FR15) - Optimized for micro profit ===
+		MinOrderSizeUSD: 10.0,   // Increased to ensure notional min
+		MaxOrderSizeUSD: 1000.0, // Increased to leverage 150x effectively
 
 		// === NEW: Spread Protection (FR9) ===
 		SpreadThreshold: 0.001, // 0.1%

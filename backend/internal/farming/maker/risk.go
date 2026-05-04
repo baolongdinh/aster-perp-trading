@@ -10,11 +10,11 @@ import (
 )
 
 type LiquidationGuard struct {
-	config         *Config
-	logger         *zap.Logger
-	positions      map[string]*PositionState
-	mu             sync.RWMutex
-	checkInterval  time.Duration
+	config        *Config
+	logger        *zap.Logger
+	positions     map[string]*PositionState
+	mu            sync.RWMutex
+	checkInterval time.Duration
 }
 
 func NewLiquidationGuard(config *Config, logger *zap.Logger) *LiquidationGuard {
@@ -57,7 +57,7 @@ func (g *LiquidationGuard) Check(ctx context.Context) (bool, string) {
 		}
 
 		liqPrice := g.calculateLiqPrice(pos.EntryPrice, pos.Amount > 0, g.config.MaxLeverage)
-		distanceToLiq := math.Abs(pos.MarkPrice - liqPrice) / liqPrice
+		distanceToLiq := math.Abs(pos.MarkPrice-liqPrice) / liqPrice
 
 		if distanceToLiq < g.config.LiquidationBuffer {
 			g.logger.Warn("Liquidation risk high, position should close",
@@ -73,20 +73,26 @@ func (g *LiquidationGuard) Check(ctx context.Context) (bool, string) {
 }
 
 func (g *LiquidationGuard) calculateLiqPrice(entryPrice float64, isLong bool, leverage int) float64 {
-	liqPrice := entryPrice
-	if isLong {
-		liqPrice = entryPrice * (1 - float64(leverage-1)/float64(leverage))
-	} else {
-		liqPrice = entryPrice * (1 + float64(leverage-1)/float64(leverage))
+	if leverage <= 0 {
+		return entryPrice
 	}
-	return liqPrice
+	// For isolated margin perp futures:
+	// Long: liquidated when loss = 100% of margin = (1/leverage) of position value
+	// liqPrice_long  = entryPrice * (1 - 1/leverage)
+	// Short: liquidated when loss = (1/leverage) of position value
+	// liqPrice_short = entryPrice * (1 + 1/leverage)
+	marginRatio := 1.0 / float64(leverage)
+	if isLong {
+		return entryPrice * (1 - marginRatio)
+	}
+	return entryPrice * (1 + marginRatio)
 }
 
 type MaxPositionGuard struct {
-	config      *Config
-	logger      *zap.Logger
+	config        *Config
+	logger        *zap.Logger
 	totalExposure float64
-	mu          sync.RWMutex
+	mu            sync.RWMutex
 }
 
 func NewMaxPositionGuard(config *Config, logger *zap.Logger) *MaxPositionGuard {
@@ -127,12 +133,12 @@ func (g *MaxPositionGuard) GetTotalExposure() float64 {
 }
 
 type DailyLossGuard struct {
-	config        *Config
-	logger        *zap.Logger
+	config          *Config
+	logger          *zap.Logger
 	startingBalance float64
-	dailyPnL      float64
-	mu            sync.RWMutex
-	lastReset     time.Time
+	dailyPnL        float64
+	mu              sync.RWMutex
+	lastReset       time.Time
 }
 
 func NewDailyLossGuard(config *Config, logger *zap.Logger) *DailyLossGuard {
@@ -192,11 +198,11 @@ func (g *DailyLossGuard) GetDailyPnL() float64 {
 }
 
 type OrderToTradeGuard struct {
-	config    *Config
-	logger    *zap.Logger
+	config      *Config
+	logger      *zap.Logger
 	totalOrders int
-	totalFills int
-	mu        sync.RWMutex
+	totalFills  int
+	mu          sync.RWMutex
 }
 
 func NewOrderToTradeGuard(config *Config, logger *zap.Logger) *OrderToTradeGuard {
@@ -253,10 +259,10 @@ func (g *OrderToTradeGuard) Reset() {
 }
 
 type EmergencyStop struct {
-	logger         *zap.Logger
-	shouldStop     bool
-	stopReason     string
-	mu             sync.RWMutex
+	logger     *zap.Logger
+	shouldStop bool
+	stopReason string
+	mu         sync.RWMutex
 }
 
 func NewEmergencyStop(logger *zap.Logger) *EmergencyStop {
