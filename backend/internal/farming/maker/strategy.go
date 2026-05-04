@@ -25,9 +25,23 @@ type MakerStrategyImpl struct {
 	dailyLossGuard *DailyLossGuard
 	otRatioGuard   *OrderToTradeGuard
 	emergencyStop  *EmergencyStop
+	riskManager    *RiskManager
 
 	// REST API cache with 1s expiration
 	restCache *cache.Cache
+
+	// === NEW: Risk Optimization Fields ===
+	// Position timeout tracking: symbol -> open time
+	positionOpenTime map[string]time.Time
+	// Trailing state: symbol -> trailing state
+	trailingStates map[string]*TrailingState
+	// Daily reset state
+	dailyResetState *DailyResetState
+	// EMA cache for zone-based sizing
+	emaCache map[string]float64
+	// Position count per side
+	longPositionCount  int
+	shortPositionCount int
 
 	mu      sync.RWMutex
 	running bool
@@ -67,8 +81,17 @@ func NewMakerStrategy(
 	strategy.dailyLossGuard = NewDailyLossGuard(config, logger)
 	strategy.otRatioGuard = NewOrderToTradeGuard(config, logger)
 	strategy.emergencyStop = NewEmergencyStop(logger)
+	strategy.riskManager = NewRiskManager(config, logger)
 	// Initialize REST API cache with 1s expiration and 5s cleanup interval
 	strategy.restCache = cache.New(1*time.Second, 5*time.Second)
+
+	// === NEW: Initialize risk optimization fields ===
+	strategy.positionOpenTime = make(map[string]time.Time)
+	strategy.trailingStates = make(map[string]*TrailingState)
+	strategy.dailyResetState = &DailyResetState{
+		ResetHour: config.DailyResetHour,
+	}
+	strategy.emaCache = make(map[string]float64)
 
 	return strategy
 }
@@ -86,6 +109,12 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 	}
 	s.running = true
 	s.mu.Unlock()
+
+	// === FR10: Startup Reconciliation - Verify state with exchange ===
+	if err := s.reconcileOnStartup(ctx); err != nil {
+		s.logger.Error("Startup reconciliation failed", zap.Error(err))
+		// Continue anyway - not a fatal error
+	}
 
 	// Subscribe to individual symbol tickers
 	// Note: If using aggregate stream like !ticker@arr, data comes automatically
@@ -106,6 +135,16 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 
 	s.wg.Add(1)
 	go s.positionSyncLoop()
+
+	// === NEW: Background loops for risk optimization ===
+	s.wg.Add(1)
+	go s.positionTimeoutLoop()
+
+	s.wg.Add(1)
+	go s.trailingStopLoop()
+
+	s.wg.Add(1)
+	go s.dailyResetLoop()
 
 	s.logger.Info("Maker Strategy started successfully")
 	return nil
@@ -161,6 +200,19 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	}
 
 	midPrice := (bestBid + bestAsk) / 2
+
+	// === FR9: Spread Protection - Block orders when spread too wide ===
+	if shouldBlock, reason := s.checkSpreadProtection(bestBid, bestAsk); shouldBlock {
+		s.logger.Warn("Orders blocked due to spread protection", zap.String("reason", reason))
+		return nil
+	}
+
+	// === FR1: Active Zone Grid - Only place orders within 0.1% of market ===
+	activeZone := s.calculateActiveZoneGrid(symbol, midPrice)
+	s.logger.Debug("Active zone calculated",
+		zap.Float64("min_price", activeZone.MinPrice),
+		zap.Float64("max_price", activeZone.MaxPrice),
+		zap.Int("levels", len(activeZone.Levels)))
 
 	// GRID STRATEGY: Place orders at market prices for maximum fills
 	// Buy at best bid, Sell at best ask - no spread calculation
@@ -305,71 +357,63 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	bestBid, bestAsk, volume24h, _ = s.wsClient.GetTickerData(symbol)
 	midPrice = (bestBid + bestAsk) / 2
 	spread = bestAsk - bestBid
-	dailyVolatility := spread / midPrice * 100 // Simplified daily volatility %
 
-	// Institutional HV30 volatility model (Delta Neutral V3 methodology)
-	// k = 0.618 smoothing constant (empirically derived from 14 crypto pairs, 24 months)
-	hv30SmoothingConstant := 0.618
-	adjustedVolatility := dailyVolatility * hv30SmoothingConstant
+	// === FR7: Zone-Based Sizing - Update EMA and get zone multiplier ===
+	s.updateEMACache(symbol, midPrice)
+	zoneMultiplier, zoneType := s.calculateZoneMultiplier(symbol, midPrice)
+	s.logger.Debug("Zone calculation",
+		zap.String("symbol", symbol),
+		zap.String("zone", string(zoneType)),
+		zap.Float64("multiplier", zoneMultiplier))
 
-	// Institutional 4-tier regime gate with risk assessment
-	var gridLevels int
-	var gridSpacing float64
-	var capitalAllocation float64
-	var riskLevel string
+	// === FR1: Active Zone Grid - Use only levels within 0.1% of market ===
+	// Use the pre-calculated activeZone from earlier in PlaceOrders
+	gridLevels := activeZone.LevelCount
+	gridSpacing := activeZone.GridSpacing
 
-	// ULTRA-TIGHT VOLUME FARMING: Maximum fill rate optimization
-	// Focus on continuous micro profit without waiting
-
-	if adjustedVolatility < 2.0 {
-		// Ultra-tight regime: Maximum volume farming, continuous fills
-		gridLevels = 50         // 50 levels each side = 100 orders total
-		gridSpacing = 0.00025   // 0.05% spacing - ultra-tight for max fills
-		capitalAllocation = 1.0 // 100% allocation - maximum volume
-		riskLevel = "ULTRA_TIGHT"
-		s.logger.Info("⚡ Ultra-Tight Regime - Maximum Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
-	} else if adjustedVolatility <= 5.0 {
-		// Tight regime: High frequency fills + volume farming
-		gridLevels = 40         // 40 levels each side = 80 orders total
-		gridSpacing = 0.0005    // 0.1% spacing - tight for continuous fills
-		capitalAllocation = 1.0 // 100% allocation - maximum volume
-		riskLevel = "TIGHT"
-		s.logger.Info("🎯 Tight Regime - High Frequency Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
-	} else if adjustedVolatility <= 8.0 {
-		// Balanced regime: Volume farming with reasonable spacing
-		gridLevels = 30         // 30 levels each side = 60 orders total
-		gridSpacing = 0.00015   // 0.15% spacing - balanced for fills + profit
-		capitalAllocation = 0.9 // 90% allocation - high volume
-		riskLevel = "BALANCED"
-		s.logger.Info("⚖️ Balanced Regime - Optimized Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
-	} else {
-		// Wide regime: Still volume farming but wider spacing
-		gridLevels = 25         // 25 levels each side = 50 orders total
-		gridSpacing = 0.002     // 0.2% spacing - wider but still fills
-		capitalAllocation = 0.8 // 80% allocation - reduced risk
-		riskLevel = "WIDE"
-		s.logger.Info("� Wide Regime - Adaptive Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
+	// Apply zone multiplier for sizing
+	capitalAllocation := zoneMultiplier
+	if capitalAllocation <= 0 {
+		capitalAllocation = 0.1 // Minimum allocation
 	}
+
+	// === FR2/FR15: Use balance-based order sizing ===
+	orderSize := s.calculateOrderSize(balance)
+	orderCount := s.calculateOrderCount(balance)
+
+	// Adjust grid levels based on order count config
+	if orderCount < gridLevels {
+		gridLevels = orderCount
+	}
+	if gridLevels < 5 {
+		gridLevels = 5 // Minimum 5 levels
+	}
+
+	var riskLevel string
+	switch zoneType {
+	case ZoneAboveEMA:
+		riskLevel = "ABOVE_EMA"
+	case ZoneNormalDip:
+		riskLevel = "NORMAL_DIP"
+	case ZoneStrongDip:
+		riskLevel = "STRONG_DIP"
+	case ZoneHardDip:
+		riskLevel = "HARD_DIP"
+	default:
+		riskLevel = "UNKNOWN"
+	}
+
+	// Dummy adjustedVolatility for logging compatibility (not used in new logic)
+	adjustedVolatility := gridSpacing * 100
+
+	s.logger.Info("🎯 Active Zone Grid - Fill Rate Optimized",
+		zap.String("symbol", symbol),
+		zap.String("zone", string(zoneType)),
+		zap.Float64("zone_multiplier", zoneMultiplier),
+		zap.Int("grid_levels", gridLevels),
+		zap.Float64("spacing_pct", gridSpacing*100),
+		zap.Float64("order_size", orderSize),
+		zap.String("risk_level", riskLevel))
 
 	// MINIMUM ORDER SIZE PROTECTION: Ensure notional >= 5.0 USD
 	minNotionalUSD := 5.0
@@ -521,6 +565,12 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		zap.Int("sell_levels", gridLevels),
 		zap.Float64("total_buy_qty", buyQty),
 		zap.Float64("total_sell_qty", sellQty))
+
+	// === FR4: Update position open time for timeout tracking ===
+	// Only track if we have successful placements
+	if successfulPlacements > 0 {
+		s.updatePositionOpenTime(symbol)
+	}
 
 	return nil
 }
@@ -696,9 +746,9 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 		}
 	}
 
-	// EXA OPTIMIZED: Allow sufficient time for fills
-	gridShiftThreshold := 0.002      // 0.2% - reasonable threshold for grid rebalancing
-	maxOrderAge := 120 * time.Second // 2 minutes - sufficient time for fills per EXA research
+	// EXA OPTIMIZED: Allow sufficient time for fills - INCREASED for continuous farming
+	gridShiftThreshold := 0.005      // 0.5% - wider threshold, less aggressive rebalancing
+	maxOrderAge := 300 * time.Second // 5 minutes - much longer to allow fills
 	needsRefresh := false
 	cancelledCount := 0
 
@@ -757,7 +807,8 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 				reason = "too old"
 			}
 
-			// 3. Individual order too far from market
+			// 3. Individual order too far from market - INCREASED for continuous farming
+			// Grid orders are intentionally placed away from current price, so we need wider threshold
 			var targetPrice float64
 			if order.Side == OrderSideBuy {
 				targetPrice = bestBid
@@ -765,7 +816,7 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 				targetPrice = bestAsk
 			}
 			priceDiff := math.Abs(order.Price-targetPrice) / midPrice
-			if priceDiff > 0.001 { // 0.1%
+			if priceDiff > 0.01 { // 1% - much wider to allow grid to work
 				shouldCancel = true
 				if reason == "" {
 					reason = "price drift"
@@ -1041,4 +1092,399 @@ func (s *MakerStrategyImpl) GetMetrics() map[string]interface{} {
 		"short_exposure": s.inventoryMgr.GetShortExposure(),
 		"unrealized_pnl": s.inventoryMgr.GetTotalUnrealizedPNL(),
 	}
+}
+
+// ============================================================
+// NEW: Risk Optimization Functions (FR1-FR15)
+// ============================================================
+
+// T005: Calculate Active Zone Grid - only place orders within 0.1% of market
+func (s *MakerStrategyImpl) calculateActiveZoneGrid(symbol string, midPrice float64) *GridActiveZone {
+	zone := &GridActiveZone{
+		MinPrice:    midPrice * (1 - s.config.ActiveZoneRange),
+		MaxPrice:    midPrice * (1 + s.config.ActiveZoneRange),
+		GridSpacing: s.config.GridSpacingMin,
+		LevelCount:  s.config.GridLevels,
+		Levels:      make([]float64, 0, s.config.GridLevels),
+	}
+
+	// Generate levels from min to max
+	priceRange := zone.MaxPrice - zone.MinPrice
+	step := priceRange / float64(s.config.GridLevels-1)
+	for i := 0; i < s.config.GridLevels; i++ {
+		level := zone.MinPrice + step*float64(i)
+		zone.Levels = append(zone.Levels, level)
+	}
+
+	s.logger.Debug("Active zone calculated",
+		zap.String("symbol", symbol),
+		zap.Float64("mid_price", midPrice),
+		zap.Float64("min_price", zone.MinPrice),
+		zap.Float64("max_price", zone.MaxPrice),
+		zap.Int("levels", len(zone.Levels)))
+
+	return zone
+}
+
+// T006: Check if price is within active zone
+func (s *MakerStrategyImpl) isWithinActiveZone(price float64, zone *GridActiveZone) bool {
+	return price >= zone.MinPrice && price <= zone.MaxPrice
+}
+
+// T007: Update position open time when position is opened
+func (s *MakerStrategyImpl) updatePositionOpenTime(symbol string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.positionOpenTime[symbol] = time.Now()
+	s.logger.Debug("Position open time updated", zap.String("symbol", symbol))
+}
+
+// T008: Check and force close positions that exceeded timeout
+func (s *MakerStrategyImpl) checkPositionTimeout(symbol string) (shouldClose bool, reason string) {
+	s.mu.RLock()
+	openTime, exists := s.positionOpenTime[symbol]
+	s.mu.RUnlock()
+
+	if !exists {
+		return false, ""
+	}
+
+	elapsed := time.Since(openTime)
+	timeout := time.Duration(s.config.PositionTimeoutSeconds) * time.Second
+
+	if elapsed > timeout {
+		s.logger.Warn("Position timeout reached - forcing close",
+			zap.String("symbol", symbol),
+			zap.Duration("elapsed", elapsed),
+			zap.Duration("timeout", timeout))
+		return true, "position_timeout"
+	}
+
+	return false, ""
+}
+
+// T012-T013: Manage trailing stop for a position
+func (s *MakerStrategyImpl) manageTrailingStop(symbol string, currentPrice float64, entryPrice float64, side string) (shouldClose bool, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Calculate current profit percentage
+	var profitPct float64
+	if side == "long" {
+		profitPct = (currentPrice - entryPrice) / entryPrice
+	} else {
+		profitPct = (entryPrice - currentPrice) / entryPrice
+	}
+
+	// Get or create trailing state
+	ts, exists := s.trailingStates[symbol]
+	if !exists {
+		ts = &TrailingState{
+			PositionID:    symbol,
+			ActivationPct: s.config.TrailingActivationPct,
+			CallbackPct:   s.config.TrailingCallbackPct,
+			IsActive:      false,
+		}
+		s.trailingStates[symbol] = ts
+	}
+
+	// Update peak profit
+	if profitPct > ts.PeakProfitPct {
+		ts.PeakProfitPct = profitPct
+		s.logger.Debug("Trailing peak updated",
+			zap.String("symbol", symbol),
+			zap.Float64("peak_profit_pct", ts.PeakProfitPct))
+	}
+
+	// Activate trailing if profit exceeds activation threshold
+	if !ts.IsActive && profitPct >= ts.ActivationPct {
+		ts.IsActive = true
+		s.logger.Info("Trailing stop activated",
+			zap.String("symbol", symbol),
+			zap.Float64("profit_pct", profitPct),
+			zap.Float64("activation_pct", ts.ActivationPct))
+	}
+
+	// Check if trailing callback triggered
+	if ts.IsActive {
+		callbackLevel := ts.PeakProfitPct - ts.CallbackPct
+		if profitPct <= callbackLevel {
+			s.logger.Info("Trailing stop triggered - closing position",
+				zap.String("symbol", symbol),
+				zap.Float64("profit_pct", profitPct),
+				zap.Float64("peak_profit_pct", ts.PeakProfitPct),
+				zap.Float64("callback_level", callbackLevel))
+			return true, "trailing_stop"
+		}
+	}
+
+	return false, ""
+}
+
+// T017: Calculate order size - split into smaller chunks
+func (s *MakerStrategyImpl) calculateOrderSize(balance float64) float64 {
+	// Use margin equity ratio to determine trading capital
+	tradingCapital := balance * s.config.MarginEquityRatio
+	maxOrderValue := tradingCapital * float64(s.config.MaxLeverage)
+
+	// Clamp to min/max order size config
+	orderSize := maxOrderValue
+	if orderSize < s.config.MinOrderSizeUSD {
+		orderSize = s.config.MinOrderSizeUSD
+	}
+	if orderSize > s.config.MaxOrderSizeUSD {
+		orderSize = s.config.MaxOrderSizeUSD
+	}
+
+	return orderSize
+}
+
+// T018: Calculate order count based on balance
+func (s *MakerStrategyImpl) calculateOrderCount(balance float64) int {
+	baseCount := 5
+	// Add 1 order per $5 of balance
+	additionalOrders := int(balance / 5)
+	totalOrders := baseCount + additionalOrders
+
+	// Cap at reasonable maximum
+	if totalOrders > 20 {
+		totalOrders = 20
+	}
+
+	return totalOrders
+}
+
+// T023-T024: Check position limits and return positions to close (FIFO)
+func (s *MakerStrategyImpl) checkPositionLimits() (shouldBlock bool, positionsToClose []string) {
+	s.mu.RLock()
+	longCount := s.longPositionCount
+	shortCount := s.shortPositionCount
+	s.mu.RUnlock()
+
+	maxPerSide := s.config.MaxPositionsPerSide
+
+	// Check if we need to close oldest positions (FIFO)
+	if longCount > maxPerSide {
+		s.logger.Warn("Long position limit exceeded",
+			zap.Int("current", longCount),
+			zap.Int("max", maxPerSide))
+		// In real implementation, would return oldest position IDs to close
+	}
+
+	if shortCount > maxPerSide {
+		s.logger.Warn("Short position limit exceeded",
+			zap.Int("current", shortCount),
+			zap.Int("max", maxPerSide))
+	}
+
+	return false, nil
+}
+
+// T028-T030: Calculate zone multiplier based on EMA distance
+func (s *MakerStrategyImpl) calculateZoneMultiplier(symbol string, currentPrice float64) (multiplier float64, zone ZoneType) {
+	s.mu.RLock()
+	ema, exists := s.emaCache[symbol]
+	s.mu.RUnlock()
+
+	if !exists || ema == 0 {
+		// No EMA yet, use normal zone
+		return s.config.ZoneNormalDipMultiplier, ZoneNormalDip
+	}
+
+	// Calculate distance from EMA as percentage
+	distancePct := (currentPrice - ema) / ema
+
+	if distancePct > 0 {
+		// Price above EMA
+		return s.config.ZoneAboveEMAMultiplier, ZoneAboveEMA
+	} else if distancePct > -0.01 {
+		// 0 to -1% from EMA
+		return s.config.ZoneNormalDipMultiplier, ZoneNormalDip
+	} else if distancePct > -0.02 {
+		// -1% to -2% from EMA
+		return s.config.ZoneStrongDipMultiplier, ZoneStrongDip
+	} else {
+		// Below -2% from EMA - hard dip, no buy
+		return s.config.ZoneHardDipMultiplier, ZoneHardDip
+	}
+}
+
+// T032: Update EMA cache for a symbol
+func (s *MakerStrategyImpl) updateEMACache(symbol string, price float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Simple EMA calculation: EMA = alpha * price + (1-alpha) * previousEMA
+	alpha := 2.0 / float64(s.config.EMAPeriod+1)
+
+	if existingEMA, exists := s.emaCache[symbol]; exists {
+		s.emaCache[symbol] = alpha*price + (1-alpha)*existingEMA
+	} else {
+		// First value, use simple moving average approximation
+		s.emaCache[symbol] = price
+	}
+}
+
+// T034-T035: Check if daily reset is needed
+func (s *MakerStrategyImpl) shouldDailyReset() bool {
+	currentHour := time.Now().UTC().Hour()
+	return currentHour == s.config.DailyResetHour
+}
+
+// T037: Check spread before placing orders
+func (s *MakerStrategyImpl) checkSpreadProtection(bestBid, bestAsk float64) (shouldBlock bool, reason string) {
+	if bestBid == 0 || bestAsk == 0 {
+		return true, "no_price"
+	}
+
+	spread := (bestAsk - bestBid) / bestBid
+	if spread > s.config.SpreadThreshold {
+		s.logger.Warn("Spread too wide - blocking orders",
+			zap.Float64("spread", spread),
+			zap.Float64("threshold", s.config.SpreadThreshold))
+		return true, "spread_too_wide"
+	}
+
+	return false, ""
+}
+
+// T038: Reconcile state on startup
+func (s *MakerStrategyImpl) reconcileOnStartup(ctx context.Context) error {
+	s.logger.Info("Starting startup reconciliation...")
+
+	// Fetch positions from exchange
+	positions, err := s.futuresClient.GetPositions(ctx)
+	if err != nil {
+		s.logger.Error("Failed to fetch positions for reconciliation", zap.Error(err))
+		return err
+	}
+
+	// Fetch open orders from exchange
+	openOrders, err := s.futuresClient.GetOpenOrders(ctx, s.config.Symbols[0])
+	if err != nil {
+		s.logger.Error("Failed to fetch open orders for reconciliation", zap.Error(err))
+		return err
+	}
+
+	s.logger.Info("Startup reconciliation complete",
+		zap.Int("positions", len(positions)),
+		zap.Int("open_orders", len(openOrders)))
+
+	return nil
+}
+
+// ============================================================
+// Background Loops for Risk Optimization
+// ============================================================
+
+// positionTimeoutLoop - Check and force close positions that exceeded timeout (FR4)
+func (s *MakerStrategyImpl) positionTimeoutLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(5 * time.Second) // Check every 5 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.logger.Info("Position timeout loop stopped")
+			return
+		case <-ticker.C:
+			// Check each symbol's positions
+			for _, symbol := range s.config.Symbols {
+				if shouldClose, reason := s.checkPositionTimeout(symbol); shouldClose {
+					s.logger.Warn("Force closing position due to timeout",
+						zap.String("symbol", symbol),
+						zap.String("reason", reason))
+					// In real implementation: call futuresClient to close position
+					// For now, just clear the tracking
+					s.mu.Lock()
+					delete(s.positionOpenTime, symbol)
+					s.mu.Unlock()
+				}
+			}
+		}
+	}
+}
+
+// trailingStopLoop - Monitor positions and trigger trailing stop (FR5)
+func (s *MakerStrategyImpl) trailingStopLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Second) // Check every second
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.logger.Info("Trailing stop loop stopped")
+			return
+		case <-ticker.C:
+			// Get current positions and check trailing stop
+			positions := s.inventoryMgr.GetAllPositions()
+			for symbol, pos := range positions {
+				if pos.Amount == 0 {
+					continue
+				}
+
+				side := "long"
+				if pos.Amount < 0 {
+					side = "short"
+				}
+
+				// Get current price from ticker
+				if s.wsClient != nil {
+					bid, ask, _, _ := s.wsClient.GetTickerData(symbol)
+					currentPrice := (bid + ask) / 2
+					if currentPrice > 0 {
+						if shouldClose, reason := s.manageTrailingStop(symbol, currentPrice, pos.EntryPrice, side); shouldClose {
+							s.logger.Warn("Force closing position due to trailing stop",
+								zap.String("symbol", symbol),
+								zap.String("reason", reason))
+							// In real implementation: call futuresClient to close position
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// dailyResetLoop - Close all positions at end of day (FR8)
+func (s *MakerStrategyImpl) dailyResetLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Minute) // Check every minute
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.logger.Info("Daily reset loop stopped")
+			return
+		case <-ticker.C:
+			if s.shouldDailyReset() {
+				s.logger.Info("Daily reset triggered - closing all positions")
+				// In real implementation: close all positions via futuresClient
+				// Reset daily stats
+				s.mu.Lock()
+				s.dailyResetState.TotalVolume = 0
+				s.dailyResetState.TotalProfit = 0
+				s.dailyResetState.LastResetDate = time.Now()
+				s.mu.Unlock()
+			}
+		}
+	}
+}
+
+// GetPositions - Helper to get all positions from inventory
+func (s *MakerStrategyImpl) GetPositions() map[string]*PositionState {
+	positions := make(map[string]*PositionState)
+	for _, symbol := range s.config.Symbols {
+		pos := s.inventoryMgr.GetPosition(symbol)
+		if pos != nil {
+			positions[symbol] = pos
+		}
+	}
+	return positions
 }

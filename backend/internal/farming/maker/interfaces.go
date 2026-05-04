@@ -124,3 +124,38 @@ type WebSocketClientInterface interface {
 	GetCachedPositions() map[string]client.Position
 	GetCachedBalance() client.Balance
 }
+
+// === NEW: Extended Types for Risk Optimization ===
+
+type ZoneType string
+
+const (
+	ZoneAboveEMA  ZoneType = "above_ema"
+	ZoneNormalDip ZoneType = "normal_dip"
+	ZoneStrongDip ZoneType = "strong_dip"
+	ZoneHardDip   ZoneType = "hard_dip"
+)
+
+type TrailingState struct {
+	PositionID    string
+	PeakProfitPct float64
+	ActivationPct float64
+	CallbackPct   float64
+	IsActive      bool
+}
+
+type GridActiveZone struct {
+	MinPrice    float64
+	MaxPrice    float64
+	GridSpacing float64
+	LevelCount  int
+	Levels      []float64
+}
+
+type DailyResetState struct {
+	LastResetDate   time.Time
+	ResetHour       int
+	PositionsClosed int
+	TotalVolume     float64
+	TotalProfit     float64
+}
