@@ -86,13 +86,15 @@ type MaxPositionGuard struct {
 	config        *Config
 	logger        *zap.Logger
 	totalExposure float64
+	positions     map[string]float64 // Per-symbol exposure tracking
 	mu            sync.RWMutex
 }
 
 func NewMaxPositionGuard(config *Config, logger *zap.Logger) *MaxPositionGuard {
 	return &MaxPositionGuard{
-		config: config,
-		logger: logger,
+		config:    config,
+		logger:    logger,
+		positions: make(map[string]float64),
 	}
 }
 
@@ -104,7 +106,16 @@ func (g *MaxPositionGuard) UpdateExposure(symbol string, amount, price float64) 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	exposure := math.Abs(amount * price)
-	g.totalExposure = exposure
+	// Store per-symbol exposure for accurate tracking
+	if g.positions == nil {
+		g.positions = make(map[string]float64)
+	}
+	g.positions[symbol] = exposure
+	// Calculate total exposure across all symbols
+	g.totalExposure = 0
+	for _, exp := range g.positions {
+		g.totalExposure += exp
+	}
 }
 
 func (g *MaxPositionGuard) Check(ctx context.Context) (bool, string) {
@@ -369,7 +380,16 @@ func (f *FlowDirectionTracker) GetReductionFactor() float64 {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	if !f.IsToxicFlow() {
+	// Inline logic to avoid deadlock (IsToxicFlow also tries to acquire RLock)
+	total := f.buyVolume + f.sellVolume
+	if total == 0 {
+		return 1.0 // No data = no reduction
+	}
+
+	buyRatio := f.buyVolume / total
+	isToxic := buyRatio > f.config.ToxicFlowThreshold || buyRatio < (1-f.config.ToxicFlowThreshold)
+
+	if !isToxic {
 		return 1.0
 	}
 	return f.config.ToxicFlowReducePct
@@ -381,4 +401,73 @@ func (f *FlowDirectionTracker) Reset() {
 	f.buyVolume = 0
 	f.sellVolume = 0
 	f.windowStart = time.Now()
+}
+
+// MomentumGuard detects rapid price movements to prevent adverse selection
+type MomentumGuard struct {
+	config        *Config
+	logger        *zap.Logger
+	lastPrice     float64
+	lastCheckTime time.Time
+	mu            sync.RWMutex
+}
+
+func NewMomentumGuard(config *Config, logger *zap.Logger) *MomentumGuard {
+	return &MomentumGuard{
+		config:        config,
+		logger:        logger,
+		lastPrice:     0,
+		lastCheckTime: time.Now(),
+	}
+}
+
+func (m *MomentumGuard) Name() string {
+	return "MomentumGuard"
+}
+
+func (m *MomentumGuard) Check(midPrice float64) (bool, string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.lastPrice == 0 || midPrice == 0 {
+		m.lastPrice = midPrice
+		m.lastCheckTime = time.Now()
+		return false, ""
+	}
+
+	movePct := math.Abs(midPrice-m.lastPrice) / m.lastPrice
+	timePassed := time.Since(m.lastCheckTime)
+
+	// Use config values, with safe defaults
+	threshold := m.config.MomentumThresholdPct
+	if threshold <= 0 {
+		threshold = 0.03 // Safe default: 3%
+	}
+	timeWindow := time.Duration(m.config.MomentumTimeWindow) * time.Second
+	if timeWindow <= 0 {
+		timeWindow = 30 * time.Second // Safe default: 30s
+	}
+
+	if timePassed < timeWindow && movePct > threshold {
+		m.logger.Warn("⚡ High Momentum Detected",
+			zap.Float64("last_price", m.lastPrice),
+			zap.Float64("current_price", midPrice),
+			zap.Float64("move_pct", movePct*100),
+			zap.Duration("time_passed", timePassed),
+			zap.Float64("threshold_pct", threshold*100))
+		m.lastPrice = midPrice
+		m.lastCheckTime = time.Now()
+		return true, "high_momentum"
+	}
+
+	m.lastPrice = midPrice
+	m.lastCheckTime = time.Now()
+	return false, ""
+}
+
+func (m *MomentumGuard) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastPrice = 0
+	m.lastCheckTime = time.Now()
 }

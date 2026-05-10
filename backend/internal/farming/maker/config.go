@@ -34,6 +34,11 @@ type Config struct {
 	ToxicFlowDetection bool    `mapstructure:"toxic_flow_detection" yaml:"toxic_flow_detection"`
 	ToxicFlowThreshold float64 `mapstructure:"toxic_flow_threshold" yaml:"toxic_flow_threshold"`   // 0.6 = 60% buy volume = toxic
 	ToxicFlowReducePct float64 `mapstructure:"toxic_flow_reduce_pct" yaml:"toxic_flow_reduce_pct"` // Reduce exposure when toxic detected
+
+	// Momentum Protection
+	MomentumDetection    bool    `mapstructure:"momentum_detection" yaml:"momentum_detection"`
+	MomentumThresholdPct float64 `mapstructure:"momentum_threshold_pct" yaml:"momentum_threshold_pct"` // 0.03 = 3% price move
+	MomentumTimeWindow   int     `mapstructure:"momentum_time_window" yaml:"momentum_time_window"`     // seconds
 }
 
 func DefaultConfig() *Config {
@@ -69,5 +74,10 @@ func DefaultConfig() *Config {
 		ToxicFlowDetection: true,
 		ToxicFlowThreshold: 0.6, // 60% one-sided = toxic flow
 		ToxicFlowReducePct: 0.5, // Cut exposure in half
+
+		// Momentum Protection
+		MomentumDetection:    true,
+		MomentumThresholdPct: 0.03, // 3% price move
+		MomentumTimeWindow:   30,   // 30 seconds
 	}
 }

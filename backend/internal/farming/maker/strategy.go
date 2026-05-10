@@ -33,6 +33,9 @@ type MakerStrategyImpl struct {
 	// Flow direction tracker for toxic flow detection
 	flowTracker *FlowDirectionTracker
 
+	// Momentum guard for detecting rapid price movements
+	momentumGuard *MomentumGuard
+
 	mu      sync.RWMutex
 	running bool
 	stopCh  chan struct{}
@@ -72,6 +75,7 @@ func NewMakerStrategy(
 	strategy.otRatioGuard = NewOrderToTradeGuard(config, logger)
 	strategy.emergencyStop = NewEmergencyStop(logger)
 	strategy.flowTracker = NewFlowDirectionTracker(config, logger)
+	strategy.momentumGuard = NewMomentumGuard(config, logger)
 	// Initialize REST API cache with 1s expiration and 5s cleanup interval
 	strategy.restCache = cache.New(1*time.Second, 5*time.Second)
 
@@ -100,6 +104,17 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 			s.logger.Warn("Failed to subscribe to ticker (may be using aggregate stream)", zap.Error(err))
 		} else {
 			s.logger.Info("Subscribed to ticker for symbols", zap.Strings("symbols", s.config.Symbols))
+		}
+	}
+
+	// Initialize DailyLossGuard with starting balance
+	if s.wsClient != nil {
+		time.Sleep(2 * time.Second) // Wait for WebSocket to receive balance
+		balance := s.wsClient.GetCachedBalance()
+		if balance.AvailableBalance > 0 {
+			s.dailyLossGuard.SetStartingBalance(balance.AvailableBalance)
+			s.logger.Info("DailyLossGuard initialized with starting balance",
+				zap.Float64("balance", balance.AvailableBalance))
 		}
 	}
 
@@ -228,26 +243,51 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	buyAdjustment := 1.0
 	sellAdjustment := 1.0
 
-	// Check position bias and apply reduction
 	if math.Abs(positionBiasPct) > s.config.PositionBiasThreshold {
+		s.logger.Warn(" Position Bias Exceeded - Taking aggressive action",
+			zap.String("symbol", symbol),
+			zap.Float64("position_bias_pct", positionBiasPct),
+			zap.Float64("threshold", s.config.PositionBiasThreshold),
+			zap.Float64("current_position", positionBias))
+
+		// Cancel ALL existing orders to stop accumulating position
+		existingOrders := s.orderManager.GetOpenOrders(symbol)
+		for _, order := range existingOrders {
+			if order.Status == OrderStatusNew || order.Status == OrderStatusPartially {
+				s.orderManager.CancelOrder(s.ctx, symbol, order.OrderID)
+				s.orderManager.RemoveOrder(symbol, order.OrderID)
+				s.logger.Info(" Cancelled order due to position bias",
+					zap.String("symbol", symbol),
+					zap.Int64("order_id", order.OrderID),
+					zap.String("side", string(order.Side)))
+			}
+		}
+
+		// Apply aggressive reduction - reduce BOTH sides to minimize new exposure
+		// Only allow minimal orders to slowly unwind position
 		if positionBias > 0 {
-			// Long biased - reduce buy orders, increase sell orders
-			buyAdjustment = s.config.PositionBiasReducePct
-			sellAdjustment = 1.0 + (1.0 - s.config.PositionBiasReducePct)
-			s.logger.Warn("� Position Bias - Reducing buy orders",
-				zap.String("symbol", symbol),
-				zap.Float64("position_bias_pct", positionBiasPct),
+			// Long biased - significantly reduce buy, moderate sell to unwind
+			buyAdjustment = s.config.PositionBiasReducePct * 0.3 // More aggressive reduction
+			sellAdjustment = 1.5                                 // Allow more sells to unwind
+			s.logger.Warn(" Long Bias - Aggressive reduction",
 				zap.Float64("buy_adjustment", buyAdjustment),
 				zap.Float64("sell_adjustment", sellAdjustment))
 		} else if positionBias < 0 {
-			// Short biased - increase buy orders, reduce sell orders
-			buyAdjustment = 1.0 + (1.0 - s.config.PositionBiasReducePct)
-			sellAdjustment = s.config.PositionBiasReducePct
-			s.logger.Warn("� Position Bias - Reducing sell orders",
-				zap.String("symbol", symbol),
-				zap.Float64("position_bias_pct", positionBiasPct),
+			// Short biased - moderate buy to unwind, significantly reduce sell
+			buyAdjustment = 1.5                                   // Allow more buys to unwind
+			sellAdjustment = s.config.PositionBiasReducePct * 0.3 // More aggressive reduction
+			s.logger.Warn(" Short Bias - Aggressive reduction",
 				zap.Float64("buy_adjustment", buyAdjustment),
 				zap.Float64("sell_adjustment", sellAdjustment))
+		}
+
+		// Check if we should emergency stop due to extreme bias
+		if math.Abs(positionBiasPct) > 0.8 { // 80% of max position
+			s.logger.Error(" Extreme Position Bias - Triggering emergency stop",
+				zap.Float64("position_bias_pct", positionBiasPct))
+			s.emergencyStop.Trigger("extreme_position_bias")
+			s.cancelAllOrders()
+			return nil
 		}
 	}
 
@@ -604,12 +644,52 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 			s.orderManager.RemoveOrder(symbol, order.OrderID)
 			s.otRatioGuard.RecordFill()
 
+			// ============================================================
+			// REAL-TIME POSITION UPDATE - Update immediately after fill
+			// ============================================================
+			position := s.inventoryMgr.GetPosition(symbol)
+			var currentAmount float64
+			if position != nil {
+				currentAmount = position.Amount
+			}
+
+			// Update position based on fill side
+			var newAmount float64
+			if order.Side == OrderSideBuy {
+				newAmount = currentAmount + order.OrigQty
+			} else {
+				newAmount = currentAmount - order.OrigQty
+			}
+
+			// Update all position-dependent components
+			s.inventoryMgr.UpdatePosition(symbol, newAmount, order.Price, midPrice)
+			s.liqGuard.UpdatePosition(symbol, newAmount, order.Price, midPrice)
+			s.maxPosGuard.UpdateExposure(symbol, newAmount, midPrice)
+
+			s.logger.Info("📊 Position Updated After Fill",
+				zap.String("symbol", symbol),
+				zap.String("side", string(order.Side)),
+				zap.Float64("fill_qty", order.OrigQty),
+				zap.Float64("old_position", currentAmount),
+				zap.Float64("new_position", newAmount))
+
+			// ============================================================
+			// CHECK RISK CONDITIONS AFTER EVERY FILL
+			// ============================================================
+			if stop, reason := s.liqGuard.Check(s.ctx); stop {
+				s.logger.Error("🚨 Liquidation risk after fill - triggering emergency stop",
+					zap.String("reason", reason),
+					zap.Float64("position", newAmount))
+				s.emergencyStop.Trigger(reason)
+				s.cancelAllOrders()
+				return
+			}
+
 			// Calculate fill ratio and PnL
 			fillRatio := float64(filledCount) / float64(totalOrders) * 100
 
 			// Calculate PnL for this fill
 			var fillPnL float64
-			position := s.inventoryMgr.GetPosition(symbol)
 			if position != nil {
 				if order.Side == OrderSideBuy {
 					fillPnL = (midPrice - order.Price) * order.OrigQty // Buy order profit
@@ -632,16 +712,49 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 	}
 
 	// EXA OPTIMIZED: Allow sufficient time for fills
-	gridShiftThreshold := 0.002      // 0.2% - reasonable threshold for grid rebalancing
+	// DYNAMIC GRID SHIFT THRESHOLD - Scale with grid configuration
+	// For micro profit mode: 50 levels × 0.001% = 5% total range, use 50% = 2.5%
+	gridSpacing := s.config.MicroGridSpacingBps / 10000.0
+	gridLevels := s.config.MicroGridLevels
+	dynamicGridShiftThreshold := gridSpacing * float64(gridLevels) * 0.5
+	if dynamicGridShiftThreshold < 0.01 {
+		dynamicGridShiftThreshold = 0.01 // Minimum 1%
+	}
+
+	gridShiftThreshold := dynamicGridShiftThreshold
 	maxOrderAge := 120 * time.Second // 2 minutes - sufficient time for fills per EXA research
 	needsRefresh := false
 	cancelledCount := 0
+	needsGridShift := false // Declare early for momentum check
+
+	// ============================================================
+	// MOMENTUM CHECK - Cancel all orders if high momentum detected
+	// ============================================================
+	if s.momentumGuard != nil {
+		if momentumDetected, reason := s.momentumGuard.Check(midPrice); momentumDetected {
+			s.logger.Warn("⚡ High Momentum - Cancelling all orders to prevent adverse selection",
+				zap.String("symbol", symbol),
+				zap.String("reason", reason),
+				zap.Float64("mid_price", midPrice))
+			needsGridShift = true
+			// Force cancel all orders
+			for _, order := range orders {
+				if order.Status == OrderStatusNew || order.Status == OrderStatusPartially {
+					s.orderManager.CancelOrder(s.ctx, symbol, order.OrderID)
+					s.orderManager.RemoveOrder(symbol, order.OrderID)
+					cancelledCount++
+				}
+			}
+			// Don't place new orders immediately - wait for momentum to subside
+			s.logger.Info("⏸️ Pausing order placement due to high momentum")
+			return
+		}
+	}
 
 	// Calculate current grid center vs market center
 	currentGridCenter := (bestBid + bestAsk) / 2
 
-	// Check if we need to shift the entire grid
-	needsGridShift := false
+	// Check if we need to shift the entire grid (update if not already set by momentum)
 
 	if len(orders) > 0 {
 		// Find average price of existing grid orders

@@ -33,6 +33,10 @@ func main() {
 	toxicFlowDetection := flag.Bool("toxic-flow", true, "Enable toxic flow detection")
 	positionBiasThreshold := flag.Float64("bias-threshold", 0.3, "Position bias threshold (default: 0.3)")
 
+	// Momentum protection flags
+	momentumDetection := flag.Bool("momentum", true, "Enable momentum detection")
+	momentumThreshold := flag.Float64("momentum-threshold", 0.03, "Momentum threshold (default: 3%)")
+
 	flag.Parse()
 
 	logger, err := zap.NewDevelopment()
@@ -114,6 +118,8 @@ func main() {
 	makerConfig.MicroGridLevels = *microGridLevels
 	makerConfig.ToxicFlowDetection = *toxicFlowDetection
 	makerConfig.PositionBiasThreshold = *positionBiasThreshold
+	makerConfig.MomentumDetection = *momentumDetection
+	makerConfig.MomentumThresholdPct = *momentumThreshold
 
 	logger.Info("Maker Strategy Config",
 		zap.Strings("symbols", makerConfig.Symbols),
@@ -124,7 +130,9 @@ func main() {
 		zap.Float64("micro_grid_spacing_bps", makerConfig.MicroGridSpacingBps),
 		zap.Int("micro_grid_levels", makerConfig.MicroGridLevels),
 		zap.Bool("toxic_flow_detection", makerConfig.ToxicFlowDetection),
-		zap.Float64("position_bias_threshold", makerConfig.PositionBiasThreshold))
+		zap.Float64("position_bias_threshold", makerConfig.PositionBiasThreshold),
+		zap.Bool("momentum_detection", makerConfig.MomentumDetection),
+		zap.Float64("momentum_threshold_pct", makerConfig.MomentumThresholdPct))
 
 	wrappedClient := &wsClientWrapper{wsClient, logger}
 	makerStrategy := maker.NewMakerStrategy(futuresClient, wrappedClient, makerConfig, logger)
