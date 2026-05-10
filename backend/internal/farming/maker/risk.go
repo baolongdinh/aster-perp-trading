@@ -10,11 +10,11 @@ import (
 )
 
 type LiquidationGuard struct {
-	config         *Config
-	logger         *zap.Logger
-	positions      map[string]*PositionState
-	mu             sync.RWMutex
-	checkInterval  time.Duration
+	config        *Config
+	logger        *zap.Logger
+	positions     map[string]*PositionState
+	mu            sync.RWMutex
+	checkInterval time.Duration
 }
 
 func NewLiquidationGuard(config *Config, logger *zap.Logger) *LiquidationGuard {
@@ -57,7 +57,7 @@ func (g *LiquidationGuard) Check(ctx context.Context) (bool, string) {
 		}
 
 		liqPrice := g.calculateLiqPrice(pos.EntryPrice, pos.Amount > 0, g.config.MaxLeverage)
-		distanceToLiq := math.Abs(pos.MarkPrice - liqPrice) / liqPrice
+		distanceToLiq := math.Abs(pos.MarkPrice-liqPrice) / liqPrice
 
 		if distanceToLiq < g.config.LiquidationBuffer {
 			g.logger.Warn("Liquidation risk high, position should close",
@@ -83,10 +83,10 @@ func (g *LiquidationGuard) calculateLiqPrice(entryPrice float64, isLong bool, le
 }
 
 type MaxPositionGuard struct {
-	config      *Config
-	logger      *zap.Logger
+	config        *Config
+	logger        *zap.Logger
 	totalExposure float64
-	mu          sync.RWMutex
+	mu            sync.RWMutex
 }
 
 func NewMaxPositionGuard(config *Config, logger *zap.Logger) *MaxPositionGuard {
@@ -127,12 +127,12 @@ func (g *MaxPositionGuard) GetTotalExposure() float64 {
 }
 
 type DailyLossGuard struct {
-	config        *Config
-	logger        *zap.Logger
+	config          *Config
+	logger          *zap.Logger
 	startingBalance float64
-	dailyPnL      float64
-	mu            sync.RWMutex
-	lastReset     time.Time
+	dailyPnL        float64
+	mu              sync.RWMutex
+	lastReset       time.Time
 }
 
 func NewDailyLossGuard(config *Config, logger *zap.Logger) *DailyLossGuard {
@@ -192,11 +192,11 @@ func (g *DailyLossGuard) GetDailyPnL() float64 {
 }
 
 type OrderToTradeGuard struct {
-	config    *Config
-	logger    *zap.Logger
+	config      *Config
+	logger      *zap.Logger
 	totalOrders int
-	totalFills int
-	mu        sync.RWMutex
+	totalFills  int
+	mu          sync.RWMutex
 }
 
 func NewOrderToTradeGuard(config *Config, logger *zap.Logger) *OrderToTradeGuard {
@@ -253,10 +253,10 @@ func (g *OrderToTradeGuard) Reset() {
 }
 
 type EmergencyStop struct {
-	logger         *zap.Logger
-	shouldStop     bool
-	stopReason     string
-	mu             sync.RWMutex
+	logger     *zap.Logger
+	shouldStop bool
+	stopReason string
+	mu         sync.RWMutex
 }
 
 func NewEmergencyStop(logger *zap.Logger) *EmergencyStop {
@@ -290,4 +290,95 @@ func (e *EmergencyStop) IsStopped() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.shouldStop
+}
+
+// FlowDirectionTracker tracks buy/sell volume ratio to detect toxic flow
+type FlowDirectionTracker struct {
+	config         *Config
+	logger         *zap.Logger
+	buyVolume      float64
+	sellVolume     float64
+	mu             sync.RWMutex
+	windowDuration time.Duration
+	windowStart    time.Time
+}
+
+func NewFlowDirectionTracker(config *Config, logger *zap.Logger) *FlowDirectionTracker {
+	return &FlowDirectionTracker{
+		config:         config,
+		logger:         logger,
+		buyVolume:      0,
+		sellVolume:     0,
+		windowDuration: 60 * time.Second, // 60 second window
+		windowStart:    time.Now(),
+	}
+}
+
+func (f *FlowDirectionTracker) RecordBuy(volume float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkWindowReset()
+	f.buyVolume += volume
+}
+
+func (f *FlowDirectionTracker) RecordSell(volume float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkWindowReset()
+	f.sellVolume += volume
+}
+
+func (f *FlowDirectionTracker) checkWindowReset() {
+	if time.Since(f.windowStart) > f.windowDuration {
+		f.buyVolume = 0
+		f.sellVolume = 0
+		f.windowStart = time.Now()
+	}
+}
+
+func (f *FlowDirectionTracker) GetBuyRatio() float64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	total := f.buyVolume + f.sellVolume
+	if total == 0 {
+		return 0.5 // Neutral if no data
+	}
+	return f.buyVolume / total
+}
+
+func (f *FlowDirectionTracker) IsToxicFlow() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	buyRatio := f.GetBuyRatio()
+	// Toxic if > 60% buy or > 60% sell
+	isToxic := buyRatio > f.config.ToxicFlowThreshold || buyRatio < (1-f.config.ToxicFlowThreshold)
+
+	if isToxic {
+		f.logger.Warn("⚠️ Toxic flow detected",
+			zap.Float64("buy_ratio", buyRatio),
+			zap.Float64("threshold", f.config.ToxicFlowThreshold),
+			zap.Float64("buy_volume", f.buyVolume),
+			zap.Float64("sell_volume", f.sellVolume))
+	}
+	return isToxic
+}
+
+func (f *FlowDirectionTracker) GetReductionFactor() float64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if !f.IsToxicFlow() {
+		return 1.0
+	}
+	return f.config.ToxicFlowReducePct
+}
+
+func (f *FlowDirectionTracker) Reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.buyVolume = 0
+	f.sellVolume = 0
+	f.windowStart = time.Now()
 }

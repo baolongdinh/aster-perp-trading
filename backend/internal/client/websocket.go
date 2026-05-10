@@ -170,8 +170,6 @@ func (ws *WebSocketClient) realWebSocketHandler(ctx context.Context) {
 				return
 			}
 
-			ws.logger.Info("WebSocket message received", zap.Int("size", len(rawMsg)))
-
 			// Try to parse as object first (for individual streams)
 			var msgObj map[string]interface{}
 			if err := json.Unmarshal(rawMsg, &msgObj); err == nil {
@@ -595,8 +593,6 @@ func (ws *WebSocketClient) processMessage(msg map[string]interface{}) {
 		return
 	}
 
-	// Log other messages for debugging
-	ws.logger.Debug("WebSocket message received", zap.Any("msg", msg))
 }
 
 // processAccountUpdate handles ACCOUNT_UPDATE events (positions & balance)

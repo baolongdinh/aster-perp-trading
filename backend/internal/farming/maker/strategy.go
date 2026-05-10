@@ -3,6 +3,7 @@ package maker
 import (
 	"aster-bot/internal/client"
 	"context"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -28,6 +29,9 @@ type MakerStrategyImpl struct {
 
 	// REST API cache with 1s expiration
 	restCache *cache.Cache
+
+	// Flow direction tracker for toxic flow detection
+	flowTracker *FlowDirectionTracker
 
 	mu      sync.RWMutex
 	running bool
@@ -67,6 +71,7 @@ func NewMakerStrategy(
 	strategy.dailyLossGuard = NewDailyLossGuard(config, logger)
 	strategy.otRatioGuard = NewOrderToTradeGuard(config, logger)
 	strategy.emergencyStop = NewEmergencyStop(logger)
+	strategy.flowTracker = NewFlowDirectionTracker(config, logger)
 	// Initialize REST API cache with 1s expiration and 5s cleanup interval
 	strategy.restCache = cache.New(1*time.Second, 5*time.Second)
 
@@ -161,229 +166,169 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	}
 
 	midPrice := (bestBid + bestAsk) / 2
+	spread := bestAsk - bestBid
 
-	// GRID STRATEGY: Place orders at market prices for maximum fills
-	// Buy at best bid, Sell at best ask - no spread calculation
-	buyPrice := bestBid
-	sellPrice := bestAsk
-
-	// Log grid placement
 	s.logger.Info("🎯 Grid Strategy - Market Touching Orders",
 		zap.String("symbol", symbol),
 		zap.Float64("best_bid", bestBid),
 		zap.Float64("best_ask", bestAsk),
 		zap.Float64("mid_price", midPrice),
-		zap.Float64("buy_price", buyPrice),
-		zap.Float64("sell_price", sellPrice))
+		zap.Float64("spread", spread))
 
+	// ============================================================
+	// DYNAMIC BALANCE-BASED SIZING - Compounding with current balance
+	// ============================================================
 	balance := s.getAvailableBalance()
 	if balance <= 0 {
 		s.logger.Warn("No available balance for order placement")
 		return nil
 	}
 
-	// ADVANCED POSITION MANAGEMENT: Dynamic hedging with market impact detection
+	s.logger.Info("💰 Current Balance",
+		zap.String("symbol", symbol),
+		zap.Float64("available_balance", balance),
+		zap.Bool("dynamic_sizing", s.config.UseDynamicSizing))
+
+	// Calculate order size based on current balance (compounding)
+	var baseNotional float64
+	if s.config.UseDynamicSizing {
+		// Dynamic: Scale with balance, leverage applied
+		effectiveLeverage := float64(s.config.MaxLeverage)
+		baseNotional = balance * effectiveLeverage * (s.config.BaseNotionalUSD / 100.0)
+		// Clamp to min/max
+		if baseNotional < s.config.MinNotionalUSD {
+			baseNotional = s.config.MinNotionalUSD
+		}
+		if baseNotional > s.config.MaxNotionalUSD*float64(s.config.MaxLeverage) {
+			baseNotional = s.config.MaxNotionalUSD * float64(s.config.MaxLeverage)
+		}
+	} else {
+		// Legacy: Static leverage calculation
+		baseNotional = balance * float64(s.config.MaxLeverage)
+	}
+
+	buyQty := baseNotional / bestBid
+	sellQty := baseNotional / bestAsk
+
+	// ============================================================
+	// POSITION BIAS PROTECTION - Reduce orders when skewed
+	// ============================================================
 	position := s.inventoryMgr.GetPosition(symbol)
 	var positionBias float64
-	var positionSize float64
-	var entryPrice float64
 	if position != nil {
-		positionBias = position.Amount // Positive = long bias, Negative = short bias
-		positionSize = math.Abs(position.Amount)
-		entryPrice = position.EntryPrice
-	} else {
-		positionBias = 0 // No position = neutral
-		positionSize = 0
-		entryPrice = 0
-		_ = entryPrice // Use entryPrice to avoid unused variable warning
+		positionBias = position.Amount
 	}
 
-	// Calculate market impact and volatility
-	bestBid, bestAsk, volume24h, _ := s.wsClient.GetTickerData(symbol)
-	if bestBid == 0 || bestAsk == 0 {
-		s.logger.Warn("No market data for position management", zap.String("symbol", symbol))
-		return nil
+	maxPositionQty := s.config.MaxPositionUSDT / midPrice
+	positionBiasPct := 0.0
+	if maxPositionQty > 0 {
+		positionBiasPct = math.Abs(positionBias) / maxPositionQty
 	}
 
-	midPrice = (bestBid + bestAsk) / 2
-	spread := bestAsk - bestBid
-	volatility := spread / midPrice            // Simple volatility measure
-	marketImpact := volume24h * spread / 10000 // Market impact score
+	buyAdjustment := 1.0
+	sellAdjustment := 1.0
 
-	// DYNAMIC HEDGING RATIOS based on position size and market conditions
-	var buyHedgeRatio, sellHedgeRatio float64
-	var riskMultiplier float64
-
-	if positionSize > 0 {
-		// Larger positions need stronger hedging
-		riskMultiplier = 1.0 + (positionSize / 1000.0) // Scale risk with position size
-	} else {
-		riskMultiplier = 1.0
-	}
-
-	// Adjust hedging based on market volatility
-	if volatility > 0.02 { // High volatility market
-		buyHedgeRatio = 0.5 + (riskMultiplier * 0.3) // Conservative hedging
-		sellHedgeRatio = 0.5 + (riskMultiplier * 0.3)
-	} else if volatility > 0.01 { // Medium volatility
-		buyHedgeRatio = 0.3 + (riskMultiplier * 0.2)
-		sellHedgeRatio = 0.3 + (riskMultiplier * 0.2)
-	} else { // Low volatility
-		buyHedgeRatio = 0.2 + (riskMultiplier * 0.1)
-		sellHedgeRatio = 0.2 + (riskMultiplier * 0.1)
-	}
-
-	// Calculate dynamic order adjustments
-	var buyAdjustment, sellAdjustment float64
-	if positionBias > 0.001 { // Long position - aggressive hedging
-		buyAdjustment = (1.0 - buyHedgeRatio)   // Reduce buy orders
-		sellAdjustment = (1.0 + sellHedgeRatio) // Increase sell orders
-		s.logger.Info("🔄 Advanced Hedging - Long Position",
-			zap.String("symbol", symbol),
-			zap.Float64("position_size", positionSize),
-			zap.Float64("position_bias", positionBias),
-			zap.Float64("volatility", volatility),
-			zap.Float64("buy_hedge_ratio", buyHedgeRatio),
-			zap.Float64("sell_hedge_ratio", sellHedgeRatio),
-			zap.Float64("risk_multiplier", riskMultiplier))
-	} else if positionBias < -0.001 { // Short position - aggressive hedging
-		buyAdjustment = (1.0 + buyHedgeRatio)   // Increase buy orders
-		sellAdjustment = (1.0 - sellHedgeRatio) // Reduce sell orders
-		s.logger.Info("🔄 Advanced Hedging - Short Position",
-			zap.String("symbol", symbol),
-			zap.Float64("position_size", positionSize),
-			zap.Float64("position_bias", positionBias),
-			zap.Float64("volatility", volatility),
-			zap.Float64("buy_hedge_ratio", buyHedgeRatio),
-			zap.Float64("sell_hedge_ratio", sellHedgeRatio),
-			zap.Float64("risk_multiplier", riskMultiplier))
-	} else { // Neutral position - balanced with market adaptation
-		buyAdjustment = 1.0
-		sellAdjustment = 1.0
-
-		// Adapt to market conditions
-		if volatility > 0.02 {
-			buyAdjustment = 0.8 // Reduce both sides in high volatility
-			sellAdjustment = 0.8
-		} else if volatility > 0.01 {
-			buyAdjustment = 0.9 // Slight reduction in medium volatility
-			sellAdjustment = 0.9
+	// Check position bias and apply reduction
+	if math.Abs(positionBiasPct) > s.config.PositionBiasThreshold {
+		if positionBias > 0 {
+			// Long biased - reduce buy orders, increase sell orders
+			buyAdjustment = s.config.PositionBiasReducePct
+			sellAdjustment = 1.0 + (1.0 - s.config.PositionBiasReducePct)
+			s.logger.Warn("� Position Bias - Reducing buy orders",
+				zap.String("symbol", symbol),
+				zap.Float64("position_bias_pct", positionBiasPct),
+				zap.Float64("buy_adjustment", buyAdjustment),
+				zap.Float64("sell_adjustment", sellAdjustment))
+		} else if positionBias < 0 {
+			// Short biased - increase buy orders, reduce sell orders
+			buyAdjustment = 1.0 + (1.0 - s.config.PositionBiasReducePct)
+			sellAdjustment = s.config.PositionBiasReducePct
+			s.logger.Warn("� Position Bias - Reducing sell orders",
+				zap.String("symbol", symbol),
+				zap.Float64("position_bias_pct", positionBiasPct),
+				zap.Float64("buy_adjustment", buyAdjustment),
+				zap.Float64("sell_adjustment", sellAdjustment))
 		}
-
-		s.logger.Info("⚖️ Advanced Position Management - Neutral",
-			zap.String("symbol", symbol),
-			zap.Float64("market_impact", marketImpact),
-			zap.Float64("volatility", volatility),
-			zap.Float64("buy_adjustment", buyAdjustment),
-			zap.Float64("sell_adjustment", sellAdjustment))
 	}
 
-	maxOrderValue := balance * float64(s.config.MaxLeverage) * 1 // 100% of leveraged balance for larger orders
-	buyQty := maxOrderValue / buyPrice
-	sellQty := maxOrderValue / sellPrice
+	// ============================================================
+	// TOXIC FLOW PROTECTION - Reduce exposure in one-sided markets
+	// ============================================================
+	if s.config.ToxicFlowDetection && s.flowTracker != nil {
+		if s.flowTracker.IsToxicFlow() {
+			toxicReduction := s.flowTracker.GetReductionFactor()
+			buyAdjustment *= toxicReduction
+			sellAdjustment *= toxicReduction
+			s.logger.Warn("⚠️ Toxic Flow Detected - Reducing all orders",
+				zap.String("symbol", symbol),
+				zap.Float64("toxic_reduction", toxicReduction),
+				zap.Float64("buy_ratio", s.flowTracker.GetBuyRatio()))
+		}
+	}
 
-	// Apply dynamic hedging adjustments
-	buyQty = buyQty * buyAdjustment
-	sellQty = sellQty * sellAdjustment
+	// Apply adjustments
+	buyQty *= buyAdjustment
+	sellQty *= sellAdjustment
 
-	buyQty = s.roundToPrecision(buyQty, symbol)
-	sellQty = s.roundToPrecision(sellQty, symbol)
-
-	// Log volume farming metrics
-	s.logger.Info("💰 High-Leverage Volume Farming",
-		zap.String("symbol", symbol),
-		zap.Float64("balance", balance),
-		zap.Float64("leverage", float64(s.config.MaxLeverage)),
-		zap.Float64("order_value_usdt", maxOrderValue),
-		zap.Float64("buy_qty", buyQty),
-		zap.Float64("sell_qty", sellQty))
-
-	// INSTITUTIONAL DELTA-NEUTRAL GRID STRATEGY (EXA Deep Research)
-	// Combining HV30 optimization + delta-neutral hedging + minimum risk
-
-	// Calculate institutional-grade volatility metrics
-	bestBid, bestAsk, volume24h, _ = s.wsClient.GetTickerData(symbol)
-	midPrice = (bestBid + bestAsk) / 2
-	spread = bestAsk - bestBid
-	dailyVolatility := spread / midPrice * 100 // Simplified daily volatility %
-
-	// Institutional HV30 volatility model (Delta Neutral V3 methodology)
-	// k = 0.618 smoothing constant (empirically derived from 14 crypto pairs, 24 months)
-	hv30SmoothingConstant := 0.618
-	adjustedVolatility := dailyVolatility * hv30SmoothingConstant
-
-	// Institutional 4-tier regime gate with risk assessment
+	// ============================================================
+	// MICRO PROFIT OPTIMIZATION - Ultra-tight grid for max fills
+	// ============================================================
 	var gridLevels int
 	var gridSpacing float64
 	var capitalAllocation float64
 	var riskLevel string
 
-	// ULTRA-TIGHT VOLUME FARMING: Maximum fill rate optimization
-	// Focus on continuous micro profit without waiting
-
-	if adjustedVolatility < 2.0 {
-		// Ultra-tight regime: Maximum volume farming, continuous fills
-		gridLevels = 50         // 50 levels each side = 100 orders total
-		gridSpacing = 0.00025   // 0.05% spacing - ultra-tight for max fills
-		capitalAllocation = 1.0 // 100% allocation - maximum volume
-		riskLevel = "ULTRA_TIGHT"
-		s.logger.Info("⚡ Ultra-Tight Regime - Maximum Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
-	} else if adjustedVolatility <= 5.0 {
-		// Tight regime: High frequency fills + volume farming
-		gridLevels = 40         // 40 levels each side = 80 orders total
-		gridSpacing = 0.0005    // 0.1% spacing - tight for continuous fills
-		capitalAllocation = 1.0 // 100% allocation - maximum volume
-		riskLevel = "TIGHT"
-		s.logger.Info("🎯 Tight Regime - High Frequency Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
-	} else if adjustedVolatility <= 8.0 {
-		// Balanced regime: Volume farming with reasonable spacing
-		gridLevels = 30         // 30 levels each side = 60 orders total
-		gridSpacing = 0.00015   // 0.15% spacing - balanced for fills + profit
-		capitalAllocation = 0.9 // 90% allocation - high volume
-		riskLevel = "BALANCED"
-		s.logger.Info("⚖️ Balanced Regime - Optimized Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
+	if s.config.MicroProfitMode {
+		// Micro profit mode: Use configured ultra-tight parameters
+		gridLevels = s.config.MicroGridLevels
+		gridSpacing = s.config.MicroGridSpacingBps / 10000.0 // Convert bps to decimal
+		capitalAllocation = 1.0
+		riskLevel = "MICRO_PROFIT"
 	} else {
-		// Wide regime: Still volume farming but wider spacing
-		gridLevels = 25         // 25 levels each side = 50 orders total
-		gridSpacing = 0.002     // 0.2% spacing - wider but still fills
-		capitalAllocation = 0.8 // 80% allocation - reduced risk
-		riskLevel = "WIDE"
-		s.logger.Info("� Wide Regime - Adaptive Volume Farming",
-			zap.String("symbol", symbol),
-			zap.Float64("hv30_adj", adjustedVolatility),
-			zap.Int("grid_levels", gridLevels),
-			zap.Float64("spacing_pct", gridSpacing*100),
-			zap.String("risk_level", riskLevel))
+		// Legacy volatility-based regime
+		dailyVolatility := spread / midPrice * 100
+		hv30SmoothingConstant := 0.618
+		adjustedVolatility := dailyVolatility * hv30SmoothingConstant
+
+		if adjustedVolatility < 2.0 {
+			gridLevels = 50
+			gridSpacing = 0.00025
+			capitalAllocation = 1.0
+			riskLevel = "ULTRA_TIGHT"
+		} else if adjustedVolatility <= 5.0 {
+			gridLevels = 40
+			gridSpacing = 0.0005
+			capitalAllocation = 1.0
+			riskLevel = "TIGHT"
+		} else if adjustedVolatility <= 8.0 {
+			gridLevels = 30
+			gridSpacing = 0.0015
+			capitalAllocation = 0.9
+			riskLevel = "BALANCED"
+		} else {
+			gridLevels = 25
+			gridSpacing = 0.002
+			capitalAllocation = 0.8
+			riskLevel = "WIDE"
+		}
 	}
 
-	// MINIMUM ORDER SIZE PROTECTION: Ensure notional >= 5.0 USD
-	minNotionalUSD := 5.0
+	// Calculate minimum quantity per order
+	minNotionalUSD := s.config.MicroMinNotionalUSD
+	if minNotionalUSD <= 0 {
+		minNotionalUSD = 5.0
+	}
 	minQtyPerOrder := minNotionalUSD / midPrice
 
-	// Reduce grid levels if total capital insufficient (BEFORE calculating quantities)
+	// Adjust grid levels if capital is insufficient
 	maxAffordableLevels := int(buyQty / minQtyPerOrder)
 	if maxAffordableLevels < gridLevels {
 		oldLevels := gridLevels
 		gridLevels = maxAffordableLevels
 		if gridLevels < 5 {
-			gridLevels = 5 // Minimum 5 levels each side
+			gridLevels = 5
 		}
-		s.logger.Info("🔧 Reduced grid levels for minimum notional",
+		s.logger.Info("🔧 Reduced grid levels for capital",
 			zap.Int("old_levels", oldLevels),
 			zap.Int("new_levels", gridLevels),
 			zap.Float64("min_qty_per_level", minQtyPerOrder))
@@ -392,63 +337,40 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	perLevelBuyQty := buyQty * capitalAllocation / float64(gridLevels)
 	perLevelSellQty := sellQty * capitalAllocation / float64(gridLevels)
 
-	// DEBUG: Log actual calculations
-	buyNotional := perLevelBuyQty * midPrice
-	sellNotional := perLevelSellQty * midPrice
-	s.logger.Info("🔍 Order Size Debug",
-		zap.Float64("mid_price", midPrice),
-		zap.Float64("min_qty_required", minQtyPerOrder),
-		zap.Float64("buy_qty", perLevelBuyQty),
-		zap.Float64("sell_qty", perLevelSellQty),
-		zap.Float64("buy_notional_usd", buyNotional),
-		zap.Float64("sell_notional_usd", sellNotional),
-		zap.Int("grid_levels", gridLevels))
-
-	// EMERGENCY FIX: Force minimum quantity regardless of calculations
-	if perLevelBuyQty < minQtyPerOrder {
-		perLevelBuyQty = minQtyPerOrder * 1.1 // Add 10% buffer
-		s.logger.Info("🔧 EMERGENCY: Adjusted buy quantity for minimum notional",
-			zap.Float64("old_qty", buyQty*capitalAllocation/float64(gridLevels)),
-			zap.Float64("new_qty", perLevelBuyQty),
-			zap.Float64("min_notional_usd", minNotionalUSD),
-			zap.Float64("price", midPrice))
-	}
-
-	if perLevelSellQty < minQtyPerOrder {
-		perLevelSellQty = minQtyPerOrder * 1.1 // Add 10% buffer
-		s.logger.Info("🔧 EMERGENCY: Adjusted sell quantity for minimum notional",
-			zap.Float64("old_qty", sellQty*capitalAllocation/float64(gridLevels)),
-			zap.Float64("new_qty", perLevelSellQty),
-			zap.Float64("min_notional_usd", minNotionalUSD),
-			zap.Float64("price", midPrice))
-	}
-
-	// FINAL SAFETY: Force minimum quantity if still too small
-	finalMinQty := minQtyPerOrder * 1.2 // 20% buffer for safety
+	// Ensure minimum quantity per order
+	finalMinQty := minQtyPerOrder * 1.2
 	if perLevelBuyQty < finalMinQty {
 		perLevelBuyQty = finalMinQty
-		s.logger.Warn("🚨 FINAL SAFETY: Forced minimum buy quantity",
-			zap.Float64("forced_qty", perLevelBuyQty),
-			zap.Float64("min_required", minQtyPerOrder))
 	}
-
 	if perLevelSellQty < finalMinQty {
 		perLevelSellQty = finalMinQty
-		s.logger.Warn("🚨 FINAL SAFETY: Forced minimum sell quantity",
-			zap.Float64("forced_qty", perLevelSellQty),
-			zap.Float64("min_required", minQtyPerOrder))
 	}
 
-	// Use wait group for concurrent order placement
-	var wg sync.WaitGroup
-	orderPlaced := make(chan bool, gridLevels*2) // Track successful placements
+	// Round to precision
+	perLevelBuyQty = s.roundToPrecision(perLevelBuyQty, symbol)
+	perLevelSellQty = s.roundToPrecision(perLevelSellQty, symbol)
 
-	// Place buy orders concurrently with optimal spacing
+	s.logger.Info("� Micro Profit Grid Config",
+		zap.String("symbol", symbol),
+		zap.String("risk_level", riskLevel),
+		zap.Int("grid_levels", gridLevels),
+		zap.Float64("spacing_bps", s.config.MicroGridSpacingBps),
+		zap.Float64("per_level_buy_qty", perLevelBuyQty),
+		zap.Float64("per_level_sell_qty", perLevelSellQty),
+		zap.Float64("total_buy_notional", perLevelBuyQty*bestBid*float64(gridLevels)),
+		zap.Float64("total_sell_notional", perLevelSellQty*bestAsk*float64(gridLevels)))
+
+	// ============================================================
+	// PLACE GRID ORDERS
+	// ============================================================
+	var wg sync.WaitGroup
+	orderPlaced := make(chan bool, gridLevels*2)
+
+	// Place buy orders
 	for i := 0; i < gridLevels; i++ {
 		wg.Add(1)
 		go func(level int) {
 			defer wg.Done()
-			// Ultra-Tight Volume Farming: Maximum fill rate spacing below bid
 			gridOffset := gridSpacing * float64(level+1)
 			gridBuyPrice := bestBid * (1 - gridOffset)
 
@@ -458,13 +380,11 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 					s.logger.Error("Failed to place grid buy order", zap.Error(err))
 				} else {
 					s.otRatioGuard.RecordOrder()
-					s.logger.Info("⚡ Ultra-Tight Grid Buy",
+					s.flowTracker.RecordBuy(perLevelBuyQty * gridBuyPrice)
+					s.logger.Info("📗 Grid Buy",
 						zap.String("symbol", symbol),
-						zap.String("risk_level", riskLevel),
-						zap.Float64("hv30_adj", adjustedVolatility),
 						zap.Int("level", level+1),
 						zap.Float64("price", gridBuyPrice),
-						zap.Float64("spacing_pct", gridOffset*100),
 						zap.Float64("qty", perLevelBuyQty))
 				}
 				orderPlaced <- true
@@ -472,12 +392,11 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		}(i)
 	}
 
-	// Place sell orders concurrently with optimal spacing
+	// Place sell orders
 	for i := 0; i < gridLevels; i++ {
 		wg.Add(1)
 		go func(level int) {
 			defer wg.Done()
-			// Ultra-Tight Volume Farming: Maximum fill rate spacing above ask
 			gridOffset := gridSpacing * float64(level+1)
 			gridSellPrice := bestAsk * (1 + gridOffset)
 
@@ -487,13 +406,11 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 					s.logger.Error("Failed to place grid sell order", zap.Error(err))
 				} else {
 					s.otRatioGuard.RecordOrder()
-					s.logger.Info("⚡ Ultra-Tight Grid Sell",
+					s.flowTracker.RecordSell(perLevelSellQty * gridSellPrice)
+					s.logger.Info("📕 Grid Sell",
 						zap.String("symbol", symbol),
-						zap.String("risk_level", riskLevel),
-						zap.Float64("hv30_adj", adjustedVolatility),
 						zap.Int("level", level+1),
 						zap.Float64("price", gridSellPrice),
-						zap.Float64("spacing_pct", gridOffset*100),
 						zap.Float64("qty", perLevelSellQty))
 				}
 				orderPlaced <- true
@@ -622,11 +539,29 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 	}
 	midPrice := (bestBid + bestAsk) / 2
 
-	// SYNC WITH EXCHANGE: Get current order state from exchange
-	exchangeOrders, err := s.futuresClient.GetOpenOrders(s.ctx, symbol)
-	if err != nil {
-		s.logger.Warn("Failed to sync with exchange orders", zap.Error(err))
-	} else {
+	// SYNC WITH EXCHANGE: Get current order state from exchange (with 1s cache)
+	cacheKey := fmt.Sprintf("open_orders_%s", symbol)
+	var exchangeOrders []client.Order
+
+	if cached, found := s.restCache.Get(cacheKey); found {
+		if orders, ok := cached.([]client.Order); ok {
+			s.logger.Debug("Using cached open orders", zap.String("symbol", symbol))
+			exchangeOrders = orders
+		}
+	}
+
+	if exchangeOrders == nil {
+		var err error
+		exchangeOrders, err = s.futuresClient.GetOpenOrders(s.ctx, symbol)
+		if err != nil {
+			s.logger.Warn("Failed to sync with exchange orders", zap.Error(err))
+		} else {
+			// Cache for 1s
+			s.restCache.Set(cacheKey, exchangeOrders, cache.DefaultExpiration)
+		}
+	}
+
+	if exchangeOrders != nil {
 		// Clean up local orders that don't exist on exchange
 		var localOrdersToRemove []int64
 		for _, localOrder := range orders {

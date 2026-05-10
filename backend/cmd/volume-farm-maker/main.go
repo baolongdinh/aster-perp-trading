@@ -23,6 +23,16 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "Run in dry-run mode (no real orders)")
 	spreadBps := flag.Float64("spread", 5, "Spread in basis points (default: 5)")
 	maxLeverage := flag.Int("leverage", 50, "Max leverage (default: 50)")
+
+	// New config flags for micro profit optimization
+	useDynamicSizing := flag.Bool("dynamic-sizing", true, "Use dynamic balance-based sizing")
+	baseNotionalUSD := flag.Float64("base-notional", 100, "Base notional USD for dynamic sizing")
+	microProfitMode := flag.Bool("micro-profit", true, "Use micro profit ultra-tight grid")
+	microGridSpacingBps := flag.Float64("micro-spacing", 0.1, "Micro grid spacing in bps (default: 0.1)")
+	microGridLevels := flag.Int("micro-levels", 50, "Micro grid levels per side (default: 50)")
+	toxicFlowDetection := flag.Bool("toxic-flow", true, "Enable toxic flow detection")
+	positionBiasThreshold := flag.Float64("bias-threshold", 0.3, "Position bias threshold (default: 0.3)")
+
 	flag.Parse()
 
 	logger, err := zap.NewDevelopment()
@@ -96,10 +106,25 @@ func main() {
 	makerConfig.DefaultSpreadBps = *spreadBps
 	makerConfig.MaxLeverage = *maxLeverage
 
+	// Apply new config flags
+	makerConfig.UseDynamicSizing = *useDynamicSizing
+	makerConfig.BaseNotionalUSD = *baseNotionalUSD
+	makerConfig.MicroProfitMode = *microProfitMode
+	makerConfig.MicroGridSpacingBps = *microGridSpacingBps
+	makerConfig.MicroGridLevels = *microGridLevels
+	makerConfig.ToxicFlowDetection = *toxicFlowDetection
+	makerConfig.PositionBiasThreshold = *positionBiasThreshold
+
 	logger.Info("Maker Strategy Config",
 		zap.Strings("symbols", makerConfig.Symbols),
 		zap.Float64("spread_bps", makerConfig.DefaultSpreadBps),
-		zap.Int("max_leverage", makerConfig.MaxLeverage))
+		zap.Int("max_leverage", makerConfig.MaxLeverage),
+		zap.Bool("dynamic_sizing", makerConfig.UseDynamicSizing),
+		zap.Bool("micro_profit_mode", makerConfig.MicroProfitMode),
+		zap.Float64("micro_grid_spacing_bps", makerConfig.MicroGridSpacingBps),
+		zap.Int("micro_grid_levels", makerConfig.MicroGridLevels),
+		zap.Bool("toxic_flow_detection", makerConfig.ToxicFlowDetection),
+		zap.Float64("position_bias_threshold", makerConfig.PositionBiasThreshold))
 
 	wrappedClient := &wsClientWrapper{wsClient, logger}
 	makerStrategy := maker.NewMakerStrategy(futuresClient, wrappedClient, makerConfig, logger)

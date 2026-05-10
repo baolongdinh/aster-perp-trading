@@ -20,6 +20,18 @@ Bot tự động đặt lệnh mua (BUY) và bán (SELL) xung quanh giá hiện 
 - **Volume Farming**: Tạo volume giao dịch liên tục để tích lũy điểm thưởng
 - **Micro Profit**: Chốt lời ngắn (take profit) ngay sau khi grid order khớp, sau đó đặt grid mới
 
+
+7. Recommended Usage
+Conservative (Lower Risk):
+bash
+./volume-farm-maker.exe -micro-spacing 0.5 -micro-levels 30 -toxic-flow true
+Aggressive (Max Volume):
+bash
+./volume-farm-maker.exe -micro-spacing 0.1 -micro-levels 50 -toxic-flow false
+Balanced:
+bash
+./volume-farm-maker.exe -micro-spacing 0.2 -micro-levels 40 -bias-thresho
+
 ### Cơ Chế Đơn Giản
 ```
 Giá hiện tại: $100
