@@ -527,3 +527,102 @@ func (f *FuturesClient) SetLeverage(ctx context.Context, req SetLeverageRequest)
 
 	return nil
 }
+
+// CommissionRate represents maker and taker commission rates for a symbol
+type CommissionRate struct {
+	Symbol              string
+	MakerCommissionRate float64
+	TakerCommissionRate float64
+}
+
+// GetCommissionRate gets the commission rate for a symbol
+// GET /fapi/v1/commissionRate (signed)
+func (f *FuturesClient) GetCommissionRate(ctx context.Context, symbol string) (*CommissionRate, error) {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	params := map[string]string{
+		"symbol": symbol,
+	}
+
+	resp, err := f.http.GetSigned(ctx, f.apiPath("/fapi/v1/commissionRate"), params)
+	if err != nil {
+		return nil, fmt.Errorf("get commission rate: %w", err)
+	}
+
+	var result struct {
+		Symbol              string `json:"symbol"`
+		MakerCommissionRate string `json:"makerCommissionRate"`
+		TakerCommissionRate string `json:"takerCommissionRate"`
+	}
+
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal commission rate: %w", err)
+	}
+
+	makerRate, _ := strconv.ParseFloat(result.MakerCommissionRate, 64)
+	takerRate, _ := strconv.ParseFloat(result.TakerCommissionRate, 64)
+
+	return &CommissionRate{
+		Symbol:              result.Symbol,
+		MakerCommissionRate: makerRate,
+		TakerCommissionRate: takerRate,
+	}, nil
+}
+
+// LeverageBracket represents a leverage bracket for a symbol
+type LeverageBracket struct {
+	Symbol          string
+	Bracket         int
+	NotionalCap     float64
+	NotionalFloor   float64
+	InitialLeverage int
+}
+
+// GetLeverageBracket gets leverage bracket info for a symbol
+// GET /fapi/v1/leverageBracket (signed)
+func (f *FuturesClient) GetLeverageBracket(ctx context.Context, symbol string) ([]LeverageBracket, error) {
+	// Wait for rate limiter
+	if err := f.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
+
+	params := map[string]string{}
+	if symbol != "" {
+		params["symbol"] = symbol
+	}
+
+	resp, err := f.http.GetSigned(ctx, f.apiPath("/fapi/v1/leverageBracket"), params)
+	if err != nil {
+		return nil, fmt.Errorf("get leverage bracket: %w", err)
+	}
+
+	var rawBrackets []struct {
+		Symbol          string `json:"symbol"`
+		Bracket         int    `json:"bracket"`
+		NotionalCap     string `json:"notionalCap"`
+		NotionalFloor   string `json:"notionalFloor"`
+		InitialLeverage int    `json:"initialLeverage"`
+	}
+
+	if err := json.Unmarshal(resp, &rawBrackets); err != nil {
+		return nil, fmt.Errorf("unmarshal leverage bracket: %w", err)
+	}
+
+	brackets := make([]LeverageBracket, len(rawBrackets))
+	for i, rb := range rawBrackets {
+		notionalCap, _ := strconv.ParseFloat(rb.NotionalCap, 64)
+		notionalFloor, _ := strconv.ParseFloat(rb.NotionalFloor, 64)
+		brackets[i] = LeverageBracket{
+			Symbol:          rb.Symbol,
+			Bracket:         rb.Bracket,
+			NotionalCap:     notionalCap,
+			NotionalFloor:   notionalFloor,
+			InitialLeverage: rb.InitialLeverage,
+		}
+	}
+
+	return brackets, nil
+}

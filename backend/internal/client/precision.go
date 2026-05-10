@@ -12,11 +12,15 @@ import (
 // SymbolPrecision tracks exchange rules for a symbol.
 type SymbolPrecision struct {
 	Symbol       string
-	TickSize     float64
-	StepSize     float64
-	PricePrec    int
-	QuantityPrec int
-	MaxLeverage  float64
+	TickSize     float64 // Price tick size (e.g., 0.0001)
+	StepSize     float64 // Quantity step size (e.g., 0.001)
+	PricePrec    int     // Price precision decimals
+	QuantityPrec int     // Quantity precision decimals
+	MaxLeverage  float64 // Max leverage (e.g., 50)
+	MinQty       float64 // Minimum order quantity
+	MaxQty       float64 // Maximum order quantity
+	MinNotional  float64 // Minimum notional value in USDT
+	MaxNotional  float64 // Maximum notional value in USDT
 }
 
 // PrecisionManager manages symbol-specific formatting rules.
@@ -38,9 +42,13 @@ func (p *PrecisionManager) UpdateFromExchangeInfo(raw []byte) error {
 		Symbols []struct {
 			Symbol  string `json:"symbol"`
 			Filters []struct {
-				FilterType string `json:"filterType"`
-				TickSize   string `json:"tickSize"`
-				StepSize   string `json:"stepSize"`
+				FilterType  string `json:"filterType"`
+				TickSize    string `json:"tickSize"`
+				StepSize    string `json:"stepSize"`
+				MinQty      string `json:"minQty"`
+				MaxQty      string `json:"maxQty"`
+				MinNotional string `json:"minNotional"`
+				MaxNotional string `json:"maxNotional"`
 			} `json:"filters"`
 			LeverageBrackets []struct {
 				Bracket     int     `json:"bracket"`
@@ -67,9 +75,17 @@ func (p *PrecisionManager) UpdateFromExchangeInfo(raw []byte) error {
 			if f.FilterType == "LOT_SIZE" {
 				sp.StepSize, _ = strconv.ParseFloat(f.StepSize, 64)
 				sp.QuantityPrec = precisionFromStep(f.StepSize)
+				sp.MinQty, _ = strconv.ParseFloat(f.MinQty, 64)
+				sp.MaxQty, _ = strconv.ParseFloat(f.MaxQty, 64)
+			}
+			if f.FilterType == "MIN_NOTIONAL" {
+				sp.MinNotional, _ = strconv.ParseFloat(f.MinNotional, 64)
+			}
+			if f.FilterType == "MAX_NOTIONAL" {
+				sp.MaxNotional, _ = strconv.ParseFloat(f.MaxNotional, 64)
 			}
 		}
-		// NEW: Parse max leverage from brackets
+		// Parse max leverage from brackets
 		for _, b := range s.LeverageBrackets {
 			if b.Leverage > sp.MaxLeverage {
 				sp.MaxLeverage = b.Leverage
@@ -129,6 +145,28 @@ func (p *PrecisionManager) GetMaxLeverage(symbol string) float64 {
 		return sp.MaxLeverage
 	}
 	return 0 // Unknown
+}
+
+// GetSymbolInfo returns all precision info for a symbol.
+func (p *PrecisionManager) GetSymbolInfo(symbol string) SymbolPrecision {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if sp, ok := p.symbols[symbol]; ok {
+		return sp
+	}
+	return SymbolPrecision{} // Return empty if not found
+}
+
+// GetMinNotional returns the minimum notional value for a symbol.
+func (p *PrecisionManager) GetMinNotional(symbol string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if sp, ok := p.symbols[symbol]; ok {
+		return sp.MinNotional
+	}
+	return 5.0 // Default fallback
 }
 
 // precisionFromStep converts "0.0001" to 4

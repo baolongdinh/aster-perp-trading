@@ -36,6 +36,9 @@ type MakerStrategyImpl struct {
 	// Momentum guard for detecting rapid price movements
 	momentumGuard *MomentumGuard
 
+	// Alert manager for sending notifications
+	alertManager *AlertManager
+
 	mu      sync.RWMutex
 	running bool
 	stopCh  chan struct{}
@@ -78,6 +81,8 @@ func NewMakerStrategy(
 	strategy.momentumGuard = NewMomentumGuard(config, logger)
 	// Initialize REST API cache with 1s expiration and 5s cleanup interval
 	strategy.restCache = cache.New(1*time.Second, 5*time.Second)
+	// Initialize alert manager
+	strategy.alertManager = NewAlertManager(logger, 5*time.Minute)
 
 	return strategy
 }
@@ -95,6 +100,11 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 	}
 	s.running = true
 	s.mu.Unlock()
+
+	// Send startup notification to Telegram
+	if s.alertManager != nil {
+		s.alertManager.NotifyStartup(s.config.Symbols[0], "adaptive")
+	}
 
 	// Subscribe to individual symbol tickers
 	// Note: If using aggregate stream like !ticker@arr, data comes automatically
@@ -148,6 +158,10 @@ func (s *MakerStrategyImpl) Stop(ctx context.Context) error {
 	s.wg.Wait()
 
 	s.cancelAllOrders()
+
+	if s.alertManager != nil {
+		s.alertManager.NotifyShutdown()
+	}
 
 	s.logger.Info("Maker Strategy stopped")
 	return nil
@@ -226,6 +240,24 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	sellQty := baseNotional / bestAsk
 
 	// ============================================================
+	// LEVERAGE-AWARE ADJUSTMENT - Reduce orders for low-leverage symbols
+	// ============================================================
+	// For symbols with low max leverage (e.g., AGT 5x), we need to reduce
+	// order quantity to stay within margin limits
+	leverageFactor := float64(s.config.MaxLeverage) / 50.0 // Normalize to 50x as baseline
+	if leverageFactor < 0.1 {
+		leverageFactor = 0.1 // Cap at 10% for very low leverage symbols
+	}
+	// Apply leverage factor to reduce total notional
+	buyQty *= leverageFactor
+	sellQty *= leverageFactor
+	s.logger.Debug("Leverage adjustment applied",
+		zap.Int("max_leverage", s.config.MaxLeverage),
+		zap.Float64("leverage_factor", leverageFactor),
+		zap.Float64("adjusted_buy_qty", buyQty),
+		zap.Float64("adjusted_sell_qty", sellQty))
+
+	// ============================================================
 	// POSITION BIAS PROTECTION - Reduce orders when skewed
 	// ============================================================
 	position := s.inventoryMgr.GetPosition(symbol)
@@ -287,6 +319,13 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 				zap.Float64("position_bias_pct", positionBiasPct))
 			s.emergencyStop.Trigger("extreme_position_bias")
 			s.cancelAllOrders()
+			if s.alertManager != nil {
+				s.alertManager.NotifyEmergencyStop("extreme_position_bias", map[string]interface{}{
+					"Symbol":    symbol,
+					"Bias":      fmt.Sprintf("%.1f%%", positionBiasPct*100),
+					"Threshold": "80%",
+				})
+			}
 			return nil
 		}
 	}
@@ -356,7 +395,7 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	// Calculate minimum quantity per order
 	minNotionalUSD := s.config.MicroMinNotionalUSD
 	if minNotionalUSD <= 0 {
-		minNotionalUSD = 5.0
+		minNotionalUSD = 10.0 // Minimum $10 per order for low-leverage symbols
 	}
 	minQtyPerOrder := minNotionalUSD / midPrice
 
@@ -372,6 +411,23 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 			zap.Int("old_levels", oldLevels),
 			zap.Int("new_levels", gridLevels),
 			zap.Float64("min_qty_per_level", minQtyPerOrder))
+	}
+
+	// Additional leverage-based grid reduction for low-leverage symbols
+	// With low leverage, we need fewer levels to stay within margin
+	if s.config.MaxLeverage <= 10 {
+		maxLevelsForLeverage := 20 // Cap at 20 levels for 5-10x leverage
+		if s.config.MaxLeverage <= 5 {
+			maxLevelsForLeverage = 10 // Cap at 10 levels for <=5x leverage
+		}
+		if gridLevels > maxLevelsForLeverage {
+			oldLevels := gridLevels
+			gridLevels = maxLevelsForLeverage
+			s.logger.Info("🔧 Reduced grid levels for low leverage",
+				zap.Int("old_levels", oldLevels),
+				zap.Int("new_levels", gridLevels),
+				zap.Int("max_leverage", s.config.MaxLeverage))
+		}
 	}
 
 	perLevelBuyQty := buyQty * capitalAllocation / float64(gridLevels)
@@ -682,6 +738,13 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 					zap.Float64("position", newAmount))
 				s.emergencyStop.Trigger(reason)
 				s.cancelAllOrders()
+				if s.alertManager != nil {
+					s.alertManager.NotifyEmergencyStop(reason, map[string]interface{}{
+						"Symbol":   symbol,
+						"Position": fmt.Sprintf("%.4f", newAmount),
+						"Source":   "liquidation_check_after_fill",
+					})
+				}
 				return
 			}
 
@@ -945,18 +1008,33 @@ func (s *MakerStrategyImpl) checkRiskConditions() {
 	if stop, reason := s.liqGuard.Check(s.ctx); stop {
 		s.emergencyStop.Trigger(reason)
 		s.cancelAllOrders()
+		if s.alertManager != nil {
+			s.alertManager.NotifyEmergencyStop(reason, map[string]interface{}{
+				"Source": "risk_monitoring_liquidation",
+			})
+		}
 		return
 	}
 
 	if stop, reason := s.maxPosGuard.Check(s.ctx); stop {
 		s.emergencyStop.Trigger(reason)
 		s.cancelAllOrders()
+		if s.alertManager != nil {
+			s.alertManager.NotifyEmergencyStop(reason, map[string]interface{}{
+				"Source": "risk_monitoring_max_position",
+			})
+		}
 		return
 	}
 
 	if stop, reason := s.dailyLossGuard.Check(s.ctx); stop {
 		s.emergencyStop.Trigger(reason)
 		s.cancelAllOrders()
+		if s.alertManager != nil {
+			s.alertManager.NotifyEmergencyStop(reason, map[string]interface{}{
+				"Source": "risk_monitoring_daily_loss",
+			})
+		}
 		return
 	}
 

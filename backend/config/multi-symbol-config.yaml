@@ -1,0 +1,85 @@
+# Multi-Symbol Configuration for Volume Farm Maker
+# This file demonstrates symbol-specific parameter overrides
+
+# Global defaults (used when symbol-specific not defined)
+global:
+  default_spread_bps: 5
+  max_leverage: 50
+  max_position_usdt: 3000
+  use_dynamic_sizing: true
+  base_notional_usd: 100
+  micro_profit_mode: true
+  micro_grid_spacing_bps: 0.1
+  micro_grid_levels: 50
+  toxic_flow_detection: true
+  momentum_detection: true
+
+# Symbol-specific configurations
+symbols:
+  ethusd1:
+    # ETH characteristics: High liquidity, tight spreads, high volatility
+    default_spread_bps: 3
+    max_position_usdt: 2000
+    base_notional_usd: 80
+    micro_grid_spacing_bps: 0.08  # Tighter spacing for high liquidity
+    micro_grid_levels: 60          # More levels for volume capture
+    micro_min_notional_usd: 5
+    position_bias_threshold: 0.25   # Lower threshold for ETH's volatility
+    momentum_threshold_pct: 0.025    # 2.5% for ETH's higher volatility
+    toxic_flow_threshold: 0.65       # Higher tolerance for ETH flow
+    
+  btcusd1:
+    # BTC characteristics: Good liquidity, wider spreads, lower volatility than ETH
+    default_spread_bps: 8           # Wider spread typical for BTC
+    max_position_usdt: 5000          # Larger position size for BTC
+    base_notional_usd: 150          # Larger base notional
+    micro_grid_spacing_bps: 0.15      # Wider spacing for BTC
+    micro_grid_levels: 40             # Fewer levels, wider spacing
+    micro_min_notional_usd: 10
+    position_bias_threshold: 0.35      # Higher threshold for lower volatility
+    momentum_threshold_pct: 0.02       # 2% for BTC's lower volatility
+    toxic_flow_threshold: 0.6         # Standard tolerance
+    
+  solusd1:
+    # SOL characteristics: Lower liquidity, wider spreads, high volatility
+    default_spread_bps: 12          # Much wider spread for lower liquidity
+    max_position_usdt: 1500          # Smaller position due to volatility
+    base_notional_usd: 60           # Smaller base notional
+    micro_grid_spacing_bps: 0.25      # Much wider spacing
+    micro_grid_levels: 30             # Fewer levels due to wider spacing
+    micro_min_notional_usd: 3
+    position_bias_threshold: 0.2       # Lower threshold for high volatility
+    momentum_threshold_pct: 0.04       # 4% for SOL's high volatility
+    toxic_flow_threshold: 0.55        # Lower tolerance for toxic flow
+    
+  adausd1:
+    # ADA characteristics: Moderate liquidity, moderate spreads
+    default_spread_bps: 10
+    max_position_usdt: 1800
+    base_notional_usd: 70
+    micro_grid_spacing_bps: 0.2
+    micro_grid_levels: 35
+    micro_min_notional_usd: 4
+    position_bias_threshold: 0.3
+    momentum_threshold_pct: 0.03
+    toxic_flow_threshold: 0.58
+
+# Process allocation settings
+process_management:
+  # How to divide total balance among processes
+  balance_allocation:
+    method: "proportional"  # "equal" or "proportional" to symbol risk
+    min_balance_per_process: 100  # Minimum USDT per process
+    reserve_balance: 500          # Reserve balance not allocated
+    
+  # Health monitoring
+  health_check:
+    interval_seconds: 30
+    restart_attempts: 3
+    restart_delay_seconds: 10
+    
+  # Process isolation
+  isolation:
+    separate_websockets: true
+    separate_order_managers: true
+    separate_risk_management: true

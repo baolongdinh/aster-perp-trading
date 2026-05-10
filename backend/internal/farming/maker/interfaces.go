@@ -114,6 +114,7 @@ type FuturesClientInterface interface {
 	GetOpenOrders(ctx context.Context, symbol string) ([]client.Order, error)
 	GetPositions(ctx context.Context) ([]client.Position, error)
 	GetAccountInfo(ctx context.Context) (*client.AccountInfo, error)
+	Get24hrTicker(ctx context.Context) ([]client.Ticker, error)
 }
 
 type WebSocketClientInterface interface {

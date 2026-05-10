@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +45,14 @@ func (m *OrderManagerImpl) PlaceLimitOrder(ctx context.Context, req LimitOrderRe
 	// Round to correct precision for the symbol
 	priceStr := formatPrice(req.Symbol, req.Price)
 	qtyStr := formatQuantity(req.Symbol, req.Quantity)
+
+	// Debug log the formatted values
+	m.logger.Debug("Order precision debug",
+		zap.String("symbol", req.Symbol),
+		zap.Float64("price_raw", req.Price),
+		zap.String("price_formatted", priceStr),
+		zap.Float64("qty_raw", req.Quantity),
+		zap.String("qty_formatted", qtyStr))
 
 	orderReq := client.PlaceOrderRequest{
 		Symbol:      req.Symbol,
@@ -223,32 +230,38 @@ func (m *OrderManagerImpl) GetOrderCount(symbol string) int {
 
 // formatPrice rounds price to correct precision for symbol
 func formatPrice(symbol string, price float64) string {
-	// ETHUSD1: tick size 0.1 (price precision 1)
-	if strings.EqualFold(symbol, "ETHUSD1") {
-		rounded := math.Round(price*10) / 10
-		return strconv.FormatFloat(rounded, 'f', 1, 64)
+	// High-priced symbols (>$100): 2 decimals
+	if price > 100 {
+		rounded := math.Round(price*100) / 100
+		return strconv.FormatFloat(rounded, 'f', 2, 64)
 	}
-	// BTCUSD1: tick size 0.1 (price precision 1)
-	if strings.EqualFold(symbol, "BTCUSD1") {
-		rounded := math.Round(price*10) / 10
-		return strconv.FormatFloat(rounded, 'f', 1, 64)
+
+	// Medium-priced symbols ($1-$100): 4 decimals
+	if price > 1 {
+		rounded := math.Round(price*10000) / 10000
+		return strconv.FormatFloat(rounded, 'f', 4, 64)
 	}
-	// Default: 2 decimals
-	rounded := math.Round(price*100) / 100
-	return strconv.FormatFloat(rounded, 'f', 2, 64)
+
+	// Low-priced symbols (<$1): Use 6 decimals (safer for most tokens)
+	rounded := math.Round(price*1000000) / 1000000
+	return strconv.FormatFloat(rounded, 'f', 6, 64)
 }
 
 // formatQuantity rounds quantity to correct precision for symbol
 func formatQuantity(symbol string, qty float64) string {
-	// ETHUSD1: quantity precision 3 (step size 0.001)
-	if strings.EqualFold(symbol, "ETHUSD1") || strings.EqualFold(symbol, "BTCUSD1") {
-		rounded := math.Round(qty*1000) / 1000
-		if rounded < 0.001 {
-			rounded = 0.001 // Minimum step
+	// For very large quantities (like AGT with low price), use integer
+	if qty > 100 {
+		rounded := math.Round(qty)
+		if rounded < 1 {
+			rounded = 1
 		}
-		return strconv.FormatFloat(rounded, 'f', 3, 64)
+		return strconv.FormatFloat(rounded, 'f', 0, 64)
 	}
+
 	// Default: 3 decimals
 	rounded := math.Round(qty*1000) / 1000
+	if rounded < 0.001 {
+		rounded = 0.001 // Minimum step
+	}
 	return strconv.FormatFloat(rounded, 'f', 3, 64)
 }
