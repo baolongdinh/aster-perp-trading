@@ -92,7 +92,7 @@ func main() {
 	futuresClient := client.NewFuturesClient(httpClient, cfg.Bot.DryRun, logger, cfg.Exchange.RequestsPerSecond)
 	logger.Info("Futures client initialized", zap.String("url", restURL))
 
-	// Use bookTicker stream for real-time best bid/ask
+	// Use bookTicker stream for real-time best bid/ask data
 	wsURL := "wss://fstream.asterdex.com/ws/ethusd1@bookTicker"
 
 	wsClient := client.NewWebSocketClient(wsURL, logger)
@@ -106,7 +106,7 @@ func main() {
 
 	makerConfig := maker.DefaultConfig()
 	// Only trade ETHUSD1 for simplicity
-	makerConfig.Symbols = []string{"ethusd1"}
+	makerConfig.Symbols = []string{"ETHUSD1"}
 	makerConfig.DefaultSpreadBps = *spreadBps
 	makerConfig.MaxLeverage = *maxLeverage
 
@@ -133,6 +133,19 @@ func main() {
 		zap.Float64("position_bias_threshold", makerConfig.PositionBiasThreshold),
 		zap.Bool("momentum_detection", makerConfig.MomentumDetection),
 		zap.Float64("momentum_threshold_pct", makerConfig.MomentumThresholdPct))
+
+	// Subscribe to user data stream for balance updates
+	listenKey, err := futuresClient.StartListenKey(context.Background())
+	if err != nil {
+		logger.Error("Failed to get listen key for user data stream", zap.Error(err))
+	} else {
+		logger.Info("Subscribing to user data stream", zap.String("listenKey", listenKey[:10]+"..."))
+		if err := wsClient.SubscribeToUserData(listenKey); err != nil {
+			logger.Error("Failed to subscribe to user data stream", zap.Error(err))
+		} else {
+			logger.Info("✅ User data stream subscribed successfully")
+		}
+	}
 
 	wrappedClient := &wsClientWrapper{wsClient, logger}
 	makerStrategy := maker.NewMakerStrategy(futuresClient, wrappedClient, makerConfig, logger)

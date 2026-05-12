@@ -2,6 +2,7 @@ package maker
 
 import (
 	"aster-bot/internal/client"
+	"aster-bot/internal/farming/volume_optimization"
 	"context"
 	"fmt"
 	"math"
@@ -35,6 +36,21 @@ type MakerStrategyImpl struct {
 
 	// Momentum guard for detecting rapid price movements
 	momentumGuard *MomentumGuard
+
+	// Volume Optimization Modules
+	pennyJumpMgr      *volume_optimization.PennyJumpManager
+	inventoryHedgeMgr *volume_optimization.InventoryHedgeManager
+	smartCancelMgr    *volume_optimization.SmartCancellationManager
+	tickSizeMgr       *volume_optimization.TickSizeManager
+
+	// Order Book Imbalance Detection (NEW)
+	obiDetector *volume_optimization.OrderBookImbalanceDetector
+
+	// Market Microstructure Analysis (NEW)
+	microstructureAnalyzer *volume_optimization.MarketMicrostructureAnalyzer
+
+	// NEW: Adaptive Leverage System
+	leverageAdapter *LeverageAdapter
 
 	mu      sync.RWMutex
 	running bool
@@ -79,6 +95,91 @@ func NewMakerStrategy(
 	// Initialize REST API cache with 1s expiration and 5s cleanup interval
 	strategy.restCache = cache.New(1*time.Second, 5*time.Second)
 
+	// Initialize Volume Optimization Modules
+	strategy.tickSizeMgr = volume_optimization.NewTickSizeManager(logger)
+	if err := strategy.tickSizeMgr.RefreshTickSizes(); err != nil {
+		logger.Warn("Failed to refresh tick sizes", zap.Error(err))
+	}
+
+	if config.PennyJumpingEnabled {
+		strategy.pennyJumpMgr = volume_optimization.NewPennyJumpManager(config.PennyJumpingConfig, logger)
+		strategy.pennyJumpMgr.SetTickSizeManager(strategy.tickSizeMgr)
+		logger.Info("PennyJumpManager initialized")
+	}
+
+	if config.InventoryHedgingEnabled {
+		strategy.inventoryHedgeMgr = volume_optimization.NewInventoryHedgeManager(config.InventoryHedgingConfig, logger)
+		strategy.inventoryHedgeMgr.SetTickSizeManager(strategy.tickSizeMgr)
+		logger.Info("InventoryHedgeManager initialized")
+	}
+
+	if config.SmartCancellationEnabled {
+		strategy.smartCancelMgr = volume_optimization.NewSmartCancellationManager(config.SmartCancellationConfig, logger)
+		strategy.smartCancelMgr.SetCallbacks(
+			func(symbol string, oldSpread, newSpread float64, changePct float64) {
+				logger.Info("Spread change detected",
+					zap.String("symbol", symbol),
+					zap.Float64("old_spread", oldSpread),
+					zap.Float64("new_spread", newSpread),
+					zap.Float64("change_pct", changePct))
+			},
+			func(ctx context.Context, symbol string) error {
+				return strategy.CancelOrders(symbol)
+			},
+			func(ctx context.Context, symbol string) error {
+				return strategy.PlaceOrders(symbol)
+			},
+		)
+		logger.Info("SmartCancellationManager initialized")
+	}
+
+	// Initialize Order Book Imbalance Detector (NEW)
+	if config.OBIDetectionEnabled {
+		strategy.obiDetector = volume_optimization.NewOrderBookImbalanceDetector(
+			config.OBIWindowSize,
+			config.OBIThreshold,
+			logger,
+		)
+		logger.Info("📊 OrderBookImbalanceDetector initialized",
+			zap.Int("window_size", config.OBIWindowSize),
+			zap.Float64("threshold", config.OBIThreshold))
+
+		// Wire OBI detector to spread calculator
+		strategy.spreadCalc.SetOBIDetector(strategy.obiDetector)
+	}
+
+	// Initialize Market Microstructure Analyzer (NEW)
+	if config.MicrostructureAnalysisEnabled {
+		if strategy.obiDetector != nil {
+			// Create VPIN monitor for microstructure analysis
+			vpin := volume_optimization.NewVPINMonitor(volume_optimization.VPINConfig{
+				WindowSize:        10,
+				BucketSize:        100,
+				VPINThreshold:     0.6,
+				SustainedBreaches: 3,
+				AutoResumeDelay:   30 * time.Second,
+			}, logger)
+
+			strategy.microstructureAnalyzer = volume_optimization.NewMarketMicrostructureAnalyzer(
+				vpin,
+				strategy.obiDetector,
+				logger,
+			)
+			strategy.microstructureAnalyzer.SetAggressivenessLevel(config.AggressivenessLevel)
+			logger.Info("🧠 MarketMicrostructureAnalyzer initialized",
+				zap.Int("aggressiveness_level", config.AggressivenessLevel))
+
+			// Wire all components to spread calculator
+			strategy.spreadCalc.SetVPINMonitor(vpin)
+			strategy.spreadCalc.SetMicrostructureAnalyzer(strategy.microstructureAnalyzer)
+		}
+	}
+
+	// Initialize Adaptive Leverage System (NEW)
+	strategy.leverageAdapter = NewLeverageAdapter(config.MaxLeverage, logger)
+	logger.Info("🎚️ AdaptiveLeverageAdapter initialized",
+		zap.Int("base_max_leverage", config.MaxLeverage))
+
 	return strategy
 }
 
@@ -118,6 +219,20 @@ func (s *MakerStrategyImpl) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start Volume Optimization Modules
+	if s.pennyJumpMgr != nil {
+		s.logger.Info("PennyJumpManager is enabled and ready")
+	}
+	if s.inventoryHedgeMgr != nil {
+		s.inventoryHedgeMgr.Start(s.ctx)
+	}
+	if s.smartCancelMgr != nil {
+		s.smartCancelMgr.Start(s.ctx)
+	}
+	if s.tickSizeMgr != nil {
+		go s.tickSizeMgr.StartPeriodicRefresh(s.ctx, 5*time.Minute)
+	}
+
 	s.wg.Add(1)
 	go s.orderManagementLoop()
 
@@ -145,6 +260,14 @@ func (s *MakerStrategyImpl) Stop(ctx context.Context) error {
 	close(s.stopCh)
 	s.cancel()
 
+	// Stop Volume Optimization Modules
+	if s.inventoryHedgeMgr != nil {
+		s.inventoryHedgeMgr.Stop()
+	}
+	if s.smartCancelMgr != nil {
+		s.smartCancelMgr.Stop()
+	}
+
 	s.wg.Wait()
 
 	s.cancelAllOrders()
@@ -154,7 +277,12 @@ func (s *MakerStrategyImpl) Stop(ctx context.Context) error {
 }
 
 func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
+	s.logger.Debug("🚀 PlaceOrders called",
+		zap.String("symbol", symbol),
+		zap.Bool("running", s.running))
+
 	if !s.running {
+		s.logger.Debug("❌ PlaceOrders returning - not running")
 		return nil
 	}
 
@@ -180,6 +308,55 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		return nil
 	}
 
+	// Update optimization managers with best prices
+	if s.pennyJumpMgr != nil {
+		s.pennyJumpMgr.UpdateBestPrices(symbol, bestBid, bestAsk)
+	}
+	if s.smartCancelMgr != nil {
+		s.smartCancelMgr.UpdateSpread(symbol, bestBid, bestAsk)
+	}
+
+	// ============================================================
+	// NEW: Update OBI detector with orderbook data
+	// ============================================================
+	s.logger.Debug("🔍 Starting OBI detector operations")
+	if s.obiDetector != nil {
+		s.logger.Debug("📊 Updating OBI detector with orderbook data")
+		// For now, simulate orderbook depth - in production, get real orderbook
+		// TODO: Replace with real orderbook depth from WebSocket/REST
+		bidQty := bestBid * 1000 // Simulated bid quantity
+		askQty := bestAsk * 1000 // Simulated ask quantity
+		midPrice := (bestBid + bestAsk) / 2
+
+		s.logger.Debug("📊 Calling UpdateOrderBook")
+		s.obiDetector.UpdateOrderBook(bidQty, askQty, midPrice)
+		s.logger.Debug("✅ UpdateOrderBook completed")
+
+		s.logger.Debug("📊 Calling GetSignal")
+		// Log OBI signal for monitoring
+		obiSignal := s.obiDetector.GetSignal()
+		s.logger.Debug("✅ GetSignal completed")
+		s.logger.Debug("📊 OBI Signal",
+			zap.String("symbol", symbol),
+			zap.Float64("obi_score", obiSignal.OBIScore),
+			zap.String("bias_direction", obiSignal.BiasDirection),
+			zap.String("strength", obiSignal.Strength),
+			zap.String("recommended_action", obiSignal.RecommendedAction),
+			zap.Float64("confidence", obiSignal.Confidence))
+	}
+	s.logger.Debug("✅ OBI detector operations completed")
+	// Update inventory skew
+	if s.inventoryHedgeMgr != nil {
+		pos := s.inventoryMgr.GetPosition(symbol)
+		if pos != nil {
+			if pos.Amount > 0 {
+				s.inventoryHedgeMgr.UpdateInventorySkew(symbol, math.Abs(pos.Amount), 0)
+			} else {
+				s.inventoryHedgeMgr.UpdateInventorySkew(symbol, 0, math.Abs(pos.Amount))
+			}
+		}
+	}
+
 	midPrice := (bestBid + bestAsk) / 2
 	spread := bestAsk - bestBid
 
@@ -194,8 +371,13 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	// DYNAMIC BALANCE-BASED SIZING - Compounding with current balance
 	// ============================================================
 	balance := s.getAvailableBalance()
+	s.logger.Debug("💰 Balance check",
+		zap.String("symbol", symbol),
+		zap.Float64("available_balance", balance),
+		zap.Bool("dynamic_sizing", s.config.UseDynamicSizing))
+
 	if balance <= 0 {
-		s.logger.Warn("No available balance for order placement")
+		s.logger.Warn("❌ No available balance for order placement", zap.Float64("balance", balance))
 		return nil
 	}
 
@@ -204,22 +386,45 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		zap.Float64("available_balance", balance),
 		zap.Bool("dynamic_sizing", s.config.UseDynamicSizing))
 
-	// Calculate order size based on current balance (compounding)
+	// ============================================================
+	// NEW: ADAPTIVE LEVERAGE-BASED SIZING
+	// ============================================================
 	var baseNotional float64
+	var effectiveLeverage float64
+
 	if s.config.UseDynamicSizing {
-		// Dynamic: Scale with balance, leverage applied
-		effectiveLeverage := float64(s.config.MaxLeverage)
+		// Get adaptive leverage based on market conditions
+		if s.leverageAdapter != nil {
+			// Update leverage adapter with current price
+			s.leverageAdapter.UpdatePrice(symbol, midPrice)
+
+			// Get adaptive leverage multiplier
+			leverageMultiplier := s.leverageAdapter.GetLeverageMultiplier(symbol)
+			effectiveLeverage = float64(s.config.MaxLeverage) * leverageMultiplier
+
+			s.logger.Info("🎚️ Adaptive Leverage Applied",
+				zap.String("symbol", symbol),
+				zap.Float64("base_leverage", float64(s.config.MaxLeverage)),
+				zap.Float64("leverage_multiplier", leverageMultiplier),
+				zap.Float64("effective_leverage", effectiveLeverage))
+		} else {
+			// Fallback to static leverage
+			effectiveLeverage = float64(s.config.MaxLeverage)
+		}
+
+		// Dynamic: Scale with balance, adaptive leverage applied
 		baseNotional = balance * effectiveLeverage * (s.config.BaseNotionalUSD / 100.0)
 		// Clamp to min/max
 		if baseNotional < s.config.MinNotionalUSD {
 			baseNotional = s.config.MinNotionalUSD
 		}
-		if baseNotional > s.config.MaxNotionalUSD*float64(s.config.MaxLeverage) {
-			baseNotional = s.config.MaxNotionalUSD * float64(s.config.MaxLeverage)
+		if baseNotional > s.config.MaxNotionalUSD*effectiveLeverage {
+			baseNotional = s.config.MaxNotionalUSD * effectiveLeverage
 		}
 	} else {
 		// Legacy: Static leverage calculation
 		baseNotional = balance * float64(s.config.MaxLeverage)
+		effectiveLeverage = float64(s.config.MaxLeverage)
 	}
 
 	buyQty := baseNotional / bestBid
@@ -292,14 +497,35 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	}
 
 	// ============================================================
-	// TOXIC FLOW PROTECTION - Reduce exposure in one-sided markets
+	// MICROSTRUCTURE-AWARE ORDER SIZING
+	// ============================================================
+	microSizeMultiplier := 1.0
+	if s.microstructureAnalyzer != nil {
+		signal := s.microstructureAnalyzer.AnalyzeMarket()
+		microSizeMultiplier = signal.OrderSizeMultiplier
+
+		s.logger.Info("🧠 Microstructure Signal Applied",
+			zap.String("symbol", symbol),
+			zap.String("trading_mode", signal.TradingMode),
+			zap.Float64("composite_score", signal.CompositeScore),
+			zap.Float64("order_size_mult", signal.OrderSizeMultiplier),
+			zap.Float64("spread_mult", signal.SpreadMultiplier),
+			zap.String("rationale", signal.Rationale))
+
+		// Apply microstructure-based size adjustment
+		buyQty *= microSizeMultiplier
+		sellQty *= microSizeMultiplier
+	}
+
+	// ============================================================
+	// LEGACY: TOXIC FLOW PROTECTION (kept for compatibility)
 	// ============================================================
 	if s.config.ToxicFlowDetection && s.flowTracker != nil {
 		if s.flowTracker.IsToxicFlow() {
 			toxicReduction := s.flowTracker.GetReductionFactor()
 			buyAdjustment *= toxicReduction
 			sellAdjustment *= toxicReduction
-			s.logger.Warn("⚠️ Toxic Flow Detected - Reducing all orders",
+			s.logger.Warn("⚠️ Legacy Toxic Flow Detected - Reducing all orders",
 				zap.String("symbol", symbol),
 				zap.Float64("toxic_reduction", toxicReduction),
 				zap.Float64("buy_ratio", s.flowTracker.GetBuyRatio()))
@@ -311,6 +537,35 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	sellQty *= sellAdjustment
 
 	// ============================================================
+	// NEW: OBI-AWARE GRID SPACING ADJUSTMENT
+	// ============================================================
+	obiGridSpacingMultiplier := 1.0
+	if s.obiDetector != nil && s.config.OBISpreadAdjustment {
+		obiSignal := s.obiDetector.GetSignal()
+
+		// Adjust grid spacing based on OBI - tighter when imbalanced to attract counter-orders
+		switch obiSignal.RecommendedAction {
+		case "TIGHTEN_SELL":
+			// More buyers needed - tighten sell grid more than buy
+			obiGridSpacingMultiplier = 0.8 // 20% tighter on sell side
+		case "TIGHTEN_BUY":
+			// More sellers needed - tighten buy grid more than sell
+			obiGridSpacingMultiplier = 0.8 // 20% tighter on buy side
+		case "MODERATE_SELL":
+			obiGridSpacingMultiplier = 0.9 // 10% tighter
+		case "MODERATE_BUY":
+			obiGridSpacingMultiplier = 0.9 // 10% tighter
+		default:
+			obiGridSpacingMultiplier = 1.0 // No adjustment
+		}
+
+		s.logger.Info("🎯 OBI Grid Spacing Adjustment",
+			zap.String("symbol", symbol),
+			zap.String("action", obiSignal.RecommendedAction),
+			zap.Float64("spacing_multiplier", obiGridSpacingMultiplier))
+	}
+
+	// ============================================================
 	// MICRO PROFIT OPTIMIZATION - Ultra-tight grid for max fills
 	// ============================================================
 	var gridLevels int
@@ -319,10 +574,10 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 	var riskLevel string
 
 	if s.config.MicroProfitMode {
-		// Micro profit mode: Use configured ultra-tight parameters
+		// Micro profit mode: Use configured ultra-tight parameters with OBI adjustment
 		gridLevels = s.config.MicroGridLevels
-		gridSpacing = s.config.MicroGridSpacingBps / 10000.0 // Convert bps to decimal
-		capitalAllocation = 1.0
+		gridSpacing = (s.config.MicroGridSpacingBps / 10000.0) * obiGridSpacingMultiplier // Apply OBI adjustment
+		capitalAllocation = 2.0                                                           // Increased to ensure minimum quantity meets tick size
 		riskLevel = "MICRO_PROFIT"
 	} else {
 		// Legacy volatility-based regime
@@ -386,9 +641,15 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 		perLevelSellQty = finalMinQty
 	}
 
-	// Round to precision
-	perLevelBuyQty = s.roundToPrecision(perLevelBuyQty, symbol)
-	perLevelSellQty = s.roundToPrecision(perLevelSellQty, symbol)
+	// Round to precision using TickSizeManager
+	if s.tickSizeMgr != nil {
+		tickSize := s.tickSizeMgr.GetTickSize(symbol)
+		perLevelBuyQty = math.Round(perLevelBuyQty/tickSize) * tickSize
+		perLevelSellQty = math.Round(perLevelSellQty/tickSize) * tickSize
+	} else {
+		perLevelBuyQty = s.roundToPrecision(perLevelBuyQty, symbol)
+		perLevelSellQty = s.roundToPrecision(perLevelSellQty, symbol)
+	}
 
 	s.logger.Info("� Micro Profit Grid Config",
 		zap.String("symbol", symbol),
@@ -413,6 +674,16 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 			defer wg.Done()
 			gridOffset := gridSpacing * float64(level+1)
 			gridBuyPrice := bestBid * (1 - gridOffset)
+
+			// Apply penny jumping if enabled
+			if s.pennyJumpMgr != nil {
+				gridBuyPrice = s.pennyJumpMgr.GetPennyJumpedPrice(symbol, "BUY", gridBuyPrice)
+			}
+
+			// Round price to tick size
+			if s.tickSizeMgr != nil {
+				gridBuyPrice = s.tickSizeMgr.RoundToTickForSymbol(symbol, gridBuyPrice)
+			}
 
 			if perLevelBuyQty > 0 {
 				err := s.placeLimitOrder(symbol, OrderSideBuy, gridBuyPrice, perLevelBuyQty)
@@ -439,6 +710,16 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 			defer wg.Done()
 			gridOffset := gridSpacing * float64(level+1)
 			gridSellPrice := bestAsk * (1 + gridOffset)
+
+			// Apply penny jumping if enabled
+			if s.pennyJumpMgr != nil {
+				gridSellPrice = s.pennyJumpMgr.GetPennyJumpedPrice(symbol, "SELL", gridSellPrice)
+			}
+
+			// Round price to tick size
+			if s.tickSizeMgr != nil {
+				gridSellPrice = s.tickSizeMgr.RoundToTickForSymbol(symbol, gridSellPrice)
+			}
 
 			if perLevelSellQty > 0 {
 				err := s.placeLimitOrder(symbol, OrderSideSell, gridSellPrice, perLevelSellQty)
@@ -483,6 +764,12 @@ func (s *MakerStrategyImpl) PlaceOrders(symbol string) error {
 }
 
 func (s *MakerStrategyImpl) placeLimitOrder(symbol string, side OrderSide, price, quantity float64) error {
+	s.logger.Debug("🎯 placeLimitOrder called",
+		zap.String("symbol", symbol),
+		zap.String("side", string(side)),
+		zap.Float64("price", price),
+		zap.Float64("quantity", quantity))
+
 	req := LimitOrderRequest{
 		Symbol:      symbol,
 		Side:        side,
@@ -491,12 +778,17 @@ func (s *MakerStrategyImpl) placeLimitOrder(symbol string, side OrderSide, price
 		TimeInForce: "GTX",
 	}
 
+	s.logger.Debug("📝 Calling orderManager.PlaceLimitOrder")
 	order, err := s.orderManager.PlaceLimitOrder(s.ctx, req)
 	if err != nil {
+		s.logger.Error("❌ placeLimitOrder failed",
+			zap.String("symbol", symbol),
+			zap.String("side", string(side)),
+			zap.Error(err))
 		return err
 	}
 
-	s.logger.Info("Placed limit order",
+	s.logger.Info("✅ Placed limit order",
 		zap.String("symbol", symbol),
 		zap.String("side", string(side)),
 		zap.Float64("price", price),
@@ -555,29 +847,36 @@ func (s *MakerStrategyImpl) orderManagementLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
+			s.logger.Debug("🔄 Order management cycle started")
 			for _, symbol := range s.config.Symbols {
+				s.logger.Debug("🔄 Processing order lifecycle", zap.String("symbol", symbol))
 				s.processOrderLifecycle(symbol)
 			}
+			s.logger.Debug("✅ Order management cycle completed")
 		}
 	}
 }
 
 func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
+	s.logger.Debug("🔍 processOrderLifecycle started", zap.String("symbol", symbol))
 	// Smart Order Lifecycle - High Fill Rate Strategy:
 	// 1. Give orders time to fill (30-60 seconds)
 	// 2. Only cancel if: price moves significantly OR order is too old
 	// 3. Maintain 2-sided quote for continuous volume + micro-profit
 
 	orders := s.orderManager.GetOpenOrders(symbol)
+	s.logger.Debug("📋 Retrieved open orders", zap.String("symbol", symbol), zap.Int("count", len(orders)))
 	filledCount := 0
 
 	// Get current market price
+	s.logger.Debug("💰 Getting ticker data", zap.String("symbol", symbol))
 	bestBid, bestAsk, _, err := s.wsClient.GetTickerData(symbol)
 	if err != nil {
 		s.logger.Warn("Failed to get ticker data", zap.String("symbol", symbol), zap.Error(err))
 		return
 	}
 	midPrice := (bestBid + bestAsk) / 2
+	s.logger.Debug("💰 Got ticker data", zap.String("symbol", symbol), zap.Float64("bid", bestBid), zap.Float64("ask", bestAsk))
 
 	// SYNC WITH EXCHANGE: Get current order state from exchange (with 1s cache)
 	cacheKey := fmt.Sprintf("open_orders_%s", symbol)
@@ -591,13 +890,19 @@ func (s *MakerStrategyImpl) processOrderLifecycle(symbol string) {
 	}
 
 	if exchangeOrders == nil {
+		s.logger.Debug("📡 Calling REST API to get open orders", zap.String("symbol", symbol))
 		var err error
 		exchangeOrders, err = s.futuresClient.GetOpenOrders(s.ctx, symbol)
+		s.logger.Debug("📡 REST API call completed",
+			zap.String("symbol", symbol),
+			zap.Error(err),
+			zap.Int("order_count", len(exchangeOrders)))
 		if err != nil {
 			s.logger.Warn("Failed to sync with exchange orders", zap.Error(err))
 		} else {
 			// Cache for 1s
 			s.restCache.Set(cacheKey, exchangeOrders, cache.DefaultExpiration)
+			s.logger.Debug("📋 Cached open orders", zap.String("symbol", symbol), zap.Int("count", len(exchangeOrders)))
 		}
 	}
 
@@ -961,9 +1266,10 @@ func (s *MakerStrategyImpl) checkRiskConditions() {
 	}
 
 	if stop, reason := s.otRatioGuard.Check(s.ctx); stop {
-		s.logger.Warn("Order-to-Trade ratio high, pausing order placement", zap.String("reason", reason))
+		s.logger.Warn("❌ Order-to-Trade ratio high, pausing order placement", zap.String("reason", reason))
 		time.Sleep(30 * time.Second)
 		s.otRatioGuard.Reset()
+	} else {
 	}
 }
 
@@ -1053,17 +1359,19 @@ func (s *MakerStrategyImpl) getAvailableBalance() float64 {
 			}
 		}
 
+		s.logger.Debug("📡 Getting account info via REST API")
 		account, err := s.futuresClient.GetAccountInfo(s.ctx)
 		if err != nil {
-			s.logger.Warn("Failed to get account info from REST", zap.Error(err))
-		} else if account != nil {
-			s.logger.Info("Account info retrieved", zap.Float64("available_balance", account.AvailableBalance), zap.Float64("total_wallet", account.TotalWalletBalance))
-			// Cache for 1s (cache default expiration)
-			s.restCache.Set("account_info", account, cache.DefaultExpiration)
+			s.logger.Error("❌ Failed to get account info", zap.Error(err))
+		} else {
+			s.logger.Debug("✅ Account info received", zap.Float64("balance", account.AvailableBalance))
+			// Cache for 30 seconds
+			s.restCache.Set("account_info", account, 30*time.Second)
 			return account.AvailableBalance
 		}
 	}
 
+	s.logger.Warn("⚠️ getAvailableBalance returning 0 (fallback)")
 	s.logger.Warn("No balance available from any source")
 	return 0
 }

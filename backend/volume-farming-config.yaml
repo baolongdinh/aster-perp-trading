@@ -65,7 +65,7 @@ symbols:
 
 # Bot Configuration
 bot:
-  dry_run: true
+  dry_run: false
 
 # API Configuration
 api:

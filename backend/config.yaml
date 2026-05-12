@@ -82,10 +82,11 @@ volume_farming:
     futures_ws_base: "wss://fstream.asterdex.com"
     recv_window: 5000
     requests_per_second: 1
-
-  risk:
-    max_position_usdt: 1000
-    max_open_positions: 2
+    # Order Book Imbalance Detection (OBI) - DEFAULT: ON - DEADLOCK FIXED
+    OBIDetectionEnabled: true
+    OBIWindowSize:       10
+    OBIThreshold:        0.5
+    OBISpreadAdjustment: true
     max_global_pending_limit_orders: 4
     max_pending_per_side: 1
     daily_loss_limit_usdt: 25

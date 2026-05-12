@@ -71,6 +71,14 @@ func (m *OrderManagerImpl) PlaceLimitOrder(ctx context.Context, req LimitOrderRe
 		return nil, fmt.Errorf("place order failed: %w", err)
 	}
 
+	m.logger.Info("✅ Order placed successfully!",
+		zap.String("symbol", resp.Symbol),
+		zap.String("side", resp.Side),
+		zap.Float64("price", resp.Price),
+		zap.Float64("quantity", resp.OrigQty),
+		zap.Int64("order_id", resp.OrderID),
+		zap.String("status", resp.Status))
+
 	order := &Order{
 		OrderID:       resp.OrderID,
 		Symbol:        resp.Symbol,

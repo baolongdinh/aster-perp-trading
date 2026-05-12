@@ -1,6 +1,10 @@
 package maker
 
-import "time"
+import (
+	"time"
+
+	"aster-bot/internal/farming/volume_optimization"
+)
 
 type Config struct {
 	DefaultSpreadBps     float64       `mapstructure:"default_spread_bps" yaml:"default_spread_bps"`
@@ -39,6 +43,25 @@ type Config struct {
 	MomentumDetection    bool    `mapstructure:"momentum_detection" yaml:"momentum_detection"`
 	MomentumThresholdPct float64 `mapstructure:"momentum_threshold_pct" yaml:"momentum_threshold_pct"` // 0.03 = 3% price move
 	MomentumTimeWindow   int     `mapstructure:"momentum_time_window" yaml:"momentum_time_window"`     // seconds
+
+	// Order Book Imbalance Detection (OBI)
+	OBIDetectionEnabled bool    `mapstructure:"obi_detection_enabled" yaml:"obi_detection_enabled"`
+	OBIWindowSize       int     `mapstructure:"obi_window_size" yaml:"obi_window_size"`             // Number of snapshots to track
+	OBIThreshold        float64 `mapstructure:"obi_threshold" yaml:"obi_threshold"`                 // What constitutes "strong" imbalance
+	OBISpreadAdjustment bool    `mapstructure:"obi_spread_adjustment" yaml:"obi_spread_adjustment"` // Adjust spread based on OBI
+	OBISizeAdjustment   bool    `mapstructure:"obi_size_adjustment" yaml:"obi_size_adjustment"`     // Adjust order size based on OBI
+
+	// Market Microstructure Analyzer (combines VPIN + OBI)
+	MicrostructureAnalysisEnabled bool `mapstructure:"microstructure_analysis_enabled" yaml:"microstructure_analysis_enabled"`
+	AggressivenessLevel           int  `mapstructure:"aggressiveness_level" yaml:"aggressiveness_level"` // 1-5 scale
+
+	// Volume Optimization Modules
+	PennyJumpingEnabled      bool                                     `mapstructure:"penny_jumping_enabled" yaml:"penny_jumping_enabled"`
+	PennyJumpingConfig       volume_optimization.PennyConfig          `mapstructure:"penny_jumping_config" yaml:"penny_jumping_config"`
+	InventoryHedgingEnabled  bool                                     `mapstructure:"inventory_hedging_enabled" yaml:"inventory_hedging_enabled"`
+	InventoryHedgingConfig   volume_optimization.InventoryHedgeConfig `mapstructure:"inventory_hedging_config" yaml:"inventory_hedging_config"`
+	SmartCancellationEnabled bool                                     `mapstructure:"smart_cancellation_enabled" yaml:"smart_cancellation_enabled"`
+	SmartCancellationConfig  volume_optimization.SmartCancelConfig    `mapstructure:"smart_cancellation_config" yaml:"smart_cancellation_config"`
 }
 
 func DefaultConfig() *Config {
@@ -79,5 +102,39 @@ func DefaultConfig() *Config {
 		MomentumDetection:    true,
 		MomentumThresholdPct: 0.03, // 3% price move
 		MomentumTimeWindow:   30,   // 30 seconds
+
+		// Order Book Imbalance Detection (OBI) - DEFAULT: ON
+		OBIDetectionEnabled: true,
+		OBIWindowSize:       10,   // Track 10 snapshots (10 seconds @ 1Hz)
+		OBIThreshold:        0.5,  // 50% imbalance = significant
+		OBISpreadAdjustment: true, // Adjust spread based on OBI signal
+		OBISizeAdjustment:   true, // Adjust order size based on OBI signal
+
+		// Market Microstructure Analyzer (combines VPIN + OBI) - DEFAULT: ON
+		MicrostructureAnalysisEnabled: true,
+		AggressivenessLevel:           3, // 1-5 scale, 3 = medium
+
+		// Volume Optimization Modules (DEFAULT: ON)
+		PennyJumpingEnabled: true,
+		PennyJumpingConfig: volume_optimization.PennyConfig{
+			Enabled:       true,
+			JumpThreshold: 0.1,
+			MaxJump:       1,
+		},
+		InventoryHedgingEnabled: true,
+		InventoryHedgingConfig: volume_optimization.InventoryHedgeConfig{
+			Enabled:        true,
+			HedgeThreshold: 0.3,
+			HedgeRatio:     0.3,
+			MaxHedgeSize:   100.0,
+			HedgingMode:    "internal",
+			CheckInterval:  30 * time.Second,
+		},
+		SmartCancellationEnabled: true,
+		SmartCancellationConfig: volume_optimization.SmartCancelConfig{
+			Enabled:               true,
+			SpreadChangeThreshold: 0.2,
+			CheckInterval:         5 * time.Second,
+		},
 	}
 }
